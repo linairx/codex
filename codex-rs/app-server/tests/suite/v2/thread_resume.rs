@@ -12,13 +12,22 @@ use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use chrono::Utc;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::CommandExecutionSource;
+use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
+use codex_app_server_protocol::GuardianApprovalReview;
+use codex_app_server_protocol::GuardianApprovalReviewAction;
+use codex_app_server_protocol::GuardianApprovalReviewState;
+use codex_app_server_protocol::GuardianApprovalReviewStatus;
+use codex_app_server_protocol::GuardianRiskLevel;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::NetworkApprovalProtocol;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::RequestId;
@@ -44,8 +53,15 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
+use codex_protocol::protocol::GuardianAssessmentAction;
+use codex_protocol::protocol::GuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus;
+use codex_protocol::protocol::GuardianRiskLevel as CoreGuardianRiskLevel;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource as RolloutSessionSource;
@@ -576,6 +592,155 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
     assert_eq!(read_thread.turns.len(), 2);
     assert_eq!(read_thread.turns[1].id, turn_id);
     assert_eq!(read_thread.turns[1].status, TurnStatus::Interrupted);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_and_read_preserve_network_guardian_review_on_command_item() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let filename_ts = "2025-01-05T12-00-00";
+    let meta_rfc3339 = "2025-01-05T12:00:00Z";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        meta_rfc3339,
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let rollout_file_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
+    let turn_id = "network-review-turn";
+    let appended_rollout = [
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: "exec-1".to_string(),
+                process_id: None,
+                turn_id: turn_id.to_string(),
+                command: vec!["curl".to_string(), "https://api.example.com".to_string()],
+                cwd: PathBuf::from("/tmp"),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "curl https://api.example.com".to_string(),
+                }],
+                source: CoreExecCommandSource::Agent,
+                interaction_input: None,
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                id: "exec-1".to_string(),
+                turn_id: turn_id.to_string(),
+                status: GuardianAssessmentStatus::Approved,
+                risk_score: Some(12),
+                risk_level: Some(CoreGuardianRiskLevel::Low),
+                rationale: Some("expected outbound request".to_string()),
+                action: GuardianAssessmentAction::NetworkAccess {
+                    target: "https://api.example.com:443".to_string(),
+                    host: "api.example.com".to_string(),
+                    protocol: codex_protocol::protocol::NetworkApprovalProtocol::Https,
+                    port: 443,
+                },
+            }))?,
+        })
+        .to_string(),
+    ]
+    .join("\n");
+    std::fs::write(
+        &rollout_file_path,
+        format!("{persisted_rollout}{appended_rollout}\n"),
+    )?;
+
+    let expected_item = ThreadItem::CommandExecution {
+        id: "exec-1".to_string(),
+        command: "curl https://api.example.com".to_string(),
+        cwd: PathBuf::from("/tmp"),
+        process_id: None,
+        source: CommandExecutionSource::Agent,
+        status: CommandExecutionStatus::InProgress,
+        command_actions: vec![CommandAction::Unknown {
+            command: "curl https://api.example.com".to_string(),
+        }],
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+        guardian_review: Some(GuardianApprovalReviewState {
+            review: GuardianApprovalReview {
+                status: GuardianApprovalReviewStatus::Approved,
+                risk_score: Some(12),
+                risk_level: Some(GuardianRiskLevel::Low),
+                rationale: Some("expected outbound request".to_string()),
+            },
+            action: GuardianApprovalReviewAction::NetworkAccess {
+                target: "https://api.example.com:443".to_string(),
+                host: "api.example.com".to_string(),
+                protocol: NetworkApprovalProtocol::Https,
+                port: 443,
+            },
+        }),
+    };
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.turns[1].id, turn_id);
+    assert_eq!(thread.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(thread.turns[1].items, vec![expected_item.clone()]);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id,
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert_eq!(read_thread.status, ThreadStatus::Idle);
+    assert_eq!(read_thread.turns.len(), 2);
+    assert_eq!(read_thread.turns[1].id, turn_id);
+    assert_eq!(read_thread.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(read_thread.turns[1].items, vec![expected_item]);
 
     Ok(())
 }
@@ -1301,6 +1466,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
             diff: "new line\n".to_string(),
         }],
         status: PatchApplyStatus::InProgress,
+        guardian_review: None,
     };
     assert_eq!(original_started, expected_file_change);
 

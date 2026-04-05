@@ -13,6 +13,7 @@ import type { CommandExecutionStatus } from "./CommandExecutionStatus";
 import type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputContentItem";
 import type { DynamicToolCallStatus } from "./DynamicToolCallStatus";
 import type { FileUpdateChange } from "./FileUpdateChange";
+import type { GuardianApprovalReviewState } from "./GuardianApprovalReviewState";
 import type { HookPromptFragment } from "./HookPromptFragment";
 import type { McpToolCallError } from "./McpToolCallError";
 import type { McpToolCallResult } from "./McpToolCallResult";
@@ -52,11 +53,11 @@ exitCode: number | null,
 /**
  * The duration of the command execution in milliseconds.
  */
-durationMs: number | null, } | { "type": "fileChange", id: string, changes: Array<FileUpdateChange>, status: PatchApplyStatus, } | { "type": "mcpToolCall", id: string, server: string, tool: string, status: McpToolCallStatus, arguments: JsonValue, result: McpToolCallResult | null, error: McpToolCallError | null, 
+durationMs: number | null, guardianReview: GuardianApprovalReviewState | null, } | { "type": "fileChange", id: string, changes: Array<FileUpdateChange>, status: PatchApplyStatus, guardianReview: GuardianApprovalReviewState | null, } | { "type": "mcpToolCall", id: string, server: string, tool: string, status: McpToolCallStatus, arguments: JsonValue, result: McpToolCallResult | null, error: McpToolCallError | null, 
 /**
  * The duration of the MCP tool call in milliseconds.
  */
-durationMs: number | null, } | { "type": "dynamicToolCall", id: string, tool: string, arguments: JsonValue, status: DynamicToolCallStatus, contentItems: Array<DynamicToolCallOutputContentItem> | null, success: boolean | null, 
+durationMs: number | null, guardianReview: GuardianApprovalReviewState | null, } | { "type": "dynamicToolCall", id: string, tool: string, arguments: JsonValue, status: DynamicToolCallStatus, contentItems: Array<DynamicToolCallOutputContentItem> | null, success: boolean | null, 
 /**
  * The duration of the dynamic tool call in milliseconds.
  */

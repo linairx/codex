@@ -285,6 +285,16 @@ impl NetworkApprovalService {
         format!("network#{}#{}#{}", key.protocol, key.host, key.port)
     }
 
+    fn guardian_review_id_for_call(
+        owner_call: Option<&ActiveNetworkApprovalCall>,
+        key: &HostApprovalKey,
+    ) -> String {
+        owner_call.map_or_else(
+            || Self::approval_id_for_key(key),
+            |call| call.registration_id.clone(),
+        )
+    }
+
     pub(crate) async fn handle_inline_policy_request(
         &self,
         session: Arc<Session>,
@@ -351,13 +361,11 @@ impl NetworkApprovalService {
         };
         let owner_call = self.resolve_single_active_call().await;
         let approval_decision = if routes_approval_to_guardian(&turn_context) {
-            // TODO(ccunningham): Attach guardian network reviews to the reviewed tool item
-            // lifecycle instead of this temporary standalone network approval id.
             review_approval_request(
                 &session,
                 &turn_context,
                 GuardianApprovalRequest::NetworkAccess {
-                    id: Self::approval_id_for_key(&key),
+                    id: Self::guardian_review_id_for_call(owner_call.as_deref(), &key),
                     turn_id: owner_call
                         .as_ref()
                         .map_or_else(|| turn_context.sub_id.clone(), |call| call.turn_id.clone()),

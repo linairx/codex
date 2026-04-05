@@ -52,6 +52,8 @@ use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
+use codex_protocol::protocol::GuardianAssessmentEvent as CoreGuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus as CoreGuardianAssessmentStatus;
 use codex_protocol::protocol::GuardianRiskLevel as CoreGuardianRiskLevel;
 use codex_protocol::protocol::HookEventName as CoreHookEventName;
 use codex_protocol::protocol::HookExecutionMode as CoreHookExecutionMode;
@@ -4289,6 +4291,7 @@ pub enum ThreadItem {
         /// The duration of the command execution in milliseconds.
         #[ts(type = "number | null")]
         duration_ms: Option<i64>,
+        guardian_review: Option<GuardianApprovalReviewState>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -4296,6 +4299,7 @@ pub enum ThreadItem {
         id: String,
         changes: Vec<FileUpdateChange>,
         status: PatchApplyStatus,
+        guardian_review: Option<GuardianApprovalReviewState>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -4310,6 +4314,7 @@ pub enum ThreadItem {
         /// The duration of the MCP tool call in milliseconds.
         #[ts(type = "number | null")]
         duration_ms: Option<i64>,
+        guardian_review: Option<GuardianApprovalReviewState>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -4421,6 +4426,17 @@ pub enum GuardianApprovalReviewStatus {
     Aborted,
 }
 
+impl From<CoreGuardianAssessmentStatus> for GuardianApprovalReviewStatus {
+    fn from(value: CoreGuardianAssessmentStatus) -> Self {
+        match value {
+            CoreGuardianAssessmentStatus::InProgress => Self::InProgress,
+            CoreGuardianAssessmentStatus::Approved => Self::Approved,
+            CoreGuardianAssessmentStatus::Denied => Self::Denied,
+            CoreGuardianAssessmentStatus::Aborted => Self::Aborted,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export_to = "v2/")]
@@ -4453,6 +4469,36 @@ pub struct GuardianApprovalReview {
     pub risk_score: Option<u8>,
     pub risk_level: Option<GuardianRiskLevel>,
     pub rationale: Option<String>,
+}
+
+impl GuardianApprovalReview {
+    pub fn from_core_assessment(value: &CoreGuardianAssessmentEvent) -> Self {
+        Self {
+            status: value.status.into(),
+            risk_score: value.risk_score,
+            risk_level: value.risk_level.map(Into::into),
+            rationale: value.rationale.clone(),
+        }
+    }
+}
+
+/// [UNSTABLE] Guardian review state attached to a reviewed thread item so the
+/// item lifecycle can be replayed through `thread/read` and `thread/resume`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GuardianApprovalReviewState {
+    pub review: GuardianApprovalReview,
+    pub action: GuardianApprovalReviewAction,
+}
+
+impl GuardianApprovalReviewState {
+    pub fn from_core_assessment(value: &CoreGuardianAssessmentEvent) -> Self {
+        Self {
+            review: GuardianApprovalReview::from_core_assessment(value),
+            action: value.action.clone().into(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -5150,11 +5196,8 @@ pub struct ItemStartedNotification {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// [UNSTABLE] Temporary notification payload for guardian automatic approval
-/// review. This shape is expected to change soon.
-///
-/// TODO(ccunningham): Attach guardian review state to the reviewed tool item's
-/// lifecycle instead of sending separate standalone review notifications so the
-/// app-server API can persist and replay review state via `thread/read`.
+/// review. This shape is expected to change soon. For persisted history,
+/// prefer inline `guardianReview` on supported thread items when available.
 pub struct ItemGuardianApprovalReviewStartedNotification {
     pub thread_id: String,
     pub turn_id: String,
@@ -5167,11 +5210,8 @@ pub struct ItemGuardianApprovalReviewStartedNotification {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// [UNSTABLE] Temporary notification payload for guardian automatic approval
-/// review. This shape is expected to change soon.
-///
-/// TODO(ccunningham): Attach guardian review state to the reviewed tool item's
-/// lifecycle instead of sending separate standalone review notifications so the
-/// app-server API can persist and replay review state via `thread/read`.
+/// review. This shape is expected to change soon. For persisted history,
+/// prefer inline `guardianReview` on supported thread items when available.
 pub struct ItemGuardianApprovalReviewCompletedNotification {
     pub thread_id: String,
     pub turn_id: String,

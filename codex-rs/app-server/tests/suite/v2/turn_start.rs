@@ -1554,12 +1554,14 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
         ref id,
         status,
         ref changes,
+        ref guardian_review,
     } = started_file_change
     else {
         unreachable!("loop ensures we break on file change items");
     };
     assert_eq!(id, "patch-call");
     assert_eq!(status, PatchApplyStatus::InProgress);
+    assert_eq!(guardian_review, &None);
     let started_changes = changes.clone();
 
     let server_req = timeout(
@@ -2311,12 +2313,14 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
         ref id,
         status,
         ref changes,
+        ref guardian_review,
     } = started_file_change
     else {
         unreachable!("loop ensures we break on file change items");
     };
     assert_eq!(id, "patch-call");
     assert_eq!(status, PatchApplyStatus::InProgress);
+    assert_eq!(guardian_review, &None);
     let started_changes = changes.clone();
 
     let server_req = timeout(

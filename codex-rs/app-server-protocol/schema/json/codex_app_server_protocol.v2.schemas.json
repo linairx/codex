@@ -5017,6 +5017,22 @@
         }
       ]
     },
+    "GuardianApprovalReviewState": {
+      "description": "[UNSTABLE] Guardian review state attached to a reviewed thread item so the item lifecycle can be replayed through `thread/read` and `thread/resume`.",
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/GuardianApprovalReviewAction"
+        },
+        "review": {
+          "$ref": "#/definitions/GuardianApprovalReview"
+        }
+      },
+      "required": [
+        "action",
+        "review"
+      ],
+      "type": "object"
+    },
     "GuardianApprovalReviewStatus": {
       "description": "[UNSTABLE] Lifecycle state for a guardian approval review.",
       "enum": [
@@ -10566,6 +10582,16 @@
                 "null"
               ]
             },
+            "guardianReview": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GuardianApprovalReviewState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "id": {
               "type": "string"
             },
@@ -10614,6 +10640,16 @@
               },
               "type": "array"
             },
+            "guardianReview": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GuardianApprovalReviewState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "id": {
               "type": "string"
             },
@@ -10652,6 +10688,16 @@
               "anyOf": [
                 {
                   "$ref": "#/definitions/McpToolCallError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "guardianReview": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GuardianApprovalReviewState"
                 },
                 {
                   "type": "null"

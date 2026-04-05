@@ -179,6 +179,38 @@ fn only_never_policy_disables_network_approval_flow() {
     assert!(allows_network_approval_flow(AskForApproval::UnlessTrusted));
 }
 
+#[test]
+fn guardian_review_id_uses_owner_call_when_available() {
+    let key = HostApprovalKey {
+        host: "example.com".to_string(),
+        protocol: "https",
+        port: 443,
+    };
+    let owner_call = ActiveNetworkApprovalCall {
+        registration_id: "command-call-1".to_string(),
+        turn_id: "turn-1".to_string(),
+    };
+
+    assert_eq!(
+        NetworkApprovalService::guardian_review_id_for_call(Some(&owner_call), &key),
+        "command-call-1".to_string()
+    );
+}
+
+#[test]
+fn guardian_review_id_falls_back_to_standalone_network_id_without_owner_call() {
+    let key = HostApprovalKey {
+        host: "example.com".to_string(),
+        protocol: "https",
+        port: 443,
+    };
+
+    assert_eq!(
+        NetworkApprovalService::guardian_review_id_for_call(None, &key),
+        "network#https#example.com#443".to_string()
+    );
+}
+
 fn denied_blocked_request(host: &str) -> BlockedRequest {
     BlockedRequest::new(BlockedRequestArgs {
         host: host.to_string(),

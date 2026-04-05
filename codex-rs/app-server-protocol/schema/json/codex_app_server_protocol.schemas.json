@@ -8238,6 +8238,22 @@
           }
         ]
       },
+      "GuardianApprovalReviewState": {
+        "description": "[UNSTABLE] Guardian review state attached to a reviewed thread item so the item lifecycle can be replayed through `thread/read` and `thread/resume`.",
+        "properties": {
+          "action": {
+            "$ref": "#/definitions/v2/GuardianApprovalReviewAction"
+          },
+          "review": {
+            "$ref": "#/definitions/v2/GuardianApprovalReview"
+          }
+        },
+        "required": [
+          "action",
+          "review"
+        ],
+        "type": "object"
+      },
       "GuardianApprovalReviewStatus": {
         "description": "[UNSTABLE] Lifecycle state for a guardian approval review.",
         "enum": [
@@ -12711,6 +12727,16 @@
                   "null"
                 ]
               },
+              "guardianReview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/GuardianApprovalReviewState"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "id": {
                 "type": "string"
               },
@@ -12759,6 +12785,16 @@
                 },
                 "type": "array"
               },
+              "guardianReview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/GuardianApprovalReviewState"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "id": {
                 "type": "string"
               },
@@ -12797,6 +12833,16 @@
                 "anyOf": [
                   {
                     "$ref": "#/definitions/v2/McpToolCallError"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "guardianReview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/GuardianApprovalReviewState"
                   },
                   {
                     "type": "null"

@@ -43,8 +43,6 @@ use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
 use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
-use codex_app_server_protocol::GuardianApprovalReview;
-use codex_app_server_protocol::GuardianApprovalReviewStatus;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
@@ -196,34 +194,15 @@ fn guardian_auto_approval_review_notification(
     event_turn_id: &str,
     assessment: &GuardianAssessmentEvent,
 ) -> ServerNotification {
-    // TODO(ccunningham): Attach guardian review state to the reviewed tool
-    // item's lifecycle instead of sending standalone review notifications so
-    // the app-server API can persist and replay review state via `thread/read`.
     let turn_id = if assessment.turn_id.is_empty() {
         event_turn_id.to_string()
     } else {
         assessment.turn_id.clone()
     };
-    let review = GuardianApprovalReview {
-        status: match assessment.status {
-            codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
-                GuardianApprovalReviewStatus::InProgress
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::Approved => {
-                GuardianApprovalReviewStatus::Approved
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::Denied => {
-                GuardianApprovalReviewStatus::Denied
-            }
-            codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
-                GuardianApprovalReviewStatus::Aborted
-            }
-        },
-        risk_score: assessment.risk_score,
-        risk_level: assessment.risk_level.map(Into::into),
-        rationale: assessment.rationale.clone(),
-    };
-    let action = assessment.action.clone().into();
+    let guardian_review =
+        codex_app_server_protocol::GuardianApprovalReviewState::from_core_assessment(assessment);
+    let review = guardian_review.review;
+    let action = guardian_review.action;
     match assessment.status {
         codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
             ServerNotification::ItemGuardianApprovalReviewStarted(
@@ -548,6 +527,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                             id: item_id.clone(),
                             changes: patch_changes.clone(),
                             status: PatchApplyStatus::InProgress,
+                            guardian_review: None,
                         };
                         let notification = ItemStartedNotification {
                             thread_id: conversation_id.to_string(),
@@ -1569,6 +1549,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     id: item_id.clone(),
                     changes,
                     status: PatchApplyStatus::InProgress,
+                    guardian_review: None,
                 };
                 let notification = ItemStartedNotification {
                     thread_id: conversation_id.to_string(),
@@ -1628,6 +1609,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 aggregated_output: None,
                 exit_code: None,
                 duration_ms: None,
+                guardian_review: None,
             };
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
@@ -1741,6 +1723,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 aggregated_output,
                 exit_code: Some(exit_code),
                 duration_ms: Some(duration_ms),
+                guardian_review: None,
             };
 
             let notification = ItemCompletedNotification {
@@ -1980,6 +1963,7 @@ async fn complete_file_change_item(
         id: item_id,
         changes,
         status,
+        guardian_review: None,
     };
     let notification = ItemCompletedNotification {
         thread_id: conversation_id.to_string(),
@@ -2015,6 +1999,7 @@ async fn complete_command_execution_item(
         aggregated_output: None,
         exit_code: None,
         duration_ms: None,
+        guardian_review: None,
     };
     let notification = ItemCompletedNotification {
         thread_id: conversation_id.to_string(),
@@ -2793,6 +2778,7 @@ async fn construct_mcp_tool_call_notification(
         result: None,
         error: None,
         duration_ms: None,
+        guardian_review: None,
     };
     ItemStartedNotification {
         thread_id,
@@ -2839,6 +2825,7 @@ async fn construct_mcp_tool_call_end_notification(
         result,
         error,
         duration_ms,
+        guardian_review: None,
     };
     ItemCompletedNotification {
         thread_id,
@@ -3599,6 +3586,7 @@ mod tests {
                 result: None,
                 error: None,
                 duration_ms: None,
+                guardian_review: None,
             },
         };
 
@@ -3735,6 +3723,7 @@ mod tests {
                 result: None,
                 error: None,
                 duration_ms: None,
+                guardian_review: None,
             },
         };
 
@@ -3789,6 +3778,7 @@ mod tests {
                 }),
                 error: None,
                 duration_ms: Some(0),
+                guardian_review: None,
             },
         };
 
@@ -3831,6 +3821,7 @@ mod tests {
                     message: "boom".to_string(),
                 }),
                 duration_ms: Some(1),
+                guardian_review: None,
             },
         };
 
