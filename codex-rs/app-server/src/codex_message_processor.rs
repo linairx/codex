@@ -4329,6 +4329,21 @@ impl CodexMessageProcessor {
         let history_cwd =
             read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
                 .await;
+        let source_history_items =
+            match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+                Ok(items) => items,
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!(
+                            "failed to load source rollout `{}` for thread fork: {err}",
+                            rollout_path.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -4446,97 +4461,23 @@ impl CodexMessageProcessor {
             "thread",
         );
 
-        // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
-        // pathless, so they rebuild their visible history from the copied source rollout instead.
-        let mut thread = if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref() {
-            match read_summary_from_rollout(
-                fork_rollout_path.as_path(),
+        let thread = match self
+            .build_forked_thread_snapshot(
+                thread_id,
+                &forked_thread,
+                session_configured.rollout_path.as_deref(),
                 fallback_model_provider.as_str(),
-            )
-            .await
-            {
-                Ok(summary) => {
-                    let mut thread = summary_to_thread(summary);
-                    thread.forked_from_id =
-                        forked_from_id_from_rollout(fork_rollout_path.as_path()).await;
-                    thread
-                }
-                Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to load rollout `{}` for thread {thread_id}: {err}",
-                            fork_rollout_path.display()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        } else {
-            let config_snapshot = forked_thread.config_snapshot().await;
-            // forked thread names do not inherit the source thread name
-            let mut thread =
-                build_thread_from_snapshot(thread_id, &config_snapshot, /*path*/ None);
-            let history_items = match read_rollout_items_from_rollout(rollout_path.as_path()).await
-            {
-                Ok(items) => items,
-                Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to load source rollout `{}` for thread {thread_id}: {err}",
-                            rollout_path.display()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            thread.preview = preview_from_rollout_items(&history_items);
-            thread.forked_from_id = source_thread_id
-                .or_else(|| {
-                    history_items.iter().find_map(|item| match item {
-                        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
-                        _ => None,
-                    })
-                })
-                .map(|id| id.to_string());
-            if let Err(message) = populate_thread_turns(
-                &mut thread,
-                ThreadTurnSource::HistoryItems(&history_items),
-                /*active_turn*/ None,
-            )
-            .await
-            {
-                self.send_internal_error(request_id, message).await;
-                return;
-            }
-            thread
-        };
-
-        if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref()
-            && let Err(message) = populate_thread_turns(
-                &mut thread,
-                ThreadTurnSource::RolloutPath(fork_rollout_path.as_path()),
-                /*active_turn*/ None,
+                source_thread_id,
+                &source_history_items,
             )
             .await
         {
-            self.send_internal_error(request_id, message).await;
-            return;
-        }
-
-        self.thread_watch_manager
-            .upsert_thread_silently(thread.clone())
-            .await;
-
-        thread.status = resolve_thread_status(
-            self.thread_watch_manager
-                .loaded_status_for_thread(&thread.id)
-                .await,
-            /*has_in_progress_turn*/ false,
-        );
+            Ok(thread) => thread,
+            Err(message) => {
+                self.send_internal_error(request_id, message).await;
+                return;
+            }
+        };
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
@@ -4565,6 +4506,85 @@ impl CodexMessageProcessor {
         self.outgoing
             .send_server_notification(ServerNotification::ThreadStarted(notif))
             .await;
+    }
+
+    async fn build_forked_thread_snapshot(
+        &self,
+        thread_id: ThreadId,
+        forked_thread: &Arc<CodexThread>,
+        fork_rollout_path: Option<&Path>,
+        fallback_model_provider: &str,
+        source_thread_id: Option<ThreadId>,
+        source_history_items: &[RolloutItem],
+    ) -> std::result::Result<Thread, String> {
+        let mut thread = if let Some(fork_rollout_path) = fork_rollout_path {
+            read_summary_from_rollout(fork_rollout_path, fallback_model_provider)
+                .await
+                .map(|summary| {
+                    let mut thread = summary_to_thread(summary);
+                    thread.forked_from_id =
+                        source_thread_id.map(|id| id.to_string()).or_else(|| {
+                            source_history_items.iter().find_map(|item| match item {
+                                RolloutItem::SessionMeta(meta_line) => {
+                                    Some(meta_line.meta.id.to_string())
+                                }
+                                _ => None,
+                            })
+                        });
+                    thread
+                })
+                .map_err(|err| {
+                    format!(
+                        "failed to load rollout `{}` for thread {thread_id}: {err}",
+                        fork_rollout_path.display()
+                    )
+                })?
+        } else {
+            let config_snapshot = forked_thread.config_snapshot().await;
+            let mut thread =
+                build_thread_from_snapshot(thread_id, &config_snapshot, /*path*/ None);
+            thread.preview = preview_from_rollout_items(source_history_items);
+            thread.forked_from_id = source_thread_id
+                .or_else(|| {
+                    source_history_items.iter().find_map(|item| match item {
+                        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+                        _ => None,
+                    })
+                })
+                .map(|id| id.to_string());
+            populate_thread_turns(
+                &mut thread,
+                ThreadTurnSource::HistoryItems(source_history_items),
+                /*active_turn*/ None,
+            )
+            .await?;
+            thread
+        };
+
+        let source_snapshot_turns = build_turns_from_rollout_items(source_history_items);
+        if let Some(fork_rollout_path) = fork_rollout_path {
+            populate_thread_turns(
+                &mut thread,
+                ThreadTurnSource::RolloutPath(fork_rollout_path),
+                /*active_turn*/ None,
+            )
+            .await?;
+        }
+        overlay_missing_turn_items_from_snapshot(&mut thread.turns, &source_snapshot_turns);
+
+        self.thread_watch_manager
+            .upsert_thread_silently(thread.clone())
+            .await;
+
+        let thread_id_for_status = thread.id.clone();
+        set_thread_status_and_interrupt_stale_turns(
+            &mut thread,
+            self.thread_watch_manager
+                .loaded_status_for_thread(&thread_id_for_status)
+                .await,
+            /*has_live_in_progress_turn*/ false,
+        );
+        Ok(thread)
     }
 
     async fn get_thread_summary(
@@ -7018,7 +7038,7 @@ impl CodexMessageProcessor {
             .fork_thread(
                 ForkSnapshot::Interrupted,
                 config,
-                rollout_path,
+                rollout_path.clone(),
                 /*persist_extended_history*/ false,
                 self.request_trace_context(request_id).await,
             )
@@ -7043,19 +7063,32 @@ impl CodexMessageProcessor {
         );
 
         let fallback_provider = self.config.model_provider_id.as_str();
-        if let Some(rollout_path) = review_thread.rollout_path() {
-            match read_summary_from_rollout(rollout_path.as_path(), fallback_provider).await {
-                Ok(summary) => {
-                    let mut thread = summary_to_thread(summary);
-                    self.thread_watch_manager
-                        .upsert_thread_silently(thread.clone())
-                        .await;
-                    thread.status = resolve_thread_status(
-                        self.thread_watch_manager
-                            .loaded_status_for_thread(&thread.id)
-                            .await,
-                        /*has_in_progress_turn*/ false,
+        let source_history_items =
+            match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to load source rollout `{}` for review thread {}: {}",
+                        rollout_path.display(),
+                        session_configured.session_id,
+                        err
                     );
+                    Vec::new()
+                }
+            };
+        if let Some(rollout_path) = review_thread.rollout_path() {
+            match self
+                .build_forked_thread_snapshot(
+                    thread_id,
+                    &review_thread,
+                    Some(rollout_path.as_path()),
+                    fallback_provider,
+                    Some(parent_thread_id),
+                    &source_history_items,
+                )
+                .await
+            {
+                Ok(thread) => {
                     let notif = ThreadStartedNotification { thread };
                     self.outgoing
                         .send_server_notification(ServerNotification::ThreadStarted(notif))
@@ -7063,7 +7096,7 @@ impl CodexMessageProcessor {
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "failed to load summary for review thread {}: {}",
+                        "failed to build detached review thread snapshot {}: {}",
                         session_configured.session_id,
                         err
                     );
@@ -8007,6 +8040,19 @@ async fn resolve_pending_server_request(
 fn merge_turn_history_with_active_turn(turns: &mut Vec<Turn>, active_turn: Turn) {
     turns.retain(|turn| turn.id != active_turn.id);
     turns.push(active_turn);
+}
+
+fn overlay_missing_turn_items_from_snapshot(turns: &mut [Turn], snapshot_turns: &[Turn]) {
+    for turn in turns {
+        if let Some(snapshot_turn) = snapshot_turns
+            .iter()
+            .find(|candidate| candidate.id == turn.id)
+        {
+            if turn.items.is_empty() && !snapshot_turn.items.is_empty() {
+                turn.items = snapshot_turn.items.clone();
+            }
+        }
+    }
 }
 
 fn set_thread_status_and_interrupt_stale_turns(

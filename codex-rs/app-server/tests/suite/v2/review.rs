@@ -1,16 +1,27 @@
 use anyhow::Result;
 use app_test_support::McpProcess;
+use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
+use app_test_support::rollout_path;
 use app_test_support::to_response;
+use codex_app_server_protocol::CommandAction;
+use codex_app_server_protocol::CommandExecutionSource;
+use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::GuardianApprovalReview;
+use codex_app_server_protocol::GuardianApprovalReviewAction;
+use codex_app_server_protocol::GuardianApprovalReviewState;
+use codex_app_server_protocol::GuardianApprovalReviewStatus;
+use codex_app_server_protocol::GuardianRiskLevel;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::NetworkApprovalProtocol;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
@@ -18,6 +29,8 @@ use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
@@ -25,8 +38,18 @@ use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
+use codex_protocol::protocol::GuardianAssessmentAction;
+use codex_protocol::protocol::GuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus;
+use codex_protocol::protocol::GuardianRiskLevel as CoreGuardianRiskLevel;
+use codex_protocol::protocol::TurnStartedEvent;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -329,6 +352,187 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let started: ThreadStartedNotification =
         serde_json::from_value(notification.params.expect("params must be present"))?;
     assert_eq!(started.thread.id, review_thread_id);
+
+    Ok(())
+}
+
+#[cfg_attr(target_os = "windows", ignore = "flaky on windows CI")]
+#[tokio::test]
+async fn review_start_with_detached_delivery_preserves_guardian_review_in_started_thread()
+-> Result<()> {
+    let review_payload = json!({
+        "findings": [],
+        "overall_correctness": "ok",
+        "overall_explanation": "detached review",
+        "overall_confidence_score": 0.5
+    })
+    .to_string();
+    let server = create_mock_responses_server_repeating_assistant(&review_payload).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let filename_ts = "2025-01-05T12-00-00";
+    let meta_rfc3339 = "2025-01-05T12:00:00Z";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        meta_rfc3339,
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let rollout_file_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
+    let turn_id = "network-review-turn";
+    let appended_rollout = [
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: "exec-1".to_string(),
+                process_id: None,
+                turn_id: turn_id.to_string(),
+                command: vec!["curl".to_string(), "https://api.example.com".to_string()],
+                cwd: PathBuf::from("/tmp"),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "curl https://api.example.com".to_string(),
+                }],
+                source: CoreExecCommandSource::Agent,
+                interaction_input: None,
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                id: "exec-1".to_string(),
+                turn_id: turn_id.to_string(),
+                status: GuardianAssessmentStatus::Approved,
+                risk_score: Some(12),
+                risk_level: Some(CoreGuardianRiskLevel::Low),
+                rationale: Some("expected outbound request".to_string()),
+                action: GuardianAssessmentAction::NetworkAccess {
+                    target: "https://api.example.com:443".to_string(),
+                    host: "api.example.com".to_string(),
+                    protocol: codex_protocol::protocol::NetworkApprovalProtocol::Https,
+                    port: 443,
+                },
+            }))?,
+        })
+        .to_string(),
+    ]
+    .join("\n");
+    std::fs::write(
+        &rollout_file_path,
+        format!("{persisted_rollout}{appended_rollout}\n"),
+    )?;
+
+    let expected_item = ThreadItem::CommandExecution {
+        id: "exec-1".to_string(),
+        command: "curl https://api.example.com".to_string(),
+        cwd: PathBuf::from("/tmp"),
+        process_id: None,
+        source: CommandExecutionSource::Agent,
+        status: CommandExecutionStatus::InProgress,
+        command_actions: vec![CommandAction::Unknown {
+            command: "curl https://api.example.com".to_string(),
+        }],
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+        guardian_review: Some(GuardianApprovalReviewState {
+            review: GuardianApprovalReview {
+                status: GuardianApprovalReviewStatus::Approved,
+                risk_score: Some(12),
+                risk_level: Some(GuardianRiskLevel::Low),
+                rationale: Some("expected outbound request".to_string()),
+            },
+            action: GuardianApprovalReviewAction::NetworkAccess {
+                target: "https://api.example.com:443".to_string(),
+                host: "api.example.com".to_string(),
+                protocol: NetworkApprovalProtocol::Https,
+                port: 443,
+            },
+        }),
+    };
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(thread.id, conversation_id);
+
+    let review_req = mcp
+        .send_review_start_request(ReviewStartParams {
+            thread_id: conversation_id,
+            delivery: Some(ReviewDelivery::Detached),
+            target: ReviewTarget::Custom {
+                instructions: "detached review".to_string(),
+            },
+        })
+        .await?;
+    let review_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
+    )
+    .await??;
+    let ReviewStartResponse {
+        review_thread_id, ..
+    } = to_response::<ReviewStartResponse>(review_resp)?;
+
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
+    let notification = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = timeout(remaining, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        if notification.method == "thread/status/changed" {
+            let status_changed: ThreadStatusChangedNotification =
+                serde_json::from_value(notification.params.expect("params must be present"))?;
+            if status_changed.thread_id == review_thread_id {
+                anyhow::bail!(
+                    "detached review threads should be introduced without a preceding thread/status/changed"
+                );
+            }
+            continue;
+        }
+        if notification.method == "thread/started" {
+            break notification;
+        }
+    };
+    let started: ThreadStartedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(started.thread.id, review_thread_id);
+    assert_eq!(started.thread.forked_from_id, Some(thread.id));
+    assert_eq!(started.thread.turns.len(), 2);
+    assert_eq!(started.thread.turns[1].id, turn_id);
+    assert_eq!(started.thread.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(started.thread.turns[1].items, vec![expected_item]);
 
     Ok(())
 }

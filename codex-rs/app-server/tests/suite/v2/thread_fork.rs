@@ -2,12 +2,23 @@ use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::McpProcess;
 use app_test_support::create_fake_rollout;
+use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::rollout_path;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use codex_app_server_protocol::CommandAction;
+use codex_app_server_protocol::CommandExecutionSource;
+use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::GuardianApprovalReview;
+use codex_app_server_protocol::GuardianApprovalReviewAction;
+use codex_app_server_protocol::GuardianApprovalReviewState;
+use codex_app_server_protocol::GuardianApprovalReviewStatus;
+use codex_app_server_protocol::GuardianRiskLevel;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::NetworkApprovalProtocol;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadForkParams;
@@ -26,10 +37,20 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
+use codex_protocol::protocol::GuardianAssessmentAction;
+use codex_protocol::protocol::GuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus;
+use codex_protocol::protocol::GuardianRiskLevel as CoreGuardianRiskLevel;
+use codex_protocol::protocol::TurnStartedEvent;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -176,6 +197,160 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
         Some(&Value::Null),
         "thread/started must serialize `name: null` when unset"
     );
+    let started: ThreadStartedNotification =
+        serde_json::from_value(notif.params.expect("params must be present"))?;
+    assert_eq!(started.thread, thread);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_preserves_network_guardian_review_on_command_item() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let filename_ts = "2025-01-05T12-00-00";
+    let meta_rfc3339 = "2025-01-05T12:00:00Z";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        meta_rfc3339,
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let rollout_file_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
+    let turn_id = "network-review-turn";
+    let appended_rollout = [
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: "exec-1".to_string(),
+                process_id: None,
+                turn_id: turn_id.to_string(),
+                command: vec!["curl".to_string(), "https://api.example.com".to_string()],
+                cwd: PathBuf::from("/tmp"),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "curl https://api.example.com".to_string(),
+                }],
+                source: CoreExecCommandSource::Agent,
+                interaction_input: None,
+            }))?,
+        })
+        .to_string(),
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": serde_json::to_value(EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                id: "exec-1".to_string(),
+                turn_id: turn_id.to_string(),
+                status: GuardianAssessmentStatus::Approved,
+                risk_score: Some(12),
+                risk_level: Some(CoreGuardianRiskLevel::Low),
+                rationale: Some("expected outbound request".to_string()),
+                action: GuardianAssessmentAction::NetworkAccess {
+                    target: "https://api.example.com:443".to_string(),
+                    host: "api.example.com".to_string(),
+                    protocol: codex_protocol::protocol::NetworkApprovalProtocol::Https,
+                    port: 443,
+                },
+            }))?,
+        })
+        .to_string(),
+    ]
+    .join("\n");
+    std::fs::write(
+        &rollout_file_path,
+        format!("{persisted_rollout}{appended_rollout}\n"),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert_eq!(thread.turns.len(), 2);
+    assert_eq!(thread.turns[1].id, turn_id);
+    assert_eq!(thread.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(
+        thread.turns[1].items,
+        vec![ThreadItem::CommandExecution {
+            id: "exec-1".to_string(),
+            command: "curl https://api.example.com".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            process_id: None,
+            source: CommandExecutionSource::Agent,
+            status: CommandExecutionStatus::InProgress,
+            command_actions: vec![CommandAction::Unknown {
+                command: "curl https://api.example.com".to_string(),
+            }],
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            guardian_review: Some(GuardianApprovalReviewState {
+                review: GuardianApprovalReview {
+                    status: GuardianApprovalReviewStatus::Approved,
+                    risk_score: Some(12),
+                    risk_level: Some(GuardianRiskLevel::Low),
+                    rationale: Some("expected outbound request".to_string()),
+                },
+                action: GuardianApprovalReviewAction::NetworkAccess {
+                    target: "https://api.example.com:443".to_string(),
+                    host: "api.example.com".to_string(),
+                    protocol: NetworkApprovalProtocol::Https,
+                    port: 443,
+                },
+            }),
+        }]
+    );
+
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
+    let notif = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = timeout(remaining, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notif) = message else {
+            continue;
+        };
+        if notif.method == "thread/status/changed" {
+            let status_changed: ThreadStatusChangedNotification =
+                serde_json::from_value(notif.params.expect("params must be present"))?;
+            if status_changed.thread_id == thread.id {
+                anyhow::bail!(
+                    "thread/fork should introduce the thread without a preceding thread/status/changed"
+                );
+            }
+            continue;
+        }
+        if notif.method == "thread/started" {
+            break notif;
+        }
+    };
     let started: ThreadStartedNotification =
         serde_json::from_value(notif.params.expect("params must be present"))?;
     assert_eq!(started.thread, thread);
