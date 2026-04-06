@@ -14,9 +14,11 @@ use crate::tui::TuiEvent;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::Thread;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
+use codex_app_server_protocol::ThreadStatus;
 use codex_core::Cursor;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
@@ -529,6 +531,7 @@ struct Row {
     preview: String,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
+    active_flags: Vec<ThreadActiveFlag>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     cwd: Option<PathBuf>,
@@ -1081,6 +1084,7 @@ fn head_to_row(item: &ThreadItem) -> Row {
         preview,
         thread_id: item.thread_id,
         thread_name: None,
+        active_flags: Vec::new(),
         created_at,
         updated_at,
         cwd: item.cwd.clone(),
@@ -1089,30 +1093,56 @@ fn head_to_row(item: &ThreadItem) -> Row {
 }
 
 fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
-    let thread_id = match ThreadId::from_string(&thread.id) {
+    let Thread {
+        id,
+        preview,
+        created_at,
+        updated_at,
+        status,
+        path,
+        cwd,
+        git_info,
+        name,
+        ..
+    } = thread;
+    let thread_id = match ThreadId::from_string(&id) {
         Ok(thread_id) => thread_id,
         Err(err) => {
-            warn!(thread_id = thread.id, %err, "Skipping app-server picker row with invalid id");
+            warn!(thread_id = id, %err, "Skipping app-server picker row with invalid id");
             return None;
         }
     };
-    let preview = thread.preview.trim();
+    let active_flags = match status {
+        ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => Vec::new(),
+        ThreadStatus::Active { active_flags } => active_flags,
+    };
+    let preview = preview.trim();
     Some(Row {
-        path: thread.path,
+        path,
         preview: if preview.is_empty() {
             String::from("(no message yet)")
         } else {
             preview.to_string()
         },
         thread_id: Some(thread_id),
-        thread_name: thread.name,
-        created_at: chrono::DateTime::from_timestamp(thread.created_at, 0)
+        thread_name: name,
+        active_flags,
+        created_at: chrono::DateTime::from_timestamp(created_at, 0)
             .map(|dt| dt.with_timezone(&Utc)),
-        updated_at: chrono::DateTime::from_timestamp(thread.updated_at, 0)
+        updated_at: chrono::DateTime::from_timestamp(updated_at, 0)
             .map(|dt| dt.with_timezone(&Utc)),
-        cwd: Some(thread.cwd),
-        git_branch: thread.git_info.and_then(|git_info| git_info.branch),
+        cwd: Some(cwd),
+        git_branch: git_info.and_then(|git_info| git_info.branch),
     })
+}
+
+fn active_flag_label(flag: ThreadActiveFlag) -> &'static str {
+    match flag {
+        ThreadActiveFlag::WaitingOnApproval => "[approval]",
+        ThreadActiveFlag::WaitingOnUserInput => "[input]",
+        ThreadActiveFlag::BackgroundTerminalRunning => "[shell]",
+        ThreadActiveFlag::WorkspaceChanged => "[changed]",
+    }
 }
 
 fn thread_list_params(
@@ -1324,6 +1354,10 @@ fn render_list(
         if add_leading_gap {
             preview_width = preview_width.saturating_sub(2);
         }
+        for flag in &row.active_flags {
+            preview_width =
+                preview_width.saturating_sub(UnicodeWidthStr::width(active_flag_label(*flag)) + 1);
+        }
         let preview = truncate_text(row.display_preview(), preview_width);
         let mut spans: Vec<Span> = vec![marker];
         if let Some(created) = created_span {
@@ -1344,6 +1378,16 @@ fn render_list(
         }
         if add_leading_gap {
             spans.push("  ".into());
+        }
+        for flag in &row.active_flags {
+            let badge = match flag {
+                ThreadActiveFlag::WaitingOnApproval => active_flag_label(*flag).cyan(),
+                ThreadActiveFlag::WaitingOnUserInput => active_flag_label(*flag).green(),
+                ThreadActiveFlag::BackgroundTerminalRunning => active_flag_label(*flag).magenta(),
+                ThreadActiveFlag::WorkspaceChanged => active_flag_label(*flag).red(),
+            };
+            spans.push(badge);
+            spans.push(" ".into());
         }
         spans.push(preview.into());
 
@@ -1840,6 +1884,7 @@ mod tests {
             preview: String::from("first message"),
             thread_id: None,
             thread_name: Some(String::from("My session")),
+            active_flags: Vec::new(),
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -1900,6 +1945,7 @@ mod tests {
             preview: String::from("remote session"),
             thread_id: Some(ThreadId::new()),
             thread_name: None,
+            active_flags: Vec::new(),
             created_at: None,
             updated_at: None,
             cwd: Some(PathBuf::from("/srv/remote-project")),
@@ -1934,6 +1980,7 @@ mod tests {
                 preview: String::from("Fix resume picker timestamps"),
                 thread_id: None,
                 thread_name: None,
+                active_flags: Vec::new(),
                 created_at: Some(now - Duration::minutes(16)),
                 updated_at: Some(now - Duration::seconds(42)),
                 cwd: None,
@@ -1944,6 +1991,7 @@ mod tests {
                 preview: String::from("Investigate lazy pagination cap"),
                 thread_id: None,
                 thread_name: None,
+                active_flags: Vec::new(),
                 created_at: Some(now - Duration::hours(1)),
                 updated_at: Some(now - Duration::minutes(35)),
                 cwd: None,
@@ -1954,6 +2002,7 @@ mod tests {
                 preview: String::from("Explain the codebase"),
                 thread_id: None,
                 thread_name: None,
+                active_flags: Vec::new(),
                 created_at: Some(now - Duration::hours(2)),
                 updated_at: Some(now - Duration::hours(2)),
                 cwd: None,
@@ -1987,6 +2036,81 @@ mod tests {
 
         let snapshot = terminal.backend().to_string();
         assert_snapshot!("resume_picker_table", snapshot);
+    }
+
+    #[test]
+    fn resume_table_with_active_flags_snapshot() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+        use ratatui::layout::Constraint;
+        use ratatui::layout::Layout;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+
+        let now = Utc::now();
+        let rows = vec![
+            Row {
+                path: None,
+                preview: String::from("Investigate resident thread watcher drift"),
+                thread_id: Some(ThreadId::new()),
+                thread_name: Some(String::from("Remote active thread")),
+                active_flags: vec![
+                    ThreadActiveFlag::WorkspaceChanged,
+                    ThreadActiveFlag::WaitingOnApproval,
+                ],
+                created_at: Some(now - Duration::minutes(20)),
+                updated_at: Some(now - Duration::minutes(1)),
+                cwd: Some(PathBuf::from("/srv/project")),
+                git_branch: Some(String::from("feature/resident")),
+            },
+            Row {
+                path: None,
+                preview: String::from("Tail background command logs"),
+                thread_id: Some(ThreadId::new()),
+                thread_name: None,
+                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+                created_at: Some(now - Duration::hours(2)),
+                updated_at: Some(now - Duration::minutes(8)),
+                cwd: Some(PathBuf::from("/srv/project")),
+                git_branch: Some(String::from("feature/resident")),
+            },
+        ];
+        state.all_rows = rows.clone();
+        state.filtered_rows = rows;
+        state.view_rows = Some(2);
+        state.selected = 0;
+        state.scroll_top = 0;
+        state.update_view_rows(/*rows*/ 2);
+
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
+
+        let width: u16 = 90;
+        let height: u16 = 5;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            let segments =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
+            render_list(&mut frame, segments[1], &state, &metrics);
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("resume_picker_active_flags", snapshot);
     }
 
     #[test]
@@ -2248,6 +2372,7 @@ mod tests {
                 preview: String::from("First message preview"),
                 thread_id: Some(id1),
                 thread_name: None,
+                active_flags: Vec::new(),
                 created_at: None,
                 updated_at: Some(now - Duration::days(2)),
                 cwd: None,
@@ -2258,6 +2383,7 @@ mod tests {
                 preview: String::from("Second message preview"),
                 thread_id: Some(id2),
                 thread_name: None,
+                active_flags: Vec::new(),
                 created_at: None,
                 updated_at: Some(now - Duration::days(3)),
                 cwd: None,
@@ -2327,6 +2453,7 @@ mod tests {
             preview: String::from("First prompt"),
             thread_id: Some(thread_id),
             thread_name: Some(String::from("stale backend title")),
+            active_flags: Vec::new(),
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -2592,6 +2719,7 @@ mod tests {
             preview: String::from("missing metadata"),
             thread_id: None,
             thread_name: None,
+            active_flags: Vec::new(),
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -2632,6 +2760,7 @@ mod tests {
             preview: String::from("pathless thread"),
             thread_id: Some(thread_id),
             thread_name: None,
+            active_flags: Vec::new(),
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -2683,6 +2812,46 @@ mod tests {
         assert_eq!(row.path, None);
         assert_eq!(row.thread_id, Some(thread_id));
         assert_eq!(row.thread_name, Some(String::from("Named thread")));
+        assert_eq!(row.active_flags, Vec::new());
+    }
+
+    #[test]
+    fn app_server_row_preserves_active_flags() {
+        let thread = Thread {
+            id: ThreadId::new().to_string(),
+            forked_from_id: None,
+            preview: String::from("remote thread"),
+            ephemeral: false,
+            model_provider: String::from("openai"),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Active {
+                active_flags: vec![
+                    ThreadActiveFlag::WorkspaceChanged,
+                    ThreadActiveFlag::BackgroundTerminalRunning,
+                ],
+            },
+            resident: true,
+            path: None,
+            cwd: PathBuf::from("/tmp"),
+            cli_version: String::from("0.0.0"),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        };
+
+        let row = row_from_app_server_thread(thread).expect("row should be preserved");
+
+        assert_eq!(
+            row.active_flags,
+            vec![
+                ThreadActiveFlag::WorkspaceChanged,
+                ThreadActiveFlag::BackgroundTerminalRunning,
+            ]
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,7 @@ use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
+use crate::multi_agents::agent_picker_active_flag_spans;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut_matches;
@@ -76,9 +77,12 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadItem;
-use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadRollbackResponse;
+use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
@@ -518,6 +522,7 @@ struct ThreadEventStore {
     turns: Vec<Turn>,
     buffer: VecDeque<ThreadBufferedEvent>,
     pending_interactive_replay: PendingInteractiveReplayState,
+    pending_thread_approvals_from_status: bool,
     active_turn_id: Option<String>,
     input_state: Option<ThreadInputState>,
     capacity: usize,
@@ -541,6 +546,7 @@ impl ThreadEventStore {
             turns: Vec::new(),
             buffer: VecDeque::new(),
             pending_interactive_replay: PendingInteractiveReplayState::default(),
+            pending_thread_approvals_from_status: false,
             active_turn_id: None,
             input_state: None,
             capacity,
@@ -578,6 +584,10 @@ impl ThreadEventStore {
         self.pending_interactive_replay
             .note_server_notification(&notification);
         match &notification {
+            ServerNotification::ThreadStatusChanged(notification) => {
+                self.pending_thread_approvals_from_status =
+                    status_has_pending_thread_approvals(&notification.status);
+            }
             ServerNotification::TurnStarted(turn) => {
                 self.active_turn_id = Some(turn.turn.id.clone());
             }
@@ -585,9 +595,11 @@ impl ThreadEventStore {
                 if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.active_turn_id = None;
                 }
+                self.pending_thread_approvals_from_status = false;
             }
             ServerNotification::ThreadClosed(_) => {
                 self.active_turn_id = None;
+                self.pending_thread_approvals_from_status = false;
             }
             _ => {}
         }
@@ -619,6 +631,7 @@ impl ThreadEventStore {
         self.turns = response.thread.turns.clone();
         self.buffer.clear();
         self.pending_interactive_replay = PendingInteractiveReplayState::default();
+        self.pending_thread_approvals_from_status = false;
         self.active_turn_id = None;
     }
 
@@ -662,6 +675,7 @@ impl ThreadEventStore {
     fn has_pending_thread_approvals(&self) -> bool {
         self.pending_interactive_replay
             .has_pending_thread_approvals()
+            || self.pending_thread_approvals_from_status
     }
 
     fn active_turn_id(&self) -> Option<&str> {
@@ -671,6 +685,38 @@ impl ThreadEventStore {
     fn clear_active_turn_id(&mut self) {
         self.active_turn_id = None;
     }
+}
+
+fn status_has_pending_thread_approvals(status: &ThreadStatus) -> bool {
+    match status {
+        ThreadStatus::Active { active_flags } => active_flags.iter().any(|flag| {
+            matches!(
+                flag,
+                ThreadActiveFlag::WaitingOnApproval | ThreadActiveFlag::WaitingOnUserInput
+            )
+        }),
+        ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => false,
+    }
+}
+
+fn status_has_workspace_changed(status: &ThreadStatus) -> bool {
+    match status {
+        ThreadStatus::Active { active_flags } => {
+            active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+        }
+        ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => false,
+    }
+}
+
+fn active_flags_from_status(status: &ThreadStatus) -> Vec<ThreadActiveFlag> {
+    match status {
+        ThreadStatus::Active { active_flags } => active_flags.clone(),
+        ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => Vec::new(),
+    }
+}
+
+fn status_marks_thread_closed(status: &ThreadStatus) -> bool {
+    matches!(status, ThreadStatus::NotLoaded)
 }
 
 #[derive(Debug)]
@@ -997,6 +1043,7 @@ pub(crate) struct App {
     agent_navigation: AgentNavigationState,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
+    active_thread_workspace_changed: bool,
     primary_thread_id: Option<ThreadId>,
     last_subagent_backfill_attempt: Option<ThreadId>,
     primary_session_configured: Option<ThreadSessionState>,
@@ -2469,6 +2516,22 @@ impl App {
         thread_id: ThreadId,
         notification: ServerNotification,
     ) -> Result<()> {
+        if let ServerNotification::ThreadStatusChanged(status_notification) = &notification {
+            let existing_entry = self.agent_navigation.get(&thread_id).cloned();
+            self.upsert_agent_picker_thread(
+                thread_id,
+                existing_entry
+                    .as_ref()
+                    .and_then(|entry| entry.agent_nickname.clone()),
+                existing_entry
+                    .as_ref()
+                    .and_then(|entry| entry.agent_role.clone()),
+                status_marks_thread_closed(&status_notification.status)
+                    || existing_entry.as_ref().is_some_and(|entry| entry.is_closed),
+                active_flags_from_status(&status_notification.status),
+            );
+        }
+
         let inferred_session = self
             .infer_session_for_thread_notification(thread_id, &notification)
             .await;
@@ -2553,7 +2616,8 @@ impl App {
                         thread_id,
                         thread.agent_nickname,
                         thread.agent_role,
-                        /*is_closed*/ false,
+                        status_marks_thread_closed(&thread.status),
+                        active_flags_from_status(&thread.status),
                     );
                 }
                 Err(err) => {
@@ -2595,7 +2659,8 @@ impl App {
             thread_id,
             notification.thread.agent_nickname.clone(),
             notification.thread.agent_role.clone(),
-            /*is_closed*/ false,
+            status_marks_thread_closed(&notification.thread.status),
+            active_flags_from_status(&notification.thread.status),
         );
         Some(session)
     }
@@ -2704,8 +2769,11 @@ impl App {
         self.primary_thread_id = Some(thread_id);
         self.primary_session_configured = Some(session.clone());
         self.upsert_agent_picker_thread(
-            thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+            thread_id,
+            /*agent_nickname*/ None,
+            /*agent_role*/ None,
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
         let channel = self.ensure_thread_channel(thread_id);
         {
@@ -2871,10 +2939,12 @@ impl App {
                     entry.agent_role.as_deref(),
                     is_primary,
                 );
+                let mut name_prefix_spans = agent_picker_status_dot_spans(entry.is_closed);
+                name_prefix_spans.extend(agent_picker_active_flag_spans(&entry.active_flags));
                 let uuid = thread_id.to_string();
                 SelectionItem {
                     name: name.clone(),
-                    name_prefix_spans: agent_picker_status_dot_spans(entry.is_closed),
+                    name_prefix_spans,
                     description: Some(uuid.clone()),
                     is_current: self.active_thread_id == Some(*thread_id),
                     actions: vec![Box::new(move |tx| {
@@ -2927,14 +2997,20 @@ impl App {
         agent_nickname: Option<String>,
         agent_role: Option<String>,
         is_closed: bool,
+        active_flags: Vec<ThreadActiveFlag>,
     ) {
         self.chat_widget.set_collab_agent_metadata(
             thread_id,
             agent_nickname.clone(),
             agent_role.clone(),
         );
-        self.agent_navigation
-            .upsert(thread_id, agent_nickname, agent_role, is_closed);
+        self.agent_navigation.upsert(
+            thread_id,
+            agent_nickname,
+            agent_role,
+            is_closed,
+            active_flags,
+        );
         self.sync_active_agent_label();
     }
 
@@ -2975,6 +3051,7 @@ impl App {
                         thread.status,
                         codex_app_server_protocol::ThreadStatus::NotLoaded
                     ),
+                    active_flags_from_status(&thread.status),
                 );
                 true
             }
@@ -2993,11 +3070,15 @@ impl App {
                         entry.agent_nickname,
                         entry.agent_role,
                         is_closed,
+                        entry.active_flags,
                     );
                 } else {
                     self.upsert_agent_picker_thread(
-                        thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+                        thread_id,
+                        /*agent_nickname*/ None,
+                        /*agent_role*/ None,
                         is_closed,
+                        /*active_flags*/ Vec::new(),
                     );
                 }
                 true
@@ -3243,6 +3324,7 @@ impl App {
         self.has_emitted_history_lines = false;
         self.backtrack = BacktrackState::default();
         self.backtrack_render_pending = false;
+        self.active_thread_workspace_changed = false;
         tui.terminal.clear_scrollback()?;
         tui.terminal.clear()?;
         Ok(())
@@ -3254,6 +3336,7 @@ impl App {
         self.agent_navigation.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
+        self.active_thread_workspace_changed = false;
         self.primary_thread_id = None;
         self.last_subagent_backfill_attempt = None;
         self.primary_session_configured = None;
@@ -3331,17 +3414,17 @@ impl App {
         Ok(())
     }
 
-    /// Fetches all loaded threads from the app server and registers descendants of the primary
-    /// thread in the navigation cache and chat widget metadata.
+    /// Fetches loaded thread summaries from the app server and registers descendants of the
+    /// primary thread in the navigation cache and chat widget metadata.
     ///
     /// Called after `replace_chat_widget_with_app_server_thread` during resume, fork, and new
     /// thread creation so that the `/agent` picker and keyboard navigation are pre-populated even
     /// if the TUI did not witness the original spawn events.
     ///
-    /// The loaded-thread list is fetched in full (no pagination) and the spawn tree is walked
-    /// by `find_loaded_subagent_threads_for_primary`. Each discovered subagent is registered via
-    /// `upsert_agent_picker_thread`, which writes to both `AgentNavigationState` and the
-    /// `ChatWidget` metadata map.
+    /// The loaded-thread summaries are fetched in full (no pagination) via `thread/loaded/read`,
+    /// then the spawn tree is walked by `find_loaded_subagent_threads_for_primary`. Each
+    /// discovered subagent is registered via `upsert_agent_picker_thread`, which writes to both
+    /// `AgentNavigationState` and the `ChatWidget` metadata map.
     async fn backfill_loaded_subagent_threads(
         &mut self,
         app_server: &mut AppServerSession,
@@ -3350,8 +3433,8 @@ impl App {
             return false;
         };
 
-        let loaded_thread_ids = match app_server
-            .thread_loaded_list(ThreadLoadedListParams {
+        let loaded_threads = match app_server
+            .thread_loaded_read(ThreadLoadedReadParams {
                 cursor: None,
                 limit: None,
                 model_providers: None,
@@ -3362,45 +3445,22 @@ impl App {
         {
             Ok(response) => response.data,
             Err(err) => {
-                tracing::warn!(%err, "failed to list loaded threads for subagent backfill");
+                tracing::warn!(%err, "failed to read loaded threads for subagent backfill");
                 return false;
             }
         };
 
-        let mut threads = Vec::new();
-        let mut had_read_error = false;
-        for thread_id in loaded_thread_ids {
-            let Ok(thread_id) = ThreadId::from_string(&thread_id) else {
-                tracing::warn!("ignoring loaded thread with invalid id during subagent backfill");
-                continue;
-            };
-
-            if thread_id == primary_thread_id {
-                continue;
-            }
-
-            match app_server
-                .thread_read(thread_id, /*include_turns*/ false)
-                .await
-            {
-                Ok(thread) => threads.push(thread),
-                Err(err) => {
-                    had_read_error = true;
-                    tracing::warn!(thread_id = %thread_id, %err, "failed to read loaded thread");
-                }
-            }
-        }
-
-        for thread in find_loaded_subagent_threads_for_primary(threads, primary_thread_id) {
+        for thread in find_loaded_subagent_threads_for_primary(loaded_threads, primary_thread_id) {
             self.upsert_agent_picker_thread(
                 thread.thread_id,
                 thread.agent_nickname,
                 thread.agent_role,
-                /*is_closed*/ false,
+                status_marks_thread_closed(&thread.status),
+                active_flags_from_status(&thread.status),
             );
         }
 
-        !had_read_error
+        true
     }
 
     /// Returns the adjacent thread id for keyboard navigation, backfilling from the server if the
@@ -3789,6 +3849,7 @@ impl App {
             agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
+            active_thread_workspace_changed: false,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
@@ -5600,6 +5661,7 @@ impl App {
             &event,
             ThreadBufferedEvent::Notification(ServerNotification::TurnStarted(_))
                 | ThreadBufferedEvent::Notification(ServerNotification::ThreadTokenUsageUpdated(_))
+                | ThreadBufferedEvent::Notification(ServerNotification::ThreadStatusChanged(_))
         );
         match event {
             ThreadBufferedEvent::Notification(notification) => {
@@ -5620,6 +5682,21 @@ impl App {
         if needs_refresh {
             self.refresh_status_line();
         }
+    }
+
+    fn handle_active_thread_status_notification(
+        &mut self,
+        notification: &ThreadStatusChangedNotification,
+    ) {
+        let workspace_changed = status_has_workspace_changed(&notification.status);
+        if workspace_changed && !self.active_thread_workspace_changed {
+            self.chat_widget.add_info_message(
+                "Workspace changed on disk while this thread was active. Review local changes before continuing."
+                    .to_string(),
+                /*hint*/ None,
+            );
+        }
+        self.active_thread_workspace_changed = workspace_changed;
     }
 
     fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
@@ -5697,6 +5774,9 @@ impl App {
         if let ThreadBufferedEvent::Notification(notification) = &event {
             self.hydrate_collab_agent_metadata_for_notification(app_server, notification)
                 .await;
+            if let ServerNotification::ThreadStatusChanged(notification) = notification {
+                self.handle_active_thread_status_notification(notification);
+            }
         }
 
         self.handle_thread_event_now(event);
@@ -7399,6 +7479,7 @@ mod tests {
                 agent_nickname: None,
                 agent_role: None,
                 is_closed: true,
+                active_flags: Vec::new(),
             })
         );
         assert_eq!(app.agent_navigation.ordered_thread_ids(), vec![thread_id]);
@@ -7420,6 +7501,7 @@ mod tests {
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ true,
+            /*active_flags*/ Vec::new(),
         );
 
         app.open_agent_picker(&mut app_server).await;
@@ -7431,6 +7513,7 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
+                active_flags: Vec::new(),
             })
         );
         Ok(())
@@ -7449,6 +7532,7 @@ mod tests {
             Some("Ghost".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         app.open_agent_picker(&mut app_server).await;
@@ -7473,6 +7557,7 @@ mod tests {
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         app.open_agent_picker(&mut app_server).await;
@@ -7483,6 +7568,7 @@ mod tests {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
+                active_flags: Vec::new(),
             })
         );
         Ok(())
@@ -7563,6 +7649,7 @@ mod tests {
                 agent_nickname: None,
                 agent_role: None,
                 is_closed: false,
+                active_flags: Vec::new(),
             })
         );
         Ok(())
@@ -7585,6 +7672,7 @@ mod tests {
             Some("Scout".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         let err = app
@@ -7617,6 +7705,7 @@ mod tests {
             Some("Scout".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         let err = app
@@ -7641,6 +7730,7 @@ mod tests {
             Some("Ghost".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ true,
+            /*active_flags*/ Vec::new(),
         );
 
         assert!(!app.should_attach_live_thread_for_selection(thread_id));
@@ -7650,6 +7740,7 @@ mod tests {
             Some("Ghost".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
         assert!(app.should_attach_live_thread_for_selection(thread_id));
 
@@ -7672,6 +7763,7 @@ mod tests {
             Some("Ghost".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         let is_available = app
@@ -8297,6 +8389,7 @@ guardian_approval = true
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         app.refresh_pending_thread_approvals().await;
@@ -8340,6 +8433,7 @@ guardian_approval = true
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         app.enqueue_thread_request(
@@ -8553,6 +8647,7 @@ guardian_approval = true
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         app.enqueue_thread_request(
@@ -8582,6 +8677,116 @@ guardian_approval = true
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn inactive_thread_approval_badge_tracks_thread_status_notifications() -> Result<()> {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000301").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000302").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(main_thread_id);
+        app.thread_event_channels
+            .insert(main_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+        app.thread_event_channels
+            .insert(agent_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+        app.agent_navigation.upsert(
+            agent_thread_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
+        );
+
+        app.enqueue_thread_notification(
+            agent_thread_id,
+            thread_status_changed_notification(
+                agent_thread_id,
+                ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+                },
+            ),
+        )
+        .await?;
+
+        assert_eq!(
+            app.chat_widget.pending_thread_approvals(),
+            &["Robie [explorer]".to_string()]
+        );
+        assert_eq!(
+            app.agent_navigation
+                .get(&agent_thread_id)
+                .expect("agent navigation entry")
+                .active_flags,
+            vec![ThreadActiveFlag::WaitingOnApproval]
+        );
+
+        app.enqueue_thread_notification(
+            agent_thread_id,
+            thread_status_changed_notification(agent_thread_id, ThreadStatus::Idle),
+        )
+        .await?;
+
+        assert!(app.chat_widget.pending_thread_approvals().is_empty());
+        assert_eq!(
+            app.agent_navigation
+                .get(&agent_thread_id)
+                .expect("agent navigation entry")
+                .active_flags,
+            Vec::new()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_thread_workspace_changed_status_emits_info_once_per_transition() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        let changed = ThreadStatusChangedNotification {
+            thread_id: ThreadId::new().to_string(),
+            status: ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+        };
+
+        app.handle_active_thread_status_notification(&changed);
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Workspace changed on disk while this thread was active. Review local changes before continuing."
+        );
+
+        app.handle_active_thread_status_notification(&changed);
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&ThreadStatusChangedNotification {
+            thread_id: changed.thread_id.clone(),
+            status: ThreadStatus::Idle,
+        });
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&changed);
+        let second = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell after reset, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&second.display_lines(/*width*/ 120)),
+            "• Workspace changed on disk while this thread was active. Review local changes before continuing."
+        );
     }
 
     #[tokio::test]
@@ -8689,6 +8894,7 @@ guardian_approval = true
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
                 is_closed: false,
+                active_flags: Vec::new(),
             })
         );
 
@@ -9100,6 +9306,7 @@ guardian_approval = true
             agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
+            active_thread_workspace_changed: false,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
@@ -9154,6 +9361,7 @@ guardian_approval = true
                 agent_navigation: AgentNavigationState::default(),
                 active_thread_id: None,
                 active_thread_rx: None,
+                active_thread_workspace_changed: false,
                 primary_thread_id: None,
                 last_subagent_backfill_attempt: None,
                 primary_session_configured: None,
@@ -9209,6 +9417,16 @@ guardian_approval = true
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             thread_id: thread_id.to_string(),
             turn: test_turn(turn_id, status, Vec::new()),
+        })
+    }
+
+    fn thread_status_changed_notification(
+        thread_id: ThreadId,
+        status: ThreadStatus,
+    ) -> ServerNotification {
+        ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+            thread_id: thread_id.to_string(),
+            status,
         })
     }
 
@@ -9361,6 +9579,38 @@ guardian_approval = true
             TurnStatus::Interrupted,
         ));
         assert_eq!(store.active_turn_id(), None);
+    }
+
+    #[test]
+    fn thread_event_store_tracks_pending_approvals_from_status_notifications() {
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        let thread_id = ThreadId::new();
+
+        store.push_notification(thread_status_changed_notification(
+            thread_id,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            },
+        ));
+        assert!(store.has_pending_thread_approvals());
+
+        store.push_notification(thread_status_changed_notification(
+            thread_id,
+            ThreadStatus::Idle,
+        ));
+        assert!(!store.has_pending_thread_approvals());
+    }
+
+    #[test]
+    fn status_with_user_input_counts_as_pending_thread_approval() {
+        assert!(status_has_pending_thread_approvals(&ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+        }));
+        assert!(!status_has_pending_thread_approvals(
+            &ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            }
+        ));
     }
 
     #[test]
@@ -10489,6 +10739,7 @@ guardian_approval = true
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         let replacement = ChatWidget::new_with_app_event(ChatWidgetInit {

@@ -7,6 +7,7 @@
 use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AgentStatus;
@@ -43,6 +44,8 @@ pub(crate) struct AgentPickerThreadEntry {
     pub(crate) agent_role: Option<String>,
     /// Whether the thread has emitted a close event and should render dimmed.
     pub(crate) is_closed: bool,
+    /// Live activity badges surfaced in the `/agent` picker.
+    pub(crate) active_flags: Vec<ThreadActiveFlag>,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +68,37 @@ pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static
         "•".green()
     };
     vec![dot, " ".into()]
+}
+
+pub(crate) fn agent_picker_active_flag_spans(
+    active_flags: &[ThreadActiveFlag],
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for flag in active_flags {
+        let badge = match flag {
+            ThreadActiveFlag::WaitingOnApproval => "[approval]".cyan(),
+            ThreadActiveFlag::WaitingOnUserInput => "[input]".green(),
+            ThreadActiveFlag::BackgroundTerminalRunning => "[shell]".magenta(),
+            ThreadActiveFlag::WorkspaceChanged => "[changed]".red(),
+        };
+        spans.push(badge);
+        spans.push(" ".into());
+    }
+    spans
+}
+
+pub(crate) fn agent_picker_active_flag_labels(
+    active_flags: &[ThreadActiveFlag],
+) -> Vec<&'static str> {
+    active_flags
+        .iter()
+        .map(|flag| match flag {
+            ThreadActiveFlag::WaitingOnApproval => "[approval]",
+            ThreadActiveFlag::WaitingOnUserInput => "[input]",
+            ThreadActiveFlag::BackgroundTerminalRunning => "[shell]",
+            ThreadActiveFlag::WorkspaceChanged => "[changed]",
+        })
+        .collect()
 }
 
 pub(crate) fn format_agent_picker_item_name(
@@ -591,6 +625,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ratatui::style::Color;
     use ratatui::style::Modifier;
+    use ratatui::text::Line;
 
     #[test]
     fn collab_events_snapshot() {
@@ -681,6 +716,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         assert_snapshot!("collab_agent_transcript", snapshot);
+    }
+
+    #[test]
+    fn agent_picker_active_flag_spans_snapshot() {
+        let line = Line::from(agent_picker_active_flag_spans(&[
+            ThreadActiveFlag::WorkspaceChanged,
+            ThreadActiveFlag::WaitingOnApproval,
+            ThreadActiveFlag::WaitingOnUserInput,
+            ThreadActiveFlag::BackgroundTerminalRunning,
+        ]));
+        assert_snapshot!("agent_picker_active_flag_spans", line.to_string());
     }
 
     #[cfg(target_os = "macos")]

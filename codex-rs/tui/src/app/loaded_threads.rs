@@ -3,7 +3,7 @@
 //! When the TUI resumes or switches to an existing thread, it needs to populate
 //! `AgentNavigationState` and `ChatWidget` metadata for every subagent that was spawned during
 //! that thread's lifetime. The app server exposes a flat list of currently loaded threads via
-//! `thread/loaded/list`, but the TUI must figure out which of those are descendants of the
+//! `thread/loaded/read`, but the TUI must figure out which of those are descendants of the
 //! primary thread.
 //!
 //! This module provides the pure, synchronous tree-walk that turns that flat list into the filtered
@@ -23,11 +23,12 @@ use std::collections::HashSet;
 
 /// A subagent thread discovered by the spawn-tree walk, carrying just enough metadata for the
 /// TUI to register it in the navigation cache and rendering metadata map.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoadedSubagentThread {
     pub(crate) thread_id: ThreadId,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
+    pub(crate) status: codex_app_server_protocol::ThreadStatus,
 }
 
 /// Walks the spawn tree rooted at `primary_thread_id` and returns every descendant subagent.
@@ -89,6 +90,7 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
                     thread_id,
                     agent_nickname: thread.agent_nickname,
                     agent_role: thread.agent_role,
+                    status: thread.status,
                 })
         })
         .collect();
@@ -198,11 +200,13 @@ mod tests {
                     thread_id: child_thread_id,
                     agent_nickname: Some("Scout".to_string()),
                     agent_role: Some("explorer".to_string()),
+                    status: ThreadStatus::Idle,
                 },
                 LoadedSubagentThread {
                     thread_id: grandchild_thread_id,
                     agent_nickname: Some("Atlas".to_string()),
                     agent_role: Some("worker".to_string()),
+                    status: ThreadStatus::Idle,
                 },
             ]
         );

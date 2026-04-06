@@ -19,6 +19,7 @@
 //! updated or marked closed.
 
 use crate::multi_agents::AgentPickerThreadEntry;
+use crate::multi_agents::agent_picker_active_flag_labels;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut;
 use crate::multi_agents::previous_agent_shortcut;
@@ -82,6 +83,7 @@ impl AgentNavigationState {
         agent_nickname: Option<String>,
         agent_role: Option<String>,
         is_closed: bool,
+        active_flags: Vec<codex_app_server_protocol::ThreadActiveFlag>,
     ) {
         if !self.threads.contains_key(&thread_id) {
             self.order.push(thread_id);
@@ -92,6 +94,7 @@ impl AgentNavigationState {
                 agent_nickname,
                 agent_role,
                 is_closed,
+                active_flags,
             },
         );
     }
@@ -107,8 +110,11 @@ impl AgentNavigationState {
             entry.is_closed = true;
         } else {
             self.upsert(
-                thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+                thread_id,
+                /*agent_nickname*/ None,
+                /*agent_role*/ None,
                 /*is_closed*/ true,
+                /*active_flags*/ Vec::new(),
             );
         }
     }
@@ -217,11 +223,17 @@ impl AgentNavigationState {
             self.threads
                 .get(&thread_id)
                 .map(|entry| {
-                    format_agent_picker_item_name(
+                    let mut label = format_agent_picker_item_name(
                         entry.agent_nickname.as_deref(),
                         entry.agent_role.as_deref(),
                         is_primary,
-                    )
+                    );
+                    let active_flags = agent_picker_active_flag_labels(&entry.active_flags);
+                    if !active_flags.is_empty() {
+                        label.push(' ');
+                        label.push_str(&active_flags.join(" "));
+                    }
+                    label
                 })
                 .unwrap_or_else(|| {
                     format_agent_picker_item_name(
@@ -276,18 +288,21 @@ mod tests {
             /*agent_nickname*/ None,
             /*agent_role*/ None,
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
         state.upsert(
             first_agent_id,
             Some("Robie".to_string()),
             Some("explorer".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
         state.upsert(
             second_agent_id,
             Some("Bob".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
         );
 
         (state, main_thread_id, first_agent_id, second_agent_id)
@@ -302,6 +317,7 @@ mod tests {
             Some("Robie".to_string()),
             Some("worker".to_string()),
             /*is_closed*/ true,
+            /*active_flags*/ Vec::new(),
         );
 
         assert_eq!(
@@ -340,11 +356,21 @@ mod tests {
 
     #[test]
     fn active_agent_label_tracks_current_thread() {
-        let (state, main_thread_id, first_agent_id, _) = populated_state();
+        let (mut state, main_thread_id, first_agent_id, _) = populated_state();
+        state.upsert(
+            first_agent_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            /*is_closed*/ false,
+            vec![
+                codex_app_server_protocol::ThreadActiveFlag::WorkspaceChanged,
+                codex_app_server_protocol::ThreadActiveFlag::WaitingOnApproval,
+            ],
+        );
 
         assert_eq!(
             state.active_agent_label(Some(first_agent_id), Some(main_thread_id)),
-            Some("Robie [explorer]".to_string())
+            Some("Robie [explorer] [changed] [approval]".to_string())
         );
         assert_eq!(
             state.active_agent_label(Some(main_thread_id), Some(main_thread_id)),

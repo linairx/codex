@@ -32,8 +32,8 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
-use codex_app_server_protocol::ThreadLoadedListParams;
-use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
@@ -374,20 +374,20 @@ impl AppServerSession {
             .wrap_err("thread/list failed during TUI session lookup")
     }
 
-    /// Lists thread ids that the app server currently holds in memory.
+    /// Reads loaded thread summaries that the app server currently holds in memory.
     ///
     /// Used by `App::backfill_loaded_subagent_threads` to discover subagent threads that were
-    /// spawned before the TUI connected. The caller then fetches full metadata per thread via
-    /// `thread_read` and walks the spawn tree.
-    pub(crate) async fn thread_loaded_list(
+    /// spawned before the TUI connected without issuing an extra `thread/read` for every loaded
+    /// thread.
+    pub(crate) async fn thread_loaded_read(
         &mut self,
-        params: ThreadLoadedListParams,
-    ) -> Result<ThreadLoadedListResponse> {
+        params: ThreadLoadedReadParams,
+    ) -> Result<ThreadLoadedReadResponse> {
         let request_id = self.next_request_id();
         self.client
-            .request_typed(ClientRequest::ThreadLoadedList { request_id, params })
+            .request_typed(ClientRequest::ThreadLoadedRead { request_id, params })
             .await
-            .wrap_err("failed to list loaded threads from app server")
+            .wrap_err("failed to read loaded threads from app server")
     }
 
     pub(crate) async fn thread_read(

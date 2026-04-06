@@ -1669,6 +1669,23 @@ mod tests {
         };
 
         snapshot_footer("footer_status_line_with_active_agent_label", props);
+
+        let props = FooterProps {
+            mode: FooterMode::ComposerEmpty,
+            esc_backtrack_hint: false,
+            use_shift_enter_hint: false,
+            is_task_running: false,
+            collaboration_modes_enabled: false,
+            is_wsl: false,
+            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+            context_window_percent: None,
+            context_window_used_tokens: None,
+            status_line_value: None,
+            status_line_enabled: false,
+            active_agent_label: Some("Robie [explorer] [changed] [approval]".to_string()),
+        };
+
+        snapshot_footer("footer_active_agent_label_with_status_badges", props);
     }
 
     #[test]
