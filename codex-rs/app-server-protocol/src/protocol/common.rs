@@ -1318,6 +1318,7 @@ mod tests {
                     created_at: 1,
                     updated_at: 2,
                     status: v2::ThreadStatus::Idle,
+                    resident: false,
                     path: None,
                     cwd: PathBuf::from("/tmp"),
                     cli_version: "0.0.0".to_string(),
@@ -1357,6 +1358,7 @@ mod tests {
                         "status": {
                             "type": "idle"
                         },
+                        "resident": false,
                         "path": null,
                         "cwd": "/tmp",
                         "cliVersion": "0.0.0",

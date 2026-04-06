@@ -1342,6 +1342,10 @@
           "description": "Usually the first user message in the thread, if available.",
           "type": "string"
         },
+        "resident": {
+          "description": "Whether the thread should remain loaded after the last subscriber detaches. This is runtime-only and defaults to false for stored threads.",
+          "type": "boolean"
+        },
         "source": {
           "allOf": [
             {
@@ -1379,6 +1383,7 @@
         "id",
         "modelProvider",
         "preview",
+        "resident",
         "source",
         "status",
         "turns",
@@ -1390,7 +1395,8 @@
       "enum": [
         "waitingOnApproval",
         "waitingOnUserInput",
-        "backgroundTerminalRunning"
+        "backgroundTerminalRunning",
+        "workspaceChanged"
       ],
       "type": "string"
     },

@@ -118,6 +118,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             status: ThreadStatus::Idle,
+            resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),

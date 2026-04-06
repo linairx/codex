@@ -91,6 +91,10 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         !thread.ephemeral,
         "new persistent threads should not be ephemeral"
     );
+    assert!(
+        !thread.resident,
+        "new threads should not be resident by default"
+    );
     assert_eq!(thread.status, ThreadStatus::Idle);
     let thread_path = thread.path.clone().expect("thread path should be present");
     assert!(thread_path.is_absolute(), "thread path should be absolute");
@@ -113,6 +117,11 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         thread_json.get("ephemeral").and_then(Value::as_bool),
         Some(false),
         "new persistent threads should serialize `ephemeral: false`"
+    );
+    assert_eq!(
+        thread_json.get("resident").and_then(Value::as_bool),
+        Some(false),
+        "new persistent threads should serialize `resident: false`"
     );
     assert_eq!(thread.name, None);
 
@@ -154,6 +163,11 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
             .and_then(Value::as_bool),
         Some(false),
         "thread/started should serialize `ephemeral: false` for new persistent threads"
+    );
+    assert_eq!(
+        started_thread_json.get("resident").and_then(Value::as_bool),
+        Some(false),
+        "thread/started should serialize `resident: false` for new persistent threads"
     );
     let started: ThreadStartedNotification =
         serde_json::from_value(notif.params.expect("params must be present"))?;

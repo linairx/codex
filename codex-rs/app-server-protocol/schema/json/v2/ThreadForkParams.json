@@ -139,6 +139,10 @@
         "null"
       ]
     },
+    "resident": {
+      "description": "When true, keep the thread loaded after the last client unsubscribes so it can continue acting as a long-lived background assistant.",
+      "type": "boolean"
+    },
     "sandbox": {
       "anyOf": [
         {

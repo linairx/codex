@@ -2088,6 +2088,7 @@ impl CodexMessageProcessor {
             experimental_raw_events,
             personality,
             ephemeral,
+            resident,
             persist_extended_history,
         } = params;
         let mut typesafe_overrides = self.build_thread_config_overrides(
@@ -2132,6 +2133,7 @@ impl CodexMessageProcessor {
                 persist_extended_history,
                 service_name,
                 experimental_raw_events,
+                resident,
                 request_trace,
             )
             .await;
@@ -2207,6 +2209,7 @@ impl CodexMessageProcessor {
         persist_extended_history: bool,
         service_name: Option<String>,
         experimental_raw_events: bool,
+        resident: bool,
         request_trace: Option<W3cTraceContext>,
     ) {
         let requested_cwd = typesafe_overrides.cwd.clone();
@@ -2392,6 +2395,11 @@ impl CodexMessageProcessor {
                     request_id.connection_id,
                     "thread",
                 );
+                listener_task_context
+                    .thread_state_manager
+                    .set_thread_resident(thread_id, resident)
+                    .await;
+                thread.resident = resident;
 
                 listener_task_context
                     .thread_watch_manager
@@ -3570,7 +3578,8 @@ impl CodexMessageProcessor {
             } else {
                 build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
             };
-            self.attach_thread_name(thread_uuid, &mut thread).await;
+            self.attach_runtime_thread_metadata(thread_uuid, &mut thread)
+                .await;
 
             let loaded_status = self
                 .thread_watch_manager
@@ -3765,7 +3774,8 @@ impl CodexMessageProcessor {
         {
             thread.forked_from_id = forked_from_id_from_rollout(rollout_path).await;
         }
-        self.attach_thread_name(thread_uuid, &mut thread).await;
+        self.attach_runtime_thread_metadata(thread_uuid, &mut thread)
+            .await;
 
         if include_turns && let Some(rollout_path) = rollout_path.as_ref() {
             match read_rollout_items_from_rollout(rollout_path).await {
@@ -3908,6 +3918,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            resident,
             persist_extended_history,
         } = params;
 
@@ -4014,6 +4025,9 @@ impl CodexMessageProcessor {
                     request_id.connection_id,
                     "thread",
                 );
+                self.thread_state_manager
+                    .set_thread_resident(thread_id, resident)
+                    .await;
 
                 let mut thread = match self
                     .load_thread_from_resume_source_or_send_internal(
@@ -4032,6 +4046,7 @@ impl CodexMessageProcessor {
                         return;
                     }
                 };
+                thread.resident = resident;
 
                 self.thread_watch_manager
                     .upsert_thread(thread.clone())
@@ -4202,6 +4217,9 @@ impl CodexMessageProcessor {
                 ApiVersion::V2,
             )
             .await;
+            self.thread_state_manager
+                .set_thread_resident(existing_thread_id, params.resident)
+                .await;
 
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
@@ -4212,7 +4230,7 @@ impl CodexMessageProcessor {
                     mismatch_details.join("; ")
                 );
             }
-            let thread_summary = match load_thread_summary_for_rollout(
+            let mut thread_summary = match load_thread_summary_for_rollout(
                 &self.config,
                 existing_thread_id,
                 rollout_path.as_path(),
@@ -4227,6 +4245,7 @@ impl CodexMessageProcessor {
                     return true;
                 }
             };
+            thread_summary.resident = params.resident;
 
             let listener_command_tx = {
                 let thread_state = thread_state.lock().await;
@@ -4406,6 +4425,14 @@ impl CodexMessageProcessor {
         }
     }
 
+    async fn attach_runtime_thread_metadata(&self, thread_id: ThreadId, thread: &mut Thread) {
+        thread.resident = self
+            .thread_state_manager
+            .is_thread_resident(thread_id)
+            .await;
+        self.attach_thread_name(thread_id, thread).await;
+    }
+
     async fn thread_fork(&mut self, request_id: ConnectionRequestId, params: ThreadForkParams) {
         let ThreadForkParams {
             thread_id,
@@ -4421,6 +4448,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             ephemeral,
+            resident,
             persist_extended_history,
         } = params;
 
@@ -4599,8 +4627,11 @@ impl CodexMessageProcessor {
             request_id.connection_id,
             "thread",
         );
+        self.thread_state_manager
+            .set_thread_resident(thread_id, resident)
+            .await;
 
-        let thread = match self
+        let mut thread = match self
             .build_forked_thread_snapshot(
                 thread_id,
                 &forked_thread,
@@ -4617,6 +4648,7 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        thread.resident = resident;
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
@@ -5590,7 +5622,12 @@ impl CodexMessageProcessor {
             return;
         }
 
-        if !self.thread_state_manager.has_subscribers(thread_id).await {
+        if !self.thread_state_manager.has_subscribers(thread_id).await
+            && !self
+                .thread_state_manager
+                .is_thread_resident(thread_id)
+                .await
+        {
             // This connection was the last subscriber. Only now do we unload the thread.
             info!("thread {thread_id} has no subscribers; shutting down");
             self.pending_thread_unloads.lock().await.insert(thread_id);
@@ -9101,6 +9138,7 @@ fn build_thread_from_snapshot(
         created_at: now,
         updated_at: now,
         status: ThreadStatus::NotLoaded,
+        resident: false,
         path,
         cwd: config_snapshot.cwd.clone(),
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -9144,6 +9182,7 @@ pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         status: ThreadStatus::NotLoaded,
+        resident: false,
         path: Some(path),
         cwd,
         cli_version,
@@ -9274,6 +9313,7 @@ mod tests {
             base_instructions: None,
             developer_instructions: None,
             personality: None,
+            resident: false,
             persist_extended_history: false,
         };
         let config_snapshot = ThreadConfigSnapshot {

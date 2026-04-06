@@ -6039,6 +6039,7 @@ impl ChatWidget {
                 aggregated_output,
                 exit_code,
                 duration_ms,
+                ..
             } => {
                 if matches!(
                     status,
@@ -6100,6 +6101,7 @@ impl ChatWidget {
                 id,
                 changes,
                 status,
+                ..
             } => {
                 if !matches!(
                     status,

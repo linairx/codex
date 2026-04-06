@@ -2581,6 +2581,10 @@ pub struct ThreadStartParams {
     pub personality: Option<Personality>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
+    /// When true, keep the thread loaded after the last client unsubscribes so
+    /// it can continue acting as a long-lived background assistant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resident: bool,
     #[experimental("thread/start.dynamicTools")]
     #[ts(optional = nullable)]
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
@@ -2697,6 +2701,10 @@ pub struct ThreadResumeParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// When true, keep the thread loaded after the last client unsubscribes so
+    /// it can continue acting as a long-lived background assistant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resident: bool,
     /// If true, persist additional rollout EventMsg variants required to
     /// reconstruct a richer thread history on subsequent resume/fork/read.
     #[experimental("thread/resume.persistFullHistory")]
@@ -2774,6 +2782,10 @@ pub struct ThreadForkParams {
     pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// When true, keep the thread loaded after the last client unsubscribes so
+    /// it can continue acting as a long-lived background assistant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resident: bool,
     /// If true, persist additional rollout EventMsg variants required to
     /// reconstruct a richer thread history on subsequent resume/fork/read.
     #[experimental("thread/fork.persistFullHistory")]
@@ -3184,6 +3196,7 @@ pub enum ThreadActiveFlag {
     WaitingOnApproval,
     WaitingOnUserInput,
     BackgroundTerminalRunning,
+    WorkspaceChanged,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -3642,6 +3655,9 @@ pub struct Thread {
     pub updated_at: i64,
     /// Current runtime status for the thread.
     pub status: ThreadStatus,
+    /// Whether the thread should remain loaded after the last subscriber
+    /// detaches. This is runtime-only and defaults to false for stored threads.
+    pub resident: bool,
     /// [UNSTABLE] Path to the thread on disk.
     pub path: Option<PathBuf>,
     /// Working directory captured for the thread.

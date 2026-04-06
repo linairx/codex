@@ -11,18 +11,18 @@ cursor?: string | null,
 /**
  * Optional page size; defaults to no limit.
  */
-limit?: number | null,
+limit?: number | null, 
 /**
  * Optional provider filter; when set, only loaded threads whose current
  * model provider matches one of these values are returned. When present
  * but empty, includes all providers.
  */
-modelProviders?: Array<string> | null,
+modelProviders?: Array<string> | null, 
 /**
  * Optional source filter; when set, only loaded threads from these source
  * kinds are returned. When present but empty, includes all source kinds.
  */
-sourceKinds?: Array<ThreadSourceKind> | null,
+sourceKinds?: Array<ThreadSourceKind> | null, 
 /**
  * Optional cwd filter; when set, only loaded threads whose session cwd
  * exactly matches this path are returned.

@@ -3354,6 +3354,9 @@ impl App {
             .thread_loaded_list(ThreadLoadedListParams {
                 cursor: None,
                 limit: None,
+                model_providers: None,
+                source_kinds: None,
+                cwd: None,
             })
             .await
         {
@@ -8648,6 +8651,7 @@ guardian_approval = true
                     created_at: 1,
                     updated_at: 2,
                     status: codex_app_server_protocol::ThreadStatus::Idle,
+                    resident: false,
                     path: Some(rollout_path.clone()),
                     cwd: PathBuf::from("/tmp/agent"),
                     cli_version: "0.0.0".to_string(),
@@ -8729,6 +8733,7 @@ guardian_approval = true
                     created_at: 1,
                     updated_at: 2,
                     status: codex_app_server_protocol::ThreadStatus::Idle,
+                    resident: false,
                     path: None,
                     cwd: PathBuf::from("/tmp/agent"),
                     cli_version: "0.0.0".to_string(),
@@ -10691,6 +10696,7 @@ guardian_approval = true
                     created_at: 0,
                     updated_at: 0,
                     status: codex_app_server_protocol::ThreadStatus::Idle,
+                    resident: false,
                     path: None,
                     cwd: PathBuf::from("/tmp/project"),
                     cli_version: "0.0.0".to_string(),

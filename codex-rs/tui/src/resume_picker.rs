@@ -2666,6 +2666,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             status: codex_app_server_protocol::ThreadStatus::Idle,
+            resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: String::from("0.0.0"),

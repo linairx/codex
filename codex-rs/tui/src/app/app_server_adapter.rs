@@ -913,6 +913,7 @@ fn command_execution_completed_event(turn_id: &str, item: &ThreadItem) -> Option
         aggregated_output,
         exit_code,
         duration_ms,
+        ..
     } = item
     else {
         return None;
@@ -1140,6 +1141,7 @@ mod tests {
             aggregated_output: None,
             exit_code: None,
             duration_ms: None,
+            guardian_review: None,
         };
 
         let (_, started_events) = server_notification_thread_events(
@@ -1196,6 +1198,7 @@ mod tests {
             aggregated_output: Some("hello world\n".to_string()),
             exit_code: Some(0),
             duration_ms: Some(5),
+            guardian_review: None,
         };
         let (_, completed_events) = server_notification_thread_events(
             ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -1231,6 +1234,7 @@ mod tests {
             aggregated_output: None,
             exit_code: None,
             duration_ms: None,
+            guardian_review: None,
         };
 
         let events =
@@ -1258,6 +1262,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             status: ThreadStatus::Idle,
+            resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "test".to_string(),
@@ -1281,6 +1286,7 @@ mod tests {
                     aggregated_output: Some("hello world\n".to_string()),
                     exit_code: Some(0),
                     duration_ms: Some(5),
+                    guardian_review: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -1425,6 +1431,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 status: ThreadStatus::Idle,
+                resident: false,
                 path: None,
                 cwd: PathBuf::from("/tmp/project"),
                 cli_version: "test".to_string(),

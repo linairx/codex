@@ -5,7 +5,8 @@
       "enum": [
         "waitingOnApproval",
         "waitingOnUserInput",
-        "backgroundTerminalRunning"
+        "backgroundTerminalRunning",
+        "workspaceChanged"
       ],
       "type": "string"
     },

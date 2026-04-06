@@ -37,6 +37,10 @@ model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier 
  * and subsequent turns.
  */
 approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, /**
+ * When true, keep the thread loaded after the last client unsubscribes so
+ * it can continue acting as a long-lived background assistant.
+ */
+resident?: boolean, /**
  * If true, persist additional rollout EventMsg variants required to
  * reconstruct a richer thread history on subsequent resume/fork/read.
  */

@@ -132,17 +132,17 @@ Example with notification opt-out:
 
 ## API Overview
 
-- `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
-- `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it.
-- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread.
+- `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
+- `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it. Pass `resident: true` to keep the thread loaded after the last client unsubscribes.
+- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork and `resident: true` to keep the fork loaded after the last client unsubscribes, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread.
 - `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
 - `thread/loaded/list` — list the thread ids currently loaded in memory. Supports optional `modelProviders`, `sourceKinds`, and `cwd` filters for the loaded thread's current config snapshot.
 - `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including live `status`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`.
-- `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, and `backgroundTerminalRunning`.
+- `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
-- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, then emits `thread/closed`.
+- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, unless the thread is `resident: true`; non-resident unloads emit `thread/closed`.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
@@ -331,6 +331,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - Includes `threadId` and the new `status`.
 - Status can be `notLoaded`, `idle`, `systemError`, or `active` (with `activeFlags`; `active` implies running).
 - Threads with live unified-exec background terminals remain `active` after the turn completes, with `activeFlags` including `backgroundTerminalRunning`, until those terminals exit or are cleaned.
+- Resident loaded threads also transition to `active` with `activeFlags` including `workspaceChanged` when their working directory changes on disk. Starting the next turn clears that flag.
 - `thread/start`, `thread/fork`, and detached review threads do not emit a separate initial `thread/status/changed`; their `thread/started` notification already carries the current `thread.status`.
 
 ```json
@@ -351,7 +352,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - `notSubscribed` when the connection was not subscribed to that thread.
 - `notLoaded` when the thread is not loaded.
 
-If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`.
+If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Threads started/resumed/forked with `resident: true` stay loaded instead, so `thread/unsubscribe` only detaches the connection.
 
 ```json
 { "method": "thread/unsubscribe", "id": 22, "params": { "threadId": "thr_123" } }

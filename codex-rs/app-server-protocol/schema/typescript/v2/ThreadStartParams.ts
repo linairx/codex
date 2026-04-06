@@ -13,6 +13,10 @@ export type ThreadStartParams = {model?: string | null, modelProvider?: string |
  * and subsequent turns.
  */
 approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, serviceName?: string | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, ephemeral?: boolean | null, /**
+ * When true, keep the thread loaded after the last client unsubscribes so
+ * it can continue acting as a long-lived background assistant.
+ */
+resident?: boolean, /**
  * If true, opt into emitting raw Responses API items on the event stream.
  * This is for internal use only (e.g. Codex Cloud).
  */

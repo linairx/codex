@@ -68,6 +68,7 @@ fn sample_thread(thread_id: &str, ephemeral: bool) -> Thread {
         created_at: 1,
         updated_at: 2,
         status: AppServerThreadStatus::Idle,
+        resident: false,
         path: None,
         cwd: PathBuf::from("/tmp"),
         cli_version: "0.0.0".to_string(),

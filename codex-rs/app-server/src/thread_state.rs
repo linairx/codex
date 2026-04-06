@@ -119,6 +119,7 @@ impl ThreadState {
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
     connection_ids: HashSet<ConnectionId>,
+    resident: bool,
 }
 
 impl Default for ThreadEntry {
@@ -126,6 +127,7 @@ impl Default for ThreadEntry {
         Self {
             state: Arc::new(Mutex::new(ThreadState::default())),
             connection_ids: HashSet::new(),
+            resident: false,
         }
     }
 }
@@ -259,6 +261,20 @@ impl ThreadStateManager {
             .threads
             .get(&thread_id)
             .is_some_and(|thread_entry| !thread_entry.connection_ids.is_empty())
+    }
+
+    pub(crate) async fn set_thread_resident(&self, thread_id: ThreadId, resident: bool) {
+        let mut state = self.state.lock().await;
+        state.threads.entry(thread_id).or_default().resident = resident;
+    }
+
+    pub(crate) async fn is_thread_resident(&self, thread_id: ThreadId) -> bool {
+        self.state
+            .lock()
+            .await
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread_entry| thread_entry.resident)
     }
 
     pub(crate) async fn try_ensure_connection_subscribed(

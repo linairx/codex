@@ -36,6 +36,11 @@ updatedAt: number,
  */
 status: ThreadStatus, 
 /**
+ * Whether the thread should remain loaded after the last subscriber
+ * detaches. This is runtime-only and defaults to false for stored threads.
+ */
+resident: boolean, 
+/**
  * [UNSTABLE] Path to the thread on disk.
  */
 path: string | null, 

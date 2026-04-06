@@ -10124,6 +10124,10 @@
           "description": "Usually the first user message in the thread, if available.",
           "type": "string"
         },
+        "resident": {
+          "description": "Whether the thread should remain loaded after the last subscriber detaches. This is runtime-only and defaults to false for stored threads.",
+          "type": "boolean"
+        },
         "source": {
           "allOf": [
             {
@@ -10161,6 +10165,7 @@
         "id",
         "modelProvider",
         "preview",
+        "resident",
         "source",
         "status",
         "turns",
@@ -10172,7 +10177,8 @@
       "enum": [
         "waitingOnApproval",
         "waitingOnUserInput",
-        "backgroundTerminalRunning"
+        "backgroundTerminalRunning",
+        "workspaceChanged"
       ],
       "type": "string"
     },
@@ -10303,6 +10309,10 @@
             "string",
             "null"
           ]
+        },
+        "resident": {
+          "description": "When true, keep the thread loaded after the last client unsubscribes so it can continue acting as a long-lived background assistant.",
+          "type": "boolean"
         },
         "sandbox": {
           "anyOf": [
@@ -11664,6 +11674,10 @@
             }
           ]
         },
+        "resident": {
+          "description": "When true, keep the thread loaded after the last client unsubscribes so it can continue acting as a long-lived background assistant.",
+          "type": "boolean"
+        },
         "sandbox": {
           "anyOf": [
             {
@@ -11944,6 +11958,10 @@
               "type": "null"
             }
           ]
+        },
+        "resident": {
+          "description": "When true, keep the thread loaded after the last client unsubscribes so it can continue acting as a long-lived background assistant.",
+          "type": "boolean"
         },
         "sandbox": {
           "anyOf": [
