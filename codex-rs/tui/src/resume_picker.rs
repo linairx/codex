@@ -532,6 +532,7 @@ struct Row {
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     active_flags: Vec<ThreadActiveFlag>,
+    has_system_error: bool,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     cwd: Option<PathBuf>,
@@ -1085,6 +1086,7 @@ fn head_to_row(item: &ThreadItem) -> Row {
         thread_id: item.thread_id,
         thread_name: None,
         active_flags: Vec::new(),
+        has_system_error: false,
         created_at,
         updated_at,
         cwd: item.cwd.clone(),
@@ -1112,10 +1114,11 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
             return None;
         }
     };
-    let active_flags = match status {
+    let active_flags = match &status {
         ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => Vec::new(),
-        ThreadStatus::Active { active_flags } => active_flags,
+        ThreadStatus::Active { active_flags } => active_flags.clone(),
     };
+    let has_system_error = matches!(status, ThreadStatus::SystemError);
     let preview = preview.trim();
     Some(Row {
         path,
@@ -1127,6 +1130,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         thread_id: Some(thread_id),
         thread_name: name,
         active_flags,
+        has_system_error,
         created_at: chrono::DateTime::from_timestamp(created_at, 0)
             .map(|dt| dt.with_timezone(&Utc)),
         updated_at: chrono::DateTime::from_timestamp(updated_at, 0)
@@ -1143,6 +1147,10 @@ fn active_flag_label(flag: ThreadActiveFlag) -> &'static str {
         ThreadActiveFlag::BackgroundTerminalRunning => "[shell]",
         ThreadActiveFlag::WorkspaceChanged => "[changed]",
     }
+}
+
+fn system_error_label() -> &'static str {
+    "[error]"
 }
 
 fn thread_list_params(
@@ -1354,6 +1362,10 @@ fn render_list(
         if add_leading_gap {
             preview_width = preview_width.saturating_sub(2);
         }
+        if row.has_system_error {
+            preview_width =
+                preview_width.saturating_sub(UnicodeWidthStr::width(system_error_label()) + 1);
+        }
         for flag in &row.active_flags {
             preview_width =
                 preview_width.saturating_sub(UnicodeWidthStr::width(active_flag_label(*flag)) + 1);
@@ -1378,6 +1390,10 @@ fn render_list(
         }
         if add_leading_gap {
             spans.push("  ".into());
+        }
+        if row.has_system_error {
+            spans.push(system_error_label().red());
+            spans.push(" ".into());
         }
         for flag in &row.active_flags {
             let badge = match flag {
@@ -1885,6 +1901,7 @@ mod tests {
             thread_id: None,
             thread_name: Some(String::from("My session")),
             active_flags: Vec::new(),
+            has_system_error: false,
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -1946,6 +1963,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: None,
             active_flags: Vec::new(),
+            has_system_error: false,
             created_at: None,
             updated_at: None,
             cwd: Some(PathBuf::from("/srv/remote-project")),
@@ -1981,6 +1999,7 @@ mod tests {
                 thread_id: None,
                 thread_name: None,
                 active_flags: Vec::new(),
+                has_system_error: false,
                 created_at: Some(now - Duration::minutes(16)),
                 updated_at: Some(now - Duration::seconds(42)),
                 cwd: None,
@@ -1992,6 +2011,7 @@ mod tests {
                 thread_id: None,
                 thread_name: None,
                 active_flags: Vec::new(),
+                has_system_error: false,
                 created_at: Some(now - Duration::hours(1)),
                 updated_at: Some(now - Duration::minutes(35)),
                 cwd: None,
@@ -2003,6 +2023,7 @@ mod tests {
                 thread_id: None,
                 thread_name: None,
                 active_flags: Vec::new(),
+                has_system_error: false,
                 created_at: Some(now - Duration::hours(2)),
                 updated_at: Some(now - Duration::hours(2)),
                 cwd: None,
@@ -2067,6 +2088,7 @@ mod tests {
                     ThreadActiveFlag::WorkspaceChanged,
                     ThreadActiveFlag::WaitingOnApproval,
                 ],
+                has_system_error: false,
                 created_at: Some(now - Duration::minutes(20)),
                 updated_at: Some(now - Duration::minutes(1)),
                 cwd: Some(PathBuf::from("/srv/project")),
@@ -2078,6 +2100,7 @@ mod tests {
                 thread_id: Some(ThreadId::new()),
                 thread_name: None,
                 active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+                has_system_error: false,
                 created_at: Some(now - Duration::hours(2)),
                 updated_at: Some(now - Duration::minutes(8)),
                 cwd: Some(PathBuf::from("/srv/project")),
@@ -2373,6 +2396,7 @@ mod tests {
                 thread_id: Some(id1),
                 thread_name: None,
                 active_flags: Vec::new(),
+                has_system_error: false,
                 created_at: None,
                 updated_at: Some(now - Duration::days(2)),
                 cwd: None,
@@ -2384,6 +2408,7 @@ mod tests {
                 thread_id: Some(id2),
                 thread_name: None,
                 active_flags: Vec::new(),
+                has_system_error: false,
                 created_at: None,
                 updated_at: Some(now - Duration::days(3)),
                 cwd: None,
@@ -2454,6 +2479,7 @@ mod tests {
             thread_id: Some(thread_id),
             thread_name: Some(String::from("stale backend title")),
             active_flags: Vec::new(),
+            has_system_error: false,
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -2720,6 +2746,7 @@ mod tests {
             thread_id: None,
             thread_name: None,
             active_flags: Vec::new(),
+            has_system_error: false,
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -2761,6 +2788,7 @@ mod tests {
             thread_id: Some(thread_id),
             thread_name: None,
             active_flags: Vec::new(),
+            has_system_error: false,
             created_at: None,
             updated_at: None,
             cwd: None,
@@ -2813,6 +2841,7 @@ mod tests {
         assert_eq!(row.thread_id, Some(thread_id));
         assert_eq!(row.thread_name, Some(String::from("Named thread")));
         assert_eq!(row.active_flags, Vec::new());
+        assert!(!row.has_system_error);
     }
 
     #[test]
@@ -2852,6 +2881,7 @@ mod tests {
                 ThreadActiveFlag::BackgroundTerminalRunning,
             ]
         );
+        assert!(!row.has_system_error);
     }
 
     #[tokio::test]

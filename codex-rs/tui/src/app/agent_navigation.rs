@@ -84,6 +84,7 @@ impl AgentNavigationState {
         agent_role: Option<String>,
         is_closed: bool,
         active_flags: Vec<codex_app_server_protocol::ThreadActiveFlag>,
+        has_system_error: bool,
     ) {
         if !self.threads.contains_key(&thread_id) {
             self.order.push(thread_id);
@@ -95,6 +96,7 @@ impl AgentNavigationState {
                 agent_role,
                 is_closed,
                 active_flags,
+                has_system_error,
             },
         );
     }
@@ -115,6 +117,7 @@ impl AgentNavigationState {
                 /*agent_role*/ None,
                 /*is_closed*/ true,
                 /*active_flags*/ Vec::new(),
+                /*has_system_error*/ false,
             );
         }
     }
@@ -228,7 +231,10 @@ impl AgentNavigationState {
                         entry.agent_role.as_deref(),
                         is_primary,
                     );
-                    let active_flags = agent_picker_active_flag_labels(&entry.active_flags);
+                    let active_flags = agent_picker_active_flag_labels(
+                        &entry.active_flags,
+                        entry.has_system_error,
+                    );
                     if !active_flags.is_empty() {
                         label.push(' ');
                         label.push_str(&active_flags.join(" "));
@@ -289,6 +295,7 @@ mod tests {
             /*agent_role*/ None,
             /*is_closed*/ false,
             /*active_flags*/ Vec::new(),
+            /*has_system_error*/ false,
         );
         state.upsert(
             first_agent_id,
@@ -296,6 +303,7 @@ mod tests {
             Some("explorer".to_string()),
             /*is_closed*/ false,
             /*active_flags*/ Vec::new(),
+            /*has_system_error*/ false,
         );
         state.upsert(
             second_agent_id,
@@ -303,6 +311,7 @@ mod tests {
             Some("worker".to_string()),
             /*is_closed*/ false,
             /*active_flags*/ Vec::new(),
+            /*has_system_error*/ false,
         );
 
         (state, main_thread_id, first_agent_id, second_agent_id)
@@ -318,6 +327,7 @@ mod tests {
             Some("worker".to_string()),
             /*is_closed*/ true,
             /*active_flags*/ Vec::new(),
+            /*has_system_error*/ false,
         );
 
         assert_eq!(
@@ -366,6 +376,7 @@ mod tests {
                 codex_app_server_protocol::ThreadActiveFlag::WorkspaceChanged,
                 codex_app_server_protocol::ThreadActiveFlag::WaitingOnApproval,
             ],
+            /*has_system_error*/ false,
         );
 
         assert_eq!(

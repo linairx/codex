@@ -46,6 +46,8 @@ pub(crate) struct AgentPickerThreadEntry {
     pub(crate) is_closed: bool,
     /// Live activity badges surfaced in the `/agent` picker.
     pub(crate) active_flags: Vec<ThreadActiveFlag>,
+    /// Whether the thread is currently in `SystemError`.
+    pub(crate) has_system_error: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -72,8 +74,13 @@ pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static
 
 pub(crate) fn agent_picker_active_flag_spans(
     active_flags: &[ThreadActiveFlag],
+    has_system_error: bool,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
+    if has_system_error {
+        spans.push("[error]".red());
+        spans.push(" ".into());
+    }
     for flag in active_flags {
         let badge = match flag {
             ThreadActiveFlag::WaitingOnApproval => "[approval]".cyan(),
@@ -89,16 +96,19 @@ pub(crate) fn agent_picker_active_flag_spans(
 
 pub(crate) fn agent_picker_active_flag_labels(
     active_flags: &[ThreadActiveFlag],
+    has_system_error: bool,
 ) -> Vec<&'static str> {
-    active_flags
-        .iter()
-        .map(|flag| match flag {
-            ThreadActiveFlag::WaitingOnApproval => "[approval]",
-            ThreadActiveFlag::WaitingOnUserInput => "[input]",
-            ThreadActiveFlag::BackgroundTerminalRunning => "[shell]",
-            ThreadActiveFlag::WorkspaceChanged => "[changed]",
-        })
-        .collect()
+    let mut labels = Vec::new();
+    if has_system_error {
+        labels.push("[error]");
+    }
+    labels.extend(active_flags.iter().map(|flag| match flag {
+        ThreadActiveFlag::WaitingOnApproval => "[approval]",
+        ThreadActiveFlag::WaitingOnUserInput => "[input]",
+        ThreadActiveFlag::BackgroundTerminalRunning => "[shell]",
+        ThreadActiveFlag::WorkspaceChanged => "[changed]",
+    }));
+    labels
 }
 
 pub(crate) fn format_agent_picker_item_name(
@@ -720,12 +730,15 @@ mod tests {
 
     #[test]
     fn agent_picker_active_flag_spans_snapshot() {
-        let line = Line::from(agent_picker_active_flag_spans(&[
-            ThreadActiveFlag::WorkspaceChanged,
-            ThreadActiveFlag::WaitingOnApproval,
-            ThreadActiveFlag::WaitingOnUserInput,
-            ThreadActiveFlag::BackgroundTerminalRunning,
-        ]));
+        let line = Line::from(agent_picker_active_flag_spans(
+            &[
+                ThreadActiveFlag::WorkspaceChanged,
+                ThreadActiveFlag::WaitingOnApproval,
+                ThreadActiveFlag::WaitingOnUserInput,
+                ThreadActiveFlag::BackgroundTerminalRunning,
+            ],
+            /*has_system_error*/ false,
+        ));
         assert_snapshot!("agent_picker_active_flag_spans", line.to_string());
     }
 
