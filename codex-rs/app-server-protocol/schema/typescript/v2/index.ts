@@ -281,6 +281,8 @@ export type { ThreadListParams } from "./ThreadListParams";
 export type { ThreadListResponse } from "./ThreadListResponse";
 export type { ThreadLoadedListParams } from "./ThreadLoadedListParams";
 export type { ThreadLoadedListResponse } from "./ThreadLoadedListResponse";
+export type { ThreadLoadedReadParams } from "./ThreadLoadedReadParams";
+export type { ThreadLoadedReadResponse } from "./ThreadLoadedReadResponse";
 export type { ThreadMetadataGitInfoUpdateParams } from "./ThreadMetadataGitInfoUpdateParams";
 export type { ThreadMetadataUpdateParams } from "./ThreadMetadataUpdateParams";
 export type { ThreadMetadataUpdateResponse } from "./ThreadMetadataUpdateResponse";

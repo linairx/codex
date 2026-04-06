@@ -3100,6 +3100,19 @@ pub struct ThreadLoadedListParams {
     /// Optional page size; defaults to no limit.
     #[ts(optional = nullable)]
     pub limit: Option<u32>,
+    /// Optional provider filter; when set, only loaded threads whose current
+    /// model provider matches one of these values are returned. When present
+    /// but empty, includes all providers.
+    #[ts(optional = nullable)]
+    pub model_providers: Option<Vec<String>>,
+    /// Optional source filter; when set, only loaded threads from these source
+    /// kinds are returned. When present but empty, includes all source kinds.
+    #[ts(optional = nullable)]
+    pub source_kinds: Option<Vec<ThreadSourceKind>>,
+    /// Optional cwd filter; when set, only loaded threads whose session cwd
+    /// exactly matches this path are returned.
+    #[ts(optional = nullable)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -3108,6 +3121,42 @@ pub struct ThreadLoadedListParams {
 pub struct ThreadLoadedListResponse {
     /// Thread ids for sessions currently loaded in memory.
     pub data: Vec<String>,
+    /// Opaque cursor to pass to the next call to continue after the last item.
+    /// if None, there are no more items to return.
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadLoadedReadParams {
+    /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    /// Optional page size; defaults to no limit.
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+    /// Optional provider filter; when set, only loaded threads whose current
+    /// model provider matches one of these values are returned. When present
+    /// but empty, includes all providers.
+    #[ts(optional = nullable)]
+    pub model_providers: Option<Vec<String>>,
+    /// Optional source filter; when set, only loaded threads from these source
+    /// kinds are returned. When present but empty, includes all source kinds.
+    #[ts(optional = nullable)]
+    pub source_kinds: Option<Vec<ThreadSourceKind>>,
+    /// Optional cwd filter; when set, only loaded threads whose session cwd
+    /// exactly matches this path are returned.
+    #[ts(optional = nullable)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadLoadedReadResponse {
+    /// Loaded thread summaries for sessions currently resident in memory.
+    pub data: Vec<Thread>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// if None, there are no more items to return.
     pub next_cursor: Option<String>,
@@ -3134,6 +3183,7 @@ pub enum ThreadStatus {
 pub enum ThreadActiveFlag {
     WaitingOnApproval,
     WaitingOnUserInput,
+    BackgroundTerminalRunning,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

@@ -163,6 +163,7 @@ impl ThreadWatchManager {
     pub(crate) async fn note_thread_shutdown(&self, thread_id: &str) {
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.running = false;
+            runtime.running_background_terminals = 0;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.is_loaded = false;
@@ -173,6 +174,7 @@ impl ThreadWatchManager {
     pub(crate) async fn note_system_error(&self, thread_id: &str) {
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.running = false;
+            runtime.running_background_terminals = 0;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.has_system_error = true;
@@ -185,6 +187,23 @@ impl ThreadWatchManager {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
+        })
+        .await;
+    }
+
+    pub(crate) async fn note_background_terminal_started(&self, thread_id: &str) {
+        self.update_runtime_for_thread(thread_id, move |runtime| {
+            runtime.is_loaded = true;
+            runtime.running_background_terminals =
+                runtime.running_background_terminals.saturating_add(1);
+        })
+        .await;
+    }
+
+    pub(crate) async fn note_background_terminal_ended(&self, thread_id: &str) {
+        self.update_runtime_for_thread(thread_id, move |runtime| {
+            runtime.running_background_terminals =
+                runtime.running_background_terminals.saturating_sub(1);
         })
         .await;
     }
@@ -377,6 +396,7 @@ impl ThreadWatchState {
 struct RuntimeFacts {
     is_loaded: bool,
     running: bool,
+    running_background_terminals: u32,
     pending_permission_requests: u32,
     pending_user_input_requests: u32,
     has_system_error: bool,
@@ -393,6 +413,9 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     }
     if runtime.pending_user_input_requests > 0 {
         active_flags.push(ThreadActiveFlag::WaitingOnUserInput);
+    }
+    if runtime.running_background_terminals > 0 {
+        active_flags.push(ThreadActiveFlag::BackgroundTerminalRunning);
     }
 
     if runtime.running || !active_flags.is_empty() {
@@ -669,6 +692,40 @@ mod tests {
             .note_turn_completed(INTERACTIVE_THREAD_ID, false)
             .await;
         assert_eq!(manager.running_turn_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn background_terminals_keep_thread_active_after_turn_completion() {
+        let manager = ThreadWatchManager::new();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager
+            .note_background_terminal_started(INTERACTIVE_THREAD_ID)
+            .await;
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .await;
+
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+            },
+        );
+
+        manager
+            .note_background_terminal_ended(INTERACTIVE_THREAD_ID)
+            .await;
+
+        wait_for_status(&manager, INTERACTIVE_THREAD_ID, ThreadStatus::Idle).await;
     }
 
     #[tokio::test]

@@ -131,6 +131,8 @@ use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
@@ -771,6 +773,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ThreadLoadedList { request_id, params } => {
                 self.thread_loaded_list(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::ThreadLoadedRead { request_id, params } => {
+                self.thread_loaded_read(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::ThreadRead { request_id, params } => {
@@ -3387,7 +3393,7 @@ impl CodexMessageProcessor {
             cwd,
             search_term,
         } = params;
-        let cwd = match normalize_thread_list_cwd_filter(cwd) {
+        let cwd = match normalize_thread_cwd_filter("thread/list", cwd) {
             Ok(cwd) => cwd,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -3469,22 +3475,160 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: ThreadLoadedListParams,
     ) {
-        let ThreadLoadedListParams { cursor, limit } = params;
-        let mut data = self
-            .thread_manager
-            .list_thread_ids()
+        let ThreadLoadedListParams {
+            cursor,
+            limit,
+            model_providers,
+            source_kinds,
+            cwd,
+        } = params;
+        let cwd = match normalize_thread_cwd_filter("thread/loaded/list", cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+        let Some((data, next_cursor)) = self
+            .paginate_loaded_thread_ids(
+                request_id.clone(),
+                cursor,
+                limit,
+                model_providers.as_ref(),
+                source_kinds.as_ref(),
+                cwd.as_ref(),
+            )
             .await
-            .into_iter()
-            .map(|thread_id| thread_id.to_string())
-            .collect::<Vec<_>>();
+        else {
+            return;
+        };
+        let response = ThreadLoadedListResponse { data, next_cursor };
+        self.outgoing.send_response(request_id, response).await;
+    }
+
+    async fn thread_loaded_read(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadLoadedReadParams,
+    ) {
+        let ThreadLoadedReadParams {
+            cursor,
+            limit,
+            model_providers,
+            source_kinds,
+            cwd,
+        } = params;
+        let cwd = match normalize_thread_cwd_filter("thread/loaded/read", cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+        let Some((page, next_cursor)) = self
+            .paginate_loaded_thread_ids(
+                request_id.clone(),
+                cursor,
+                limit,
+                model_providers.as_ref(),
+                source_kinds.as_ref(),
+                cwd.as_ref(),
+            )
+            .await
+        else {
+            return;
+        };
+
+        let mut data = Vec::with_capacity(page.len());
+        for thread_id in page {
+            let Ok(thread_uuid) = ThreadId::from_string(&thread_id) else {
+                continue;
+            };
+            let Ok(loaded_thread) = self.thread_manager.get_thread(thread_uuid).await else {
+                continue;
+            };
+
+            let config_snapshot = loaded_thread.config_snapshot().await;
+            let loaded_rollout_path = loaded_thread.rollout_path();
+            let mut thread = if let Some(rollout_path) = loaded_rollout_path.as_ref() {
+                match load_thread_summary_for_rollout(
+                    &self.config,
+                    thread_uuid,
+                    rollout_path,
+                    self.config.model_provider_id.as_str(),
+                    /*persisted_metadata*/ None,
+                )
+                .await
+                {
+                    Ok(thread) => thread,
+                    Err(_) => build_thread_from_snapshot(
+                        thread_uuid,
+                        &config_snapshot,
+                        loaded_rollout_path.clone(),
+                    ),
+                }
+            } else {
+                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
+            };
+            self.attach_thread_name(thread_uuid, &mut thread).await;
+
+            let loaded_status = self
+                .thread_watch_manager
+                .loaded_status_for_thread(&thread.id)
+                .await;
+            let has_live_in_progress_turn =
+                matches!(loaded_thread.agent_status().await, AgentStatus::Running);
+            set_thread_status_and_interrupt_stale_turns(
+                &mut thread,
+                loaded_status,
+                has_live_in_progress_turn,
+            );
+            data.push(thread);
+        }
+
+        let response = ThreadLoadedReadResponse { data, next_cursor };
+        self.outgoing.send_response(request_id, response).await;
+    }
+
+    async fn paginate_loaded_thread_ids(
+        &self,
+        request_id: ConnectionRequestId,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        model_providers: Option<&Vec<String>>,
+        source_kinds: Option<&Vec<ThreadSourceKind>>,
+        cwd: Option<&PathBuf>,
+    ) -> Option<(Vec<String>, Option<String>)> {
+        let mut data = Vec::new();
+        for thread_id in self.thread_manager.list_thread_ids().await {
+            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+                continue;
+            };
+            let config_snapshot = thread.config_snapshot().await;
+            if let Some(model_providers) = model_providers
+                && !model_providers.is_empty()
+                && !model_providers.contains(&config_snapshot.model_provider_id)
+            {
+                continue;
+            }
+            if let Some(source_kinds) = source_kinds
+                && !source_kinds.is_empty()
+                && !source_kinds.contains(&thread_source_kind_from_session_source(
+                    &config_snapshot.session_source,
+                ))
+            {
+                continue;
+            }
+            if let Some(cwd) = cwd
+                && config_snapshot.cwd != *cwd
+            {
+                continue;
+            }
+            data.push(thread_id.to_string());
+        }
 
         if data.is_empty() {
-            let response = ThreadLoadedListResponse {
-                data,
-                next_cursor: None,
-            };
-            self.outgoing.send_response(request_id, response).await;
-            return;
+            return Some((Vec::new(), None));
         }
 
         data.sort();
@@ -3500,7 +3644,7 @@ impl CodexMessageProcessor {
                             data: None,
                         };
                         self.outgoing.send_error(request_id, error).await;
-                        return;
+                        return None;
                     }
                 };
                 match data.binary_search(&cursor) {
@@ -3515,12 +3659,7 @@ impl CodexMessageProcessor {
         let end = start.saturating_add(effective_limit).min(total);
         let page = data[start..end].to_vec();
         let next_cursor = page.last().filter(|_| end < total).cloned();
-
-        let response = ThreadLoadedListResponse {
-            data: page,
-            next_cursor,
-        };
-        self.outgoing.send_response(request_id, response).await;
+        Some((page, next_cursor))
     }
 
     async fn thread_read(&mut self, request_id: ConnectionRequestId, params: ThreadReadParams) {
@@ -7790,7 +7929,8 @@ impl CodexMessageProcessor {
     }
 }
 
-fn normalize_thread_list_cwd_filter(
+fn normalize_thread_cwd_filter(
+    method_name: &str,
     cwd: Option<String>,
 ) -> Result<Option<PathBuf>, JSONRPCErrorError> {
     let Some(cwd) = cwd else {
@@ -7801,14 +7941,38 @@ fn normalize_thread_list_cwd_filter(
         .map(Some)
         .map_err(|err| JSONRPCErrorError {
             code: INVALID_PARAMS_ERROR_CODE,
-            message: format!("invalid thread/list cwd filter `{cwd}`: {err}"),
+            message: format!("invalid {method_name} cwd filter `{cwd}`: {err}"),
             data: None,
         })
 }
 
+fn thread_source_kind_from_session_source(
+    source: &codex_protocol::protocol::SessionSource,
+) -> ThreadSourceKind {
+    match source {
+        codex_protocol::protocol::SessionSource::Cli => ThreadSourceKind::Cli,
+        codex_protocol::protocol::SessionSource::VSCode => ThreadSourceKind::VsCode,
+        codex_protocol::protocol::SessionSource::Exec => ThreadSourceKind::Exec,
+        codex_protocol::protocol::SessionSource::Mcp => ThreadSourceKind::AppServer,
+        codex_protocol::protocol::SessionSource::Custom(_) => ThreadSourceKind::Unknown,
+        codex_protocol::protocol::SessionSource::SubAgent(sub_source) => match sub_source {
+            codex_protocol::protocol::SubAgentSource::Review => ThreadSourceKind::SubAgentReview,
+            codex_protocol::protocol::SubAgentSource::Compact => ThreadSourceKind::SubAgentCompact,
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. } => {
+                ThreadSourceKind::SubAgentThreadSpawn
+            }
+            codex_protocol::protocol::SubAgentSource::MemoryConsolidation => {
+                ThreadSourceKind::SubAgentOther
+            }
+            codex_protocol::protocol::SubAgentSource::Other(_) => ThreadSourceKind::SubAgent,
+        },
+        codex_protocol::protocol::SessionSource::Unknown => ThreadSourceKind::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod thread_list_cwd_filter_tests {
-    use super::normalize_thread_list_cwd_filter;
+    use super::normalize_thread_cwd_filter;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -7822,7 +7986,8 @@ mod thread_list_cwd_filter_tests {
         };
 
         assert_eq!(
-            normalize_thread_list_cwd_filter(Some(cwd.clone())).expect("cwd filter should parse"),
+            normalize_thread_cwd_filter("thread/list", Some(cwd.clone()))
+                .expect("cwd filter should parse"),
             Some(PathBuf::from(cwd))
         );
     }
@@ -7833,7 +7998,7 @@ mod thread_list_cwd_filter_tests {
         let expected = AbsolutePathBuf::relative_to_current_dir("repo-b")?.to_path_buf();
 
         assert_eq!(
-            normalize_thread_list_cwd_filter(Some(String::from("repo-b")))
+            normalize_thread_cwd_filter("thread/list", Some(String::from("repo-b")))
                 .expect("cwd filter should parse"),
             Some(expected)
         );
@@ -8047,10 +8212,10 @@ fn overlay_missing_turn_items_from_snapshot(turns: &mut [Turn], snapshot_turns: 
         if let Some(snapshot_turn) = snapshot_turns
             .iter()
             .find(|candidate| candidate.id == turn.id)
+            && turn.items.is_empty()
+            && !snapshot_turn.items.is_empty()
         {
-            if turn.items.is_empty() && !snapshot_turn.items.is_empty() {
-                turn.items = snapshot_turn.items.clone();
-            }
+            turn.items = snapshot_turn.items.clone();
         }
     }
 }

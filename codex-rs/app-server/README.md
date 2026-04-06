@@ -136,10 +136,11 @@ Example with notification opt-out:
 - `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it.
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread.
 - `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
-- `thread/loaded/list` — list the thread ids currently loaded in memory.
+- `thread/loaded/list` — list the thread ids currently loaded in memory. Supports optional `modelProviders`, `sourceKinds`, and `cwd` filters for the loaded thread's current config snapshot.
+- `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including live `status`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`.
-- `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`).
+- `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, and `backgroundTerminalRunning`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, then emits `thread/closed`.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
@@ -298,12 +299,28 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 ### Example: List loaded threads
 
-`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk.
+`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk. You can also filter by the loaded thread's current `modelProviders`, `sourceKinds`, and exact-match `cwd`.
 
 ```json
 { "method": "thread/loaded/list", "id": 21 }
 { "id": 21, "result": {
     "data": ["thr_123", "thr_456"]
+} }
+```
+
+### Example: Read loaded thread summaries
+
+`thread/loaded/read` returns loaded thread summaries for sessions currently resident in memory. This is useful for polling a remote control plane without separately calling `thread/read` for each loaded thread id. It supports the same optional `modelProviders`, `sourceKinds`, and exact-match `cwd` filters as `thread/loaded/list`.
+
+```json
+{ "method": "thread/loaded/read", "id": 22 }
+{ "id": 22, "result": {
+    "data": [
+      {
+        "id": "thr_123",
+        "status": { "type": "idle" }
+      }
+    ]
 } }
 ```
 
@@ -313,6 +330,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 - Includes `threadId` and the new `status`.
 - Status can be `notLoaded`, `idle`, `systemError`, or `active` (with `activeFlags`; `active` implies running).
+- Threads with live unified-exec background terminals remain `active` after the turn completes, with `activeFlags` including `backgroundTerminalRunning`, until those terminals exit or are cleaned.
 - `thread/start`, `thread/fork`, and detached review threads do not emit a separate initial `thread/status/changed`; their `thread/started` notification already carries the current `thread.status`.
 
 ```json

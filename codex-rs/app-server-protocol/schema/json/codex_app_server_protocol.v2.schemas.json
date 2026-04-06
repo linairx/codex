@@ -1136,6 +1136,30 @@
             },
             "method": {
               "enum": [
+                "thread/loaded/read"
+              ],
+              "title": "Thread/loaded/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadLoadedReadParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/loaded/readRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/read"
               ],
               "title": "Thread/readRequestMethod",
@@ -5354,7 +5378,7 @@
     },
     "ItemGuardianApprovalReviewCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "[UNSTABLE] Temporary notification payload for guardian automatic approval review. This shape is expected to change soon.\n\nTODO(ccunningham): Attach guardian review state to the reviewed tool item's lifecycle instead of sending separate standalone review notifications so the app-server API can persist and replay review state via `thread/read`.",
+      "description": "[UNSTABLE] Temporary notification payload for guardian automatic approval review. This shape is expected to change soon. For persisted history, prefer inline `guardianReview` on supported thread items when available.",
       "properties": {
         "action": {
           "$ref": "#/definitions/GuardianApprovalReviewAction"
@@ -5384,7 +5408,7 @@
     },
     "ItemGuardianApprovalReviewStartedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "[UNSTABLE] Temporary notification payload for guardian automatic approval review. This shape is expected to change soon.\n\nTODO(ccunningham): Attach guardian review state to the reviewed tool item's lifecycle instead of sending separate standalone review notifications so the app-server API can persist and replay review state via `thread/read`.",
+      "description": "[UNSTABLE] Temporary notification payload for guardian automatic approval review. This shape is expected to change soon. For persisted history, prefer inline `guardianReview` on supported thread items when available.",
       "properties": {
         "action": {
           "$ref": "#/definitions/GuardianApprovalReviewAction"
@@ -10147,7 +10171,8 @@
     "ThreadActiveFlag": {
       "enum": [
         "waitingOnApproval",
-        "waitingOnUserInput"
+        "waitingOnUserInput",
+        "backgroundTerminalRunning"
       ],
       "type": "string"
     },
@@ -11159,12 +11184,39 @@
             "null"
           ]
         },
+        "cwd": {
+          "description": "Optional cwd filter; when set, only loaded threads whose session cwd exactly matches this path are returned.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "limit": {
           "description": "Optional page size; defaults to no limit.",
           "format": "uint32",
           "minimum": 0.0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "modelProviders": {
+          "description": "Optional provider filter; when set, only loaded threads whose current model provider matches one of these values are returned. When present but empty, includes all providers.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "sourceKinds": {
+          "description": "Optional source filter; when set, only loaded threads from these source kinds are returned. When present but empty, includes all source kinds.",
+          "items": {
+            "$ref": "#/definitions/ThreadSourceKind"
+          },
+          "type": [
+            "array",
             "null"
           ]
         }
@@ -11194,6 +11246,80 @@
         "data"
       ],
       "title": "ThreadLoadedListResponse",
+      "type": "object"
+    },
+    "ThreadLoadedReadParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cursor": {
+          "description": "Opaque pagination cursor returned by a previous call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Optional cwd filter; when set, only loaded threads whose session cwd exactly matches this path are returned.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "Optional page size; defaults to no limit.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "modelProviders": {
+          "description": "Optional provider filter; when set, only loaded threads whose current model provider matches one of these values are returned. When present but empty, includes all providers.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "sourceKinds": {
+          "description": "Optional source filter; when set, only loaded threads from these source kinds are returned. When present but empty, includes all source kinds.",
+          "items": {
+            "$ref": "#/definitions/ThreadSourceKind"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "title": "ThreadLoadedReadParams",
+      "type": "object"
+    },
+    "ThreadLoadedReadResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "data": {
+          "description": "Loaded thread summaries for sessions currently resident in memory.",
+          "items": {
+            "$ref": "#/definitions/Thread"
+          },
+          "type": "array"
+        },
+        "nextCursor": {
+          "description": "Opaque cursor to pass to the next call to continue after the last item. if None, there are no more items to return.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "title": "ThreadLoadedReadResponse",
       "type": "object"
     },
     "ThreadMetadataGitInfoUpdateParams": {

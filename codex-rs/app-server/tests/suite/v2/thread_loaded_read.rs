@@ -4,11 +4,12 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ThreadLoadedListParams;
-use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStatus;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::TempDir;
@@ -17,7 +18,7 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
-async fn thread_loaded_list_returns_loaded_thread_ids() -> Result<()> {
+async fn thread_loaded_read_returns_loaded_thread_summaries() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -27,27 +28,27 @@ async fn thread_loaded_list_returns_loaded_thread_ids() -> Result<()> {
 
     let thread_id = start_thread(&mut mcp).await?;
 
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+    let read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
         .await?;
     let resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
     )
     .await??;
-    let ThreadLoadedListResponse {
-        mut data,
-        next_cursor,
-    } = to_response::<ThreadLoadedListResponse>(resp)?;
-    data.sort();
-    assert_eq!(data, vec![thread_id]);
+    let ThreadLoadedReadResponse { data, next_cursor } =
+        to_response::<ThreadLoadedReadResponse>(resp)?;
+
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].id, thread_id);
+    assert_eq!(data[0].status, ThreadStatus::Idle);
     assert_eq!(next_cursor, None);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_loaded_list_paginates() -> Result<()> {
+async fn thread_loaded_read_paginates() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -57,12 +58,11 @@ async fn thread_loaded_list_paginates() -> Result<()> {
 
     let first = start_thread(&mut mcp).await?;
     let second = start_thread(&mut mcp).await?;
-
     let mut expected = [first, second];
     expected.sort();
 
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams {
+    let read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams {
             cursor: None,
             limit: Some(1),
             model_providers: None,
@@ -72,18 +72,19 @@ async fn thread_loaded_list_paginates() -> Result<()> {
         .await?;
     let resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
     )
     .await??;
-    let ThreadLoadedListResponse {
+    let ThreadLoadedReadResponse {
         data: first_page,
         next_cursor,
-    } = to_response::<ThreadLoadedListResponse>(resp)?;
-    assert_eq!(first_page, vec![expected[0].clone()]);
+    } = to_response::<ThreadLoadedReadResponse>(resp)?;
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, expected[0]);
     assert_eq!(next_cursor, Some(expected[0].clone()));
 
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams {
+    let read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams {
             cursor: next_cursor,
             limit: Some(1),
             model_providers: None,
@@ -93,21 +94,22 @@ async fn thread_loaded_list_paginates() -> Result<()> {
         .await?;
     let resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
     )
     .await??;
-    let ThreadLoadedListResponse {
+    let ThreadLoadedReadResponse {
         data: second_page,
         next_cursor,
-    } = to_response::<ThreadLoadedListResponse>(resp)?;
-    assert_eq!(second_page, vec![expected[1].clone()]);
+    } = to_response::<ThreadLoadedReadResponse>(resp)?;
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, expected[1]);
     assert_eq!(next_cursor, None);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_loaded_list_filters_by_cwd() -> Result<()> {
+async fn thread_loaded_read_filters_by_cwd() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -129,8 +131,8 @@ async fn thread_loaded_list_filters_by_cwd() -> Result<()> {
     let target_thread = start_thread_in_cwd(&mut mcp, &target_cwd).await?;
     let _other_thread = start_thread_in_cwd(&mut mcp, &other_cwd).await?;
 
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams {
+    let read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams {
             cursor: None,
             limit: None,
             model_providers: None,
@@ -140,20 +142,21 @@ async fn thread_loaded_list_filters_by_cwd() -> Result<()> {
         .await?;
     let resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
     )
     .await??;
-    let ThreadLoadedListResponse { data, next_cursor } =
-        to_response::<ThreadLoadedListResponse>(resp)?;
+    let ThreadLoadedReadResponse { data, next_cursor } =
+        to_response::<ThreadLoadedReadResponse>(resp)?;
 
-    assert_eq!(data, vec![target_thread]);
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].id, target_thread);
     assert_eq!(next_cursor, None);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_loaded_list_filters_by_model_provider_and_source_kind() -> Result<()> {
+async fn thread_loaded_read_filters_by_model_provider_and_source_kind() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -163,8 +166,8 @@ async fn thread_loaded_list_filters_by_model_provider_and_source_kind() -> Resul
 
     let thread_id = start_thread(&mut mcp).await?;
 
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams {
+    let read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams {
             cursor: None,
             limit: None,
             model_providers: Some(vec!["mock_provider".to_string()]),
@@ -174,13 +177,14 @@ async fn thread_loaded_list_filters_by_model_provider_and_source_kind() -> Resul
         .await?;
     let resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
     )
     .await??;
-    let ThreadLoadedListResponse { data, next_cursor } =
-        to_response::<ThreadLoadedListResponse>(resp)?;
+    let ThreadLoadedReadResponse { data, next_cursor } =
+        to_response::<ThreadLoadedReadResponse>(resp)?;
 
-    assert_eq!(data, vec![thread_id]);
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].id, thread_id);
     assert_eq!(next_cursor, None);
 
     Ok(())

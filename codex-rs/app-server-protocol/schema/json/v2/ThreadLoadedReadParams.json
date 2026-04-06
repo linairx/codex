@@ -62,6 +62,6 @@
       ]
     }
   },
-  "title": "ThreadLoadedListParams",
+  "title": "ThreadLoadedReadParams",
   "type": "object"
 }

@@ -1389,7 +1389,8 @@
     "ThreadActiveFlag": {
       "enum": [
         "waitingOnApproval",
-        "waitingOnUserInput"
+        "waitingOnUserInput",
+        "backgroundTerminalRunning"
       ],
       "type": "string"
     },

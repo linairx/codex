@@ -313,6 +313,10 @@ client_request_definitions! {
         params: v2::ThreadLoadedListParams,
         response: v2::ThreadLoadedListResponse,
     },
+    ThreadLoadedRead => "thread/loaded/read" {
+        params: v2::ThreadLoadedReadParams,
+        response: v2::ThreadLoadedReadResponse,
+    },
     ThreadRead => "thread/read" {
         params: v2::ThreadReadParams,
         response: v2::ThreadReadResponse,

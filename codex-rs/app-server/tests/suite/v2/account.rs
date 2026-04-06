@@ -89,6 +89,7 @@ model_provider = "mock_provider"
 
 [features]
 shell_snapshot = false
+plugins = false
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

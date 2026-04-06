@@ -118,6 +118,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
@@ -1580,6 +1581,14 @@ pub(crate) async fn apply_bespoke_event_handling(
             .await;
         }
         EventMsg::ExecCommandBegin(exec_command_begin_event) => {
+            if matches!(
+                exec_command_begin_event.source,
+                CoreExecCommandSource::UnifiedExecStartup
+            ) {
+                thread_watch_manager
+                    .note_background_terminal_started(&conversation_id.to_string())
+                    .await;
+            }
             let item_id = exec_command_begin_event.call_id.clone();
             let command_actions = exec_command_begin_event
                 .parsed_cmd
@@ -1676,6 +1685,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::ExecCommandEnd(exec_command_end_event) => {
+            if matches!(
+                exec_command_end_event.source,
+                CoreExecCommandSource::UnifiedExecStartup
+            ) {
+                thread_watch_manager
+                    .note_background_terminal_ended(&conversation_id.to_string())
+                    .await;
+            }
             let ExecCommandEndEvent {
                 call_id,
                 command,
