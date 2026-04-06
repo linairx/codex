@@ -8,20 +8,32 @@ use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_core::file_watcher::FileWatcher;
+use codex_core::file_watcher::FileWatcherSubscriber;
+use codex_core::file_watcher::ThrottledWatchReceiver;
+use codex_core::file_watcher::WatchPath;
+use codex_core::file_watcher::WatchRegistration;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tracing::warn;
+
+const WORKSPACE_CHANGED_NOTIFICATION_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub(crate) struct ThreadWatchManager {
     state: Arc<Mutex<ThreadWatchState>>,
     outgoing: Option<Arc<OutgoingMessageSender>>,
     running_turn_count_tx: watch::Sender<usize>,
+    file_watcher: Arc<FileWatcher>,
+    workspace_watch_state: Arc<Mutex<HashMap<String, WorkspaceWatchEntry>>>,
 }
 
 pub(crate) struct ThreadWatchActiveGuard {
@@ -65,6 +77,13 @@ enum ThreadWatchActiveGuardType {
     UserInput,
 }
 
+struct WorkspaceWatchEntry {
+    cwd: std::path::PathBuf,
+    terminate_tx: oneshot::Sender<oneshot::Sender<()>>,
+    _subscriber: FileWatcherSubscriber,
+    _registration: WatchRegistration,
+}
+
 impl Default for ThreadWatchManager {
     fn default() -> Self {
         Self::new()
@@ -73,24 +92,43 @@ impl Default for ThreadWatchManager {
 
 impl ThreadWatchManager {
     pub(crate) fn new() -> Self {
+        let file_watcher = match FileWatcher::new() {
+            Ok(file_watcher) => Arc::new(file_watcher),
+            Err(err) => {
+                warn!("thread watch manager falling back to noop core watcher: {err}");
+                Arc::new(FileWatcher::noop())
+            }
+        };
+        Self::new_with_file_watcher(None, file_watcher)
+    }
+
+    fn new_with_file_watcher(
+        outgoing: Option<Arc<OutgoingMessageSender>>,
+        file_watcher: Arc<FileWatcher>,
+    ) -> Self {
         let (running_turn_count_tx, _running_turn_count_rx) = watch::channel(0);
         Self {
             state: Arc::new(Mutex::new(ThreadWatchState::default())),
-            outgoing: None,
+            outgoing,
             running_turn_count_tx,
+            file_watcher,
+            workspace_watch_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(crate) fn new_with_outgoing(outgoing: Arc<OutgoingMessageSender>) -> Self {
-        let (running_turn_count_tx, _running_turn_count_rx) = watch::channel(0);
-        Self {
-            state: Arc::new(Mutex::new(ThreadWatchState::default())),
-            outgoing: Some(outgoing),
-            running_turn_count_tx,
-        }
+        let file_watcher = match FileWatcher::new() {
+            Ok(file_watcher) => Arc::new(file_watcher),
+            Err(err) => {
+                warn!("thread watch manager falling back to noop core watcher: {err}");
+                Arc::new(FileWatcher::noop())
+            }
+        };
+        Self::new_with_file_watcher(Some(outgoing), file_watcher)
     }
 
     pub(crate) async fn upsert_thread(&self, thread: Thread) {
+        self.ensure_workspace_watch(&thread).await;
         self.mutate_and_publish(move |state| {
             state.upsert_thread(thread.id, /*emit_notification*/ true)
         })
@@ -98,6 +136,7 @@ impl ThreadWatchManager {
     }
 
     pub(crate) async fn upsert_thread_silently(&self, thread: Thread) {
+        self.ensure_workspace_watch(&thread).await;
         self.mutate_and_publish(move |state| {
             state.upsert_thread(thread.id, /*emit_notification*/ false)
         })
@@ -105,6 +144,7 @@ impl ThreadWatchManager {
     }
 
     pub(crate) async fn remove_thread(&self, thread_id: &str) {
+        self.remove_workspace_watch(thread_id).await;
         let thread_id = thread_id.to_string();
         self.mutate_and_publish(move |state| state.remove_thread(&thread_id))
             .await;
@@ -148,6 +188,7 @@ impl ThreadWatchManager {
             runtime.is_loaded = true;
             runtime.running = true;
             runtime.has_system_error = false;
+            runtime.workspace_changed = false;
         })
         .await;
     }
@@ -284,6 +325,131 @@ impl ThreadWatchManager {
             .await;
     }
 
+    async fn ensure_workspace_watch(&self, thread: &Thread) {
+        let thread_id = thread.id.clone();
+        if !thread.resident {
+            self.remove_workspace_watch(&thread_id).await;
+            return;
+        }
+
+        let cwd = thread.cwd.clone();
+        let mut ignored_roots = Vec::new();
+        let mut ignored_codex_home_files = Vec::new();
+        let mut ignored_codex_home_parent = None;
+        if let Some(sessions_root) = thread.path.as_ref().and_then(|path| {
+            path.ancestors()
+                .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "sessions"))
+                .map(std::path::Path::to_path_buf)
+        }) {
+            ignored_roots.push(sessions_root.clone());
+            if let Some(codex_home) = sessions_root.parent() {
+                ignored_codex_home_parent = Some(codex_home.to_path_buf());
+                ignored_roots.push(codex_home.join("tmp"));
+                ignored_roots.push(codex_home.join("shell_snapshots"));
+                ignored_codex_home_files.push("session_index.jsonl".to_string());
+                ignored_codex_home_files.push("state".to_string());
+                ignored_codex_home_files.push("logs".to_string());
+            }
+        }
+        let mut watch_state = self.workspace_watch_state.lock().await;
+        if watch_state
+            .get(&thread_id)
+            .is_some_and(|entry| entry.cwd == cwd)
+        {
+            return;
+        }
+
+        let existing = watch_state.remove(&thread_id);
+        drop(watch_state);
+        if let Some(existing) = existing {
+            let (done_tx, done_rx) = oneshot::channel();
+            let _ = existing.terminate_tx.send(done_tx);
+            let _ = done_rx.await;
+        }
+
+        let (subscriber, rx) = self.file_watcher.add_subscriber();
+        let registration = subscriber.register_paths(vec![WatchPath {
+            path: cwd.clone(),
+            recursive: true,
+        }]);
+        let (terminate_tx, terminate_rx) = oneshot::channel();
+        let watched_cwd = cwd.clone();
+        let mut watch_state = self.workspace_watch_state.lock().await;
+        watch_state.insert(
+            thread_id.clone(),
+            WorkspaceWatchEntry {
+                cwd,
+                terminate_tx,
+                _subscriber: subscriber,
+                _registration: registration,
+            },
+        );
+        drop(watch_state);
+
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut rx = ThrottledWatchReceiver::new(rx, WORKSPACE_CHANGED_NOTIFICATION_DEBOUNCE);
+            tokio::pin!(terminate_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    done_tx = &mut terminate_rx => {
+                        if let Ok(done_tx) = done_tx {
+                            let _ = done_tx.send(());
+                        }
+                        break;
+                    }
+                    event = rx.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        if event.paths.iter().all(|path| {
+                            path == &watched_cwd
+                                || ignored_roots.iter().any(|root| path.starts_with(root))
+                                || ignored_codex_home_parent.as_ref().is_some_and(|codex_home| {
+                                    path.parent() == Some(codex_home.as_path())
+                                        && path
+                                            .file_name()
+                                            .and_then(std::ffi::OsStr::to_str)
+                                            .is_some_and(|name| {
+                                                name == "session_index.jsonl"
+                                                    || ignored_codex_home_files.iter().any(|prefix| {
+                                                        prefix != "session_index.jsonl"
+                                                            && name.starts_with(prefix)
+                                                            && name.contains(".sqlite")
+                                                    })
+                                            })
+                                })
+                        })
+                        {
+                            continue;
+                        }
+                        manager.note_workspace_changed(&thread_id).await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn remove_workspace_watch(&self, thread_id: &str) {
+        let entry = {
+            let mut workspace_watch_state = self.workspace_watch_state.lock().await;
+            workspace_watch_state.remove(thread_id)
+        };
+        if let Some(entry) = entry {
+            let (done_tx, done_rx) = oneshot::channel();
+            let _ = entry.terminate_tx.send(done_tx);
+            let _ = done_rx.await;
+        }
+    }
+
+    async fn note_workspace_changed(&self, thread_id: &str) {
+        self.update_runtime_for_thread(thread_id, |runtime| {
+            runtime.workspace_changed = true;
+        })
+        .await;
+    }
+
     fn pending_counter(
         runtime: &mut RuntimeFacts,
         guard_type: ThreadWatchActiveGuardType,
@@ -400,6 +566,7 @@ struct RuntimeFacts {
     pending_permission_requests: u32,
     pending_user_input_requests: u32,
     has_system_error: bool,
+    workspace_changed: bool,
 }
 
 fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
@@ -416,6 +583,9 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     }
     if runtime.running_background_terminals > 0 {
         active_flags.push(ThreadActiveFlag::BackgroundTerminalRunning);
+    }
+    if runtime.workspace_changed {
+        active_flags.push(ThreadActiveFlag::WorkspaceChanged);
     }
 
     if runtime.running || !active_flags.is_empty() {
@@ -441,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn loaded_status_defaults_to_not_loaded_for_untracked_threads() {
-        let manager = ThreadWatchManager::new();
+        let manager = test_manager();
 
         assert_eq!(
             manager
@@ -453,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracks_non_interactive_thread_status() {
-        let manager = ThreadWatchManager::new();
+        let manager = test_manager();
         manager
             .upsert_thread(test_thread(
                 NON_INTERACTIVE_THREAD_ID,
@@ -475,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_updates_track_single_thread() {
-        let manager = ThreadWatchManager::new();
+        let manager = test_manager();
         manager
             .upsert_thread(test_thread(
                 INTERACTIVE_THREAD_ID,
@@ -640,7 +810,7 @@ mod tests {
 
     #[tokio::test]
     async fn loaded_statuses_default_to_not_loaded_for_untracked_threads() {
-        let manager = ThreadWatchManager::new();
+        let manager = test_manager();
         manager
             .upsert_thread(test_thread(
                 INTERACTIVE_THREAD_ID,
@@ -670,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn has_running_turns_tracks_runtime_running_flag_only() {
-        let manager = ThreadWatchManager::new();
+        let manager = test_manager();
         manager
             .upsert_thread(test_thread(
                 INTERACTIVE_THREAD_ID,
@@ -696,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_terminals_keep_thread_active_after_turn_completion() {
-        let manager = ThreadWatchManager::new();
+        let manager = test_manager();
         manager
             .upsert_thread(test_thread(
                 INTERACTIVE_THREAD_ID,
@@ -729,11 +899,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_changes_keep_thread_active_until_next_turn() {
+        let manager = test_manager();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        manager.note_workspace_changed(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+        );
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_flags: vec![],
+            },
+        );
+
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .await;
+        wait_for_status(&manager, INTERACTIVE_THREAD_ID, ThreadStatus::Idle).await;
+    }
+
+    #[tokio::test]
     async fn status_change_emits_notification() {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
-        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-        )));
+        let (manager, mut outgoing_rx) = test_manager_with_outgoing();
 
         manager
             .upsert_thread(test_thread(
@@ -772,10 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn silent_upsert_skips_initial_notification() {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
-        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-        )));
+        let (manager, mut outgoing_rx) = test_manager_with_outgoing();
 
         manager
             .upsert_thread_silently(test_thread(
@@ -846,6 +1046,21 @@ mod tests {
         notification
     }
 
+    fn test_manager() -> ThreadWatchManager {
+        ThreadWatchManager::new_with_file_watcher(None, Arc::new(FileWatcher::noop()))
+    }
+
+    fn test_manager_with_outgoing() -> (ThreadWatchManager, mpsc::Receiver<OutgoingEnvelope>) {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(8);
+        (
+            ThreadWatchManager::new_with_file_watcher(
+                Some(Arc::new(OutgoingMessageSender::new(outgoing_tx))),
+                Arc::new(FileWatcher::noop()),
+            ),
+            outgoing_rx,
+        )
+    }
+
     fn test_thread(thread_id: &str, source: codex_app_server_protocol::SessionSource) -> Thread {
         Thread {
             id: thread_id.to_string(),
@@ -856,6 +1071,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             status: ThreadStatus::NotLoaded,
+            resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "test".to_string(),

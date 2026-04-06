@@ -2,6 +2,7 @@ use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
+use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::InitializeCapabilities;
@@ -312,6 +313,65 @@ async fn thread_status_changed_tracks_background_terminal_lifecycle() -> Result<
     );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thread_status_changed_tracks_workspace_changes() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.path().display().to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+
+    std::fs::write(workspace.path().join("watched.txt"), "changed")?;
+
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = match timeout(remaining, mcp.read_next_message()).await {
+            Ok(Ok(message)) => message,
+            _ => break,
+        };
+        let JSONRPCMessage::Notification(JSONRPCNotification {
+            method,
+            params: Some(params),
+        }) = message
+        else {
+            continue;
+        };
+        if method != "thread/status/changed" {
+            continue;
+        }
+
+        let notification: ThreadStatusChangedNotification = serde_json::from_value(params)?;
+        if notification.thread_id != thread.id {
+            continue;
+        }
+        if let ThreadStatus::Active { active_flags } = notification.status
+            && active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+        {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("expected workspaceChanged in thread/status/changed notifications")
 }
 
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
