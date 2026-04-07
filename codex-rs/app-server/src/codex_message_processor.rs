@@ -289,6 +289,7 @@ use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::get_state_db;
+use codex_rollout::state_db::normalize_cwd_for_state_db;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::StateRuntime;
 use codex_state::ThreadMetadata;
@@ -2400,6 +2401,17 @@ impl CodexMessageProcessor {
                     .thread_state_manager
                     .set_thread_resident(thread_id, resident)
                     .await;
+                if let Some(rollout_path) = session_configured.rollout_path.as_deref() {
+                    ensure_thread_mode_persisted_in_state_db_for_home(
+                        listener_task_context.codex_home.as_path(),
+                        listener_task_context.fallback_model_provider.as_str(),
+                        thread_id,
+                        rollout_path,
+                        &config_snapshot,
+                        resident,
+                    )
+                    .await;
+                }
                 set_thread_resident_and_mode(&mut thread, resident);
 
                 listener_task_context
@@ -2949,19 +2961,16 @@ impl CodexMessageProcessor {
             }
 
             let config_snapshot = thread.config_snapshot().await;
-            let model_provider = config_snapshot.model_provider_id.clone();
-            let mut builder = ThreadMetadataBuilder::new(
+            let resident = self
+                .thread_state_manager
+                .is_thread_resident(thread_uuid)
+                .await;
+            let metadata = build_thread_metadata_from_snapshot(
                 thread_uuid,
-                rollout_path,
-                Utc::now(),
-                config_snapshot.session_source.clone(),
+                &rollout_path,
+                &config_snapshot,
+                resident,
             );
-            builder.model_provider = Some(model_provider.clone());
-            builder.cwd = config_snapshot.cwd.clone();
-            builder.cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
-            builder.sandbox_policy = config_snapshot.sandbox_policy.clone();
-            builder.approval_mode = config_snapshot.approval_policy;
-            let metadata = builder.build(model_provider.as_str());
             if let Err(err) = state_db_ctx.insert_thread_if_absent(&metadata).await {
                 return Err(internal_error(format!(
                     "failed to create thread metadata for {thread_uuid}: {err}"
@@ -3468,6 +3477,7 @@ impl CodexMessageProcessor {
             .thread_state_manager
             .resident_thread_ids(&thread_ids)
             .await;
+        let state_db_ctx = get_state_db(&self.config).await;
 
         let mut data = Vec::with_capacity(threads.len());
         for (conversation_id, mut thread) in threads {
@@ -3477,6 +3487,10 @@ impl CodexMessageProcessor {
             }
             if resident_thread_ids.contains(&conversation_id) {
                 set_thread_resident_and_mode(&mut thread, /*resident*/ true);
+            } else if let Some(state_db_ctx) = state_db_ctx.as_ref()
+                && let Ok(Some(metadata)) = state_db_ctx.get_thread(conversation_id).await
+            {
+                apply_persisted_thread_mode(&mut thread, &metadata);
             }
             data.push(thread);
         }
@@ -3780,6 +3794,15 @@ impl CodexMessageProcessor {
         {
             thread.forked_from_id = forked_from_id_from_rollout(rollout_path).await;
         }
+        if let Some(state_db_ctx) = loaded_thread_state_db.as_ref() {
+            if let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_uuid).await {
+                apply_persisted_thread_mode(&mut thread, &metadata);
+            }
+        } else if let Some(state_db_ctx) = get_state_db(&self.config).await
+            && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_uuid).await
+        {
+            apply_persisted_thread_mode(&mut thread, &metadata);
+        }
         self.attach_runtime_thread_metadata(thread_uuid, &mut thread)
             .await;
 
@@ -3966,6 +3989,10 @@ impl CodexMessageProcessor {
                 &mut typesafe_overrides,
             )
             .await;
+        let resident = resident
+            || persisted_resume_metadata
+                .as_ref()
+                .is_some_and(ThreadMetadata::is_resident_assistant);
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
@@ -4034,6 +4061,14 @@ impl CodexMessageProcessor {
                 self.thread_state_manager
                     .set_thread_resident(thread_id, resident)
                     .await;
+                ensure_thread_mode_persisted_in_state_db(
+                    self.config.as_ref(),
+                    thread_id,
+                    rollout_path.as_path(),
+                    &thread.config_snapshot().await,
+                    resident,
+                )
+                .await;
 
                 let mut thread = match self
                     .load_thread_from_resume_source_or_send_internal(
@@ -4216,6 +4251,11 @@ impl CodexMessageProcessor {
                 .thread_state_manager
                 .thread_state(existing_thread_id)
                 .await;
+            let resident = params.resident
+                || self
+                    .thread_state_manager
+                    .is_thread_resident(existing_thread_id)
+                    .await;
             self.ensure_listener_task_running(
                 existing_thread_id,
                 existing_thread.clone(),
@@ -4224,10 +4264,17 @@ impl CodexMessageProcessor {
             )
             .await;
             self.thread_state_manager
-                .set_thread_resident(existing_thread_id, params.resident)
+                .set_thread_resident(existing_thread_id, resident)
                 .await;
-
             let config_snapshot = existing_thread.config_snapshot().await;
+            ensure_thread_mode_persisted_in_state_db(
+                self.config.as_ref(),
+                existing_thread_id,
+                rollout_path.as_path(),
+                &config_snapshot,
+                resident,
+            )
+            .await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
             if !mismatch_details.is_empty() {
                 tracing::warn!(
@@ -4251,7 +4298,7 @@ impl CodexMessageProcessor {
                     return true;
                 }
             };
-            set_thread_resident_and_mode(&mut thread_summary, params.resident);
+            set_thread_resident_and_mode(&mut thread_summary, resident);
 
             let listener_command_tx = {
                 let thread_state = thread_state.lock().await;
@@ -4432,11 +4479,13 @@ impl CodexMessageProcessor {
     }
 
     async fn attach_runtime_thread_metadata(&self, thread_id: ThreadId, thread: &mut Thread) {
-        let resident = self
+        if self
             .thread_state_manager
             .is_thread_resident(thread_id)
-            .await;
-        set_thread_resident_and_mode(thread, resident);
+            .await
+        {
+            set_thread_resident_and_mode(thread, /*resident*/ true);
+        }
         self.attach_thread_name(thread_id, thread).await;
     }
 
@@ -4637,6 +4686,16 @@ impl CodexMessageProcessor {
         self.thread_state_manager
             .set_thread_resident(thread_id, resident)
             .await;
+        if let Some(rollout_path) = session_configured.rollout_path.as_deref() {
+            ensure_thread_mode_persisted_in_state_db(
+                self.config.as_ref(),
+                thread_id,
+                rollout_path,
+                &forked_thread.config_snapshot().await,
+                resident,
+            )
+            .await;
+        }
 
         let mut thread = match self
             .build_forked_thread_snapshot(
@@ -6706,7 +6765,7 @@ impl CodexMessageProcessor {
             self.outgoing.send_error(request_id, error).await;
             return;
         }
-        let (_, thread) = match self.load_thread(&params.thread_id).await {
+        let (thread_id, thread) = match self.load_thread(&params.thread_id).await {
             Ok(v) => v,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -6722,6 +6781,18 @@ impl CodexMessageProcessor {
         {
             self.outgoing.send_error(request_id, error).await;
             return;
+        }
+        if let Some(rollout_path) = thread.rollout_path() {
+            ensure_thread_mode_persisted_in_state_db(
+                self.config.as_ref(),
+                thread_id,
+                rollout_path.as_path(),
+                &thread.config_snapshot().await,
+                self.thread_state_manager
+                    .is_thread_resident(thread_id)
+                    .await,
+            )
+            .await;
         }
 
         let collaboration_modes_config = CollaborationModesConfig {
@@ -6788,6 +6859,18 @@ impl CodexMessageProcessor {
 
         match turn_id {
             Ok(turn_id) => {
+                if let Some(rollout_path) = thread.rollout_path() {
+                    ensure_thread_mode_persisted_in_state_db(
+                        self.config.as_ref(),
+                        thread_id,
+                        rollout_path.as_path(),
+                        &thread.config_snapshot().await,
+                        self.thread_state_manager
+                            .is_thread_resident(thread_id)
+                            .await,
+                    )
+                    .await;
+                }
                 self.outgoing
                     .record_request_turn_id(&request_id, &turn_id)
                     .await;
@@ -9044,8 +9127,14 @@ async fn load_thread_summary_for_rollout(
             &mut thread,
             summary_to_thread(summary_from_thread_metadata(persisted_metadata)),
         );
+        apply_persisted_thread_mode(&mut thread, persisted_metadata);
     } else if let Some(summary) = read_summary_from_state_db_by_thread_id(config, thread_id).await {
         merge_mutable_thread_metadata(&mut thread, summary_to_thread(summary));
+        if let Some(state_db_ctx) = get_state_db(config).await
+            && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
+        {
+            apply_persisted_thread_mode(&mut thread, &metadata);
+        }
     }
     Ok(thread)
 }
@@ -9060,6 +9149,8 @@ async fn forked_from_id_from_rollout(path: &Path) -> Option<String> {
 
 fn merge_mutable_thread_metadata(thread: &mut Thread, persisted_thread: Thread) {
     thread.git_info = persisted_thread.git_info;
+    thread.resident = persisted_thread.resident;
+    thread.mode = persisted_thread.mode;
 }
 
 fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
@@ -9170,6 +9261,122 @@ fn thread_mode_from_resident(resident: bool) -> ThreadMode {
 fn set_thread_resident_and_mode(thread: &mut Thread, resident: bool) {
     thread.resident = resident;
     thread.mode = thread_mode_from_resident(resident);
+}
+
+async fn ensure_thread_mode_persisted_in_state_db(
+    config: &Config,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    config_snapshot: &ThreadConfigSnapshot,
+    resident: bool,
+) {
+    let Some(state_db_ctx) = get_state_db(config).await else {
+        return;
+    };
+    ensure_thread_mode_with_state_db(
+        state_db_ctx.as_ref(),
+        thread_id,
+        rollout_path,
+        config_snapshot,
+        resident,
+    )
+    .await;
+}
+
+async fn ensure_thread_mode_persisted_in_state_db_for_home(
+    codex_home: &Path,
+    default_provider: &str,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    config_snapshot: &ThreadConfigSnapshot,
+    resident: bool,
+) {
+    let state_db_ctx = match StateRuntime::init(
+        codex_home.to_path_buf(),
+        default_provider.to_string(),
+    )
+    .await
+    {
+        Ok(state_db_ctx) => state_db_ctx,
+        Err(err) => {
+            warn!(
+                "failed to initialize state db while persisting thread mode for {thread_id}: {err}"
+            );
+            return;
+        }
+    };
+    ensure_thread_mode_with_state_db(
+        state_db_ctx.as_ref(),
+        thread_id,
+        rollout_path,
+        config_snapshot,
+        resident,
+    )
+    .await;
+}
+
+async fn ensure_thread_mode_with_state_db(
+    state_db_ctx: &StateRuntime,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    config_snapshot: &ThreadConfigSnapshot,
+    resident: bool,
+) {
+    let persisted_mode = persisted_thread_mode_from_resident(resident);
+    match state_db_ctx
+        .set_thread_mode(thread_id, persisted_mode)
+        .await
+    {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            warn!("failed to persist thread mode for {thread_id}: {err}");
+            return;
+        }
+    }
+
+    let metadata =
+        build_thread_metadata_from_snapshot(thread_id, rollout_path, config_snapshot, resident);
+    if !tokio::fs::try_exists(rollout_path).await.unwrap_or(false) {
+        return;
+    }
+    if let Err(err) = state_db_ctx.insert_thread_if_absent(&metadata).await {
+        warn!("failed to bootstrap thread metadata for {thread_id}: {err}");
+    }
+}
+
+fn persisted_thread_mode_from_resident(resident: bool) -> &'static str {
+    if resident {
+        "residentAssistant"
+    } else {
+        "interactive"
+    }
+}
+
+fn apply_persisted_thread_mode(thread: &mut Thread, metadata: &ThreadMetadata) {
+    set_thread_resident_and_mode(thread, metadata.is_resident_assistant());
+}
+
+fn build_thread_metadata_from_snapshot(
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    config_snapshot: &ThreadConfigSnapshot,
+    resident: bool,
+) -> ThreadMetadata {
+    let model_provider = config_snapshot.model_provider_id.clone();
+    let mut builder = ThreadMetadataBuilder::new(
+        thread_id,
+        rollout_path.to_path_buf(),
+        Utc::now(),
+        config_snapshot.session_source.clone(),
+    );
+    builder.mode = persisted_thread_mode_from_resident(resident).to_string();
+    builder.model_provider = Some(model_provider.clone());
+    builder.cwd = normalize_cwd_for_state_db(&config_snapshot.cwd);
+    builder.cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    builder.sandbox_policy = config_snapshot.sandbox_policy.clone();
+    builder.approval_mode = config_snapshot.approval_policy;
+    builder.build(model_provider.as_str())
 }
 
 pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {

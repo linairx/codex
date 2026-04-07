@@ -11,6 +11,7 @@ SELECT
     created_at,
     updated_at,
     source,
+    mode,
     agent_nickname,
     agent_role,
     agent_path,
@@ -45,6 +46,15 @@ WHERE id = ?
             .fetch_optional(self.pool.as_ref())
             .await?;
         Ok(row.and_then(|row| row.try_get("memory_mode").ok()))
+    }
+
+    pub async fn set_thread_mode(&self, thread_id: ThreadId, mode: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE threads SET mode = ? WHERE id = ?")
+            .bind(mode)
+            .bind(thread_id.to_string())
+            .execute(self.pool.as_ref())
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Get dynamic tools for a thread, if present.
@@ -348,6 +358,7 @@ SELECT
     created_at,
     updated_at,
     source,
+    mode,
     agent_nickname,
     agent_role,
     agent_path,
@@ -449,6 +460,7 @@ INSERT INTO threads (
     created_at,
     updated_at,
     source,
+    mode,
     agent_nickname,
     agent_role,
     agent_path,
@@ -468,7 +480,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -477,6 +489,7 @@ ON CONFLICT(id) DO NOTHING
         .bind(datetime_to_epoch_seconds(metadata.created_at))
         .bind(datetime_to_epoch_seconds(metadata.updated_at))
         .bind(metadata.source.as_str())
+        .bind(metadata.mode.as_str())
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
         .bind(metadata.agent_path.as_deref())
@@ -576,6 +589,7 @@ INSERT INTO threads (
     created_at,
     updated_at,
     source,
+    mode,
     agent_nickname,
     agent_role,
     agent_path,
@@ -595,12 +609,13 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
     source = excluded.source,
+    mode = excluded.mode,
     agent_nickname = excluded.agent_nickname,
     agent_role = excluded.agent_role,
     agent_path = excluded.agent_path,
@@ -626,6 +641,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(datetime_to_epoch_seconds(metadata.created_at))
         .bind(datetime_to_epoch_seconds(metadata.updated_at))
         .bind(metadata.source.as_str())
+        .bind(metadata.mode.as_str())
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
         .bind(metadata.agent_path.as_deref())
@@ -1292,6 +1308,35 @@ mod tests {
             persisted.first_user_message.as_deref(),
             Some("first-user-message")
         );
+    }
+
+    #[tokio::test]
+    async fn set_thread_mode_persists_resident_assistant_mode() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000793").expect("valid thread id");
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+        let updated = runtime
+            .set_thread_mode(thread_id, "residentAssistant")
+            .await
+            .expect("set_thread_mode should succeed");
+        assert!(updated);
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.mode, "residentAssistant");
+        assert!(persisted.is_resident_assistant());
     }
 
     #[tokio::test]

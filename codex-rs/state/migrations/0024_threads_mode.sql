@@ -1,0 +1,1 @@
+ALTER TABLE threads ADD COLUMN mode TEXT NOT NULL DEFAULT 'interactive';

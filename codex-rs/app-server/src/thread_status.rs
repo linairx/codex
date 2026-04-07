@@ -179,6 +179,11 @@ impl ThreadWatchManager {
             .count()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn workspace_watch_count(&self) -> usize {
+        self.workspace_watch_state.lock().await.len()
+    }
+
     pub(crate) fn subscribe_running_turn_count(&self) -> watch::Receiver<usize> {
         self.running_turn_count_tx.subscribe()
     }
@@ -202,12 +207,14 @@ impl ThreadWatchManager {
     }
 
     pub(crate) async fn note_thread_shutdown(&self, thread_id: &str) {
+        self.remove_workspace_watch(thread_id).await;
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.running = false;
             runtime.running_background_terminals = 0;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.is_loaded = false;
+            runtime.workspace_changed = false;
         })
         .await;
     }
@@ -444,8 +451,14 @@ impl ThreadWatchManager {
     }
 
     async fn note_workspace_changed(&self, thread_id: &str) {
-        self.update_runtime_for_thread(thread_id, |runtime| {
-            runtime.workspace_changed = true;
+        let thread_id = thread_id.to_string();
+        self.mutate_and_publish(move |state| {
+            state.update_loaded_runtime(&thread_id, |runtime| {
+                if runtime.running {
+                    return;
+                }
+                runtime.workspace_changed = true;
+            })
         })
         .await;
     }
@@ -528,6 +541,23 @@ impl ThreadWatchState {
             .entry(thread_id.to_string())
             .or_default();
         runtime.is_loaded = true;
+        mutate(runtime);
+        self.status_changed_notification(thread_id.to_string(), previous_status)
+    }
+
+    fn update_loaded_runtime<F>(
+        &mut self,
+        thread_id: &str,
+        mutate: F,
+    ) -> Option<ThreadStatusChangedNotification>
+    where
+        F: FnOnce(&mut RuntimeFacts),
+    {
+        let previous_status = self.status_for(thread_id);
+        let runtime = self.runtime_by_thread_id.get_mut(thread_id)?;
+        if !runtime.is_loaded {
+            return None;
+        }
         mutate(runtime);
         self.status_changed_notification(thread_id.to_string(), previous_status)
     }
@@ -932,6 +962,51 @@ mod tests {
             .note_turn_completed(INTERACTIVE_THREAD_ID, false)
             .await;
         wait_for_status(&manager, INTERACTIVE_THREAD_ID, ThreadStatus::Idle).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_changes_do_not_reactivate_shutdown_thread() {
+        let manager = test_manager();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await;
+        manager.note_workspace_changed(INTERACTIVE_THREAD_ID).await;
+
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::NotLoaded,
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_removes_resident_workspace_watch() {
+        let manager = test_manager();
+        let mut thread = test_thread(
+            INTERACTIVE_THREAD_ID,
+            codex_app_server_protocol::SessionSource::Cli,
+        );
+        thread.resident = true;
+        thread.cwd = PathBuf::from("/tmp/resident-project");
+
+        manager.upsert_thread(thread).await;
+        assert_eq!(manager.workspace_watch_count().await, 1);
+
+        manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await;
+
+        assert_eq!(manager.workspace_watch_count().await, 0);
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::NotLoaded,
+        );
     }
 
     #[tokio::test]

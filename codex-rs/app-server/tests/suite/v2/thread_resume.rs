@@ -34,8 +34,11 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -167,6 +170,134 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
         "unexpected resume error: {}",
         resume_err.error.message
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_restores_persisted_resident_mode_after_server_restart() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let thread_id = {
+        let mut mcp = McpProcess::new(codex_home.path()).await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                model: Some("mock-model".to_string()),
+                resident: true,
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+        let turn_req = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "persist resident mode".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                model: Some("mock-model".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let turn_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+        )
+        .await??;
+        let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        let state_db =
+            StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+        let metadata = state_db
+            .get_thread(ThreadId::from_string(&thread.id)?)
+            .await?
+            .expect("thread metadata");
+        assert_eq!(metadata.mode, "residentAssistant");
+
+        thread.id
+    };
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let metadata = state_db
+        .get_thread(ThreadId::from_string(&thread_id)?)
+        .await?
+        .expect("thread metadata after restart");
+    assert_eq!(metadata.mode, "residentAssistant");
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let read: ThreadReadResponse = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(read.thread.resident);
+    assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .iter()
+        .find(|listed_thread| listed_thread.id == thread_id)
+        .expect("thread/list should include the resident thread after restart");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resume: ThreadResumeResponse = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert!(resume.thread.resident);
+    assert_eq!(resume.thread.mode, ThreadMode::ResidentAssistant);
 
     Ok(())
 }

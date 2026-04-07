@@ -39,15 +39,18 @@
 
 ### 当前进度（2026-04-07）
 
-这条线已经不再是纯设计状态，阶段 1 的第一批代码已开始落地：
+这条线已经不再是纯设计状态，阶段 1 到阶段 4 都已有第一批代码落地：
 
 - `app-server-protocol` 已新增 `Thread.mode`
 - `app-server` 已在主要 `Thread` 返回路径上填充 `mode`
 - schema / TypeScript 生成物已同步更新
 - `app-server/README.md` 已补充 `Thread.mode` 与 `thread.status` 的语义区分
 - `tui` 已开始消费 `Thread.mode`，至少在 resume picker 中区分长期线程与普通线程
+- `thread_status.rs` 已开始收敛 resident thread 的 watcher 生命周期，shutdown 会主动清理工作区 watch
+- `workspaceChanged` 已限制为只作用于已加载线程，避免 shutdown 之后被陈旧 watcher 事件重新激活状态
+- `state` 已新增 `threads.mode` 稳定元数据列，`thread/read` / `thread/list` / `thread/resume` 可在服务重启后回补 resident 模式
 
-这意味着接下来的“阶段 1”不再是从零开始，而是要把第一批协议与返回面改动收敛成可提交的 PR，并继续检查消费侧是否还存在遗漏。
+这意味着接下来的工作重点不再是“从零开始补字段”，而是把已经形成闭环的协议、observer 和 SQLite 最小改动收敛成可 review 的 PR，并继续检查消费侧是否还存在遗漏。
 
 ### 阶段 1：线程模式字段落地
 
@@ -181,8 +184,9 @@
 
 当前状态：
 
-- 已在当前本地改动中开始收敛
-- 需要继续以测试和 diff 为准，确认不存在漏填 `mode` 的 `Thread` 构造路径
+- 已在当前本地改动中收敛主要返回面
+- `thread/start`、`thread/resume`、`thread/fork`、`thread/read`、`thread/list`、`thread/loaded/read` 已补齐 resident / mode 对齐路径
+- 目前剩余重点已从“补字段”转为“按 PR 边界整理实现与测试”
 
 不要混入：
 
@@ -224,6 +228,14 @@
 - 明确 observer 事件到 `workspaceChanged` 的映射
 - 梳理 resident thread 的观察注册和清理语义
 
+当前状态：
+
+- `thread_status.rs` 已开始收敛 shutdown 与 observer 的边界
+- resident thread 在 shutdown 时会主动清理工作区 watch，避免 watcher 生命周期长于线程生命周期
+- `workspaceChanged` 已限制为只更新已加载线程，避免 shutdown 之后被陈旧 watcher 事件重新激活线程状态
+- resident thread 在最后一个订阅者断开后的 reconnect / `thread/resume` 会保留既有 `workspaceChanged` 与 resident 模式，不再回退成普通 interactive 线程
+- 下一次 turn 完成后会按既有状态机清理 `workspaceChanged`，避免脏标记长期滞留
+
 不要混入：
 
 - 新索引系统
@@ -246,6 +258,14 @@
 
 - 全量运行态持久化
 - 远程 bridge
+
+当前状态：
+
+- `state` 已新增 `threads.mode` 稳定元数据列，并在 rollout -> SQLite 汇总时优先保留既有线程模式
+- `thread/start`、`thread/resume`、`thread/fork`、`turn/start` 会在 rollout 已物化后补齐或修复模式元数据，而不会为未物化线程预先写入持久化垃圾行
+- 服务重启后，未加载线程的 `thread/read` / `thread/list` 以及后续 `thread/resume` 都会消费 SQLite 中持久化的 resident 模式
+- 相关最小行为闭环已可由 `codex-state`、`codex-rollout`、`codex-app-server` 的定向测试覆盖
+- 仍需保持边界，只把稳定元数据和派生摘要入库，不把 loaded 状态、watcher、连接关系一类瞬时运行态塞进 SQLite
 
 ## 4. 测试建议
 

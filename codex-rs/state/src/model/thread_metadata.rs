@@ -65,6 +65,8 @@ pub struct ThreadMetadata {
     pub updated_at: DateTime<Utc>,
     /// The session source (stringified enum).
     pub source: String,
+    /// The persisted stable thread mode.
+    pub mode: String,
     /// Optional random unique nickname assigned to an AgentControl-spawned sub-agent.
     pub agent_nickname: Option<String>,
     /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
@@ -114,6 +116,8 @@ pub struct ThreadMetadataBuilder {
     pub updated_at: Option<DateTime<Utc>>,
     /// The session source.
     pub source: SessionSource,
+    /// The stable thread mode string.
+    pub mode: String,
     /// Optional random unique nickname assigned to the session.
     pub agent_nickname: Option<String>,
     /// Optional role (agent_role) assigned to the session.
@@ -154,6 +158,7 @@ impl ThreadMetadataBuilder {
             created_at,
             updated_at: None,
             source,
+            mode: "interactive".to_string(),
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
@@ -185,6 +190,7 @@ impl ThreadMetadataBuilder {
             created_at,
             updated_at,
             source,
+            mode: self.mode.clone(),
             agent_nickname: self.agent_nickname.clone(),
             agent_role: self.agent_role.clone(),
             agent_path: self
@@ -226,6 +232,15 @@ impl ThreadMetadata {
         }
     }
 
+    /// Preserve existing stable mode metadata when rollout-derived data lacks it.
+    pub fn prefer_existing_mode(&mut self, existing: &Self) {
+        self.mode = existing.mode.clone();
+    }
+
+    pub fn is_resident_assistant(&self) -> bool {
+        self.mode == "residentAssistant"
+    }
+
     /// Return the list of field names that differ between `self` and `other`.
     pub fn diff_fields(&self, other: &Self) -> Vec<&'static str> {
         let mut diffs = Vec::new();
@@ -243,6 +258,9 @@ impl ThreadMetadata {
         }
         if self.source != other.source {
             diffs.push("source");
+        }
+        if self.mode != other.mode {
+            diffs.push("mode");
         }
         if self.agent_nickname != other.agent_nickname {
             diffs.push("agent_nickname");
@@ -310,6 +328,7 @@ pub(crate) struct ThreadRow {
     created_at: i64,
     updated_at: i64,
     source: String,
+    mode: String,
     agent_nickname: Option<String>,
     agent_role: Option<String>,
     agent_path: Option<String>,
@@ -337,6 +356,7 @@ impl ThreadRow {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             source: row.try_get("source")?,
+            mode: row.try_get("mode")?,
             agent_nickname: row.try_get("agent_nickname")?,
             agent_role: row.try_get("agent_role")?,
             agent_path: row.try_get("agent_path")?,
@@ -368,6 +388,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             created_at,
             updated_at,
             source,
+            mode,
             agent_nickname,
             agent_role,
             agent_path,
@@ -392,6 +413,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             created_at: epoch_seconds_to_datetime(created_at)?,
             updated_at: epoch_seconds_to_datetime(updated_at)?,
             source,
+            mode,
             agent_nickname,
             agent_role,
             agent_path,
@@ -461,6 +483,7 @@ mod tests {
             created_at: 1_700_000_000,
             updated_at: 1_700_000_100,
             source: "cli".to_string(),
+            mode: "interactive".to_string(),
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
@@ -489,6 +512,7 @@ mod tests {
             created_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
             updated_at: DateTime::<Utc>::from_timestamp(1_700_000_100, 0).expect("timestamp"),
             source: "cli".to_string(),
+            mode: "interactive".to_string(),
             agent_nickname: None,
             agent_role: None,
             agent_path: None,

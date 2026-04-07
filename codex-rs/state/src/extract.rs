@@ -405,6 +405,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             source: "cli".to_string(),
+            mode: "interactive".to_string(),
             agent_path: None,
             agent_nickname: None,
             agent_role: None,

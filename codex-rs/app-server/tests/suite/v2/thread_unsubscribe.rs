@@ -11,6 +11,7 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -203,6 +204,116 @@ async fn thread_unsubscribe_keeps_resident_thread_loaded() -> Result<()> {
     } = to_response::<ThreadReadResponse>(read_resp)?;
     assert!(read_thread.resident);
     assert_eq!(read_thread.status, ThreadStatus::Idle);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resident_thread_preserves_workspace_changed_across_unsubscribe_and_resume() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let req_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.path().display().to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "materialize thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let unsubscribe_id = mcp
+        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let unsubscribe_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
+    )
+    .await??;
+    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
+    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+    std::fs::write(
+        workspace.path().join("watched.txt"),
+        "changed while unsubscribed",
+    )?;
+
+    let changed_status = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let read_id = mcp
+                .send_thread_read_request(ThreadReadParams {
+                    thread_id: thread.id.clone(),
+                    include_turns: false,
+                })
+                .await?;
+            let read_resp: JSONRPCResponse = mcp
+                .read_stream_until_response_message(RequestId::Integer(read_id))
+                .await?;
+            let ThreadReadResponse {
+                thread: read_thread,
+            } = to_response::<ThreadReadResponse>(read_resp)?;
+            if let ThreadStatus::Active { active_flags } = &read_thread.status
+                && active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+            {
+                return Ok::<ThreadStatus, anyhow::Error>(read_thread.status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resume = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert!(resume.thread.resident);
+    assert_eq!(resume.thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(resume.thread.status, changed_status);
 
     Ok(())
 }

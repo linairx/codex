@@ -166,6 +166,7 @@ SELECT
     created_at,
     updated_at,
     source,
+    mode,
     agent_path,
     agent_nickname,
     agent_role,

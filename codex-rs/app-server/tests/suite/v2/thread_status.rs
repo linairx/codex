@@ -12,6 +12,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadMode;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -374,6 +376,114 @@ async fn thread_status_changed_tracks_workspace_changes() -> Result<()> {
     }
 
     anyhow::bail!("expected workspaceChanged in thread/status/changed notifications")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_changed_clears_after_next_turn() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let server =
+        create_mock_responses_server_sequence(vec![create_final_assistant_message_sse_response(
+            "done",
+        )?])
+        .await;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.path().display().to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+
+    std::fs::write(workspace.path().join("watched.txt"), "changed")?;
+
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
+    let mut saw_workspace_changed = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = match timeout(remaining, mcp.read_next_message()).await {
+            Ok(Ok(message)) => message,
+            _ => break,
+        };
+        let JSONRPCMessage::Notification(JSONRPCNotification {
+            method,
+            params: Some(params),
+        }) = message
+        else {
+            continue;
+        };
+        if method != "thread/status/changed" {
+            continue;
+        }
+
+        let notification: ThreadStatusChangedNotification = serde_json::from_value(params)?;
+        if notification.thread_id != thread.id {
+            continue;
+        }
+        if let ThreadStatus::Active { active_flags } = notification.status
+            && active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+        {
+            saw_workspace_changed = true;
+            break;
+        }
+    }
+    assert!(
+        saw_workspace_changed,
+        "expected initial workspaceChanged status"
+    );
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "clear workspace flag".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response(turn_start_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: thread_read,
+    } = to_response(read_resp)?;
+    assert_eq!(thread_read.status, ThreadStatus::Idle);
+
+    Ok(())
 }
 
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {

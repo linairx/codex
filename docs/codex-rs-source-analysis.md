@@ -989,20 +989,23 @@ SQLite 在这里不是起点，而是收敛点。
 
 到目前为止，这条后续任务已经不再只是文档拆分。
 
-第一阶段最小代码闭环已经开始落地：
+第一阶段最小代码闭环已经形成，而且已经开始向 observer 与 SQLite 收敛扩展：
 
 - `app-server-protocol` 已新增 `Thread.mode`
-- `app-server` 已开始在主要 `Thread` 返回面填充 `mode`
+- `app-server` 已在主要 `Thread` 返回面填充 `mode`
 - schema / TypeScript 生成物已同步更新
 - `app-server/README.md` 已明确 `Thread.mode` 与 `thread.status` 的语义分离
+- `thread/read`、`thread/list` 和后续 `thread/resume` 在服务重启后已能消费 SQLite 中持久化的 resident 模式
+- `thread_status.rs` 已开始收敛 watcher 生命周期，shutdown 会主动清理 resident thread 的工作区 watch
+- `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 
 接下来的工作重点不应该再继续膨胀同层设计文档，而应该转向：
 
-- 收敛阶段 1 改动成为可 review 的 PR
-- 检查所有 `Thread` 返回路径是否一致补齐 `mode`
-- 再决定是否进入消费侧改动，也就是 TUI 或其他客户端对 `Thread.mode` 的正式使用
+- 按 PR 边界收敛已经落地的协议、observer 和 SQLite 最小闭环
+- 继续整理消费侧改动，也就是 TUI 或其他客户端对 `Thread.mode` 的正式使用
+- 再决定是否进入远端消费与 bridge 侧摘要设计，而不是回到同层大文档扩写
 
 换句话说，后续主线已经从“拆文档”切换为“按实现计划逐阶段落代码”。
 
