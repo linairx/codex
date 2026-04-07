@@ -1003,6 +1003,7 @@ async fn run_ratatui_app(
                         token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
                         thread_name: None,
+                        thread_mode: None,
                         update_action: Some(action),
                         exit_reason: ExitReason::UserRequested,
                     });
@@ -1076,6 +1077,7 @@ async fn run_ratatui_app(
                 token_usage: codex_protocol::protocol::TokenUsage::default(),
                 thread_id: None,
                 thread_name: None,
+                thread_mode: None,
                 update_action: None,
                 exit_reason: ExitReason::UserRequested,
             });
@@ -1122,6 +1124,7 @@ async fn run_ratatui_app(
             token_usage: codex_protocol::protocol::TokenUsage::default(),
             thread_id: None,
             thread_name: None,
+            thread_mode: None,
             update_action: None,
             exit_reason: ExitReason::Fatal(format!(
                 "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
@@ -1209,6 +1212,7 @@ async fn run_ratatui_app(
                         token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
                         thread_name: None,
+                        thread_mode: None,
                         update_action: None,
                         exit_reason: ExitReason::UserRequested,
                     });
@@ -1270,6 +1274,7 @@ async fn run_ratatui_app(
                     token_usage: codex_protocol::protocol::TokenUsage::default(),
                     thread_id: None,
                     thread_name: None,
+                    thread_mode: None,
                     update_action: None,
                     exit_reason: ExitReason::UserRequested,
                 });
@@ -1320,6 +1325,7 @@ async fn run_ratatui_app(
                             token_usage: codex_protocol::protocol::TokenUsage::default(),
                             thread_id: None,
                             thread_name: None,
+                            thread_mode: None,
                             update_action: None,
                             exit_reason: ExitReason::UserRequested,
                         });

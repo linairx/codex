@@ -3,6 +3,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
+use codex_app_server_protocol::ThreadMode;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
@@ -435,6 +436,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
         token_usage,
         thread_id: conversation_id,
         thread_name,
+        thread_mode,
         ..
     } = exit_info;
 
@@ -455,7 +457,11 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
         } else {
             resume_cmd
         };
-        lines.push(format!("To continue this session, run {command}"));
+        let continue_verb = match thread_mode {
+            Some(ThreadMode::ResidentAssistant) => "To reconnect to this resident assistant, run",
+            Some(ThreadMode::Interactive) | None => "To continue this session, run",
+        };
+        lines.push(format!("{continue_verb} {command}"));
     }
 
     lines
@@ -1611,7 +1617,11 @@ mod tests {
         );
     }
 
-    fn sample_exit_info(conversation_id: Option<&str>, thread_name: Option<&str>) -> AppExitInfo {
+    fn sample_exit_info(
+        conversation_id: Option<&str>,
+        thread_name: Option<&str>,
+        thread_mode: Option<ThreadMode>,
+    ) -> AppExitInfo {
         let token_usage = TokenUsage {
             output_tokens: 2,
             total_tokens: 2,
@@ -1623,6 +1633,7 @@ mod tests {
                 .map(ThreadId::from_string)
                 .map(Result::unwrap),
             thread_name: thread_name.map(str::to_string),
+            thread_mode,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         }
@@ -1634,6 +1645,7 @@ mod tests {
             token_usage: TokenUsage::default(),
             thread_id: None,
             thread_name: None,
+            thread_mode: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         };
@@ -1646,6 +1658,7 @@ mod tests {
         let exit_info = sample_exit_info(
             Some("123e4567-e89b-12d3-a456-426614174000"),
             /*thread_name*/ None,
+            /*thread_mode*/ None,
         );
         let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
         assert_eq!(
@@ -1663,6 +1676,7 @@ mod tests {
         let exit_info = sample_exit_info(
             Some("123e4567-e89b-12d3-a456-426614174000"),
             /*thread_name*/ None,
+            /*thread_mode*/ None,
         );
         let lines = format_exit_messages(exit_info, /*color_enabled*/ true);
         assert_eq!(lines.len(), 2);
@@ -1674,6 +1688,7 @@ mod tests {
         let exit_info = sample_exit_info(
             Some("123e4567-e89b-12d3-a456-426614174000"),
             Some("my-thread"),
+            /*thread_mode*/ None,
         );
         let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
         assert_eq!(
@@ -1681,6 +1696,23 @@ mod tests {
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
                 "To continue this session, run codex resume my-thread".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_exit_messages_uses_reconnect_hint_for_resident_threads() {
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            Some("atlas"),
+            Some(ThreadMode::ResidentAssistant),
+        );
+        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage: total=2 input=0 output=2".to_string(),
+                "To reconnect to this resident assistant, run codex resume atlas".to_string(),
             ]
         );
     }

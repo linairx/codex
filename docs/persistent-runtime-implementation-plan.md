@@ -216,6 +216,7 @@
 - resume 路径在 attach 失败时的错误提示，也已开始按线程模式区分 “after resume” 与 “after reconnect”
 - resume 目标切 cwd 后如果配置重建失败，错误提示也已开始按线程模式区分 “for resume” 与 “for reconnect”
 - session 级恢复失败提示也已继续收口，resident thread 不再只显示通用 resume/session 文案，而会明确提示 reconnect resident assistant
+- CLI 退出后的 resume hint 也已开始消费 `Thread.mode`，resident assistant 不再统一显示成 “continue this session”
 - 仍有剩余消费侧入口需要继续检查，但主路径上的恢复/重连文案已经开始收口
 
 不要混入：

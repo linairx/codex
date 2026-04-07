@@ -999,6 +999,7 @@ SQLite 在这里不是起点，而是收敛点。
 - `thread_status.rs` 已开始收敛 watcher 生命周期，shutdown 会主动清理 resident thread 的工作区 watch
 - `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
 - `tui` 已继续收敛消费侧语义：resume picker 的入口标题之外，新线程切换、fork 后摘要提示、线程改名确认提示、replay-only 的 agent thread 回退提示、resume 路径 attach 失败提示、切 cwd 后配置重建失败提示，以及 session 级恢复失败提示，也开始按 `Thread.mode` 区分 continue / resume 与 reconnect
+- `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 

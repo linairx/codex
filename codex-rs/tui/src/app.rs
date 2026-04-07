@@ -286,6 +286,7 @@ pub struct AppExitInfo {
     pub token_usage: TokenUsage,
     pub thread_id: Option<ThreadId>,
     pub thread_name: Option<String>,
+    pub thread_mode: Option<ThreadMode>,
     pub update_action: Option<UpdateAction>,
     pub exit_reason: ExitReason,
 }
@@ -296,6 +297,7 @@ impl AppExitInfo {
             token_usage: TokenUsage::default(),
             thread_id: None,
             thread_name: None,
+            thread_mode: None,
             update_action: None,
             exit_reason: ExitReason::Fatal(message.into()),
         }
@@ -983,6 +985,7 @@ async fn handle_model_migration_prompt_if_needed(
                     token_usage: TokenUsage::default(),
                     thread_id: None,
                     thread_name: None,
+                    thread_mode: None,
                     update_action: None,
                     exit_reason: ExitReason::UserRequested,
                 });
@@ -4151,6 +4154,7 @@ impl App {
             token_usage: app.token_usage(),
             thread_id: app.chat_widget.thread_id(),
             thread_name: app.chat_widget.thread_name(),
+            thread_mode: app.chat_widget.thread_mode(),
             update_action: app.pending_update_action,
             exit_reason,
         })
