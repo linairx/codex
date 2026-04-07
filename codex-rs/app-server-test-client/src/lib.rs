@@ -61,7 +61,12 @@ use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadMode;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -244,6 +249,30 @@ enum CliCommand {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Read a stored thread summary by id.
+    #[command(name = "thread-read")]
+    ThreadRead {
+        /// Existing thread id to read.
+        thread_id: String,
+        /// Include stored turns in the response.
+        #[arg(long, default_value_t = false)]
+        include_turns: bool,
+    },
+    /// Patch stored git metadata for a thread.
+    #[command(name = "thread-metadata-update")]
+    ThreadMetadataUpdate {
+        /// Existing thread id to update.
+        thread_id: String,
+        /// Replace the stored git sha.
+        #[arg(long)]
+        sha: Option<String>,
+        /// Replace the stored git branch.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Replace the stored git origin URL.
+        #[arg(long)]
+        origin_url: Option<String>,
+    },
     /// Increment the out-of-band elicitation pause counter for a thread.
     #[command(name = "thread-increment-elicitation")]
     ThreadIncrementElicitation {
@@ -397,6 +426,32 @@ pub async fn run() -> Result<()> {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-list")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
             thread_list(&endpoint, &config_overrides, limit).await
+        }
+        CliCommand::ThreadRead {
+            thread_id,
+            include_turns,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-read")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_read(&endpoint, &config_overrides, thread_id, include_turns).await
+        }
+        CliCommand::ThreadMetadataUpdate {
+            thread_id,
+            sha,
+            branch,
+            origin_url,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-metadata-update")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_metadata_update(
+                &endpoint,
+                &config_overrides,
+                thread_id,
+                sha,
+                branch,
+                origin_url,
+            )
+            .await
         }
         CliCommand::ThreadIncrementElicitation { thread_id } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-increment-elicitation")?;
@@ -1145,6 +1200,65 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
     .await
 }
 
+async fn thread_read(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    thread_id: String,
+    include_turns: bool,
+) -> Result<()> {
+    with_client("thread-read", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_read(ThreadReadParams {
+            thread_id,
+            include_turns,
+        })?;
+        println!("< thread/read response: {response:?}");
+        print_thread_response_summary("thread/read", &response.thread);
+
+        Ok(())
+    })
+    .await
+}
+
+async fn thread_metadata_update(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    thread_id: String,
+    sha: Option<String>,
+    branch: Option<String>,
+    origin_url: Option<String>,
+) -> Result<()> {
+    if sha.is_none() && branch.is_none() && origin_url.is_none() {
+        bail!("provide at least one of --sha, --branch, or --origin-url");
+    }
+
+    with_client(
+        "thread-metadata-update",
+        endpoint,
+        config_overrides,
+        |client| {
+            let initialize = client.initialize()?;
+            println!("< initialize response: {initialize:?}");
+
+            let response = client.thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id,
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: sha.map(Some),
+                    branch: branch.map(Some),
+                    origin_url: origin_url.map(Some),
+                }),
+            })?;
+            println!("< thread/metadata/update response: {response:?}");
+            print_thread_response_summary("thread/metadata/update", &response.thread);
+
+            Ok(())
+        },
+    )
+    .await
+}
+
 async fn with_client<T>(
     command_name: &'static str,
     endpoint: &Endpoint,
@@ -1216,7 +1330,6 @@ mod tests {
     use super::thread_mode_label;
     use super::thread_resume_action_label;
     use codex_app_server_protocol::ThreadMode;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn resident_thread_mode_uses_reconnect_label() {
@@ -1735,6 +1848,29 @@ impl CodexClient {
         };
 
         self.send_request(request, request_id, "thread/list")
+    }
+
+    fn thread_read(&mut self, params: ThreadReadParams) -> Result<ThreadReadResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadRead {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/read")
+    }
+
+    fn thread_metadata_update(
+        &mut self,
+        params: ThreadMetadataUpdateParams,
+    ) -> Result<ThreadMetadataUpdateResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadMetadataUpdate {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/metadata/update")
     }
 
     fn thread_increment_elicitation(

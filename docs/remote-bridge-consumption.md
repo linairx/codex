@@ -327,5 +327,6 @@ observer 文档里已经强调，第一阶段最重要的是：
 3. 把 `thread/read` 作为详情页主读取入口，不让首页依赖全量 item 流重建
 4. 把 `thread/resume` 视为长期线程的重新连接入口，而不只是历史恢复入口
 5. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”
+6. 如果详情页支持 metadata-only 操作（例如 git metadata repair），直接消费 `thread/metadata/update` 返回的 `thread.mode`，不要把这类更新路径额外当成需要再做一次 `thread/read` 才能恢复 resident 语义的特殊情况
 
 这样做的好处是，远端消费可以立即开始受益于已经落地的 `Thread.mode`、observer 语义和 SQLite 摘要，而不需要等待完整 bridge 或更大范围的状态重构。

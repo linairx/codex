@@ -212,12 +212,14 @@ mode: ThreadMode
 - `thread/resume`
 - `thread/fork`
 - `thread/read`
+- `thread/metadata/update`
 - `thread/list`
 - `thread/loaded/read`
 - `thread/started`
 - 其他任何嵌套返回 `Thread` 的线程相关响应
 
 这样客户端才不需要在不同 API 上做“有的接口有 mode、有的没有”的补丁逻辑。
+特别是 `thread/metadata/update` 这类 metadata-only 路径，也不应被例外对待，否则客户端很容易重新引入“更新完 metadata 还要再补一次 `thread/read` 才能恢复 resident reconnect 语义”的旧耦合。
 
 ## 12. 文档与客户端迁移建议
 

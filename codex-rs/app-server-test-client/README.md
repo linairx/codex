@@ -42,6 +42,18 @@ cargo run -p codex-app-server-test-client -- thread-list --limit 5
 
 Copy a thread id from the `thread-list` output.
 
+You can also inspect or patch a stored thread directly:
+
+```bash
+cargo run -p codex-app-server-test-client -- thread-read <THREAD_ID>
+cargo run -p codex-app-server-test-client -- \
+  thread-metadata-update <THREAD_ID> --branch feature/resident-mode
+```
+
+Both commands print the full response plus a compact summary that includes
+`thread.mode`, so resident assistant reconnect semantics remain visible on
+read-only lookup and metadata-only update paths.
+
 ### 2) Rejoin while a turn is in progress (two terminals)
 
 Terminal A:

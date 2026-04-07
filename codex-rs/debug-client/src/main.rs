@@ -259,4 +259,122 @@ fn parse_approval_policy(value: &str) -> Result<AskForApproval> {
 fn drain_events(event_rx: &mpsc::Receiver<ReaderEvent>, output: &Output) {
     while let Ok(event) = event_rx.try_recv() {
         match event {
- 
+            ReaderEvent::ThreadReady {
+                thread_id,
+                thread_mode,
+            } => {
+                output
+                    .client_line(&format!(
+                        "active thread is now {} {thread_id}",
+                        thread_ready_label(thread_mode)
+                    ))
+                    .ok();
+                output.set_prompt(&thread_id);
+            }
+            ReaderEvent::ThreadList {
+                threads,
+                next_cursor,
+            } => {
+                if threads.is_empty() {
+                    output.client_line("threads: (none)").ok();
+                } else {
+                    output.client_line("threads:").ok();
+                    for thread in threads {
+                        output
+                            .client_line(&format!(
+                                "  {} ({})",
+                                thread.thread_id,
+                                thread_resume_label(thread.thread_mode)
+                            ))
+                            .ok();
+                    }
+                }
+                if let Some(next_cursor) = next_cursor {
+                    output
+                        .client_line(&format!(
+                            "more threads available, next cursor: {next_cursor}"
+                        ))
+                        .ok();
+                }
+            }
+        }
+    }
+}
+
+fn connected_thread_message(thread_connection: &ThreadConnection) -> &'static str {
+    match thread_connection.thread_mode {
+        ThreadMode::Interactive => "connected to thread",
+        ThreadMode::ResidentAssistant => "connected to resident assistant thread",
+    }
+}
+
+fn thread_ready_label(thread_mode: ThreadMode) -> &'static str {
+    match thread_mode {
+        ThreadMode::Interactive => "thread",
+        ThreadMode::ResidentAssistant => "resident assistant thread",
+    }
+}
+
+fn thread_resume_label(thread_mode: ThreadMode) -> &'static str {
+    match thread_mode {
+        ThreadMode::Interactive => "resume",
+        ThreadMode::ResidentAssistant => "reconnect",
+    }
+}
+
+fn print_help(output: &Output) {
+    let _ = output.client_line("commands:");
+    let _ = output.client_line("  :help                 show this help");
+    let _ = output.client_line("  :new                  start a new thread");
+    let _ = output.client_line("  :resume <thread-id>   resume or reconnect to a thread");
+    let _ = output.client_line("  :use <thread-id>      switch the active thread");
+    let _ = output.client_line("  :refresh-thread       list available threads");
+    let _ = output.client_line("  :quit                 exit");
+    let _ = output.client_line("type a message to send it as a new turn");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadConnection;
+    use super::connected_thread_message;
+    use super::thread_ready_label;
+    use super::thread_resume_label;
+    use codex_app_server_protocol::ThreadMode;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn resident_thread_messages_use_reconnect_language() {
+        let thread_connection = ThreadConnection {
+            thread_id: "thread-1".to_string(),
+            thread_mode: ThreadMode::ResidentAssistant,
+        };
+
+        assert_eq!(
+            connected_thread_message(&thread_connection),
+            "connected to resident assistant thread"
+        );
+        assert_eq!(
+            thread_ready_label(ThreadMode::ResidentAssistant),
+            "resident assistant thread"
+        );
+        assert_eq!(
+            thread_resume_label(ThreadMode::ResidentAssistant),
+            "reconnect"
+        );
+    }
+
+    #[test]
+    fn interactive_thread_messages_keep_resume_language() {
+        let thread_connection = ThreadConnection {
+            thread_id: "thread-1".to_string(),
+            thread_mode: ThreadMode::Interactive,
+        };
+
+        assert_eq!(
+            connected_thread_message(&thread_connection),
+            "connected to thread"
+        );
+        assert_eq!(thread_ready_label(ThreadMode::Interactive), "thread");
+        assert_eq!(thread_resume_label(ThreadMode::Interactive), "resume");
+    }
+}

@@ -852,20 +852,31 @@ mod tests {
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::GetAccountResponse;
+    use codex_app_server_protocol::GitInfo;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
+    use codex_app_server_protocol::ThreadMetadataUpdateParams;
+    use codex_app_server_protocol::ThreadMetadataUpdateResponse;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_core::config::ConfigBuilder;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
+    use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
     use futures::SinkExt;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
     use tokio::net::TcpListener;
     use tokio::time::Duration;
     use tokio::time::timeout;
@@ -876,11 +887,21 @@ mod tests {
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
     async fn build_test_config() -> Config {
-        match ConfigBuilder::default().build().await {
-            Ok(config) => config,
-            Err(_) => Config::load_default_with_cli_overrides(Vec::new())
-                .expect("default config should load"),
-        }
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let codex_home_path = std::env::temp_dir().join(format!(
+            "codex-app-server-client-test-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&codex_home_path).expect("temp codex home should exist");
+
+        ConfigBuilder::default()
+            .codex_home(codex_home_path)
+            .build()
+            .await
+            .expect("test config should load")
     }
 
     async fn start_test_client_with_capacity(
@@ -909,6 +930,61 @@ mod tests {
 
     async fn start_test_client(session_source: SessionSource) -> InProcessAppServerClient {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+    }
+
+    fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
+        let conversation_id = ThreadId::from_string(thread_id).expect("valid thread id");
+        let timestamp = "2025-01-05T12:00:00Z";
+        let meta = SessionMeta {
+            id: conversation_id,
+            forked_from_id: None,
+            timestamp: timestamp.to_string(),
+            cwd: std::env::temp_dir(),
+            originator: "codex".to_string(),
+            cli_version: "0.0.0-test".to_string(),
+            source: ProtocolSessionSource::Cli,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            model_provider: Some(model_provider.to_string()),
+            base_instructions: None,
+            dynamic_tools: None,
+            memory_mode: None,
+        };
+        let payload = serde_json::to_value(SessionMetaLine { meta, git: None })
+            .expect("session meta payload should serialize");
+        let lines = [
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": payload,
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "resident metadata update"}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "resident metadata update",
+                    "kind": "plain"
+                }
+            })
+            .to_string(),
+        ];
+
+        std::fs::create_dir_all(path.parent().expect("rollout path should have parent"))
+            .expect("rollout directory should exist");
+        std::fs::write(path, lines.join("\n") + "\n").expect("rollout should be writable");
     }
 
     async fn start_test_remote_server<F, Fut>(handler: F) -> String
@@ -1172,7 +1248,7 @@ mod tests {
                 request_id: RequestId::Integer(5),
                 params: ThreadStartParams {
                     ephemeral: Some(true),
-                    resident: Some(true),
+                    resident: true,
                     ..ThreadStartParams::default()
                 },
             })
@@ -1194,6 +1270,60 @@ mod tests {
             .expect("thread/read should return the resident thread");
         assert_eq!(read.thread.id, response.thread.id);
         assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn metadata_update_preserves_resident_thread_mode_through_typed_requests() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(7),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let updated: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(8),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should succeed");
+
+        assert_eq!(updated.thread.id, started.thread.id);
+        assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(
+            updated.thread.git_info,
+            Some(GitInfo {
+                sha: Some("abc123".to_string()),
+                branch: Some("main".to_string()),
+                origin_url: None,
+            })
+        );
 
         client.shutdown().await.expect("shutdown should complete");
     }

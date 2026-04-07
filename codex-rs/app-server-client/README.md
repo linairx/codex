@@ -58,6 +58,10 @@ phase where they reconcile startup response data with later events.
 Callers that need to distinguish ordinary resume from reconnect should
 consume `response.thread.mode` from the immediate typed response instead of
 waiting for later legacy events.
+The same rule applies to metadata-only thread operations such as
+`thread/metadata/update`: callers should trust the returned `thread.mode`
+directly instead of assuming a follow-up `thread/read` is required to recover
+resident assistant semantics.
 
 ## Backpressure and shutdown
 

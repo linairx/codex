@@ -25,6 +25,14 @@
 - `rollout` 与 `state_db` 的桥接
 - app-server 的 `thread/metadata/update`
 
+而且这条线已经不只是“基础设施存在”，还开始形成了第一批实现闭环：
+
+- `threads.mode` 已经作为 resident assistant 的稳定线程模式元数据进入 SQLite
+- `thread/read`、`thread/list`、`thread/resume` 在服务重启后已经会消费这层持久化模式，而不是只依赖 rollout 或内存态推断
+- `thread/start`、`thread/fork`、`turn/start` 已经开始在 rollout 物化后修补或持久化线程模式，同时避免给未物化线程提前创建垃圾行
+- `thread/unarchive`、archived `thread/read` / `thread/list`、以及 `thread/metadata/update` 的 stored / loaded-repair / archived 路径，都已经补上 resident mode 连续性回归
+- `codex-state` 也已有边界测试保证：metadata patch 不会顺手覆盖 resident thread 的 `threads.mode`
+
 这意味着当前讨论的不是“要不要上 SQLite”，而是：
 
 - 如何让 SQLite 从部分事实来源，逐步演进成更稳定的状态收敛层
@@ -257,9 +265,21 @@ app-server 当前已经在读写 SQLite-backed thread metadata。
 - 保持与 rollout 的修复和回填路径稳定
 - 不引入大规模新表
 
+这一步实际上已经开始落地，而且边界比草案阶段更清楚：
+
+- SQLite 已经是 resident thread 模式恢复的主干来源之一，而不再只是 rollout 的附属缓存
+- rollout -> SQLite 的修补路径已经覆盖 resident thread 的 start / resume / fork / archive / unarchive / metadata update 等主入口
+- 当前更需要做的是继续补齐边缘恢复面和消费面，而不是重新争论 thread metadata 要不要作为主干
+
 ### 阶段 2：线程模式与长期线程元数据入库
 
 在 `Thread.mode` 语义稳定后，再考虑把相关稳定元数据进入 SQLite。
+
+这一阶段也已经部分开始实现：
+
+- `Thread.mode` 已经进入协议、app-server 返回面和 SQLite 稳定元数据
+- in-process / 手工联调消费面也已开始把这条 SQLite 边界钉实：`codex-app-server-client` 已补上 metadata-only update 保留 resident `mode` 的 typed request 回归，`codex-app-server-test-client` 也已补上 `thread-read` / `thread-metadata-update` 的 resident-aware 摘要入口
+- 当前剩余工作更偏向“继续补 resident mode 在边缘恢复路径与消费侧的连续性”，而不是重新设计 mode 字段本身
 
 ### 阶段 3：observer 派生摘要入库
 

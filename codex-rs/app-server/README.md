@@ -139,7 +139,7 @@ Example with notification opt-out:
 - `thread/loaded/list` — list the thread ids currently loaded in memory. Supports optional `modelProviders`, `sourceKinds`, and `cwd` filters for the loaded thread's current config snapshot.
 - `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including live `status`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, and `mode` (`ThreadMode`) so clients can preserve reconnect semantics even on read-only lookup paths.
-- `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`.
+- `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`. The response preserves the thread’s stored `mode`, so reconnect-aware clients do not need to re-read the thread just to recover resident assistant semantics after a metadata-only update.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, unless the thread is `resident: true`; non-resident unloads emit `thread/closed`.
@@ -372,20 +372,30 @@ Use `thread/read` to fetch a stored thread by id without resuming it. Pass `incl
 ```json
 { "method": "thread/read", "id": 22, "params": { "threadId": "thr_123" } }
 { "id": 22, "result": {
-    "thread": { "id": "thr_123", "status": { "type": "notLoaded" }, "turns": [] }
+    "thread": {
+        "id": "thr_123",
+        "mode": "residentAssistant",
+        "status": { "type": "notLoaded" },
+        "turns": []
+    }
 } }
 ```
 
 ```json
 { "method": "thread/read", "id": 23, "params": { "threadId": "thr_123", "includeTurns": true } }
 { "id": 23, "result": {
-    "thread": { "id": "thr_123", "status": { "type": "notLoaded" }, "turns": [ ... ] }
+    "thread": {
+        "id": "thr_123",
+        "mode": "residentAssistant",
+        "status": { "type": "notLoaded" },
+        "turns": [ ... ]
+    }
 } }
 ```
 
 ### Example: Update stored thread metadata
 
-Use `thread/metadata/update` to patch sqlite-backed metadata for a thread without resuming it. Today this supports persisted `gitInfo`; omitted fields are left unchanged, while explicit `null` clears a stored value.
+Use `thread/metadata/update` to patch sqlite-backed metadata for a thread without resuming it. Today this supports persisted `gitInfo`; omitted fields are left unchanged, while explicit `null` clears a stored value. The returned `thread` preserves the stored `mode`, including `residentAssistant` for resident threads across stored, loaded-repair, and archived metadata update paths.
 
 ```json
 { "method": "thread/metadata/update", "id": 24, "params": {
@@ -395,6 +405,7 @@ Use `thread/metadata/update` to patch sqlite-backed metadata for a thread withou
 { "id": 24, "result": {
     "thread": {
         "id": "thr_123",
+        "mode": "residentAssistant",
         "gitInfo": { "sha": null, "branch": "feature/sidebar-pr", "originUrl": null }
     }
 } }
@@ -406,6 +417,7 @@ Use `thread/metadata/update` to patch sqlite-backed metadata for a thread withou
 { "id": 25, "result": {
     "thread": {
         "id": "thr_123",
+        "mode": "residentAssistant",
         "gitInfo": null
     }
 } }

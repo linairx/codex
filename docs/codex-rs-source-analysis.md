@@ -1007,8 +1007,10 @@ SQLite 在这里不是起点，而是收敛点。
 - `exec` 的 bootstrap 启动摘要也已开始消费 `thread/start` / `thread/resume` 返回的 `Thread.mode`，resident assistant 不再在 CLI 启动横幅里被压平为普通 session，而会显式展示当前是 `resident assistant`
 - `exec --json` 的首个 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，避免下游 JSON 消费方只能拿到 `thread_id`，却继续把 resident session 当成普通 interactive thread
 - `debug-client` 也已开始消费 `Thread.mode`：连接成功提示、活跃线程切换提示、线程列表标记和 `:resume` 帮助文案都已按 resident assistant 收口，不再把 reconnect 路径统一描述成普通 resume
+- `debug-client` 的这条消费面也已补回到可编译闭环：此前被截断的事件/帮助尾部逻辑已经恢复，并补上 resident reconnect 文案回归，避免这块客户端入口继续停留在“文案方向正确但 crate 本身不工作”的状态
 - `app-server-test-client` 的 `thread/start`、`thread/resume`、`thread/list` 和 `thread/started` 输出也已补上 resident-aware 摘要，手工联调时不再需要从整段 debug struct 里自己辨认这是不是 reconnect 场景
-- `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；MCP 接口文档也已补上同样约束，避免外围集成只盯 `thread_id` / `status`
+- `app-server-test-client` 的联调入口也已继续扩到边缘恢复面：`thread-read` 与 `thread-metadata-update` 命令现在同样会输出 resident-aware 摘要，手工验证 `Thread.mode` 在只读 lookup 和 metadata-only repair 路径上的连续性不再需要额外脚本
+- `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；同时 metadata-only update 的 typed request 回归也已补上 resident mode 保留覆盖，避免 in-process 集成只在 `thread/start` / `thread/resume` 上正确消费 `Thread.mode`，到了 `thread/metadata/update` 又退回旧假设
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
 - `app-server/README.md` 顶部 lifecycle overview 的总览入口也已补上 reconnect 语义，不再在首屏继续把 `thread/resume` 描述成单纯的普通历史恢复
 - `thread_status.rs` 也已补上 resident workspace watch 迁移/清理回归：同一线程切换 `cwd` 后旧工作区变化不会再重新激活 `workspaceChanged`，切回非 resident 后也会移除 watch，避免 observer 状态被陈旧目录继续污染
@@ -1016,6 +1018,8 @@ SQLite 在这里不是起点，而是收敛点。
 - resident thread 的归档读取面也已补上回归：进入 archived 状态后，`thread/read` 与 `thread/list archived=true` 仍会稳定保留 `ResidentAssistant`，不会因为只走 SQLite 摘要路径就掉回普通 interactive 线程
 - `thread/metadata/update` 的 resident 回归也已继续扩到 stored + archived 面：未加载 resident thread 走纯 SQLite 稳定元数据路径时，更新响应与后续 `thread/read` / `thread/list` 会继续保持 `ResidentAssistant`；loaded resident thread 在修补元数据行后也不会因为 fallback bootstrap 路径丢掉 `ResidentAssistant`；已归档 resident thread 更新 git metadata 时，响应与后续 `thread/read` / `thread/list archived=true` 同样会继续保持 `ResidentAssistant`
 - `codex-state` 的 SQLite 边界测试也已继续补强：`update_thread_git_info` 在 resident thread 上不会意外覆盖 `threads.mode`，避免元数据补丁把已持久化的 `ResidentAssistant` 降回 interactive
+- `app-server/README.md` 也已把 `thread/metadata/update` 的 resident 语义补齐：API 说明现在明确要求返回的 `thread` 保留既有 `mode`，避免外围集成把 metadata-only update 错当成需要额外 `thread/read` 才能恢复 reconnect 语义的特殊路径
+- `docs/sqlite-state-convergence.md` 也已从纯前瞻草案补成“当前状态 + 渐进收敛”视角，明确把 `threads.mode`、archive / unarchive、metadata update resident 连续性这些已落地边界写进 SQLite 文档，不再只停留在泛化设计层
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 
