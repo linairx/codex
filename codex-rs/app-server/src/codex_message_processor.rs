@@ -136,6 +136,7 @@ use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -2399,7 +2400,7 @@ impl CodexMessageProcessor {
                     .thread_state_manager
                     .set_thread_resident(thread_id, resident)
                     .await;
-                thread.resident = resident;
+                set_thread_resident_and_mode(&mut thread, resident);
 
                 listener_task_context
                     .thread_watch_manager
@@ -4046,7 +4047,7 @@ impl CodexMessageProcessor {
                         return;
                     }
                 };
-                thread.resident = resident;
+                set_thread_resident_and_mode(&mut thread, resident);
 
                 self.thread_watch_manager
                     .upsert_thread(thread.clone())
@@ -4245,7 +4246,7 @@ impl CodexMessageProcessor {
                     return true;
                 }
             };
-            thread_summary.resident = params.resident;
+            set_thread_resident_and_mode(&mut thread_summary, params.resident);
 
             let listener_command_tx = {
                 let thread_state = thread_state.lock().await;
@@ -4426,10 +4427,11 @@ impl CodexMessageProcessor {
     }
 
     async fn attach_runtime_thread_metadata(&self, thread_id: ThreadId, thread: &mut Thread) {
-        thread.resident = self
+        let resident = self
             .thread_state_manager
             .is_thread_resident(thread_id)
             .await;
+        set_thread_resident_and_mode(thread, resident);
         self.attach_thread_name(thread_id, thread).await;
     }
 
@@ -4648,7 +4650,7 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        thread.resident = resident;
+        set_thread_resident_and_mode(&mut thread, resident);
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
@@ -9138,6 +9140,7 @@ fn build_thread_from_snapshot(
         created_at: now,
         updated_at: now,
         status: ThreadStatus::NotLoaded,
+        mode: thread_mode_from_resident(/*resident*/ false),
         resident: false,
         path,
         cwd: config_snapshot.cwd.clone(),
@@ -9149,6 +9152,19 @@ fn build_thread_from_snapshot(
         name: None,
         turns: Vec::new(),
     }
+}
+
+fn thread_mode_from_resident(resident: bool) -> ThreadMode {
+    if resident {
+        ThreadMode::ResidentAssistant
+    } else {
+        ThreadMode::Interactive
+    }
+}
+
+fn set_thread_resident_and_mode(thread: &mut Thread, resident: bool) {
+    thread.resident = resident;
+    thread.mode = thread_mode_from_resident(resident);
 }
 
 pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
@@ -9182,6 +9198,7 @@ pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         status: ThreadStatus::NotLoaded,
+        mode: thread_mode_from_resident(/*resident*/ false),
         resident: false,
         path: Some(path),
         cwd,

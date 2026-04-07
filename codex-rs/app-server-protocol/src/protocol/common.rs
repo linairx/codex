@@ -1318,6 +1318,7 @@ mod tests {
                     created_at: 1,
                     updated_at: 2,
                     status: v2::ThreadStatus::Idle,
+                    mode: v2::ThreadMode::Interactive,
                     resident: false,
                     path: None,
                     cwd: PathBuf::from("/tmp"),
@@ -1358,6 +1359,7 @@ mod tests {
                         "status": {
                             "type": "idle"
                         },
+                        "mode": "interactive",
                         "resident": false,
                         "path": null,
                         "cwd": "/tmp",

@@ -104,6 +104,7 @@ mod tests {
     use super::find_loaded_subagent_threads_for_primary;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
+    use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStatus;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::SubAgentSource;
@@ -120,6 +121,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             status: ThreadStatus::Idle,
+            mode: ThreadMode::Interactive,
             resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),

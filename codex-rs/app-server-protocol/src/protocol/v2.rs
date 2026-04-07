@@ -3199,6 +3199,14 @@ pub enum ThreadActiveFlag {
     WorkspaceChanged,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadMode {
+    Interactive,
+    ResidentAssistant,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -3655,6 +3663,9 @@ pub struct Thread {
     pub updated_at: i64,
     /// Current runtime status for the thread.
     pub status: ThreadStatus,
+    /// Product-level thread mode used by clients to distinguish long-lived
+    /// assistants from ordinary interactive sessions.
+    pub mode: ThreadMode,
     /// Whether the thread should remain loaded after the last subscriber
     /// detaches. This is runtime-only and defaults to false for stored threads.
     pub resident: bool,

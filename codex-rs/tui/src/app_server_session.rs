@@ -1149,6 +1149,7 @@ fn app_server_credits_snapshot_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1260,6 +1261,7 @@ mod tests {
                 created_at: 1,
                 updated_at: 2,
                 status: ThreadStatus::Idle,
+                mode: ThreadMode::Interactive,
                 resident: false,
                 path: None,
                 cwd: PathBuf::from("/tmp/project"),

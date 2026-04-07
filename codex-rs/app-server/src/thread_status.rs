@@ -1071,6 +1071,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             status: ThreadStatus::NotLoaded,
+            mode: codex_app_server_protocol::ThreadMode::Interactive,
             resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),

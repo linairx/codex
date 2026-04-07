@@ -11,6 +11,7 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadActiveFlag;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -339,6 +340,7 @@ async fn thread_status_changed_tracks_workspace_changes() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     std::fs::write(workspace.path().join("watched.txt"), "changed")?;
 

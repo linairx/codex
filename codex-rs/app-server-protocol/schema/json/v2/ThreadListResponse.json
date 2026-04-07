@@ -1078,6 +1078,14 @@
         "id": {
           "type": "string"
         },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThreadMode"
+            }
+          ],
+          "description": "Product-level thread mode used by clients to distinguish long-lived assistants from ordinary interactive sessions."
+        },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
           "type": "string"
@@ -1139,6 +1147,7 @@
         "cwd",
         "ephemeral",
         "id",
+        "mode",
         "modelProvider",
         "preview",
         "resident",
@@ -1830,6 +1839,13 @@
           "type": "object"
         }
       ]
+    },
+    "ThreadMode": {
+      "enum": [
+        "interactive",
+        "residentAssistant"
+      ],
+      "type": "string"
     },
     "ThreadStatus": {
       "oneOf": [

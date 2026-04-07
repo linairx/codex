@@ -16,6 +16,7 @@ use chrono::Utc;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStatus;
@@ -531,6 +532,7 @@ struct Row {
     preview: String,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
+    mode: ThreadMode,
     active_flags: Vec<ThreadActiveFlag>,
     has_system_error: bool,
     created_at: Option<DateTime<Utc>>,
@@ -1085,6 +1087,7 @@ fn head_to_row(item: &ThreadItem) -> Row {
         preview,
         thread_id: item.thread_id,
         thread_name: None,
+        mode: ThreadMode::Interactive,
         active_flags: Vec::new(),
         has_system_error: false,
         created_at,
@@ -1101,6 +1104,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         created_at,
         updated_at,
         status,
+        mode,
         path,
         cwd,
         git_info,
@@ -1129,6 +1133,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         },
         thread_id: Some(thread_id),
         thread_name: name,
+        mode,
         active_flags,
         has_system_error,
         created_at: chrono::DateTime::from_timestamp(created_at, 0)
@@ -1146,6 +1151,13 @@ fn active_flag_label(flag: ThreadActiveFlag) -> &'static str {
         ThreadActiveFlag::WaitingOnUserInput => "[input]",
         ThreadActiveFlag::BackgroundTerminalRunning => "[shell]",
         ThreadActiveFlag::WorkspaceChanged => "[changed]",
+    }
+}
+
+fn thread_mode_label(mode: ThreadMode) -> Option<&'static str> {
+    match mode {
+        ThreadMode::Interactive => None,
+        ThreadMode::ResidentAssistant => Some("[assistant]"),
     }
 }
 
@@ -1366,6 +1378,9 @@ fn render_list(
             preview_width =
                 preview_width.saturating_sub(UnicodeWidthStr::width(system_error_label()) + 1);
         }
+        if let Some(mode_label) = thread_mode_label(row.mode) {
+            preview_width = preview_width.saturating_sub(UnicodeWidthStr::width(mode_label) + 1);
+        }
         for flag in &row.active_flags {
             preview_width =
                 preview_width.saturating_sub(UnicodeWidthStr::width(active_flag_label(*flag)) + 1);
@@ -1393,6 +1408,10 @@ fn render_list(
         }
         if row.has_system_error {
             spans.push(system_error_label().red());
+            spans.push(" ".into());
+        }
+        if let Some(mode_label) = thread_mode_label(row.mode) {
+            spans.push(mode_label.cyan());
             spans.push(" ".into());
         }
         for flag in &row.active_flags {
@@ -1900,6 +1919,7 @@ mod tests {
             preview: String::from("first message"),
             thread_id: None,
             thread_name: Some(String::from("My session")),
+            mode: ThreadMode::Interactive,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -1962,6 +1982,7 @@ mod tests {
             preview: String::from("remote session"),
             thread_id: Some(ThreadId::new()),
             thread_name: None,
+            mode: ThreadMode::Interactive,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -1998,6 +2019,7 @@ mod tests {
                 preview: String::from("Fix resume picker timestamps"),
                 thread_id: None,
                 thread_name: None,
+                mode: ThreadMode::Interactive,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: Some(now - Duration::minutes(16)),
@@ -2010,6 +2032,7 @@ mod tests {
                 preview: String::from("Investigate lazy pagination cap"),
                 thread_id: None,
                 thread_name: None,
+                mode: ThreadMode::Interactive,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: Some(now - Duration::hours(1)),
@@ -2022,6 +2045,7 @@ mod tests {
                 preview: String::from("Explain the codebase"),
                 thread_id: None,
                 thread_name: None,
+                mode: ThreadMode::Interactive,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: Some(now - Duration::hours(2)),
@@ -2084,6 +2108,7 @@ mod tests {
                 preview: String::from("Investigate resident thread watcher drift"),
                 thread_id: Some(ThreadId::new()),
                 thread_name: Some(String::from("Remote active thread")),
+                mode: ThreadMode::ResidentAssistant,
                 active_flags: vec![
                     ThreadActiveFlag::WorkspaceChanged,
                     ThreadActiveFlag::WaitingOnApproval,
@@ -2099,6 +2124,7 @@ mod tests {
                 preview: String::from("Tail background command logs"),
                 thread_id: Some(ThreadId::new()),
                 thread_name: None,
+                mode: ThreadMode::Interactive,
                 active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
                 has_system_error: false,
                 created_at: Some(now - Duration::hours(2)),
@@ -2395,6 +2421,7 @@ mod tests {
                 preview: String::from("First message preview"),
                 thread_id: Some(id1),
                 thread_name: None,
+                mode: ThreadMode::Interactive,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: None,
@@ -2407,6 +2434,7 @@ mod tests {
                 preview: String::from("Second message preview"),
                 thread_id: Some(id2),
                 thread_name: None,
+                mode: ThreadMode::Interactive,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: None,
@@ -2478,6 +2506,7 @@ mod tests {
             preview: String::from("First prompt"),
             thread_id: Some(thread_id),
             thread_name: Some(String::from("stale backend title")),
+            mode: ThreadMode::Interactive,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -2745,6 +2774,7 @@ mod tests {
             preview: String::from("missing metadata"),
             thread_id: None,
             thread_name: None,
+            mode: ThreadMode::Interactive,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -2787,6 +2817,7 @@ mod tests {
             preview: String::from("pathless thread"),
             thread_id: Some(thread_id),
             thread_name: None,
+            mode: ThreadMode::Interactive,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -2823,6 +2854,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             status: codex_app_server_protocol::ThreadStatus::Idle,
+            mode: ThreadMode::Interactive,
             resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),
@@ -2860,6 +2892,7 @@ mod tests {
                     ThreadActiveFlag::BackgroundTerminalRunning,
                 ],
             },
+            mode: ThreadMode::ResidentAssistant,
             resident: true,
             path: None,
             cwd: PathBuf::from("/tmp"),

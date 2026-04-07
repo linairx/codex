@@ -1022,6 +1022,7 @@ mod tests {
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnCompletedNotification;
@@ -1262,6 +1263,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             status: ThreadStatus::Idle,
+            mode: ThreadMode::Interactive,
             resident: false,
             path: None,
             cwd: PathBuf::from("/tmp"),
@@ -1431,6 +1433,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 status: ThreadStatus::Idle,
+                mode: ThreadMode::Interactive,
                 resident: false,
                 path: None,
                 cwd: PathBuf::from("/tmp/project"),

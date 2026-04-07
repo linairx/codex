@@ -13,6 +13,7 @@ use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
@@ -123,6 +124,12 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         Some(false),
         "new persistent threads should serialize `resident: false`"
     );
+    assert_eq!(
+        thread_json.get("mode").and_then(Value::as_str),
+        Some("interactive"),
+        "new persistent threads should serialize `mode: interactive`"
+    );
+    assert_eq!(thread.mode, ThreadMode::Interactive);
     assert_eq!(thread.name, None);
 
     // A corresponding thread/started notification should arrive.
@@ -168,6 +175,11 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         started_thread_json.get("resident").and_then(Value::as_bool),
         Some(false),
         "thread/started should serialize `resident: false` for new persistent threads"
+    );
+    assert_eq!(
+        started_thread_json.get("mode").and_then(Value::as_str),
+        Some("interactive"),
+        "thread/started should serialize `mode: interactive` for new persistent threads"
     );
     let started: ThreadStartedNotification =
         serde_json::from_value(notif.params.expect("params must be present"))?;
