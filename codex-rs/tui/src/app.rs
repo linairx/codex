@@ -318,6 +318,7 @@ fn session_summary(
     token_usage: TokenUsage,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
+    thread_mode: Option<ThreadMode>,
 ) -> Option<SessionSummary> {
     if token_usage.is_zero() {
         return None;
@@ -325,9 +326,14 @@ fn session_summary(
 
     let usage_line = FinalOutput::from(token_usage).to_string();
     let resume_command = codex_core::util::resume_command(thread_name.as_deref(), thread_id);
+    let continue_verb = match thread_mode {
+        Some(ThreadMode::ResidentAssistant) => "To reconnect to this resident assistant, run ",
+        Some(ThreadMode::Interactive) | None => "To continue this session, run ",
+    };
     Some(SessionSummary {
         usage_line,
         resume_command,
+        continue_verb,
     })
 }
 
@@ -491,6 +497,7 @@ fn emit_system_bwrap_warning(app_event_tx: &AppEventSender, config: &Config) {
 struct SessionSummary {
     usage_line: String,
     resume_command: Option<String>,
+    continue_verb: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -1112,12 +1119,82 @@ fn reconnect_notice_for_attach(
     }
 }
 
+fn replay_only_thread_switch_message(
+    thread_id: ThreadId,
+    thread_mode: Option<ThreadMode>,
+    attached_replay_only: bool,
+) -> String {
+    if attached_replay_only {
+        match thread_mode {
+            Some(ThreadMode::ResidentAssistant) => {
+                format!(
+                    "Agent thread {thread_id} could not be reconnected live. Replaying saved transcript."
+                )
+            }
+            Some(ThreadMode::Interactive) | None => {
+                format!(
+                    "Agent thread {thread_id} could not be resumed live. Replaying saved transcript."
+                )
+            }
+        }
+    } else {
+        format!("Agent thread {thread_id} is closed. Replaying saved transcript.")
+    }
+}
+
 fn cwd_prompt_action_for_session_selection(
     target_session: &crate::resume_picker::SessionTarget,
 ) -> CwdPromptAction {
     match target_session.mode {
         Some(ThreadMode::ResidentAssistant) => CwdPromptAction::Reconnect,
         Some(ThreadMode::Interactive) | None => CwdPromptAction::Resume,
+    }
+}
+
+fn attach_failure_message_for_session_selection(
+    target_session: &crate::resume_picker::SessionTarget,
+    err: &str,
+) -> String {
+    match target_session.mode {
+        Some(ThreadMode::ResidentAssistant) => {
+            format!("Failed to attach to app-server thread after reconnect: {err}")
+        }
+        Some(ThreadMode::Interactive) | None => {
+            format!("Failed to attach to app-server thread after resume: {err}")
+        }
+    }
+}
+
+fn rebuild_config_failure_message_for_session_selection(
+    target_session: &crate::resume_picker::SessionTarget,
+    err: impl std::fmt::Display,
+) -> String {
+    match target_session.mode {
+        Some(ThreadMode::ResidentAssistant) => {
+            format!("Failed to rebuild configuration for reconnect: {err}")
+        }
+        Some(ThreadMode::Interactive) | None => {
+            format!("Failed to rebuild configuration for resume: {err}")
+        }
+    }
+}
+
+fn session_restore_failure_message(
+    target_session: &crate::resume_picker::SessionTarget,
+    target_label: &str,
+    err: Option<&str>,
+) -> String {
+    let base = match target_session.mode {
+        Some(ThreadMode::ResidentAssistant) => {
+            format!("Failed to reconnect to resident assistant from {target_label}")
+        }
+        Some(ThreadMode::Interactive) | None => {
+            format!("Failed to resume session from {target_label}")
+        }
+    };
+    match err {
+        Some(err) => format!("{base}: {err}"),
+        None => base,
     }
 }
 
@@ -3346,17 +3423,19 @@ impl App {
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
 
+        let replay_thread_mode = snapshot
+            .session
+            .as_ref()
+            .and_then(|session| session.thread_mode);
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot, !is_replay_only);
         self.sync_active_thread_status_flags_from_navigation();
         if is_replay_only {
-            let message = if attached_replay_only {
-                format!(
-                    "Agent thread {thread_id} could not be resumed live. Replaying saved transcript."
-                )
-            } else {
-                format!("Agent thread {thread_id} is closed. Replaying saved transcript.")
-            };
+            let message = replay_only_thread_switch_message(
+                thread_id,
+                replay_thread_mode,
+                attached_replay_only,
+            );
             self.chat_widget.add_info_message(message, /*hint*/ None);
         }
         self.drain_active_thread_events(tui).await?;
@@ -3419,6 +3498,7 @@ impl App {
             self.chat_widget.token_usage(),
             self.chat_widget.thread_id(),
             self.chat_widget.thread_name(),
+            self.chat_widget.thread_mode(),
         );
         self.shutdown_current_thread(app_server).await;
         let tracked_thread_ids: Vec<ThreadId> =
@@ -3446,7 +3526,7 @@ impl App {
                 } else if let Some(summary) = summary {
                     let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
                     if let Some(command) = summary.resume_command {
-                        let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                        let spans = vec![summary.continue_verb.into(), command.cyan()];
                         lines.push(spans.into());
                     }
                     self.chat_widget.add_plain_history_lines(lines);
@@ -3805,10 +3885,7 @@ impl App {
                     .await
                     .wrap_err_with(|| {
                         let target_label = target_session.display_label();
-                        format!(
-                            "Failed to {} session from {target_label}",
-                            target_session.attach_verb()
-                        )
+                        session_restore_failure_message(&target_session, &target_label, None)
                     })?;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
@@ -4218,9 +4295,12 @@ impl App {
                         {
                             Ok(cfg) => cfg,
                             Err(err) => {
-                                self.chat_widget.add_error_message(format!(
-                                    "Failed to rebuild configuration for resume: {err}"
-                                ));
+                                self.chat_widget.add_error_message(
+                                    rebuild_config_failure_message_for_session_selection(
+                                        &target_session,
+                                        &err,
+                                    ),
+                                );
                                 return Ok(AppRunControl::Continue);
                             }
                         };
@@ -4229,6 +4309,7 @@ impl App {
                             self.chat_widget.token_usage(),
                             self.chat_widget.thread_id(),
                             self.chat_widget.thread_name(),
+                            self.chat_widget.thread_mode(),
                         );
                         match app_server
                             .resume_thread(resume_config.clone(), target_session.thread_id)
@@ -4255,7 +4336,7 @@ impl App {
                                                 vec![summary.usage_line.clone().into()];
                                             if let Some(command) = summary.resume_command {
                                                 let spans = vec![
-                                                    "To continue this session, run ".into(),
+                                                    summary.continue_verb.into(),
                                                     command.cyan(),
                                                 ];
                                                 lines.push(spans.into());
@@ -4264,18 +4345,24 @@ impl App {
                                         }
                                     }
                                     Err(err) => {
-                                        self.chat_widget.add_error_message(format!(
-                                            "Failed to attach to resumed app-server thread: {err}"
-                                        ));
+                                        self.chat_widget.add_error_message(
+                                            attach_failure_message_for_session_selection(
+                                                &target_session,
+                                                &err.to_string(),
+                                            ),
+                                        );
                                     }
                                 }
                             }
                             Err(err) => {
                                 let path_display = target_session.display_label();
-                                self.chat_widget.add_error_message(format!(
-                                    "Failed to {} session from {path_display}: {err}",
-                                    target_session.attach_verb()
-                                ));
+                                self.chat_widget.add_error_message(
+                                    session_restore_failure_message(
+                                        &target_session,
+                                        &path_display,
+                                        Some(&err.to_string()),
+                                    ),
+                                );
                             }
                         }
                     }
@@ -4297,6 +4384,7 @@ impl App {
                     self.chat_widget.token_usage(),
                     self.chat_widget.thread_id(),
                     self.chat_widget.thread_name(),
+                    self.chat_widget.thread_mode(),
                 );
                 self.chat_widget
                     .add_plain_history_lines(vec!["/fork".magenta().into()]);
@@ -4320,10 +4408,8 @@ impl App {
                                         let mut lines: Vec<Line<'static>> =
                                             vec![summary.usage_line.clone().into()];
                                         if let Some(command) = summary.resume_command {
-                                            let spans = vec![
-                                                "To continue this session, run ".into(),
-                                                command.cyan(),
-                                            ];
+                                            let spans =
+                                                vec![summary.continue_verb.into(), command.cyan()];
                                             lines.push(spans.into());
                                         }
                                         self.chat_widget.add_plain_history_lines(lines);
@@ -9916,6 +10002,124 @@ guardian_approval = true
         );
     }
 
+    #[test]
+    fn attach_failure_message_uses_reconnect_for_resident_threads() {
+        let resident_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+        };
+        let interactive_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::Interactive),
+        };
+
+        assert_eq!(
+            attach_failure_message_for_session_selection(&resident_target, "boom"),
+            "Failed to attach to app-server thread after reconnect: boom"
+        );
+        assert_eq!(
+            attach_failure_message_for_session_selection(&interactive_target, "boom"),
+            "Failed to attach to app-server thread after resume: boom"
+        );
+    }
+
+    #[test]
+    fn rebuild_config_failure_message_uses_reconnect_for_resident_threads() {
+        let resident_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+        };
+        let interactive_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::Interactive),
+        };
+
+        assert_eq!(
+            rebuild_config_failure_message_for_session_selection(&resident_target, "boom"),
+            "Failed to rebuild configuration for reconnect: boom"
+        );
+        assert_eq!(
+            rebuild_config_failure_message_for_session_selection(&interactive_target, "boom"),
+            "Failed to rebuild configuration for resume: boom"
+        );
+    }
+
+    #[test]
+    fn session_restore_failure_message_uses_reconnect_for_resident_threads() {
+        let resident_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+        };
+        let interactive_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::Interactive),
+        };
+
+        assert_eq!(
+            session_restore_failure_message(&resident_target, "/tmp/atlas", None),
+            "Failed to reconnect to resident assistant from /tmp/atlas"
+        );
+        assert_eq!(
+            session_restore_failure_message(&resident_target, "/tmp/atlas", Some("boom")),
+            "Failed to reconnect to resident assistant from /tmp/atlas: boom"
+        );
+        assert_eq!(
+            session_restore_failure_message(&interactive_target, "/tmp/chat", None),
+            "Failed to resume session from /tmp/chat"
+        );
+    }
+
+    #[test]
+    fn session_restore_failure_message_resident_snapshot() {
+        let target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+        };
+
+        assert_snapshot!(
+            "resident_session_restore_failure_message",
+            session_restore_failure_message(&target, "/tmp/atlas", Some("boom"))
+        );
+    }
+
+    #[test]
+    fn replay_only_thread_switch_message_uses_reconnect_for_resident_threads() {
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
+
+        assert_eq!(
+            replay_only_thread_switch_message(
+                thread_id,
+                Some(ThreadMode::ResidentAssistant),
+                /*attached_replay_only*/ true,
+            ),
+            "Agent thread 00000000-0000-0000-0000-000000000123 could not be reconnected live. Replaying saved transcript."
+        );
+        assert_eq!(
+            replay_only_thread_switch_message(
+                thread_id,
+                Some(ThreadMode::Interactive),
+                /*attached_replay_only*/ true,
+            ),
+            "Agent thread 00000000-0000-0000-0000-000000000123 could not be resumed live. Replaying saved transcript."
+        );
+        assert_eq!(
+            replay_only_thread_switch_message(
+                thread_id,
+                Some(ThreadMode::ResidentAssistant),
+                /*attached_replay_only*/ false,
+            ),
+            "Agent thread 00000000-0000-0000-0000-000000000123 is closed. Replaying saved transcript."
+        );
+    }
+
     fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn {
         Turn {
             id: turn_id.to_string(),
@@ -11904,7 +12108,8 @@ guardian_approval = true
             session_summary(
                 TokenUsage::default(),
                 /*thread_id*/ None,
-                /*thread_name*/ None
+                /*thread_name*/ None,
+                /*thread_mode*/ None,
             )
             .is_none()
         );
@@ -11920,8 +12125,13 @@ guardian_approval = true
         };
         let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
 
-        let summary =
-            session_summary(usage, Some(conversation), /*thread_name*/ None).expect("summary");
+        let summary = session_summary(
+            usage,
+            Some(conversation),
+            /*thread_name*/ None,
+            /*thread_mode*/ None,
+        )
+        .expect("summary");
         assert_eq!(
             summary.usage_line,
             "Token usage: total=12 input=10 output=2"
@@ -11930,6 +12140,7 @@ guardian_approval = true
             summary.resume_command,
             Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
         );
+        assert_eq!(summary.continue_verb, "To continue this session, run ");
     }
 
     #[tokio::test]
@@ -11942,11 +12153,53 @@ guardian_approval = true
         };
         let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
 
-        let summary = session_summary(usage, Some(conversation), Some("my-session".to_string()))
-            .expect("summary");
+        let summary = session_summary(
+            usage,
+            Some(conversation),
+            Some("my-session".to_string()),
+            /*thread_mode*/ None,
+        )
+        .expect("summary");
         assert_eq!(
             summary.resume_command,
             Some("codex resume my-session".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn session_summary_uses_reconnect_hint_for_resident_threads() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        };
+        let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+        let summary = session_summary(
+            usage,
+            Some(conversation),
+            Some("atlas".to_string()),
+            Some(ThreadMode::ResidentAssistant),
+        )
+        .expect("summary");
+        assert_eq!(
+            summary.resume_command,
+            Some("codex resume atlas".to_string())
+        );
+        assert_eq!(
+            summary.continue_verb,
+            "To reconnect to this resident assistant, run "
+        );
+
+        let rendered = format!(
+            "{}\n{}{}",
+            summary.usage_line,
+            summary.continue_verb,
+            summary
+                .resume_command
+                .expect("resident thread should have resume command"),
+        );
+        assert_snapshot!("resident_session_summary_reconnect_hint", rendered);
     }
 }

@@ -63,13 +63,6 @@ impl SessionTarget {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| format!("thread {}", self.thread_id))
     }
-
-    pub fn attach_verb(&self) -> &'static str {
-        match self.mode {
-            Some(ThreadMode::ResidentAssistant) => "reconnect to",
-            Some(ThreadMode::Interactive) | None => "resume",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +82,7 @@ pub enum SessionPickerAction {
 impl SessionPickerAction {
     fn title(self) -> &'static str {
         match self {
-            SessionPickerAction::Resume => "Resume a previous session",
+            SessionPickerAction::Resume => "Resume or reconnect to a previous session",
             SessionPickerAction::Fork => "Fork a previous session",
         }
     }

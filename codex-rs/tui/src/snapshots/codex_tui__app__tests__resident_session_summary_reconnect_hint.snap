@@ -1,0 +1,6 @@
+---
+source: tui/src/app.rs
+expression: rendered
+---
+Token usage: total=12 input=10 output=2
+To reconnect to this resident assistant, run codex resume atlas

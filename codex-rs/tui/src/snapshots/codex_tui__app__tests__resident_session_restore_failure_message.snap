@@ -1,0 +1,5 @@
+---
+source: tui/src/app.rs
+expression: "session_restore_failure_message(&target, \"/tmp/atlas\", Some(\"boom\"))"
+---
+Failed to reconnect to resident assistant from /tmp/atlas: boom

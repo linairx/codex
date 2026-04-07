@@ -1,4 +1,5 @@
 use super::*;
+use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -77,6 +78,22 @@ async fn slash_init_skips_when_project_doc_exists() {
         std::fs::read_to_string(existing_path).unwrap(),
         "existing instructions"
     );
+}
+
+#[tokio::test]
+async fn slash_rename_uses_reconnect_hint_for_resident_threads() {
+    let rendered = lines_to_single_string(
+        &ChatWidget::rename_confirmation_cell(
+            "atlas",
+            Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
+            Some(codex_app_server_protocol::ThreadMode::ResidentAssistant),
+        )
+        .display_lines(/*width*/ 120),
+    );
+    assert_snapshot!("slash_rename_resident_reconnect_hint", rendered);
+    assert!(rendered.contains("Thread renamed to atlas"));
+    assert!(rendered.contains("to reconnect to this resident assistant run"));
+    assert!(rendered.contains("codex resume atlas"));
 }
 
 #[tokio::test]

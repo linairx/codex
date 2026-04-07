@@ -209,7 +209,14 @@
 - 已开始第一步消费，resume picker 会对长期线程显示独立模式标记
 - `Thread.mode` 已透传到 TUI 会话状态，并在 `/status` 中显示线程模式
 - resident assistant 在线程恢复后会追加“重新连接”提示，不再只表现成普通历史恢复
-- 仍未完成更广义的恢复语义整理，例如更多入口/提示文案与长期线程语义的统一
+- TUI 已开始补齐更多恢复入口的语义一致性，例如新线程切换、fork 后摘要提示以及线程改名确认提示，都已按 `Thread.mode` 区分“continue”与“reconnect”
+- `/resume` 的命令入口说明也已开始从“历史恢复”语义扩成同时覆盖 resident assistant 的 reconnect 语义
+- resume picker 的固定入口标题也已开始从纯 “Resume” 语义扩成同时覆盖 reconnect
+- agent thread 在 live attach 失败后退回 transcript replay 时，resident thread 也已改成使用 reconnect 语义，不再统一提示成 resumed live
+- resume 路径在 attach 失败时的错误提示，也已开始按线程模式区分 “after resume” 与 “after reconnect”
+- resume 目标切 cwd 后如果配置重建失败，错误提示也已开始按线程模式区分 “for resume” 与 “for reconnect”
+- session 级恢复失败提示也已继续收口，resident thread 不再只显示通用 resume/session 文案，而会明确提示 reconnect resident assistant
+- 仍有剩余消费侧入口需要继续检查，但主路径上的恢复/重连文案已经开始收口
 
 不要混入：
 

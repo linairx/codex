@@ -5410,7 +5410,7 @@ impl ChatWidget {
                     self.add_error_message("Thread name cannot be empty.".to_string());
                     return;
                 };
-                let cell = Self::rename_confirmation_cell(&name, self.thread_id);
+                let cell = Self::rename_confirmation_cell(&name, self.thread_id, self.thread_mode);
                 self.add_boxed_history(Box::new(cell));
                 self.request_redraw();
                 self.app_event_tx.set_thread_name(name);
@@ -5491,6 +5491,7 @@ impl ChatWidget {
             "Name thread"
         };
         let thread_id = self.thread_id;
+        let thread_mode = self.thread_mode;
         let view = CustomPromptView::new(
             title.to_string(),
             "Type a name and press Enter".to_string(),
@@ -5502,7 +5503,7 @@ impl ChatWidget {
                     )));
                     return;
                 };
-                let cell = Self::rename_confirmation_cell(&name, thread_id);
+                let cell = Self::rename_confirmation_cell(&name, thread_id, thread_mode);
                 tx.send(AppEvent::InsertHistoryCell(Box::new(cell)));
                 tx.set_thread_name(name);
             }),
@@ -9920,15 +9921,23 @@ impl ChatWidget {
         self.add_error_message(format!("{feature}: {TUI_STUB_MESSAGE}"));
     }
 
-    fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
+    fn rename_confirmation_cell(
+        name: &str,
+        thread_id: Option<ThreadId>,
+        thread_mode: Option<ThreadMode>,
+    ) -> PlainHistoryCell {
         let resume_cmd = codex_core::util::resume_command(Some(name), thread_id)
             .unwrap_or_else(|| format!("codex resume {name}"));
+        let continue_verb = match thread_mode {
+            Some(ThreadMode::ResidentAssistant) => " to reconnect to this resident assistant run ",
+            Some(ThreadMode::Interactive) | None => " to resume this thread run ",
+        };
         let name = name.to_string();
         let line = vec![
             "• ".into(),
             "Thread renamed to ".into(),
             name.cyan(),
-            ", to resume this thread run ".into(),
+            continue_verb.into(),
             resume_cmd.cyan(),
         ];
         PlainHistoryCell::new(vec![line.into()])
@@ -10734,6 +10743,10 @@ impl ChatWidget {
 
     pub(crate) fn thread_id(&self) -> Option<ThreadId> {
         self.thread_id
+    }
+
+    pub(crate) fn thread_mode(&self) -> Option<ThreadMode> {
+        self.thread_mode
     }
 
     pub(crate) fn thread_name(&self) -> Option<String> {
