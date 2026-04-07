@@ -1156,6 +1156,10 @@ fn app_server_credits_snapshot_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ApprovalsReviewer;
+    use codex_app_server_protocol::ReadOnlyAccess;
+    use codex_app_server_protocol::SessionSource;
+    use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
@@ -1170,6 +1174,53 @@ mod tests {
             .build()
             .await
             .expect("config should build")
+    }
+
+    fn test_thread(thread_id: ThreadId, mode: ThreadMode, resident: bool) -> Thread {
+        Thread {
+            id: thread_id.to_string(),
+            forked_from_id: None,
+            preview: "hello".to_string(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Idle,
+            mode,
+            resident,
+            path: None,
+            cwd: PathBuf::from("/tmp/project"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        }
+    }
+
+    fn test_thread_response_fields() -> (
+        String,
+        String,
+        Option<codex_protocol::config_types::ServiceTier>,
+        PathBuf,
+        codex_app_server_protocol::AskForApproval,
+        ApprovalsReviewer,
+        codex_app_server_protocol::SandboxPolicy,
+    ) {
+        (
+            "gpt-5.4".to_string(),
+            "openai".to_string(),
+            None,
+            PathBuf::from("/tmp/project"),
+            codex_app_server_protocol::AskForApproval::Never,
+            ApprovalsReviewer::User,
+            codex_app_server_protocol::SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::FullAccess,
+                network_access: false,
+            },
+        )
     }
 
     #[tokio::test]
@@ -1316,6 +1367,79 @@ mod tests {
         assert_eq!(started.session.thread_mode, Some(ThreadMode::Interactive));
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_responses_preserve_resident_thread_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        let (
+            model,
+            model_provider,
+            service_tier,
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox,
+        ) = test_thread_response_fields();
+
+        let start_response = ThreadStartResponse {
+            thread: test_thread(thread_id, ThreadMode::ResidentAssistant, true),
+            model: model.clone(),
+            model_provider: model_provider.clone(),
+            service_tier,
+            cwd: cwd.clone(),
+            approval_policy,
+            approvals_reviewer,
+            sandbox: sandbox.clone(),
+            reasoning_effort: None,
+        };
+        let started = started_thread_from_start_response(start_response, &config)
+            .await
+            .expect("start response should map");
+        assert_eq!(
+            started.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
+        );
+
+        let resume_response = ThreadResumeResponse {
+            thread: test_thread(thread_id, ThreadMode::ResidentAssistant, true),
+            model: model.clone(),
+            model_provider: model_provider.clone(),
+            service_tier,
+            cwd: cwd.clone(),
+            approval_policy,
+            approvals_reviewer,
+            sandbox: sandbox.clone(),
+            reasoning_effort: None,
+        };
+        let resumed = started_thread_from_resume_response(resume_response, &config)
+            .await
+            .expect("resume response should map");
+        assert_eq!(
+            resumed.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
+        );
+
+        let fork_response = ThreadForkResponse {
+            thread: test_thread(thread_id, ThreadMode::ResidentAssistant, true),
+            model,
+            model_provider,
+            service_tier,
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox,
+            reasoning_effort: None,
+        };
+        let forked = started_thread_from_fork_response(fork_response, &config)
+            .await
+            .expect("fork response should map");
+        assert_eq!(
+            forked.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
+        );
     }
 
     #[tokio::test]

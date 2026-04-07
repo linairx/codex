@@ -996,9 +996,12 @@ SQLite 在这里不是起点，而是收敛点。
 - schema / TypeScript 生成物已同步更新
 - `app-server/README.md` 已明确 `Thread.mode` 与 `thread.status` 的语义分离
 - `thread/read`、`thread/list` 和后续 `thread/resume` 在服务重启后已能消费 SQLite 中持久化的 resident 模式
+- resident `thread/start` 也已补上“未物化前不落 SQLite”的回归覆盖，确保返回 `mode = residentAssistant` 不会顺手提前创建持久化线程行
+- `thread/fork` 从 resident thread 派生新线程时，默认仍会保持 `interactive`，并且这条模式边界已补上跨重启回归覆盖，不会被 SQLite 误恢复成 `residentAssistant`
+- `codex-state` 的 `set_thread_mode` 也已补上“缺失线程不建垃圾行”的回归覆盖，确保模式修复逻辑不会把未物化线程提前写入 SQLite
 - `thread_status.rs` 已开始收敛 watcher 生命周期，shutdown 会主动清理 resident thread 的工作区 watch
 - `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
-- `tui` 已继续收敛消费侧语义：resume picker 的入口标题之外，新线程切换、fork 后摘要提示、线程改名确认提示、replay-only 的 agent thread 回退提示、resume 路径 attach 失败提示、切 cwd 后配置重建失败提示，以及 session 级恢复失败提示，也开始按 `Thread.mode` 区分 continue / resume 与 reconnect
+- `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射也已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。

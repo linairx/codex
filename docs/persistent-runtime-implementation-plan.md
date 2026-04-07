@@ -208,6 +208,7 @@
 
 - 已开始第一步消费，resume picker 会对长期线程显示独立模式标记
 - `Thread.mode` 已透传到 TUI 会话状态，并在 `/status` 中显示线程模式
+- `codex-tui` 也已补上会话映射层回归：`thread/start`、`thread/resume`、`thread/fork` 返回的 resident `Thread.mode` 都会稳定落进 `ThreadSessionState`
 - resident assistant 在线程恢复后会追加“重新连接”提示，不再只表现成普通历史恢复
 - TUI 已开始补齐更多恢复入口的语义一致性，例如新线程切换、fork 后摘要提示以及线程改名确认提示，都已按 `Thread.mode` 区分“continue”与“reconnect”
 - `/resume` 的命令入口说明也已开始从“历史恢复”语义扩成同时覆盖 resident assistant 的 reconnect 语义
@@ -271,7 +272,10 @@
 
 - `state` 已新增 `threads.mode` 稳定元数据列，并在 rollout -> SQLite 汇总时优先保留既有线程模式
 - `thread/start`、`thread/resume`、`thread/fork`、`turn/start` 会在 rollout 已物化后补齐或修复模式元数据，而不会为未物化线程预先写入持久化垃圾行
+- resident `thread/start` 的边界也已补上回归覆盖：返回 `mode = residentAssistant` 时，在线程真正物化前仍不会提前写入 SQLite
 - 服务重启后，未加载线程的 `thread/read` / `thread/list` 以及后续 `thread/resume` 都会消费 SQLite 中持久化的 resident 模式
+- 从 resident thread 派生出的 fork 线程也已补上回归覆盖：默认仍保持 `interactive`，并且重启后不会从 SQLite 误恢复成 `residentAssistant`
+- `codex-state` 也已补上状态层边界测试：`set_thread_mode` 对缺失线程只返回 false，不会顺手创建 SQLite 垃圾行
 - 相关最小行为闭环已可由 `codex-state`、`codex-rollout`、`codex-app-server` 的定向测试覆盖
 - 仍需保持边界，只把稳定元数据和派生摘要入库，不把 loaded 状态、watcher、连接关系一类瞬时运行态塞进 SQLite
 

@@ -1340,6 +1340,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_thread_mode_does_not_create_missing_thread_rows() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000794").expect("valid thread id");
+
+        let updated = runtime
+            .set_thread_mode(thread_id, "residentAssistant")
+            .await
+            .expect("set_thread_mode should succeed");
+        assert!(
+            !updated,
+            "missing rows should not be created by mode updates"
+        );
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread lookup should succeed");
+        assert_eq!(persisted, None);
+    }
+
+    #[tokio::test]
     async fn apply_rollout_items_uses_override_updated_at_when_provided() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
