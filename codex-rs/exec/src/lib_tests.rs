@@ -249,6 +249,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         created_at: 0,
         updated_at: 0,
         status: codex_app_server_protocol::ThreadStatus::Idle,
+        mode: ThreadMode::Interactive,
         resident: false,
         path: None,
         cwd: PathBuf::from("/tmp/project"),
@@ -369,6 +370,7 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
             created_at: 0,
             updated_at: 0,
             status: codex_app_server_protocol::ThreadStatus::Idle,
+            mode: ThreadMode::ResidentAssistant,
             resident: false,
             path: Some(PathBuf::from("/tmp/rollout.jsonl")),
             cwd: PathBuf::from("/tmp"),
@@ -396,11 +398,16 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
         reasoning_effort: None,
     };
 
-    let event = session_configured_from_thread_start_response(&response)
+    let bootstrap_session = session_configured_from_thread_start_response(&response)
         .expect("build bootstrap session configured event");
+    let event = bootstrap_session.session_configured;
 
     assert_eq!(
         event.approvals_reviewer,
         ApprovalsReviewer::GuardianSubagent
+    );
+    assert_eq!(
+        bootstrap_session.thread_mode,
+        Some(ThreadMode::ResidentAssistant)
     );
 }

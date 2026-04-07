@@ -1004,6 +1004,12 @@ SQLite 在这里不是起点，而是收敛点。
 - resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `ResidentAssistant`，`thread/loaded/read` 也会继续把该线程暴露为 `ResidentAssistant + Idle`
 - `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射、`ThreadStartedNotification` 进入 TUI 后的 resident 会话推断路径，以及启动前按名称 lookup、latest-session 选择和按线程 ID 的 `thread/read` 路径对 resident `SessionTarget.mode` 的保留，也都已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
+- `exec` 的 bootstrap 启动摘要也已开始消费 `thread/start` / `thread/resume` 返回的 `Thread.mode`，resident assistant 不再在 CLI 启动横幅里被压平为普通 session，而会显式展示当前是 `resident assistant`
+- `exec --json` 的首个 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，避免下游 JSON 消费方只能拿到 `thread_id`，却继续把 resident session 当成普通 interactive thread
+- `debug-client` 也已开始消费 `Thread.mode`：连接成功提示、活跃线程切换提示、线程列表标记和 `:resume` 帮助文案都已按 resident assistant 收口，不再把 reconnect 路径统一描述成普通 resume
+- `app-server-test-client` 的 `thread/start`、`thread/resume`、`thread/list` 和 `thread/started` 输出也已补上 resident-aware 摘要，手工联调时不再需要从整段 debug struct 里自己辨认这是不是 reconnect 场景
+- `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；MCP 接口文档也已补上同样约束，避免外围集成只盯 `thread_id` / `status`
+- `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 

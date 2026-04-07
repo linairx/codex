@@ -28,6 +28,7 @@ use std::io::Write;
 
 use crate::output::LabelColor;
 use crate::output::Output;
+use crate::state::KnownThread;
 use crate::state::PendingRequest;
 use crate::state::ReaderEvent;
 use crate::state::State;
@@ -161,43 +162,86 @@ fn handle_response(
             let parsed = serde_json::from_value::<ThreadStartResponse>(response.result)
                 .context("decode thread/start response")?;
             let thread_id = parsed.thread.id;
+            let thread_mode = parsed.thread.mode;
             {
                 let mut state = state.lock().expect("state lock poisoned");
                 state.thread_id = Some(thread_id.clone());
-                if !state.known_threads.iter().any(|id| id == &thread_id) {
-                    state.known_threads.push(thread_id.clone());
+                if let Some(existing) = state
+                    .known_threads
+                    .iter_mut()
+                    .find(|thread| thread.thread_id == thread_id)
+                {
+                    existing.thread_mode = thread_mode;
+                } else {
+                    state.known_threads.push(KnownThread {
+                        thread_id: thread_id.clone(),
+                        thread_mode,
+                    });
                 }
             }
-            events.send(ReaderEvent::ThreadReady { thread_id }).ok();
+            events
+                .send(ReaderEvent::ThreadReady {
+                    thread_id,
+                    thread_mode,
+                })
+                .ok();
         }
         PendingRequest::Resume => {
             let parsed = serde_json::from_value::<ThreadResumeResponse>(response.result)
                 .context("decode thread/resume response")?;
             let thread_id = parsed.thread.id;
+            let thread_mode = parsed.thread.mode;
             {
                 let mut state = state.lock().expect("state lock poisoned");
                 state.thread_id = Some(thread_id.clone());
-                if !state.known_threads.iter().any(|id| id == &thread_id) {
-                    state.known_threads.push(thread_id.clone());
+                if let Some(existing) = state
+                    .known_threads
+                    .iter_mut()
+                    .find(|thread| thread.thread_id == thread_id)
+                {
+                    existing.thread_mode = thread_mode;
+                } else {
+                    state.known_threads.push(KnownThread {
+                        thread_id: thread_id.clone(),
+                        thread_mode,
+                    });
                 }
             }
-            events.send(ReaderEvent::ThreadReady { thread_id }).ok();
+            events
+                .send(ReaderEvent::ThreadReady {
+                    thread_id,
+                    thread_mode,
+                })
+                .ok();
         }
         PendingRequest::List => {
             let parsed = serde_json::from_value::<ThreadListResponse>(response.result)
                 .context("decode thread/list response")?;
-            let thread_ids: Vec<String> = parsed.data.into_iter().map(|thread| thread.id).collect();
+            let threads: Vec<KnownThread> = parsed
+                .data
+                .into_iter()
+                .map(|thread| KnownThread {
+                    thread_id: thread.id,
+                    thread_mode: thread.mode,
+                })
+                .collect();
             {
                 let mut state = state.lock().expect("state lock poisoned");
-                for thread_id in &thread_ids {
-                    if !state.known_threads.iter().any(|id| id == thread_id) {
-                        state.known_threads.push(thread_id.clone());
+                for thread in &threads {
+                    if let Some(existing) = state
+                        .known_threads
+                        .iter_mut()
+                        .find(|known| known.thread_id == thread.thread_id)
+                    {
+                        existing.thread_mode = thread.thread_mode;
+                    } else {
+                        state.known_threads.push(thread.clone());
                     }
                 }
             }
             events
                 .send(ReaderEvent::ThreadList {
-                    thread_ids,
+                    threads,
                     next_cursor: parsed.next_cursor,
                 })
                 .ok();

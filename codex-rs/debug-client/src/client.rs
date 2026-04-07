@@ -27,6 +27,7 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -37,9 +38,15 @@ use serde::Serialize;
 
 use crate::output::Output;
 use crate::reader::start_reader;
+use crate::state::KnownThread;
 use crate::state::PendingRequest;
 use crate::state::ReaderEvent;
 use crate::state::State;
+
+pub struct ThreadConnection {
+    pub thread_id: String,
+    pub thread_mode: ThreadMode,
+}
 
 pub struct AppServerClient {
     child: Child,
@@ -117,7 +124,7 @@ impl AppServerClient {
         Ok(())
     }
 
-    pub fn start_thread(&mut self, params: ThreadStartParams) -> Result<String> {
+    pub fn start_thread(&mut self, params: ThreadStartParams) -> Result<ThreadConnection> {
         let request_id = self.next_request_id();
         let request = ClientRequest::ThreadStart {
             request_id: request_id.clone(),
@@ -128,11 +135,16 @@ impl AppServerClient {
         let parsed: ThreadStartResponse =
             serde_json::from_value(response.result).context("decode thread/start response")?;
         let thread_id = parsed.thread.id;
+        let thread_mode = parsed.thread.mode;
         self.set_thread_id(thread_id.clone());
-        Ok(thread_id)
+        self.remember_thread(thread_id.clone(), thread_mode);
+        Ok(ThreadConnection {
+            thread_id,
+            thread_mode,
+        })
     }
 
-    pub fn resume_thread(&mut self, params: ThreadResumeParams) -> Result<String> {
+    pub fn resume_thread(&mut self, params: ThreadResumeParams) -> Result<ThreadConnection> {
         let request_id = self.next_request_id();
         let request = ClientRequest::ThreadResume {
             request_id: request_id.clone(),
@@ -143,8 +155,13 @@ impl AppServerClient {
         let parsed: ThreadResumeResponse =
             serde_json::from_value(response.result).context("decode thread/resume response")?;
         let thread_id = parsed.thread.id;
+        let thread_mode = parsed.thread.mode;
         self.set_thread_id(thread_id.clone());
-        Ok(thread_id)
+        self.remember_thread(thread_id.clone(), thread_mode);
+        Ok(ThreadConnection {
+            thread_id,
+            thread_mode,
+        })
     }
 
     pub fn request_thread_start(&self, params: ThreadStartParams) -> Result<RequestId> {
@@ -234,14 +251,15 @@ impl AppServerClient {
     pub fn set_thread_id(&self, thread_id: String) {
         let mut state = self.state.lock().expect("state lock poisoned");
         state.thread_id = Some(thread_id);
-        self.remember_thread_locked(&mut state);
     }
 
     pub fn use_thread(&self, thread_id: String) -> bool {
         let mut state = self.state.lock().expect("state lock poisoned");
-        let known = state.known_threads.iter().any(|id| id == &thread_id);
+        let known = state
+            .known_threads
+            .iter()
+            .any(|thread| thread.thread_id == thread_id);
         state.thread_id = Some(thread_id);
-        self.remember_thread_locked(&mut state);
         known
     }
 
@@ -257,11 +275,19 @@ impl AppServerClient {
         state.pending.insert(request_id, kind);
     }
 
-    fn remember_thread_locked(&self, state: &mut State) {
-        if let Some(thread_id) = state.thread_id.as_ref()
-            && !state.known_threads.iter().any(|id| id == thread_id)
+    fn remember_thread(&self, thread_id: String, thread_mode: ThreadMode) {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        if let Some(existing) = state
+            .known_threads
+            .iter_mut()
+            .find(|thread| thread.thread_id == thread_id)
         {
-            state.known_threads.push(thread_id.clone());
+            existing.thread_mode = thread_mode;
+        } else {
+            state.known_threads.push(KnownThread {
+                thread_id,
+                thread_mode,
+            });
         }
     }
 

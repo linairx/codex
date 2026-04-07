@@ -15,7 +15,7 @@ cargo run -p codex-debug-client -- \
   --approval-policy on-request
 ```
 
-You can resume a specific thread:
+You can resume or reconnect to a specific thread:
 
 ```
 cargo run -p codex-debug-client -- --thread-id thr_123
@@ -25,11 +25,11 @@ cargo run -p codex-debug-client -- --thread-id thr_123
 
 - `--codex-bin <path>`: path to the `codex` binary (default: `codex`).
 - `-c, --config key=value`: pass through `--config` overrides to `codex`.
-- `--thread-id <id>`: resume a thread instead of starting a new one.
+- `--thread-id <id>`: resume or reconnect to a thread instead of starting a new one.
 - `--approval-policy <policy>`: `untrusted`, `on-failure` (deprecated), `on-request`, `never`.
 - `--auto-approve`: auto-approve command/file-change approvals (default: decline).
 - `--final-only`: only show completed assistant messages and tool items.
-- `--model <name>`: optional model override for thread start/resume.
+- `--model <name>`: optional model override for thread start/resume or reconnect.
 - `--model-provider <name>`: optional provider override.
 - `--cwd <path>`: optional working directory override.
 
@@ -39,7 +39,7 @@ Type a line to send it as a new turn. Commands are prefixed with `:`:
 
 - `:help` show help
 - `:new` start a new thread
-- `:resume <thread-id>` resume a thread
+- `:resume <thread-id>` resume or reconnect to a thread
 - `:use <thread-id>` switch active thread without resuming
 - `:refresh-thread` list available threads
 - `:quit` exit

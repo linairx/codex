@@ -53,6 +53,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDecrementElicitationResponse;
 use codex_app_server_protocol::ThreadIncrementElicitationParams;
@@ -60,6 +61,7 @@ use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -723,6 +725,7 @@ async fn trigger_zsh_fork_multi_cmd_approval(
                 ..Default::default()
             })?;
             println!("< thread/start response: {thread_response:?}");
+            print_thread_response_summary("thread/start", &thread_response.thread);
 
             client.command_approval_behavior = match abort_on {
                 Some(index) => CommandApprovalBehavior::AbortOn(index),
@@ -817,6 +820,7 @@ async fn resume_message_v2(
             ..Default::default()
         })?;
         println!("< thread/resume response: {resume_response:?}");
+        print_thread_response_summary("thread/resume", &resume_response.thread);
 
         let turn_response = client.turn_start(TurnStartParams {
             thread_id: resume_response.thread.id.clone(),
@@ -849,6 +853,7 @@ async fn thread_resume_follow(
             ..Default::default()
         })?;
         println!("< thread/resume response: {resume_response:?}");
+        print_thread_response_summary("thread/resume", &resume_response.thread);
         println!("< streaming notifications until process is terminated");
 
         client.stream_notifications_forever()
@@ -961,6 +966,7 @@ async fn send_message_v2_with_policies(
                 ..Default::default()
             })?;
             println!("< thread/start response: {thread_response:?}");
+            print_thread_response_summary("thread/start", &thread_response.thread);
             let mut turn_params = TurnStartParams {
                 thread_id: thread_response.thread.id.clone(),
                 input: vec![V2UserInput::Text {
@@ -1000,6 +1006,7 @@ async fn send_follow_up_v2(
             ..Default::default()
         })?;
         println!("< thread/start response: {thread_response:?}");
+        print_thread_response_summary("thread/start", &thread_response.thread);
 
         let first_turn_params = TurnStartParams {
             thread_id: thread_response.thread.id.clone(),
@@ -1131,6 +1138,7 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
             search_term: None,
         })?;
         println!("< thread/list response: {response:?}");
+        print_thread_list_summary(&response);
 
         Ok(())
     })
@@ -1157,6 +1165,79 @@ async fn with_client<T>(
     });
     print_trace_summary(&trace_summary);
     result
+}
+
+fn print_thread_response_summary(label: &str, thread: &AppServerThread) {
+    println!(
+        "< {label} summary: id={}, mode={}, resident={}, status={:?}, action={}",
+        thread.id,
+        thread_mode_label(thread.mode),
+        thread.resident,
+        thread.status,
+        thread_resume_action_label(thread.mode)
+    );
+}
+
+fn print_thread_list_summary(response: &ThreadListResponse) {
+    if response.data.is_empty() {
+        println!("< thread/list summary: no threads");
+        return;
+    }
+
+    println!("< thread/list summary:");
+    for thread in &response.data {
+        println!(
+            "  - id={}, mode={}, resident={}, status={:?}, action={}",
+            thread.id,
+            thread_mode_label(thread.mode),
+            thread.resident,
+            thread.status,
+            thread_resume_action_label(thread.mode)
+        );
+    }
+}
+
+fn thread_mode_label(mode: ThreadMode) -> &'static str {
+    match mode {
+        ThreadMode::Interactive => "interactive",
+        ThreadMode::ResidentAssistant => "residentAssistant",
+    }
+}
+
+fn thread_resume_action_label(mode: ThreadMode) -> &'static str {
+    match mode {
+        ThreadMode::Interactive => "resume",
+        ThreadMode::ResidentAssistant => "reconnect",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thread_mode_label;
+    use super::thread_resume_action_label;
+    use codex_app_server_protocol::ThreadMode;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn resident_thread_mode_uses_reconnect_label() {
+        assert_eq!(
+            thread_mode_label(ThreadMode::ResidentAssistant),
+            "residentAssistant"
+        );
+        assert_eq!(
+            thread_resume_action_label(ThreadMode::ResidentAssistant),
+            "reconnect"
+        );
+    }
+
+    #[test]
+    fn interactive_thread_mode_uses_resume_label() {
+        assert_eq!(thread_mode_label(ThreadMode::Interactive), "interactive");
+        assert_eq!(
+            thread_resume_action_label(ThreadMode::Interactive),
+            "resume"
+        );
+    }
 }
 
 fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
@@ -1241,6 +1322,7 @@ fn live_elicitation_timeout_pause(
         ..Default::default()
     })?;
     println!("< thread/start response: {thread_response:?}");
+    print_thread_response_summary("thread/start", &thread_response.thread);
 
     let thread_id = thread_response.thread.id;
     let command = format!(
@@ -1721,6 +1803,7 @@ impl CodexClient {
                 ServerNotification::ThreadStarted(payload) => {
                     if payload.thread.id == thread_id {
                         println!("< thread/started notification: {:?}", payload.thread);
+                        print_thread_response_summary("thread/started", &payload.thread);
                     }
                 }
                 ServerNotification::TurnStarted(payload) => {

@@ -125,9 +125,13 @@ fn session_configured_produces_thread_started_event() {
     };
 
     assert_eq!(
-        EventProcessorWithJsonOutput::thread_started_event(&session_configured),
+        EventProcessorWithJsonOutput::thread_started_event(
+            &session_configured,
+            Some(codex_app_server_protocol::ThreadMode::ResidentAssistant),
+        ),
         ThreadEvent::ThreadStarted(ThreadStartedEvent {
             thread_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+            thread_mode: Some(codex_app_server_protocol::ThreadMode::ResidentAssistant),
         })
     );
 }

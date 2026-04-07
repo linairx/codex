@@ -1,3 +1,4 @@
+use codex_app_server_protocol::ThreadMode;
 use codex_protocol::models::WebSearchAction;
 use serde::Deserialize;
 use serde::Serialize;
@@ -40,6 +41,8 @@ pub enum ThreadEvent {
 pub struct ThreadStartedEvent {
     /// The identified of the new thread. Can be used to resume the thread later.
     pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_mode: Option<ThreadMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, Default)]

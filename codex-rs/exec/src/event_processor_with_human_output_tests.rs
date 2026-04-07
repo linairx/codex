@@ -1,11 +1,18 @@
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
+use codex_core::config::ConfigBuilder;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionConfiguredEvent;
 use owo_colors::Style;
 use pretty_assertions::assert_eq;
+use tempfile::tempdir;
 
 use super::EventProcessorWithHumanOutput;
+use super::config_summary_entries;
 use super::final_message_from_turn_items;
 use super::reasoning_text;
 use super::should_print_final_message_to_stdout;
@@ -343,4 +350,42 @@ fn turn_interrupted_clears_stale_final_message() {
     assert_eq!(processor.final_message, None);
     assert!(!processor.final_message_rendered);
     assert!(!processor.emit_final_message_on_shutdown);
+}
+
+#[tokio::test]
+async fn config_summary_entries_include_resident_session_mode() {
+    let codex_home = tempdir().expect("create codex home");
+    let cwd = tempdir().expect("create cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let session_configured = SessionConfiguredEvent {
+        session_id: codex_protocol::ThreadId::new(),
+        forked_from_id: None,
+        thread_name: Some("Atlas".to_string()),
+        model: "gpt-5.4".to_string(),
+        model_provider_id: "openai".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: Default::default(),
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        cwd: cwd.path().to_path_buf(),
+        reasoning_effort: None,
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: None,
+    };
+
+    let entries = config_summary_entries(
+        &config,
+        &session_configured,
+        Some(ThreadMode::ResidentAssistant),
+    );
+
+    assert!(entries.contains(&("session mode", "resident assistant".to_string())));
 }

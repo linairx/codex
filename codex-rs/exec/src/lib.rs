@@ -32,6 +32,7 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -163,6 +164,11 @@ struct ExecRunArgs {
     prompt: Option<String>,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
+}
+
+struct BootstrapSessionConfigured {
+    session_configured: SessionConfiguredEvent,
+    thread_mode: Option<ThreadMode>,
 }
 
 fn exec_root_span() -> tracing::Span {
@@ -533,7 +539,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     // Handle resume subcommand through existing `thread/list` + `thread/resume`
     // APIs so exec no longer reaches into rollout storage directly.
-    let (primary_thread_id, fallback_session_configured) =
+    let (primary_thread_id, bootstrap_session) =
         if let Some(ExecCommand::Resume(args)) = command.as_ref() {
             if let Some(thread_id) = resolve_resume_thread_id(&client, &config, args).await? {
                 let response: ThreadResumeResponse = send_request_with_response(
@@ -546,9 +552,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 )
                 .await
                 .map_err(anyhow::Error::msg)?;
-                let session_configured = session_configured_from_thread_resume_response(&response)
+                let bootstrap_session = session_configured_from_thread_resume_response(&response)
                     .map_err(anyhow::Error::msg)?;
-                (session_configured.session_id, session_configured)
+                (
+                    bootstrap_session.session_configured.session_id,
+                    bootstrap_session,
+                )
             } else {
                 let response: ThreadStartResponse = send_request_with_response(
                     &client,
@@ -560,9 +569,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 )
                 .await
                 .map_err(anyhow::Error::msg)?;
-                let session_configured = session_configured_from_thread_start_response(&response)
+                let bootstrap_session = session_configured_from_thread_start_response(&response)
                     .map_err(anyhow::Error::msg)?;
-                (session_configured.session_id, session_configured)
+                (
+                    bootstrap_session.session_configured.session_id,
+                    bootstrap_session,
+                )
             }
         } else {
             let response: ThreadStartResponse = send_request_with_response(
@@ -575,16 +587,22 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             )
             .await
             .map_err(anyhow::Error::msg)?;
-            let session_configured = session_configured_from_thread_start_response(&response)
+            let bootstrap_session = session_configured_from_thread_start_response(&response)
                 .map_err(anyhow::Error::msg)?;
-            (session_configured.session_id, session_configured)
+            (
+                bootstrap_session.session_configured.session_id,
+                bootstrap_session,
+            )
         };
 
     let primary_thread_id_for_span = primary_thread_id.to_string();
     // Use the start/resume response as the authoritative bootstrap payload.
     // Waiting for a later streamed `SessionConfigured` event adds up to 10s of
     // avoidable startup latency on the in-process path.
-    let session_configured = fallback_session_configured;
+    let BootstrapSessionConfigured {
+        session_configured,
+        thread_mode,
+    } = bootstrap_session;
 
     exec_span.record("thread.id", primary_thread_id_for_span.as_str());
 
@@ -650,7 +668,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
-    event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
+    event_processor.print_config_summary(
+        &config,
+        &prompt_summary,
+        &session_configured,
+        thread_mode,
+    );
     if !json_mode
         && let Some(message) =
             codex_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
@@ -911,11 +934,12 @@ where
 
 fn session_configured_from_thread_start_response(
     response: &ThreadStartResponse,
-) -> Result<SessionConfiguredEvent, String> {
+) -> Result<BootstrapSessionConfigured, String> {
     session_configured_from_thread_response(
         &response.thread.id,
         response.thread.name.clone(),
         response.thread.path.clone(),
+        Some(response.thread.mode),
         response.model.clone(),
         response.model_provider.clone(),
         response.service_tier,
@@ -929,11 +953,12 @@ fn session_configured_from_thread_start_response(
 
 fn session_configured_from_thread_resume_response(
     response: &ThreadResumeResponse,
-) -> Result<SessionConfiguredEvent, String> {
+) -> Result<BootstrapSessionConfigured, String> {
     session_configured_from_thread_response(
         &response.thread.id,
         response.thread.name.clone(),
         response.thread.path.clone(),
+        Some(response.thread.mode),
         response.model.clone(),
         response.model_provider.clone(),
         response.service_tier,
@@ -962,6 +987,7 @@ fn session_configured_from_thread_response(
     thread_id: &str,
     thread_name: Option<String>,
     rollout_path: Option<PathBuf>,
+    thread_mode: Option<ThreadMode>,
     model: String,
     model_provider_id: String,
     service_tier: Option<codex_protocol::config_types::ServiceTier>,
@@ -970,27 +996,30 @@ fn session_configured_from_thread_response(
     sandbox_policy: SandboxPolicy,
     cwd: PathBuf,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-) -> Result<SessionConfiguredEvent, String> {
+) -> Result<BootstrapSessionConfigured, String> {
     let session_id = codex_protocol::ThreadId::from_string(thread_id)
         .map_err(|err| format!("thread id `{thread_id}` is invalid: {err}"))?;
 
-    Ok(SessionConfiguredEvent {
-        session_id,
-        forked_from_id: None,
-        thread_name,
-        model,
-        model_provider_id,
-        service_tier,
-        approval_policy,
-        approvals_reviewer,
-        sandbox_policy,
-        cwd,
-        reasoning_effort,
-        history_log_id: 0,
-        history_entry_count: 0,
-        initial_messages: None,
-        network_proxy: None,
-        rollout_path,
+    Ok(BootstrapSessionConfigured {
+        session_configured: SessionConfiguredEvent {
+            session_id,
+            forked_from_id: None,
+            thread_name,
+            model,
+            model_provider_id,
+            service_tier,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            cwd,
+            reasoning_effort,
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path,
+        },
+        thread_mode,
     })
 }
 

@@ -857,6 +857,7 @@ mod tests {
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
@@ -1158,6 +1159,41 @@ mod tests {
             .await
             .expect("thread/read should return the newly started thread");
         assert_eq!(read.thread.id, response.thread.id);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn resident_thread_mode_is_preserved_through_typed_requests() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let response: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(5),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    resident: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(6),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: response.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the resident thread");
+        assert_eq!(read.thread.id, response.thread.id);
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
 
         client.shutdown().await.expect("shutdown should complete");
     }

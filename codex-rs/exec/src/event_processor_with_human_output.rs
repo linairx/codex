@@ -6,6 +6,7 @@ use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::config::Config;
@@ -214,10 +215,11 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         config: &Config,
         prompt: &str,
         session_configured_event: &SessionConfiguredEvent,
+        thread_mode: Option<ThreadMode>,
     ) {
         const VERSION: &str = env!("CARGO_PKG_VERSION");
         eprintln!("OpenAI Codex v{VERSION} (research preview)\n--------");
-        for (key, value) in config_summary_entries(config, session_configured_event) {
+        for (key, value) in config_summary_entries(config, session_configured_event, thread_mode) {
             eprintln!("{} {}", format!("{key}:").style(self.bold), value);
         }
         eprintln!("--------");
@@ -418,6 +420,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 fn config_summary_entries(
     config: &Config,
     session_configured_event: &SessionConfiguredEvent,
+    thread_mode: Option<ThreadMode>,
 ) -> Vec<(&'static str, String)> {
     let mut entries = vec![
         ("workdir", config.cwd.display().to_string()),
@@ -435,6 +438,12 @@ fn config_summary_entries(
             summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
         ),
     ];
+    if let Some(thread_mode) = thread_mode {
+        entries.push((
+            "session mode",
+            summarize_thread_mode(thread_mode).to_string(),
+        ));
+    }
     if config.model_provider.wire_api == WireApi::Responses {
         entries.push((
             "reasoning effort",
@@ -456,6 +465,13 @@ fn config_summary_entries(
         session_configured_event.session_id.to_string(),
     ));
     entries
+}
+
+fn summarize_thread_mode(thread_mode: ThreadMode) -> &'static str {
+    match thread_mode {
+        ThreadMode::Interactive => "interactive",
+        ThreadMode::ResidentAssistant => "resident assistant",
+    }
 }
 
 fn summarize_sandbox_policy(sandbox_policy: &SandboxPolicy) -> String {

@@ -11,6 +11,7 @@ use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::config::Config;
@@ -389,9 +390,13 @@ impl EventProcessorWithJsonOutput {
             })
     }
 
-    pub fn thread_started_event(session_configured: &SessionConfiguredEvent) -> ThreadEvent {
+    pub fn thread_started_event(
+        session_configured: &SessionConfiguredEvent,
+        thread_mode: Option<ThreadMode>,
+    ) -> ThreadEvent {
         ThreadEvent::ThreadStarted(ThreadStartedEvent {
             thread_id: session_configured.session_id.to_string(),
+            thread_mode,
         })
     }
 
@@ -591,8 +596,9 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         _: &Config,
         _: &str,
         session_configured: &SessionConfiguredEvent,
+        thread_mode: Option<ThreadMode>,
     ) {
-        self.emit(Self::thread_started_event(session_configured));
+        self.emit(Self::thread_started_event(session_configured, thread_mode));
     }
 
     fn process_server_notification(&mut self, notification: ServerNotification) -> CodexStatus {

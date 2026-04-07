@@ -20,7 +20,8 @@ This crate centralizes startup and lifecycle management for an in-process
 Callers pass both the app-server `SessionSource` and the initialize
 `client_info.name` explicitly when starting the facade.
 
-That keeps thread metadata (for example in `thread/list` and `thread/read`)
+That keeps thread metadata (for example in `thread/list` and `thread/read`,
+including `thread.mode` for resident assistant reconnect flows)
 aligned with the originating runtime without baking TUI/exec-specific policy
 into the shared client layer.
 
@@ -54,6 +55,9 @@ thread bootstrap still follows normal app-server flow:
 
 Surfaces such as TUI and exec may therefore need a short bootstrap
 phase where they reconcile startup response data with later events.
+Callers that need to distinguish ordinary resume from reconnect should
+consume `response.thread.mode` from the immediate typed response instead of
+waiting for later legacy events.
 
 ## Backpressure and shutdown
 

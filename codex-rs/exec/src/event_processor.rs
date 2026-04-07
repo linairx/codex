@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadMode;
 use codex_core::config::Config;
 use codex_protocol::protocol::SessionConfiguredEvent;
 
@@ -17,6 +18,7 @@ pub(crate) trait EventProcessor {
         config: &Config,
         prompt: &str,
         session_configured: &SessionConfiguredEvent,
+        thread_mode: Option<ThreadMode>,
     );
 
     /// Handle a single typed app-server notification emitted by the agent.
