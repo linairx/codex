@@ -34,6 +34,7 @@ use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
@@ -112,6 +113,7 @@ pub(crate) struct ThreadSessionState {
     pub(crate) thread_id: ThreadId,
     pub(crate) forked_from_id: Option<ThreadId>,
     pub(crate) thread_name: Option<String>,
+    pub(crate) thread_mode: Option<ThreadMode>,
     pub(crate) model: String,
     pub(crate) model_provider_id: String,
     pub(crate) service_tier: Option<codex_protocol::config_types::ServiceTier>,
@@ -973,6 +975,7 @@ async fn thread_session_state_from_thread_start_response(
         &response.thread.id,
         response.thread.forked_from_id.clone(),
         response.thread.name.clone(),
+        Some(response.thread.mode),
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
@@ -995,6 +998,7 @@ async fn thread_session_state_from_thread_resume_response(
         &response.thread.id,
         response.thread.forked_from_id.clone(),
         response.thread.name.clone(),
+        Some(response.thread.mode),
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
@@ -1017,6 +1021,7 @@ async fn thread_session_state_from_thread_fork_response(
         &response.thread.id,
         response.thread.forked_from_id.clone(),
         response.thread.name.clone(),
+        Some(response.thread.mode),
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
@@ -1058,6 +1063,7 @@ async fn thread_session_state_from_thread_response(
     thread_id: &str,
     forked_from_id: Option<String>,
     thread_name: Option<String>,
+    thread_mode: Option<ThreadMode>,
     rollout_path: Option<PathBuf>,
     model: String,
     model_provider_id: String,
@@ -1083,6 +1089,7 @@ async fn thread_session_state_from_thread_response(
         thread_id,
         forked_from_id,
         thread_name,
+        thread_mode,
         model,
         model_provider_id,
         service_tier,
@@ -1306,6 +1313,7 @@ mod tests {
             .await
             .expect("resume response should map");
         assert_eq!(started.session.forked_from_id, Some(forked_from_id));
+        assert_eq!(started.session.thread_mode, Some(ThreadMode::Interactive));
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
     }
@@ -1327,6 +1335,7 @@ mod tests {
             &thread_id.to_string(),
             /*forked_from_id*/ None,
             Some("restore".to_string()),
+            /*thread_mode*/ None,
             /*rollout_path*/ None,
             "gpt-5.4".to_string(),
             "openai".to_string(),
@@ -1343,6 +1352,7 @@ mod tests {
 
         assert_ne!(session.history_log_id, 0);
         assert_eq!(session.history_entry_count, 2);
+        assert_eq!(session.thread_mode, None);
     }
 
     #[tokio::test]
@@ -1356,6 +1366,7 @@ mod tests {
             &thread_id.to_string(),
             Some(forked_from_id.to_string()),
             Some("restore".to_string()),
+            /*thread_mode*/ None,
             /*rollout_path*/ None,
             "gpt-5.4".to_string(),
             "openai".to_string(),
@@ -1371,6 +1382,7 @@ mod tests {
         .expect("session should map");
 
         assert_eq!(session.forked_from_id, Some(forked_from_id));
+        assert_eq!(session.thread_mode, None);
     }
 
     #[test]

@@ -85,6 +85,7 @@ use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::Turn;
@@ -842,6 +843,7 @@ pub(crate) struct ChatWidget {
     suppress_queue_autosend: bool,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
+    thread_mode: Option<ThreadMode>,
     forked_from: Option<ThreadId>,
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
@@ -1938,6 +1940,7 @@ impl ChatWidget {
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
         self.thread_name = event.thread_name.clone();
+        self.thread_mode = None;
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
@@ -2041,7 +2044,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn handle_thread_session(&mut self, session: ThreadSessionState) {
+        let thread_mode = session.thread_mode;
         self.on_session_configured(thread_session_state_to_legacy_event(session));
+        self.thread_mode = thread_mode;
     }
 
     fn emit_forked_thread_event(&self, forked_from_id: ThreadId) {
@@ -4671,6 +4676,7 @@ impl ChatWidget {
             suppress_queue_autosend: false,
             thread_id: None,
             thread_name: None,
+            thread_mode: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
             rejected_steers_queue: VecDeque::new(),
@@ -7291,6 +7297,7 @@ impl ChatWidget {
             .map(|ti| &ti.total_token_usage)
             .unwrap_or(&default_usage);
         let collaboration_mode = self.collaboration_mode_label();
+        let thread_mode = self.thread_mode_label();
         let reasoning_effort_override = Some(self.effective_reasoning_effort());
         let rate_limit_snapshots: Vec<RateLimitSnapshotDisplay> = self
             .rate_limit_snapshots_by_limit_id
@@ -7304,6 +7311,7 @@ impl ChatWidget {
             total_usage,
             &self.thread_id,
             self.thread_name.clone(),
+            thread_mode,
             self.forked_from,
             rate_limit_snapshots.as_slice(),
             self.plan_type,
@@ -9724,6 +9732,13 @@ impl ChatWidget {
         active_mode
             .is_tui_visible()
             .then_some(active_mode.display_name())
+    }
+
+    fn thread_mode_label(&self) -> Option<&'static str> {
+        match self.thread_mode {
+            Some(ThreadMode::ResidentAssistant) => Some("Resident assistant"),
+            Some(ThreadMode::Interactive) | None => None,
+        }
     }
 
     fn collaboration_mode_indicator(&self) -> Option<CollaborationModeIndicator> {

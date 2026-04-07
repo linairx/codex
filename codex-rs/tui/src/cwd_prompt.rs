@@ -26,6 +26,7 @@ use tokio_stream::StreamExt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CwdPromptAction {
     Resume,
+    Reconnect,
     Fork,
 }
 
@@ -33,6 +34,7 @@ impl CwdPromptAction {
     fn verb(self) -> &'static str {
         match self {
             CwdPromptAction::Resume => "resume",
+            CwdPromptAction::Reconnect => "reconnect to",
             CwdPromptAction::Fork => "fork",
         }
     }
@@ -40,6 +42,7 @@ impl CwdPromptAction {
     fn past_participle(self) -> &'static str {
         match self {
             CwdPromptAction::Resume => "resumed",
+            CwdPromptAction::Reconnect => "resident assistant",
             CwdPromptAction::Fork => "forked",
         }
     }
@@ -290,6 +293,22 @@ mod tests {
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render cwd prompt");
         insta::assert_snapshot!("cwd_prompt_fork_modal", terminal.backend());
+    }
+
+    #[test]
+    fn cwd_prompt_reconnect_snapshot() {
+        let screen = CwdPromptScreen::new(
+            FrameRequester::test_dummy(),
+            CwdPromptAction::Reconnect,
+            "/Users/example/current".to_string(),
+            "/Users/example/session".to_string(),
+        );
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 80, /*height*/ 14)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
+            .expect("render cwd prompt");
+        insta::assert_snapshot!("cwd_prompt_reconnect_modal", terminal.backend());
     }
 
     #[test]

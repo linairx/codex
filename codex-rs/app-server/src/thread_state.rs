@@ -277,6 +277,23 @@ impl ThreadStateManager {
             .is_some_and(|thread_entry| thread_entry.resident)
     }
 
+    pub(crate) async fn resident_thread_ids(
+        &self,
+        thread_ids: &HashSet<ThreadId>,
+    ) -> HashSet<ThreadId> {
+        let state = self.state.lock().await;
+        thread_ids
+            .iter()
+            .filter(|thread_id| {
+                state
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|thread_entry| thread_entry.resident)
+            })
+            .copied()
+            .collect()
+    }
+
     pub(crate) async fn try_ensure_connection_subscribed(
         &self,
         thread_id: ThreadId,

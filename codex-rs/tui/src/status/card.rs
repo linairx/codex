@@ -103,6 +103,7 @@ struct StatusHistoryCell {
     model_provider: Option<String>,
     account: Option<StatusAccountDisplay>,
     thread_name: Option<String>,
+    thread_mode: Option<String>,
     session_id: Option<String>,
     forked_from: Option<String>,
     token_usage: StatusTokenUsageData,
@@ -118,6 +119,7 @@ pub(crate) fn new_status_output(
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
+    thread_mode: Option<&str>,
     forked_from: Option<ThreadId>,
     rate_limits: Option<&RateLimitSnapshotDisplay>,
     _plan_type: Option<PlanType>,
@@ -134,6 +136,7 @@ pub(crate) fn new_status_output(
         total_usage,
         session_id,
         thread_name,
+        thread_mode,
         forked_from,
         snapshots,
         _plan_type,
@@ -154,6 +157,7 @@ pub(crate) fn new_status_output_with_rate_limits(
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
+    thread_mode: Option<&str>,
     forked_from: Option<ThreadId>,
     rate_limits: &[RateLimitSnapshotDisplay],
     _plan_type: Option<PlanType>,
@@ -170,6 +174,7 @@ pub(crate) fn new_status_output_with_rate_limits(
         total_usage,
         session_id,
         thread_name,
+        thread_mode,
         forked_from,
         rate_limits,
         _plan_type,
@@ -190,6 +195,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
+    thread_mode: Option<&str>,
     forked_from: Option<ThreadId>,
     rate_limits: &[RateLimitSnapshotDisplay],
     _plan_type: Option<PlanType>,
@@ -207,6 +213,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
         total_usage,
         session_id,
         thread_name,
+        thread_mode,
         forked_from,
         rate_limits,
         _plan_type,
@@ -232,6 +239,7 @@ impl StatusHistoryCell {
         total_usage: &TokenUsage,
         session_id: &Option<ThreadId>,
         thread_name: Option<String>,
+        thread_mode: Option<&str>,
         forked_from: Option<ThreadId>,
         rate_limits: &[RateLimitSnapshotDisplay],
         _plan_type: Option<PlanType>,
@@ -345,6 +353,7 @@ impl StatusHistoryCell {
                 model_provider,
                 account,
                 thread_name,
+                thread_mode: thread_mode.map(ToString::to_string),
                 session_id,
                 forked_from,
                 token_usage,
@@ -574,6 +583,9 @@ impl HistoryCell for StatusHistoryCell {
         if thread_name.is_some() {
             push_label(&mut labels, &mut seen, "Thread name");
         }
+        if self.thread_mode.is_some() {
+            push_label(&mut labels, &mut seen, "Thread mode");
+        }
         if self.session_id.is_some() {
             push_label(&mut labels, &mut seen, "Session");
         }
@@ -633,6 +645,9 @@ impl HistoryCell for StatusHistoryCell {
 
         if let Some(thread_name) = thread_name {
             lines.push(formatter.line("Thread name", vec![Span::from(thread_name.to_string())]));
+        }
+        if let Some(thread_mode) = self.thread_mode.as_ref() {
+            lines.push(formatter.line("Thread mode", vec![Span::from(thread_mode.clone())]));
         }
         if let Some(collab_mode) = self.collaboration_mode.as_ref() {
             lines.push(formatter.line("Collaboration mode", vec![Span::from(collab_mode.clone())]));

@@ -80,6 +80,7 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
@@ -1056,6 +1057,13 @@ pub(crate) struct App {
     pending_app_server_requests: PendingAppServerRequests,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppServerThreadAttachKind {
+    Started,
+    Resumed,
+    Forked,
+}
+
 #[derive(Default)]
 struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
@@ -1090,6 +1098,27 @@ fn active_turn_not_steerable_turn_error(error: &TypedRequestError) -> Option<App
         Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable { .. })
     )
     .then_some(turn_error)
+}
+
+fn reconnect_notice_for_attach(
+    session: &ThreadSessionState,
+    attach_kind: AppServerThreadAttachKind,
+) -> Option<history_cell::PlainHistoryCell> {
+    match (attach_kind, session.thread_mode) {
+        (AppServerThreadAttachKind::Resumed, Some(ThreadMode::ResidentAssistant)) => Some(
+            history_cell::new_resident_thread_reconnected(session.thread_name.as_deref()),
+        ),
+        _ => None,
+    }
+}
+
+fn cwd_prompt_action_for_session_selection(
+    target_session: &crate::resume_picker::SessionTarget,
+) -> CwdPromptAction {
+    match target_session.mode {
+        Some(ThreadMode::ResidentAssistant) => CwdPromptAction::Reconnect,
+        Some(ThreadMode::Interactive) | None => CwdPromptAction::Resume,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2653,6 +2682,7 @@ impl App {
         let mut session = self.primary_session_configured.clone()?;
         session.thread_id = thread_id;
         session.thread_name = notification.thread.name.clone();
+        session.thread_mode = Some(notification.thread.mode);
         session.model_provider_id = notification.thread.model_provider.clone();
         session.cwd = notification.thread.cwd.clone();
         let rollout_path = notification.thread.path.clone();
@@ -3121,6 +3151,7 @@ impl App {
                 thread_id,
                 forked_from_id: None,
                 thread_name: None,
+                thread_mode: None,
                 model: self.chat_widget.current_model().to_string(),
                 model_provider_id: self.config.model_provider_id.clone(),
                 service_tier: self.chat_widget.current_service_tier(),
@@ -3136,6 +3167,7 @@ impl App {
             });
         session.thread_id = thread_id;
         session.thread_name = thread.name.clone();
+        session.thread_mode = Some(thread.mode);
         session.model_provider_id = thread.model_provider.clone();
         session.cwd = thread.cwd.clone();
         session.rollout_path = thread.path.clone();
@@ -3400,7 +3432,12 @@ impl App {
         match app_server.start_thread(&config).await {
             Ok(started) => {
                 if let Err(err) = self
-                    .replace_chat_widget_with_app_server_thread(tui, app_server, started)
+                    .replace_chat_widget_with_app_server_thread(
+                        tui,
+                        app_server,
+                        started,
+                        AppServerThreadAttachKind::Started,
+                    )
                     .await
                 {
                     self.chat_widget.add_error_message(format!(
@@ -3430,12 +3467,17 @@ impl App {
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
         started: AppServerStartedThread,
+        attach_kind: AppServerThreadAttachKind,
     ) -> Result<()> {
+        let reconnect_notice = reconnect_notice_for_attach(&started.session, attach_kind);
         self.reset_thread_event_state();
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
         self.enqueue_primary_thread_session(started.session, started.turns)
             .await?;
+        if let Some(notice) = reconnect_notice {
+            self.chat_widget.add_to_history(notice);
+        }
         self.backfill_loaded_subagent_threads(app_server).await;
         Ok(())
     }
@@ -3763,7 +3805,10 @@ impl App {
                     .await
                     .wrap_err_with(|| {
                         let target_label = target_session.display_label();
-                        format!("Failed to resume session from {target_label}")
+                        format!(
+                            "Failed to {} session from {target_label}",
+                            target_session.attach_verb()
+                        )
                     })?;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
@@ -4155,7 +4200,7 @@ impl App {
                                 &current_cwd,
                                 target_session.thread_id,
                                 target_session.path.as_deref(),
-                                CwdPromptAction::Resume,
+                                cwd_prompt_action_for_session_selection(&target_session),
                                 /*allow_prompt*/ true,
                             )
                             .await?
@@ -4197,7 +4242,10 @@ impl App {
                                     .update_search_dir(self.config.cwd.to_path_buf());
                                 match self
                                     .replace_chat_widget_with_app_server_thread(
-                                        tui, app_server, resumed,
+                                        tui,
+                                        app_server,
+                                        resumed,
+                                        AppServerThreadAttachKind::Resumed,
                                     )
                                     .await
                                 {
@@ -4225,7 +4273,8 @@ impl App {
                             Err(err) => {
                                 let path_display = target_session.display_label();
                                 self.chat_widget.add_error_message(format!(
-                                    "Failed to resume session from {path_display}: {err}"
+                                    "Failed to {} session from {path_display}: {err}",
+                                    target_session.attach_verb()
                                 ));
                             }
                         }
@@ -4258,7 +4307,12 @@ impl App {
                         Ok(forked) => {
                             self.shutdown_current_thread(app_server).await;
                             match self
-                                .replace_chat_widget_with_app_server_thread(tui, app_server, forked)
+                                .replace_chat_widget_with_app_server_thread(
+                                    tui,
+                                    app_server,
+                                    forked,
+                                    AppServerThreadAttachKind::Forked,
+                                )
                                 .await
                             {
                                 Ok(()) => {
@@ -6392,6 +6446,7 @@ mod tests {
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadClosedNotification;
     use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStartedNotification;
     use codex_app_server_protocol::ThreadTokenUsage;
     use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -6549,6 +6604,7 @@ mod tests {
                 crate::resume_picker::SessionTarget {
                     path: Some(PathBuf::from("/tmp/restore")),
                     thread_id: ThreadId::new(),
+                    mode: None,
                 }
             )),
             false
@@ -6558,6 +6614,7 @@ mod tests {
                 crate::resume_picker::SessionTarget {
                     path: Some(PathBuf::from("/tmp/fork")),
                     thread_id: ThreadId::new(),
+                    mode: None,
                 }
             )),
             false
@@ -6607,6 +6664,7 @@ mod tests {
             crate::resume_picker::SessionTarget {
                 path: Some(PathBuf::from("/tmp/restore")),
                 thread_id: ThreadId::new(),
+                mode: None,
             },
         ));
         assert_eq!(
@@ -6620,6 +6678,7 @@ mod tests {
             crate::resume_picker::SessionTarget {
                 path: Some(PathBuf::from("/tmp/fork")),
                 thread_id: ThreadId::new(),
+                mode: None,
             },
         ));
         assert_eq!(
@@ -9771,6 +9830,7 @@ guardian_approval = true
             thread_id,
             forked_from_id: None,
             thread_name: None,
+            thread_mode: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
             service_tier: None,
@@ -9784,6 +9844,76 @@ guardian_approval = true
             network_proxy: None,
             rollout_path: Some(PathBuf::new()),
         }
+    }
+
+    #[test]
+    fn resident_resume_attach_generates_reconnect_notice() {
+        let session = ThreadSessionState {
+            thread_name: Some("Atlas".to_string()),
+            thread_mode: Some(ThreadMode::ResidentAssistant),
+            ..test_thread_session(ThreadId::new(), PathBuf::from("/tmp/project"))
+        };
+
+        let notice = reconnect_notice_for_attach(&session, AppServerThreadAttachKind::Resumed)
+            .expect("resident resume should produce reconnect notice");
+        let rendered = notice
+            .display_lines(/*width*/ 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec!["• Reconnected to resident assistant thread Atlas.".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconnect_notice_is_resume_only_for_resident_threads() {
+        let resident_session = ThreadSessionState {
+            thread_mode: Some(ThreadMode::ResidentAssistant),
+            ..test_thread_session(ThreadId::new(), PathBuf::from("/tmp/project"))
+        };
+        let interactive_session = ThreadSessionState {
+            thread_mode: Some(ThreadMode::Interactive),
+            ..test_thread_session(ThreadId::new(), PathBuf::from("/tmp/project"))
+        };
+
+        assert!(
+            reconnect_notice_for_attach(&resident_session, AppServerThreadAttachKind::Started)
+                .is_none()
+        );
+        assert!(
+            reconnect_notice_for_attach(&resident_session, AppServerThreadAttachKind::Forked)
+                .is_none()
+        );
+        assert!(
+            reconnect_notice_for_attach(&interactive_session, AppServerThreadAttachKind::Resumed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resident_session_selection_uses_reconnect_cwd_prompt_action() {
+        let resident_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+        };
+        let interactive_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::Interactive),
+        };
+
+        assert_eq!(
+            cwd_prompt_action_for_session_selection(&resident_target),
+            CwdPromptAction::Reconnect
+        );
+        assert_eq!(
+            cwd_prompt_action_for_session_selection(&interactive_target),
+            CwdPromptAction::Resume
+        );
     }
 
     fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn {

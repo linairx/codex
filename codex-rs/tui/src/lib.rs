@@ -18,6 +18,7 @@ use codex_app_server_protocol::AuthMode as AppServerAuthMode;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
@@ -457,6 +458,7 @@ fn session_target_from_app_server_thread(
         Ok(thread_id) => Some(resume_picker::SessionTarget {
             path: thread.path,
             thread_id,
+            mode: Some(thread.mode),
         }),
         Err(err) => {
             warn!(
@@ -1282,9 +1284,13 @@ async fn run_ratatui_app(
     let current_cwd = config.cwd.clone();
     let allow_prompt = !remote_mode && cli.cwd.is_none();
     let action_and_target_session_if_resume_or_fork = match &session_selection {
-        resume_picker::SessionSelection::Resume(target_session) => {
-            Some((CwdPromptAction::Resume, target_session))
-        }
+        resume_picker::SessionSelection::Resume(target_session) => Some((
+            match target_session.mode {
+                Some(ThreadMode::ResidentAssistant) => CwdPromptAction::Reconnect,
+                Some(ThreadMode::Interactive) | None => CwdPromptAction::Resume,
+            },
+            target_session,
+        )),
         resume_picker::SessionSelection::Fork(target_session) => {
             Some((CwdPromptAction::Fork, target_session))
         }
@@ -1738,6 +1744,7 @@ mod tests {
         let target = crate::resume_picker::SessionTarget {
             path: None,
             thread_id,
+            mode: None,
         };
 
         assert_eq!(target.display_label(), format!("thread {thread_id}"));

@@ -1210,6 +1210,19 @@ pub(crate) fn new_session_info(
     SessionInfoCell(CompositeHistoryCell { parts })
 }
 
+pub(crate) fn new_resident_thread_reconnected(thread_name: Option<&str>) -> PlainHistoryCell {
+    let mut spans: Vec<Span<'static>> = vec![
+        "• ".dim(),
+        "Reconnected to resident assistant thread".into(),
+    ];
+    if let Some(thread_name) = thread_name.filter(|thread_name| !thread_name.trim().is_empty()) {
+        spans.push(" ".into());
+        spans.push(thread_name.to_string().cyan());
+    }
+    spans.push(".".into());
+    PlainHistoryCell::new(vec![Line::from(spans)])
+}
+
 pub(crate) fn new_user_prompt(
     message: String,
     text_elements: Vec<TextElement>,
@@ -3097,6 +3110,13 @@ mod tests {
         );
 
         let rendered = render_transcript(&cell).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn resident_thread_reconnected_snapshot() {
+        let cell = new_resident_thread_reconnected(Some("Atlas"));
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
         insta::assert_snapshot!(rendered);
     }
 

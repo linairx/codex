@@ -243,6 +243,7 @@ pub(super) async fn make_chatwidget_manual(
         suppress_queue_autosend: false,
         thread_id: None,
         thread_name: None,
+        thread_mode: None,
         forked_from: None,
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,

@@ -12,6 +12,9 @@ use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadLoadedReadResponse;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -404,6 +407,113 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
         Some(false),
         "thread/resume must serialize `thread.ephemeral` on the wire"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resident_thread_mode_is_consistent_across_read_surfaces() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "materialize".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include the resident thread");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+    let loaded_read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+        .await?;
+    let loaded_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_read_id)),
+    )
+    .await??;
+    let ThreadLoadedReadResponse { data, .. } =
+        to_response::<ThreadLoadedReadResponse>(loaded_read_resp)?;
+    let loaded_thread = data
+        .iter()
+        .find(|loaded_thread| loaded_thread.id == thread.id)
+        .expect("thread/loaded/read should include the resident thread");
+    assert!(loaded_thread.resident);
+    assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
 
     Ok(())
 }

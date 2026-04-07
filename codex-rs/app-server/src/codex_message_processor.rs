@@ -3464,17 +3464,22 @@ impl CodexMessageProcessor {
             .thread_watch_manager
             .loaded_statuses_for_threads(status_ids)
             .await;
+        let resident_thread_ids = self
+            .thread_state_manager
+            .resident_thread_ids(&thread_ids)
+            .await;
 
-        let data = threads
-            .into_iter()
-            .map(|(conversation_id, mut thread)| {
-                thread.name = names.get(&conversation_id).cloned();
-                if let Some(status) = statuses.get(&thread.id) {
-                    thread.status = status.clone();
-                }
-                thread
-            })
-            .collect();
+        let mut data = Vec::with_capacity(threads.len());
+        for (conversation_id, mut thread) in threads {
+            thread.name = names.get(&conversation_id).cloned();
+            if let Some(status) = statuses.get(&thread.id) {
+                thread.status = status.clone();
+            }
+            if resident_thread_ids.contains(&conversation_id) {
+                set_thread_resident_and_mode(&mut thread, /*resident*/ true);
+            }
+            data.push(thread);
+        }
         let response = ThreadListResponse { data, next_cursor };
         self.outgoing.send_response(request_id, response).await;
     }

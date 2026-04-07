@@ -53,6 +53,7 @@ const LOAD_NEAR_THRESHOLD: usize = 5;
 pub struct SessionTarget {
     pub path: Option<PathBuf>,
     pub thread_id: ThreadId,
+    pub mode: Option<ThreadMode>,
 }
 
 impl SessionTarget {
@@ -61,6 +62,13 @@ impl SessionTarget {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| format!("thread {}", self.thread_id))
+    }
+
+    pub fn attach_verb(&self) -> &'static str {
+        match self.mode {
+            Some(ThreadMode::ResidentAssistant) => "reconnect to",
+            Some(ThreadMode::Interactive) | None => "resume",
+        }
     }
 }
 
@@ -86,15 +94,27 @@ impl SessionPickerAction {
         }
     }
 
-    fn action_label(self) -> &'static str {
+    fn action_label(self, selected_mode: Option<ThreadMode>) -> &'static str {
         match self {
-            SessionPickerAction::Resume => "resume",
+            SessionPickerAction::Resume => match selected_mode {
+                Some(ThreadMode::ResidentAssistant) => "reconnect",
+                Some(ThreadMode::Interactive) | None => "resume",
+            },
             SessionPickerAction::Fork => "fork",
         }
     }
 
-    fn selection(self, path: Option<PathBuf>, thread_id: ThreadId) -> SessionSelection {
-        let target_session = SessionTarget { path, thread_id };
+    fn selection(
+        self,
+        path: Option<PathBuf>,
+        thread_id: ThreadId,
+        mode: Option<ThreadMode>,
+    ) -> SessionSelection {
+        let target_session = SessionTarget {
+            path,
+            thread_id,
+            mode,
+        };
         match self {
             SessionPickerAction::Resume => SessionSelection::Resume(target_session),
             SessionPickerAction::Fork => SessionSelection::Fork(target_session),
@@ -644,7 +664,7 @@ impl PickerState {
                         },
                     };
                     if let Some(thread_id) = thread_id {
-                        return Ok(Some(self.action.selection(path, thread_id)));
+                        return Ok(Some(self.action.selection(path, thread_id, Some(row.mode))));
                     }
                     self.inline_error = Some(match path {
                         Some(path) => {
@@ -1243,28 +1263,36 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         render_list(frame, list, state, &metrics);
 
         // Hint line
-        let action_label = state.action.action_label();
-        let hint_line: Line = vec![
-            key_hint::plain(KeyCode::Enter).into(),
-            format!(" to {action_label} ").dim(),
-            "    ".dim(),
-            key_hint::plain(KeyCode::Esc).into(),
-            " to start new ".dim(),
-            "    ".dim(),
-            key_hint::ctrl(KeyCode::Char('c')).into(),
-            " to quit ".dim(),
-            "    ".dim(),
-            key_hint::plain(KeyCode::Tab).into(),
-            " to toggle sort ".dim(),
-            "    ".dim(),
-            key_hint::plain(KeyCode::Up).into(),
-            "/".dim(),
-            key_hint::plain(KeyCode::Down).into(),
-            " to browse".dim(),
-        ]
-        .into();
+        let hint_line = picker_hint_line(state);
         frame.render_widget_ref(hint_line, hint);
     })
+}
+
+fn picker_hint_line(state: &PickerState) -> Line<'_> {
+    let action_label = state
+        .filtered_rows
+        .get(state.selected)
+        .map(|row| state.action.action_label(Some(row.mode)))
+        .unwrap_or_else(|| state.action.action_label(None));
+    vec![
+        key_hint::plain(KeyCode::Enter).into(),
+        format!(" to {action_label} ").dim(),
+        "    ".dim(),
+        key_hint::plain(KeyCode::Esc).into(),
+        " to start new ".dim(),
+        "    ".dim(),
+        key_hint::ctrl(KeyCode::Char('c')).into(),
+        " to quit ".dim(),
+        "    ".dim(),
+        key_hint::plain(KeyCode::Tab).into(),
+        " to toggle sort ".dim(),
+        "    ".dim(),
+        key_hint::plain(KeyCode::Up).into(),
+        "/".dim(),
+        key_hint::plain(KeyCode::Down).into(),
+        " to browse".dim(),
+    ]
+    .into()
 }
 
 fn search_line(state: &PickerState) -> Line<'_> {
@@ -2198,6 +2226,53 @@ mod tests {
         assert_snapshot!("resume_picker_search_error", snapshot);
     }
 
+    #[test]
+    fn resume_picker_hint_uses_reconnect_for_resident_threads() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Investigate resident thread watcher drift"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Remote active thread")),
+            mode: ThreadMode::ResidentAssistant,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+
+        let width: u16 = 90;
+        let height: u16 = 1;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            let line = picker_hint_line(&state);
+            frame.render_widget_ref(line, frame.area());
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("resume_picker_resident_reconnect_hint", snapshot);
+    }
+
     // TODO(jif) fix
     // #[tokio::test]
     // async fn resume_picker_screen_snapshot() {
@@ -2837,9 +2912,22 @@ mod tests {
             Some(SessionSelection::Resume(SessionTarget {
                 path: None,
                 thread_id: selected_thread_id,
+                mode: Some(ThreadMode::Interactive),
             })) => assert_eq!(selected_thread_id, thread_id),
             other => panic!("unexpected selection: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_action_label_switches_to_reconnect_for_resident_threads() {
+        assert_eq!(
+            SessionPickerAction::Resume.action_label(Some(ThreadMode::ResidentAssistant)),
+            "reconnect"
+        );
+        assert_eq!(
+            SessionPickerAction::Resume.action_label(Some(ThreadMode::Interactive)),
+            "resume"
+        );
     }
 
     #[test]

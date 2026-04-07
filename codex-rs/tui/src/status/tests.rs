@@ -151,6 +151,7 @@ async fn status_snapshot_includes_reasoning_details() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -208,6 +209,7 @@ async fn status_permissions_non_default_workspace_write_is_custom() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         /*rate_limits*/ None,
         None,
@@ -270,6 +272,7 @@ async fn status_snapshot_includes_forked_from() {
         &usage,
         &Some(session_id),
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         Some(forked_from),
         /*rate_limits*/ None,
         None,
@@ -286,6 +289,49 @@ async fn status_snapshot_includes_forked_from() {
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
     assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_includes_resident_thread_mode() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.cwd = PathBuf::from("/workspace/tests").abs();
+
+    let usage = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 2,
+        total_tokens: 12,
+        ..Default::default()
+    };
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output(
+        &config,
+        /*account_display*/ None,
+        /*token_info*/ None,
+        &usage,
+        &None,
+        /*thread_name*/ Some("Long-lived helper".to_string()),
+        /*thread_mode*/ Some("Resident assistant"),
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+    );
+    let rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
+    assert!(
+        rendered_lines
+            .iter()
+            .any(|line| { line.contains("Thread mode:") && line.contains("Resident assistant") }),
+        "expected resident thread mode line, got: {rendered_lines:?}"
+    );
 }
 
 #[tokio::test]
@@ -332,6 +378,7 @@ async fn status_snapshot_includes_monthly_limit() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -382,6 +429,7 @@ async fn status_snapshot_shows_unlimited_credits() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -431,6 +479,7 @@ async fn status_snapshot_shows_positive_credits() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -480,6 +529,7 @@ async fn status_snapshot_hides_zero_credits() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -527,6 +577,7 @@ async fn status_snapshot_hides_when_has_no_credits_flag() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -572,6 +623,7 @@ async fn status_card_token_usage_excludes_cached_tokens() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         /*rate_limits*/ None,
         None,
@@ -634,6 +686,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -683,6 +736,7 @@ async fn status_snapshot_shows_missing_limits_message() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         /*rate_limits*/ None,
         None,
@@ -746,6 +800,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         std::slice::from_ref(&rate_display),
         None,
@@ -816,6 +871,7 @@ async fn status_snapshot_includes_credits_and_limits() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -873,6 +929,7 @@ async fn status_snapshot_shows_empty_limits_message() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -939,6 +996,7 @@ async fn status_snapshot_shows_stale_limits_message() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -1009,6 +1067,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
         &usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         Some(&rate_display),
         None,
@@ -1067,6 +1126,7 @@ async fn status_context_window_uses_last_usage() {
         &total_usage,
         &None,
         /*thread_name*/ None,
+        /*thread_mode*/ None,
         /*forked_from*/ None,
         /*rate_limits*/ None,
         None,
