@@ -209,6 +209,10 @@
 - 已开始第一步消费，resume picker 会对长期线程显示独立模式标记
 - `Thread.mode` 已透传到 TUI 会话状态，并在 `/status` 中显示线程模式
 - `codex-tui` 也已补上会话映射层回归：`thread/start`、`thread/resume`、`thread/fork` 返回的 resident `Thread.mode` 都会稳定落进 `ThreadSessionState`
+- `ThreadStartedNotification` 的通知路径也已补上 resident 模式回归，确保后台线程事件推断出的 session 不会把 resident assistant 降回 interactive
+- TUI 启动前的 session lookup 路径也已补上 resident 模式回归：按名称恢复历史线程时，`SessionTarget.mode` 会稳定保留 `ResidentAssistant`
+- latest-session / `--resume --last` 路径也已补上 resident 模式回归，确保最近会话选择不会把 resident assistant 降回普通 resume 目标
+- 按线程 ID 的 lookup / `thread/read` 路径也已补上 resident 模式回归，确保直接按会话 ID 恢复时同样稳定保留 `ResidentAssistant`
 - resident assistant 在线程恢复后会追加“重新连接”提示，不再只表现成普通历史恢复
 - TUI 已开始补齐更多恢复入口的语义一致性，例如新线程切换、fork 后摘要提示以及线程改名确认提示，都已按 `Thread.mode` 区分“continue”与“reconnect”
 - `/resume` 的命令入口说明也已开始从“历史恢复”语义扩成同时覆盖 resident assistant 的 reconnect 语义
@@ -243,6 +247,7 @@
 - resident thread 在 shutdown 时会主动清理工作区 watch，避免 watcher 生命周期长于线程生命周期
 - `workspaceChanged` 已限制为只更新已加载线程，避免 shutdown 之后被陈旧 watcher 事件重新激活线程状态
 - resident thread 在最后一个订阅者断开后的 reconnect / `thread/resume` 会保留既有 `workspaceChanged` 与 resident 模式，不再回退成普通 interactive 线程
+- resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `mode = residentAssistant`，`thread/loaded/read` 里该线程也会继续保持 `mode = residentAssistant` 且 `status = idle`
 - 下一次 turn 完成后会按既有状态机清理 `workspaceChanged`，避免脏标记长期滞留
 
 不要混入：

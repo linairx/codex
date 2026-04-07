@@ -13,8 +13,12 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -175,6 +179,16 @@ async fn thread_unsubscribe_keeps_resident_thread_loaded() -> Result<()> {
     let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
 
+    let closed = timeout(
+        std::time::Duration::from_millis(200),
+        mcp.read_stream_until_notification_message("thread/closed"),
+    )
+    .await;
+    assert!(
+        closed.is_err(),
+        "resident unsubscribe should not emit thread/closed"
+    );
+
     let list_id = mcp
         .send_thread_loaded_list_request(ThreadLoadedListParams::default())
         .await?;
@@ -187,6 +201,50 @@ async fn thread_unsubscribe_keeps_resident_thread_loaded() -> Result<()> {
         to_response::<ThreadLoadedListResponse>(list_resp)?;
     assert_eq!(data, vec![thread.id.clone()]);
     assert_eq!(next_cursor, None);
+
+    let loaded_read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+        .await?;
+    let loaded_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_read_id)),
+    )
+    .await??;
+    let ThreadLoadedReadResponse { data, .. } =
+        to_response::<ThreadLoadedReadResponse>(loaded_read_resp)?;
+    let loaded_thread = data
+        .into_iter()
+        .find(|loaded_thread| loaded_thread.id == thread.id)
+        .expect("thread/loaded/read should include resident thread after unsubscribe");
+    assert!(loaded_thread.resident);
+    assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(loaded_thread.status, ThreadStatus::Idle);
+
+    let thread_list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let thread_list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(thread_list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include resident thread after unsubscribe");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(listed_thread.status, ThreadStatus::Idle);
 
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {
@@ -203,6 +261,7 @@ async fn thread_unsubscribe_keeps_resident_thread_loaded() -> Result<()> {
         thread: read_thread,
     } = to_response::<ThreadReadResponse>(read_resp)?;
     assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
     assert_eq!(read_thread.status, ThreadStatus::Idle);
 
     Ok(())

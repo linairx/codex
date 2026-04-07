@@ -1001,7 +1001,8 @@ SQLite 在这里不是起点，而是收敛点。
 - `codex-state` 的 `set_thread_mode` 也已补上“缺失线程不建垃圾行”的回归覆盖，确保模式修复逻辑不会把未物化线程提前写入 SQLite
 - `thread_status.rs` 已开始收敛 watcher 生命周期，shutdown 会主动清理 resident thread 的工作区 watch
 - `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
-- `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射也已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
+- resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `ResidentAssistant`，`thread/loaded/read` 也会继续把该线程暴露为 `ResidentAssistant + Idle`
+- `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射、`ThreadStartedNotification` 进入 TUI 后的 resident 会话推断路径，以及启动前按名称 lookup、latest-session 选择和按线程 ID 的 `thread/read` 路径对 resident `SessionTarget.mode` 的保留，也都已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。

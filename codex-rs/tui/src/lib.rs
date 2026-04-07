@@ -2009,6 +2009,7 @@ mod tests {
         let mut metadata = builder.build(config.model_provider_id.as_str());
         metadata.title = "Different rollout title".to_string();
         metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
         state_runtime
             .upsert_thread(&metadata)
             .await
@@ -2025,6 +2026,133 @@ mod tests {
         let target = target.expect("name lookup should find the saved thread");
         assert_eq!(target.path, Some(rollout_path));
         assert_eq!(target.thread_id, thread_id);
+        assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_session_lookup_preserves_resident_thread_mode() -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/02")
+            .join(format!("rollout-2025-02-02T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir)?;
+        std::fs::write(&rollout_path, "")?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-02T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Cli,
+        );
+        builder.cwd = session_cwd.clone();
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Resident latest thread".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config.clone()).await?,
+            ));
+        let target = lookup_latest_session_target_with_app_server(
+            &mut app_server,
+            &config,
+            Some(session_cwd.as_path()),
+            /*include_non_interactive*/ false,
+        )
+        .await?;
+        let target = target.expect("latest lookup should find the saved thread");
+        assert_eq!(target.path, Some(rollout_path));
+        assert_eq!(target.thread_id, thread_id);
+        assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_session_target_by_id_preserves_resident_thread_mode() -> color_eyre::Result<()>
+    {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/03")
+            .join(format!("rollout-2025-02-03T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir)?;
+        std::fs::write(&rollout_path, "")?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-03T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Cli,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Resident thread by id".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config).await?,
+            ));
+        let target =
+            lookup_session_target_with_app_server(&mut app_server, &thread_id.to_string()).await?;
+        let target = target.expect("id lookup should find the saved thread");
+        assert_eq!(target.path, Some(rollout_path));
+        assert_eq!(target.thread_id, thread_id);
+        assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
 
         app_server.shutdown().await?;
         Ok(())
