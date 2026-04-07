@@ -1674,7 +1674,9 @@ impl App {
     }
 
     async fn clear_active_thread(&mut self) {
-        if let Some(active_id) = self.active_thread_id.take() {
+        let active_id = self.current_displayed_thread_id();
+        self.active_thread_id = None;
+        if let Some(active_id) = active_id {
             self.set_thread_active(active_id, /*active*/ false).await;
         }
         self.active_thread_rx = None;
@@ -1693,7 +1695,7 @@ impl App {
         if !ThreadEventStore::op_can_change_pending_replay_state(op) {
             return;
         }
-        let Some(thread_id) = self.active_thread_id else {
+        let Some(thread_id) = self.current_displayed_thread_id() else {
             return;
         };
         self.note_thread_outbound_op(thread_id, op).await;
@@ -5794,7 +5796,7 @@ impl App {
             &event,
             ThreadBufferedEvent::Notification(ServerNotification::ThreadClosed(_))
         ) && self.pending_shutdown_exit_thread_id
-            == self.active_thread_id;
+            == self.current_displayed_thread_id();
 
         // Processing order matters:
         //
@@ -6359,6 +6361,7 @@ mod tests {
     use crate::history_cell::new_session_info;
     use crate::multi_agents::AgentPickerThreadEntry;
     use assert_matches::assert_matches;
+    use codex_protocol::protocol::ReviewDecision;
 
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
@@ -11567,6 +11570,107 @@ guardian_approval = true
             control,
             AppRunControl::Exit(ExitReason::UserRequested)
         ));
+    }
+
+    #[tokio::test]
+    async fn active_thread_closed_event_clears_pending_shutdown_for_displayed_thread_during_switch()
+    -> Result<()> {
+        use crate::custom_terminal::Terminal;
+        use ratatui::backend::CrosstermBackend;
+        use std::io::stdout;
+
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.active_thread_id = None;
+        app.pending_shutdown_exit_thread_id = Some(thread_id);
+        app.chat_widget
+            .handle_thread_session(test_thread_session(thread_id, PathBuf::from("/tmp/agent")));
+
+        let terminal = Terminal::with_options(CrosstermBackend::new(stdout())).expect("terminal");
+        let mut tui = crate::tui::Tui::new(terminal);
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        app.handle_active_thread_event(
+            &mut tui,
+            &mut app_server,
+            ThreadBufferedEvent::Notification(thread_closed_notification(thread_id)),
+        )
+        .await?;
+
+        assert_eq!(app.pending_shutdown_exit_thread_id, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn note_active_thread_outbound_op_uses_current_displayed_thread_during_switch() {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(/*capacity*/ 8));
+        app.chat_widget
+            .handle_thread_session(test_thread_session(thread_id, PathBuf::from("/tmp/agent")));
+        app.active_thread_id = None;
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get_mut(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.push_request(exec_approval_request(
+                thread_id,
+                "turn-approval",
+                "call-approval",
+                /*approval_id*/ None,
+            ));
+            assert!(store.has_pending_thread_approvals());
+        }
+
+        app.note_active_thread_outbound_op(&AppCommand::exec_approval(
+            "call-approval".to_string(),
+            Some("turn-approval".to_string()),
+            ReviewDecision::Approved,
+        ))
+        .await;
+
+        let channel = app
+            .thread_event_channels
+            .get_mut(&thread_id)
+            .expect("thread channel should still exist");
+        let store = channel.store.lock().await;
+        assert!(!store.has_pending_thread_approvals());
+    }
+
+    #[tokio::test]
+    async fn clear_active_thread_marks_displayed_thread_inactive_during_switch() {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(/*capacity*/ 8));
+        app.chat_widget
+            .handle_thread_session(test_thread_session(thread_id, PathBuf::from("/tmp/agent")));
+        app.active_thread_id = None;
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get_mut(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.active = true;
+        }
+
+        app.clear_active_thread().await;
+
+        let channel = app
+            .thread_event_channels
+            .get_mut(&thread_id)
+            .expect("thread channel should still exist");
+        let store = channel.store.lock().await;
+        assert!(!store.active);
     }
 
     #[tokio::test]
