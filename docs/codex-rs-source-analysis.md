@@ -1012,6 +1012,10 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
 - `app-server/README.md` 顶部 lifecycle overview 的总览入口也已补上 reconnect 语义，不再在首屏继续把 `thread/resume` 描述成单纯的普通历史恢复
 - `thread_status.rs` 也已补上 resident workspace watch 迁移/清理回归：同一线程切换 `cwd` 后旧工作区变化不会再重新激活 `workspaceChanged`，切回非 resident 后也会移除 watch，避免 observer 状态被陈旧目录继续污染
+- `thread/unarchive` 也已开始复用 SQLite 稳定元数据来组响应：resident 线程反归档后不再因为只读 rollout 摘要而回退成 `interactive`，`thread/unarchive`、后续 `thread/read` 与 `thread/list` 都会继续保持 `ResidentAssistant`
+- resident thread 的归档读取面也已补上回归：进入 archived 状态后，`thread/read` 与 `thread/list archived=true` 仍会稳定保留 `ResidentAssistant`，不会因为只走 SQLite 摘要路径就掉回普通 interactive 线程
+- `thread/metadata/update` 的 resident 回归也已继续扩到 stored + archived 面：未加载 resident thread 走纯 SQLite 稳定元数据路径时，更新响应与后续 `thread/read` / `thread/list` 会继续保持 `ResidentAssistant`；loaded resident thread 在修补元数据行后也不会因为 fallback bootstrap 路径丢掉 `ResidentAssistant`；已归档 resident thread 更新 git metadata 时，响应与后续 `thread/read` / `thread/list archived=true` 同样会继续保持 `ResidentAssistant`
+- `codex-state` 的 SQLite 边界测试也已继续补强：`update_thread_git_info` 在 resident thread 上不会意外覆盖 `threads.mode`，避免元数据补丁把已持久化的 `ResidentAssistant` 降回 interactive
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 

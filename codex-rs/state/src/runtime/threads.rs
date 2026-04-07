@@ -1274,6 +1274,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_thread_git_info_preserves_resident_assistant_mode() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000792").expect("valid thread id");
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("initial upsert should succeed");
+        runtime
+            .set_thread_mode(thread_id, "residentAssistant")
+            .await
+            .expect("set_thread_mode should succeed");
+
+        let updated = runtime
+            .update_thread_git_info(
+                thread_id,
+                Some(Some("abc123")),
+                Some(Some("feature/resident-branch")),
+                /*git_origin_url*/ None,
+            )
+            .await
+            .expect("git info update should succeed");
+        assert!(updated, "git info update should touch the thread row");
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("thread should load")
+            .expect("thread should exist");
+        assert_eq!(persisted.mode, "residentAssistant");
+        assert!(persisted.is_resident_assistant());
+        assert_eq!(persisted.git_sha.as_deref(), Some("abc123"));
+        assert_eq!(
+            persisted.git_branch.as_deref(),
+            Some("feature/resident-branch")
+        );
+        assert_eq!(persisted.git_origin_url, None);
+    }
+
+    #[tokio::test]
     async fn touch_thread_updated_at_updates_only_updated_at() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())

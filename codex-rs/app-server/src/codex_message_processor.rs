@@ -2875,18 +2875,28 @@ impl CodexMessageProcessor {
             return;
         }
 
-        let Some(summary) =
-            read_summary_from_state_db_context_by_thread_id(Some(&state_db_ctx), thread_uuid).await
-        else {
-            self.send_internal_error(
-                request_id,
-                format!("failed to reload updated thread metadata for {thread_uuid}"),
-            )
-            .await;
-            return;
+        let metadata = match state_db_ctx.get_thread(thread_uuid).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to reload updated thread metadata for {thread_uuid}"),
+                )
+                .await;
+                return;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to reload updated thread metadata for {thread_uuid}: {err}"),
+                )
+                .await;
+                return;
+            }
         };
 
-        let mut thread = summary_to_thread(summary);
+        let mut thread = summary_to_thread(summary_from_thread_metadata(&metadata));
+        apply_persisted_thread_mode(&mut thread, &metadata);
         self.attach_thread_name(thread_uuid, &mut thread).await;
         thread.status = resolve_thread_status(
             self.thread_watch_manager
@@ -2950,33 +2960,29 @@ impl CodexMessageProcessor {
             )
             .await;
 
-            match state_db_ctx.get_thread(thread_uuid).await {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => {}
-                Err(err) => {
-                    return Err(internal_error(format!(
-                        "failed to load reconciled thread metadata for {thread_uuid}: {err}"
-                    )));
-                }
-            }
-
             let config_snapshot = thread.config_snapshot().await;
             let resident = self
                 .thread_state_manager
                 .is_thread_resident(thread_uuid)
                 .await;
-            let metadata = build_thread_metadata_from_snapshot(
+            ensure_thread_mode_with_state_db(
+                state_db_ctx.as_ref(),
                 thread_uuid,
                 &rollout_path,
                 &config_snapshot,
                 resident,
-            );
-            if let Err(err) = state_db_ctx.insert_thread_if_absent(&metadata).await {
-                return Err(internal_error(format!(
-                    "failed to create thread metadata for {thread_uuid}: {err}"
-                )));
-            }
-            return Ok(());
+            )
+            .await;
+
+            return match state_db_ctx.get_thread(thread_uuid).await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(internal_error(format!(
+                    "failed to create thread metadata for {thread_uuid}"
+                ))),
+                Err(err) => Err(internal_error(format!(
+                    "failed to load reconciled thread metadata for {thread_uuid}: {err}"
+                ))),
+            };
         }
 
         let rollout_path =
@@ -3178,20 +3184,27 @@ impl CodexMessageProcessor {
                 message: format!("failed to update unarchived thread timestamp: {err}"),
                 data: None,
             })?;
-            if let Some(ctx) = state_db_ctx {
+            let persisted_metadata = if let Some(ctx) = state_db_ctx.as_ref() {
                 let _ = ctx
                     .mark_unarchived(thread_id, restored_path.as_path())
                     .await;
-            }
-            let summary =
-                read_summary_from_rollout(restored_path.as_path(), fallback_provider.as_str())
-                    .await
-                    .map_err(|err| JSONRPCErrorError {
-                        code: INTERNAL_ERROR_CODE,
-                        message: format!("failed to read unarchived thread: {err}"),
-                        data: None,
-                    })?;
-            Ok(summary_to_thread(summary))
+                ctx.get_thread(thread_id).await.ok().flatten()
+            } else {
+                None
+            };
+            load_thread_summary_for_rollout(
+                &self.config,
+                thread_id,
+                restored_path.as_path(),
+                fallback_provider.as_str(),
+                persisted_metadata.as_ref(),
+            )
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to read unarchived thread: {err}"),
+                data: None,
+            })
         }
         .await;
 
