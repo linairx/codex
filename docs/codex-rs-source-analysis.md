@@ -1010,6 +1010,8 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server-test-client` 的 `thread/start`、`thread/resume`、`thread/list` 和 `thread/started` 输出也已补上 resident-aware 摘要，手工联调时不再需要从整段 debug struct 里自己辨认这是不是 reconnect 场景
 - `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；MCP 接口文档也已补上同样约束，避免外围集成只盯 `thread_id` / `status`
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
+- `app-server/README.md` 顶部 lifecycle overview 的总览入口也已补上 reconnect 语义，不再在首屏继续把 `thread/resume` 描述成单纯的普通历史恢复
+- `thread_status.rs` 也已补上 resident workspace watch 迁移/清理回归：同一线程切换 `cwd` 后旧工作区变化不会再重新激活 `workspaceChanged`，切回非 resident 后也会移除 watch，避免 observer 状态被陈旧目录继续污染
 
 这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 

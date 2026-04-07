@@ -633,6 +633,7 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
     use tokio::time::Duration;
     use tokio::time::timeout;
 
@@ -1006,6 +1007,115 @@ mod tests {
                 .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
                 .await,
             ThreadStatus::NotLoaded,
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_resident_watch_to_new_cwd_ignores_old_workspace_changes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let first_workspace = temp_dir.path().join("first-workspace");
+        let second_workspace = temp_dir.path().join("second-workspace");
+        std::fs::create_dir_all(&first_workspace).expect("create first workspace");
+        std::fs::create_dir_all(&second_workspace).expect("create second workspace");
+
+        let manager = ThreadWatchManager::new_with_file_watcher(
+            None,
+            Arc::new(FileWatcher::new().expect("watcher")),
+        );
+        let mut thread = test_thread(
+            INTERACTIVE_THREAD_ID,
+            codex_app_server_protocol::SessionSource::Cli,
+        );
+        thread.resident = true;
+        thread.cwd = first_workspace.clone();
+
+        manager.upsert_thread(thread.clone()).await;
+        assert_eq!(manager.workspace_watch_count().await, 1);
+
+        thread.cwd = second_workspace.clone();
+        manager.upsert_thread(thread).await;
+        assert_eq!(manager.workspace_watch_count().await, 1);
+
+        std::fs::write(first_workspace.join("stale.txt"), "stale").expect("write stale change");
+        assert_eq!(
+            timeout(
+                Duration::from_millis(500),
+                wait_for_status(
+                    &manager,
+                    INTERACTIVE_THREAD_ID,
+                    ThreadStatus::Active {
+                        active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                    },
+                ),
+            )
+            .await
+            .is_err(),
+            true,
+        );
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
+        );
+
+        std::fs::write(second_workspace.join("fresh.txt"), "fresh").expect("write fresh change");
+        wait_for_status(
+            &manager,
+            INTERACTIVE_THREAD_ID,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn switching_resident_thread_to_non_resident_removes_workspace_watch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace = temp_dir.path().join("resident-workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let manager = ThreadWatchManager::new_with_file_watcher(
+            None,
+            Arc::new(FileWatcher::new().expect("watcher")),
+        );
+        let mut thread = test_thread(
+            INTERACTIVE_THREAD_ID,
+            codex_app_server_protocol::SessionSource::Cli,
+        );
+        thread.resident = true;
+        thread.cwd = workspace.clone();
+
+        manager.upsert_thread(thread.clone()).await;
+        assert_eq!(manager.workspace_watch_count().await, 1);
+
+        thread.resident = false;
+        manager.upsert_thread(thread).await;
+
+        assert_eq!(manager.workspace_watch_count().await, 0);
+
+        std::fs::write(workspace.join("ignored.txt"), "ignored").expect("write ignored change");
+        assert_eq!(
+            timeout(
+                Duration::from_millis(500),
+                wait_for_status(
+                    &manager,
+                    INTERACTIVE_THREAD_ID,
+                    ThreadStatus::Active {
+                        active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                    },
+                ),
+            )
+            .await
+            .is_err(),
+            true,
+        );
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
         );
     }
 

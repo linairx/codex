@@ -228,6 +228,7 @@
 - `app-server-test-client` 的 thread 响应/通知输出也已补上 resident-aware 摘要，方便手工联调时直接识别 reconnect 场景
 - `app-server-client` README、MCP 接口文档和 typed request 回归也已开始把 `Thread.mode` 固定为 bootstrap 阶段区分 reconnect 的主信号，减少外围集成对旧 resume 语义的误读
 - `app-server/README.md` 也已同步把 `Thread.mode` 固定为 resident reconnect 的主语义，不再只把 `resident: true` 当作实现细节提及
+- `app-server/README.md` 的 lifecycle overview 总览入口也已补上 reconnect 口径，首屏文案不再落后于细节章节
 - 仍有剩余消费侧入口需要继续检查，但主路径上的恢复/重连文案已经开始收口
 
 不要混入：
@@ -255,6 +256,7 @@
 - resident thread 在最后一个订阅者断开后的 reconnect / `thread/resume` 会保留既有 `workspaceChanged` 与 resident 模式，不再回退成普通 interactive 线程
 - resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `mode = residentAssistant`，`thread/loaded/read` 里该线程也会继续保持 `mode = residentAssistant` 且 `status = idle`
 - 下一次 turn 完成后会按既有状态机清理 `workspaceChanged`，避免脏标记长期滞留
+- resident workspace watch 的迁移/清理边界也已补上单测：同一线程切换 `cwd` 后旧目录变化不会再触发 `workspaceChanged`，切回非 resident 后会移除 watch，避免 observer 状态持续受陈旧工作区干扰
 
 不要混入：
 
