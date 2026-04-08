@@ -78,6 +78,10 @@ than bootstrap and metadata repair: `thread/list`, `thread/loaded/read`,
 `thread/unsubscribe`, and `thread/unarchive` must continue to surface resident
 mode for reconnectable assistants instead of dropping back to generic history,
 loaded-thread, detached-reader, or restore summaries.
+The same typed test layer now also locks down `thread/loaded/list` as the
+id-only loaded probe: typed callers must keep `next_cursor` continuity across
+pages without treating loaded ids as a substitute for `thread.mode`, and should
+continue with `thread/loaded/read` whenever reconnect semantics are needed.
 That typed pagination surface is now locked down directly too: when
 `thread/list` or `thread/loaded/read` returns `next_cursor`, follow-up typed
 requests that continue from that cursor must still preserve resident

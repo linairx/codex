@@ -1196,8 +1196,22 @@ fn thread_list_params(
             ProviderFilter::Any => None,
             ProviderFilter::MatchDefault(default_provider) => Some(vec![default_provider]),
         },
-        source_kinds: (!include_non_interactive)
-            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: Some(if include_non_interactive {
+            vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ]
+        } else {
+            vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
+        }),
         archived: Some(false),
         cwd: cwd_filter.map(|cwd| cwd.to_string_lossy().to_string()),
         search_term: None,
@@ -2047,7 +2061,21 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
-        assert_eq!(params.source_kinds, None);
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ])
+        );
     }
 
     #[test]

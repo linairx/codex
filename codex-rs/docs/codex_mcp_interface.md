@@ -14,6 +14,7 @@ At a glance:
 
 - Primary v2 RPCs
   - `thread/start`, `thread/resume`, `thread/fork`, `thread/read`, `thread/list`
+  - `thread/loaded/list`, `thread/loaded/read`
   - `turn/start`, `turn/steer`, `turn/interrupt`
   - `account/read`, `account/login/start`, `account/login/cancel`, `account/logout`, `account/rateLimits/read`
   - `config/read`, `config/value/write`, `config/batchWrite`
@@ -24,7 +25,7 @@ At a glance:
   - `gitDiffToRemote`
   - `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop`
 - Notifications
-  - v2 typed notifications such as `thread/started`, `turn/completed`, `account/login/completed`
+  - v2 typed notifications such as `thread/started`, `thread/status/changed`, `turn/completed`, `account/login/completed`
   - `codex/event/*` stream notifications for live agent events
   - `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted`
 - Approvals (server -> client requests)
@@ -50,7 +51,14 @@ Use the separate `codex mcp` subcommand to manage configured MCP server launcher
 
 ## Threads and turns
 
-Use the v2 thread and turn APIs for all new integrations. `thread/start` creates a thread, `thread/resume` resumes or reconnects one, `turn/start` submits user input, `turn/interrupt` stops an in-flight turn, and `thread/list` / `thread/read` expose persisted history. Integrations that distinguish an ordinary interactive resume target from resident reconnect should consume `thread.mode` from thread responses and `thread/started` notifications; `residentAssistant` means the thread should be presented as a reconnect target rather than an ordinary interactive resume target.
+Use the v2 thread and turn APIs for all new integrations. `thread/start` creates a thread, `thread/resume` resumes or reconnects one, `turn/start` submits user input, and `turn/interrupt` stops an in-flight turn. `thread/list` / `thread/read` expose persisted history, while `thread/loaded/read` exposes loaded thread summaries that already include both the current `thread.mode` and `thread.status`.
+
+Integrations that distinguish an ordinary interactive resume target from resident reconnect should consume `thread.mode` from thread responses and `thread/started` notifications; `residentAssistant` means the thread should be presented as a reconnect target rather than an ordinary interactive resume target.
+
+Two related boundaries matter for MCP consumers:
+
+- `thread/loaded/list` is intentionally only an id probe for currently loaded threads. If the client also needs reconnect semantics or the current thread role, it should follow up with `thread/loaded/read` and consume `thread.mode` there.
+- `thread/status/changed` is a status-only increment. It does not repeat `thread.mode`, so reconnect-aware clients should retain the last `mode` they observed from `thread/started`, `thread/read`, `thread/list`, or `thread/loaded/read`.
 
 `getConversationSummary` remains as a compatibility helper for clients that still need a summary lookup by `conversationId` or `rolloutPath`.
 

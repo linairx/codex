@@ -33,7 +33,9 @@ Build and start an app server using commands above. The app-server log is writte
 
 ### 1) Get a thread id
 
-Create at least one thread, then list threads:
+Create at least one thread, then list threads. The list commands now default to
+both interactive and non-interactive sources, so newer `Exec` or other
+resident non-interactive threads are visible without extra filters:
 
 ```bash
 cargo run -p codex-app-server-test-client -- send-message-v2 "seed thread for reconnect test"
@@ -65,14 +67,21 @@ If you need to inspect other recovery paths without reading the full debug
 struct, the test client now also exposes resident-aware summaries for loaded
 threads, archived-thread restore, and rollback responses, with the same compact
 `mode` plus `resume`/`reconnect` action labels for ordinary interactive resume
-targets vs resident reconnect targets:
+targets vs resident reconnect targets. These loaded-thread probes also default
+to both interactive and non-interactive sources:
 
 ```bash
+cargo run -p codex-app-server-test-client -- thread-loaded-list --limit 5
+cargo run -p codex-app-server-test-client -- thread-loaded-list --cursor <NEXT_CURSOR> --limit 5
 cargo run -p codex-app-server-test-client -- thread-loaded-read --limit 5
 cargo run -p codex-app-server-test-client -- thread-loaded-read --cursor <NEXT_CURSOR> --limit 5
 cargo run -p codex-app-server-test-client -- thread-unarchive <THREAD_ID>
 cargo run -p codex-app-server-test-client -- thread-rollback <THREAD_ID> --num-turns 1
 ```
+
+`thread-loaded-list` is intentionally an id-only probe. Its compact summary
+prints loaded thread ids plus `next_cursor` when present; if you need resident
+`mode` or reconnect semantics for those ids, continue with `thread-loaded-read`.
 
 When you use the streaming start/resume/reconnect commands, `thread/started`
 notifications also print the same compact resident-aware summary, so the

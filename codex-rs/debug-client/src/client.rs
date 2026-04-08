@@ -27,9 +27,11 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -196,10 +198,27 @@ impl AppServerClient {
                 limit: None,
                 sort_key: None,
                 model_providers: None,
-                source_kinds: None,
+                source_kinds: Some(all_thread_source_kinds()),
                 archived: None,
                 cwd: None,
                 search_term: None,
+            },
+        };
+        self.send(&request)?;
+        Ok(request_id)
+    }
+
+    pub fn request_thread_loaded_list(&self, cursor: Option<String>) -> Result<RequestId> {
+        let request_id = self.next_request_id();
+        self.track_pending(request_id.clone(), PendingRequest::LoadedList);
+        let request = ClientRequest::ThreadLoadedList {
+            request_id: request_id.clone(),
+            params: ThreadLoadedListParams {
+                cursor,
+                limit: None,
+                model_providers: None,
+                source_kinds: Some(all_thread_source_kinds()),
+                cwd: None,
             },
         };
         self.send(&request)?;
@@ -350,6 +369,21 @@ impl AppServerClient {
     }
 }
 
+fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
+    vec![
+        ThreadSourceKind::Cli,
+        ThreadSourceKind::VsCode,
+        ThreadSourceKind::Exec,
+        ThreadSourceKind::AppServer,
+        ThreadSourceKind::SubAgent,
+        ThreadSourceKind::SubAgentReview,
+        ThreadSourceKind::SubAgentCompact,
+        ThreadSourceKind::SubAgentThreadSpawn,
+        ThreadSourceKind::SubAgentOther,
+        ThreadSourceKind::Unknown,
+    ]
+}
+
 fn handle_server_request(
     request: JSONRPCRequest,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
@@ -436,5 +470,31 @@ pub fn build_thread_resume_params(
         cwd,
         approval_policy: Some(approval_policy),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_thread_source_kinds;
+    use codex_app_server_protocol::ThreadSourceKind;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn all_thread_source_kinds_covers_interactive_and_non_interactive_sources() {
+        assert_eq!(
+            all_thread_source_kinds(),
+            vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ]
+        );
     }
 }

@@ -32,6 +32,8 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMode;
@@ -374,6 +376,23 @@ impl AppServerSession {
             .request_typed(ClientRequest::ThreadList { request_id, params })
             .await
             .wrap_err("thread/list failed during TUI session lookup")
+    }
+
+    /// Reads loaded thread summaries that the app server currently holds in memory.
+    ///
+    /// Used by `App::backfill_loaded_subagent_threads` to discover subagent threads that were
+    /// spawned before the TUI connected without issuing an extra `thread/read` for every loaded
+    /// thread.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn thread_loaded_list(
+        &mut self,
+        params: ThreadLoadedListParams,
+    ) -> Result<ThreadLoadedListResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadLoadedList { request_id, params })
+            .await
+            .wrap_err("failed to list loaded thread ids from app server")
     }
 
     /// Reads loaded thread summaries that the app server currently holds in memory.
@@ -1162,6 +1181,7 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadListParams;
+    use codex_app_server_protocol::ThreadLoadedListParams;
     use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStartParams;
@@ -1710,6 +1730,118 @@ mod tests {
             .find(|thread| thread.id == response.thread.id)
             .expect("thread/loaded/read should include resident thread");
         assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn loaded_list_returns_loaded_thread_ids() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let request_id = app_server.next_request_id();
+
+        let response: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let loaded = app_server
+            .thread_loaded_list(ThreadLoadedListParams {
+                cursor: None,
+                limit: Some(20),
+                model_providers: None,
+                source_kinds: None,
+                cwd: None,
+            })
+            .await
+            .expect("thread/loaded/list should succeed");
+        assert!(loaded.data.contains(&response.thread.id));
+        assert_eq!(loaded.next_cursor, None);
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn loaded_list_preserves_next_cursor_across_pages() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+
+        let first_request_id = app_server.next_request_id();
+        let first_started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: first_request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("first resident thread/start should succeed");
+
+        let second_request_id = app_server.next_request_id();
+        let second_started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: second_request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("second resident thread/start should succeed");
+
+        let first_page = app_server
+            .thread_loaded_list(ThreadLoadedListParams {
+                cursor: None,
+                limit: Some(1),
+                model_providers: None,
+                source_kinds: None,
+                cwd: None,
+            })
+            .await
+            .expect("first thread/loaded/list page should succeed");
+        assert_eq!(first_page.data.len(), 1);
+        let next_cursor = first_page
+            .next_cursor
+            .clone()
+            .expect("first thread/loaded/list page should include next_cursor");
+
+        let second_page = app_server
+            .thread_loaded_list(ThreadLoadedListParams {
+                cursor: Some(next_cursor),
+                limit: Some(1),
+                model_providers: None,
+                source_kinds: None,
+                cwd: None,
+            })
+            .await
+            .expect("second thread/loaded/list page should succeed");
+        assert_eq!(second_page.data.len(), 1);
+
+        let page_ids = [first_page.data[0].clone(), second_page.data[0].clone()];
+        assert!(page_ids.contains(&first_started.thread.id));
+        assert!(page_ids.contains(&second_started.thread.id));
 
         app_server
             .shutdown()

@@ -21,6 +21,7 @@ pub enum PendingRequest {
     Start,
     Resume,
     List,
+    LoadedList,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,10 @@ pub enum ReaderEvent {
     },
     ThreadList {
         threads: Vec<KnownThread>,
+        next_cursor: Option<String>,
+    },
+    LoadedThreadList {
+        thread_ids: Vec<String>,
         next_cursor: Option<String>,
     },
 }

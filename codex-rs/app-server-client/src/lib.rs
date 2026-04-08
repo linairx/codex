@@ -862,6 +862,8 @@ mod tests {
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadListResponse;
+    use codex_app_server_protocol::ThreadLoadedListParams;
+    use codex_app_server_protocol::ThreadLoadedListResponse;
     use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadLoadedReadResponse;
     use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
@@ -1556,6 +1558,106 @@ supports_websockets = false
             first_page.data[0].id.clone(),
             second_page.data[0].id.clone(),
         ];
+        assert!(page_ids.contains(&started_a.thread.id));
+        assert!(page_ids.contains(&started_b.thread.id));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn loaded_list_returns_loaded_thread_ids_through_typed_requests() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(118),
+                params: ThreadStartParams {
+                    resident: true,
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let loaded: ThreadLoadedListResponse = client
+            .request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(119),
+                params: ThreadLoadedListParams::default(),
+            })
+            .await
+            .expect("thread/loaded/list should succeed");
+
+        assert!(loaded.data.contains(&started.thread.id));
+        assert_eq!(loaded.next_cursor, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn loaded_list_preserves_next_cursor_and_loaded_ids_across_pages() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started_a: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(120),
+                params: ThreadStartParams {
+                    resident: true,
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("first resident thread/start should succeed");
+        let started_b: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(121),
+                params: ThreadStartParams {
+                    resident: true,
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("second resident thread/start should succeed");
+
+        let first_page: ThreadLoadedListResponse = client
+            .request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(122),
+                params: ThreadLoadedListParams {
+                    cursor: None,
+                    limit: Some(1),
+                    model_providers: None,
+                    source_kinds: None,
+                    cwd: None,
+                },
+            })
+            .await
+            .expect("first thread/loaded/list page should succeed");
+
+        assert_eq!(first_page.data.len(), 1);
+        let next_cursor = first_page
+            .next_cursor
+            .clone()
+            .expect("first thread/loaded/list page should include next_cursor");
+
+        let second_page: ThreadLoadedListResponse = client
+            .request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(123),
+                params: ThreadLoadedListParams {
+                    cursor: Some(next_cursor),
+                    limit: Some(1),
+                    model_providers: None,
+                    source_kinds: None,
+                    cwd: None,
+                },
+            })
+            .await
+            .expect("second thread/loaded/list page should succeed");
+
+        assert_eq!(second_page.data.len(), 1);
+
+        let page_ids = [first_page.data[0].clone(), second_page.data[0].clone()];
         assert!(page_ids.contains(&started_a.thread.id));
         assert!(page_ids.contains(&started_b.thread.id));
 

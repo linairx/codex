@@ -2,9 +2,12 @@
 //!
 //! When the TUI resumes or switches to an existing thread, it needs to populate
 //! `AgentNavigationState` and `ChatWidget` metadata for every subagent that was spawned during
-//! that thread's lifetime. The app server exposes a flat list of currently loaded threads via
-//! `thread/loaded/read`, but the TUI must figure out which of those are descendants of the
-//! primary thread.
+//! that thread's lifetime. The app server exposes both an id-only loaded probe
+//! (`thread/loaded/list`) and full loaded summaries (`thread/loaded/read`), but the TUI must
+//! figure out which loaded threads are descendants of the primary thread and whether they should
+//! surface agent badges or closed/error markers. That requires the full `Thread` snapshots from
+//! `thread/loaded/read`, because `thread/loaded/list` does not carry `source`, `status`, or
+//! agent metadata.
 //!
 //! This module provides the pure, synchronous tree-walk that turns that flat list into the filtered
 //! set of descendants. It intentionally has no async, no I/O, and no side effects so it can be
@@ -212,5 +215,30 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn ignores_loaded_threads_without_spawn_metadata() {
+        let primary_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000010").expect("valid thread");
+        let loaded_non_subagent_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread");
+
+        let mut loaded_non_subagent = test_thread(loaded_non_subagent_id, SessionSource::Cli);
+        loaded_non_subagent.agent_nickname = Some("Looks loaded".to_string());
+        loaded_non_subagent.agent_role = Some("worker".to_string());
+        loaded_non_subagent.status = ThreadStatus::Active {
+            active_flags: Vec::new(),
+        };
+
+        let loaded = find_loaded_subagent_threads_for_primary(
+            vec![
+                test_thread(primary_thread_id, SessionSource::Cli),
+                loaded_non_subagent,
+            ],
+            primary_thread_id,
+        );
+
+        assert_eq!(loaded, Vec::<LoadedSubagentThread>::new());
     }
 }

@@ -63,6 +63,8 @@ use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
@@ -75,6 +77,7 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadRollbackResponse;
+use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
@@ -250,7 +253,7 @@ enum CliCommand {
     /// List the available models from the Codex app-server.
     #[command(name = "model-list")]
     ModelList,
-    /// List stored threads from the Codex app-server.
+    /// List stored threads from the Codex app-server across interactive and non-interactive sources.
     #[command(name = "thread-list")]
     ThreadList {
         /// Opaque pagination cursor returned by a previous `thread-list` call.
@@ -281,13 +284,26 @@ enum CliCommand {
         #[arg(long, default_value_t = false)]
         ephemeral: bool,
     },
-    /// Read loaded thread summaries currently resident in memory.
+    /// Read loaded thread summaries currently resident in memory across interactive and non-interactive sources.
     #[command(name = "thread-loaded-read")]
     ThreadLoadedRead {
         /// Opaque pagination cursor returned by a previous `thread-loaded-read` call.
         #[arg(long)]
         cursor: Option<String>,
         /// Number of loaded threads to return.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// List loaded thread ids currently resident in memory across interactive and non-interactive sources.
+    ///
+    /// This is an id-only probe; use `thread-loaded-read` when you need `thread.mode`
+    /// or status for reconnect-aware consumers.
+    #[command(name = "thread-loaded-list")]
+    ThreadLoadedList {
+        /// Opaque pagination cursor returned by a previous `thread-loaded-list` call.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Number of loaded thread ids to return.
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
@@ -496,6 +512,11 @@ pub async fn run() -> Result<()> {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-loaded-read")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
             thread_loaded_read(&endpoint, &config_overrides, cursor, limit).await
+        }
+        CliCommand::ThreadLoadedList { cursor, limit } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-loaded-list")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_loaded_list(&endpoint, &config_overrides, cursor, limit).await
         }
         CliCommand::ThreadMetadataUpdate {
             thread_id,
@@ -1267,7 +1288,7 @@ async fn thread_list(
             limit: Some(limit),
             sort_key: None,
             model_providers: None,
-            source_kinds: None,
+            source_kinds: Some(all_thread_source_kinds()),
             archived: None,
             cwd: None,
             search_term: None,
@@ -1341,12 +1362,41 @@ async fn thread_loaded_read(
             cursor,
             limit: Some(limit),
             model_providers: None,
-            source_kinds: None,
+            source_kinds: Some(all_thread_source_kinds()),
             cwd: None,
         })?;
         println!("< thread/loaded/read response: {response:?}");
         print_thread_collection_summary_with_cursor(
             "thread/loaded/read",
+            &response.data,
+            response.next_cursor.as_deref(),
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+async fn thread_loaded_list(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    cursor: Option<String>,
+    limit: u32,
+) -> Result<()> {
+    with_client("thread-loaded-list", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_loaded_list(ThreadLoadedListParams {
+            cursor,
+            limit: Some(limit),
+            model_providers: None,
+            source_kinds: Some(all_thread_source_kinds()),
+            cwd: None,
+        })?;
+        println!("< thread/loaded/list response: {response:?}");
+        print_thread_id_collection_summary_with_cursor(
+            "thread/loaded/list",
             &response.data,
             response.next_cursor.as_deref(),
         );
@@ -1479,6 +1529,16 @@ fn print_thread_collection_summary_with_cursor(
     }
 }
 
+fn print_thread_id_collection_summary_with_cursor(
+    label: &str,
+    thread_ids: &[String],
+    next_cursor: Option<&str>,
+) {
+    for line in thread_id_collection_summary_lines_with_cursor(label, thread_ids, next_cursor) {
+        println!("{line}");
+    }
+}
+
 fn thread_response_summary_line(label: &str, thread: &AppServerThread) -> String {
     format!("< {label} summary: {}", thread_summary_fields(thread))
 }
@@ -1502,6 +1562,31 @@ fn thread_collection_summary_lines_with_cursor(
             .iter()
             .map(thread_summary_fields)
             .map(|summary| format!("  - {summary}")),
+    );
+    if let Some(next_cursor) = next_cursor {
+        lines.push(format!("< {label} next_cursor: {next_cursor}"));
+    }
+    lines
+}
+
+fn thread_id_collection_summary_lines_with_cursor(
+    label: &str,
+    thread_ids: &[String],
+    next_cursor: Option<&str>,
+) -> Vec<String> {
+    if thread_ids.is_empty() {
+        let mut lines = vec![format!("< {label} summary: no threads")];
+        if let Some(next_cursor) = next_cursor {
+            lines.push(format!("< {label} next_cursor: {next_cursor}"));
+        }
+        return lines;
+    }
+
+    let mut lines = vec![format!("< {label} summary:")];
+    lines.extend(
+        thread_ids
+            .iter()
+            .map(|thread_id| format!("  - id={thread_id}")),
     );
     if let Some(next_cursor) = next_cursor {
         lines.push(format!("< {label} next_cursor: {next_cursor}"));
@@ -1534,12 +1619,29 @@ fn thread_resume_action_label(mode: ThreadMode) -> &'static str {
     }
 }
 
+fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
+    vec![
+        ThreadSourceKind::Cli,
+        ThreadSourceKind::VsCode,
+        ThreadSourceKind::Exec,
+        ThreadSourceKind::AppServer,
+        ThreadSourceKind::SubAgent,
+        ThreadSourceKind::SubAgentReview,
+        ThreadSourceKind::SubAgentCompact,
+        ThreadSourceKind::SubAgentThreadSpawn,
+        ThreadSourceKind::SubAgentOther,
+        ThreadSourceKind::Unknown,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::Cli;
+    use super::all_thread_source_kinds;
     use super::thread_collection_summary_lines_with_cursor;
+    use super::thread_id_collection_summary_lines_with_cursor;
     use super::thread_mode_label;
     use super::thread_response_summary_line;
     use super::thread_resume_action_label;
@@ -1548,6 +1650,7 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadSourceKind;
     use codex_app_server_protocol::ThreadStatus;
 
     fn make_thread(id: &str, mode: ThreadMode, resident: bool, status: ThreadStatus) -> Thread {
@@ -1596,6 +1699,25 @@ mod tests {
     }
 
     #[test]
+    fn all_thread_source_kinds_cover_interactive_and_non_interactive_sources() {
+        assert_eq!(
+            all_thread_source_kinds(),
+            vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ]
+        );
+    }
+
+    #[test]
     fn help_mentions_resume_or_reconnect_for_thread_commands() {
         let help = Cli::command().render_long_help().to_string();
 
@@ -1615,16 +1737,39 @@ mod tests {
             .expect("thread-loaded-read subcommand")
             .render_long_help()
             .to_string();
+        let thread_loaded_list_help = Cli::command()
+            .find_subcommand_mut("thread-loaded-list")
+            .expect("thread-loaded-list subcommand")
+            .render_long_help()
+            .to_string();
 
         assert!(thread_list_help.contains("--cursor <CURSOR>"));
+        assert!(thread_list_help.contains(
+            "List stored threads from the Codex app-server across interactive and non-interactive sources"
+        ));
         assert!(
             thread_list_help
                 .contains("Opaque pagination cursor returned by a previous `thread-list` call")
         );
         assert!(thread_loaded_read_help.contains("--cursor <CURSOR>"));
+        assert!(thread_loaded_read_help.contains(
+            "Read loaded thread summaries currently resident in memory across interactive and non-interactive"
+        ));
         assert!(
             thread_loaded_read_help.contains(
                 "Opaque pagination cursor returned by a previous `thread-loaded-read` call"
+            )
+        );
+        assert!(thread_loaded_list_help.contains("--cursor <CURSOR>"));
+        assert!(thread_loaded_list_help.contains(
+            "List loaded thread ids currently resident in memory across interactive and non-interactive sources"
+        ));
+        assert!(thread_loaded_list_help.contains(
+            "This is an id-only probe; use `thread-loaded-read` when you need `thread.mode`"
+        ));
+        assert!(
+            thread_loaded_list_help.contains(
+                "Opaque pagination cursor returned by a previous `thread-loaded-list` call"
             )
         );
     }
@@ -1849,6 +1994,23 @@ mod tests {
     }
 
     #[test]
+    fn thread_loaded_list_summary_lines_include_ids_and_next_cursor() {
+        assert_eq!(
+            thread_id_collection_summary_lines_with_cursor(
+                "thread/loaded/list",
+                &["thread-1".to_string(), "thread-2".to_string()],
+                Some("cursor-2")
+            ),
+            vec![
+                "< thread/loaded/list summary:".to_string(),
+                "  - id=thread-1".to_string(),
+                "  - id=thread-2".to_string(),
+                "< thread/loaded/list next_cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn empty_thread_list_summary_lines_can_still_include_next_cursor() {
         assert_eq!(
             thread_collection_summary_lines_with_cursor("thread/list", &[], Some("cursor-2")),
@@ -1870,6 +2032,21 @@ mod tests {
             vec![
                 "< thread/loaded/read summary: no threads".to_string(),
                 "< thread/loaded/read next_cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_thread_loaded_list_summary_lines_can_still_include_next_cursor() {
+        assert_eq!(
+            thread_id_collection_summary_lines_with_cursor(
+                "thread/loaded/list",
+                &[],
+                Some("cursor-2")
+            ),
+            vec![
+                "< thread/loaded/list summary: no threads".to_string(),
+                "< thread/loaded/list next_cursor: cursor-2".to_string(),
             ]
         );
     }
@@ -2418,6 +2595,19 @@ impl CodexClient {
         };
 
         self.send_request(request, request_id, "thread/loaded/read")
+    }
+
+    fn thread_loaded_list(
+        &mut self,
+        params: ThreadLoadedListParams,
+    ) -> Result<ThreadLoadedListResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadLoadedList {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/loaded/list")
     }
 
     fn thread_metadata_update(

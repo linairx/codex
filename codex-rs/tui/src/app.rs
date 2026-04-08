@@ -3572,10 +3572,13 @@ impl App {
     /// thread creation so that the `/agent` picker and keyboard navigation are pre-populated even
     /// if the TUI did not witness the original spawn events.
     ///
-    /// The loaded-thread summaries are fetched in full (no pagination) via `thread/loaded/read`,
-    /// then the spawn tree is walked by `find_loaded_subagent_threads_for_primary`. Each
-    /// discovered subagent is registered via `upsert_agent_picker_thread`, which writes to both
-    /// `AgentNavigationState` and the `ChatWidget` metadata map.
+    /// The loaded-thread summaries are fetched in full (no pagination) via `thread/loaded/read`.
+    /// `thread/loaded/list` is intentionally not enough here: subagent backfill needs each
+    /// thread's `source`, `status`, and agent metadata to rebuild the spawn tree and UI badges,
+    /// not just loaded ids. The spawn tree is then walked by
+    /// `find_loaded_subagent_threads_for_primary`. Each discovered subagent is registered via
+    /// `upsert_agent_picker_thread`, which writes to both `AgentNavigationState` and the
+    /// `ChatWidget` metadata map.
     async fn backfill_loaded_subagent_threads(
         &mut self,
         app_server: &mut AppServerSession,

@@ -47,8 +47,13 @@ Type a line to send it as a new turn. Commands are prefixed with `:`:
   is an ordinary thread or a resident assistant thread
 - `:refresh-thread [cursor]` list available threads, including both the stored
   thread mode (`interactive` vs `resident assistant`) and the suggested action
-  (`resume` vs `reconnect`); when the previous output includes `more threads
-  available, next cursor: ...`, pass that cursor back to fetch the next page
+  (`resume` vs `reconnect`) across both interactive and non-interactive
+  sources; when the previous output includes `more threads available, next
+  cursor: ...`, pass that cursor back to fetch the next page
+- `:refresh-loaded [cursor]` list loaded thread ids with pagination; this is
+  intentionally an id-only probe across both interactive and non-interactive
+  sources, so if you need resident mode or reconnect semantics for one of those
+  ids, follow up with `:refresh-thread` or `:resume <thread-id>`
 - `:quit` exit
 
 If you have not attached any thread yet, or you switch to an unknown thread id

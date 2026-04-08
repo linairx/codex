@@ -294,7 +294,13 @@
 - `app-server-test-client` 的 compact summary 输出也已补上整串回归断言：`thread/read` 与列表摘要现在都会稳定覆盖 `mode + resident + status + action` 的完整文本，不再只靠单独的 mode/action 映射测试侧面兜底
 - `app-server-test-client` 的分页列表摘要现在也已补上 cursor 回归：`thread/list` 的 compact summary 在有分页时会直接打印 `next_cursor`，而空列表 + cursor 的边界也已单独锁住，避免联调分页历史时继续依赖完整 debug struct
 - `app-server-test-client` 的分页列表消费现在也已补上请求侧闭环：`thread-list` 与 `thread-loaded-read` 命令都新增 `--cursor` 参数，并补上对应子命令 help 回归与 README 示例，避免联调时只能手动看到 `next_cursor` 却无法直接续页
+- `app-server-test-client` 的 `thread/loaded/list` 也已补成可直接联调的 id-only probe：新增 `thread-loaded-list --cursor --limit` 命令，compact summary 会稳定打印 loaded thread ids 与 `next_cursor`，并在 help/README/回归里明确这条接口只做 loaded id 探针、需要 reconnect 语义时应继续读 `thread-loaded-read`
 - `codex-app-server-client` 的 typed 分页读取面现在也已补上同层回归：`thread/list` 与 `thread/loaded/read` 在有 `next_cursor` 时，后续页请求仍会稳定保留 resident `mode`，避免共享 in-process 客户端只在首页锁住 `ResidentAssistant`，翻页后却重新退回通用线程摘要
+- `codex-app-server-client` 的 typed 请求层现在也已把 `thread/loaded/list` 这条 id-only probe 锁住：in-process 调用会稳定保留 loaded ids 与 `next_cursor` 的分页连续性，而 README 也同步明确需要 reconnect 语义时仍应继续调用 `thread/loaded/read`
+- `debug-client` 现在也已把 `thread/loaded/list` 这条 id-only probe 接到本地调试流里：新增 `:refresh-loaded [cursor]`，会稳定打印 loaded thread ids 与 `next cursor`，并在 help/README/回归中明确需要 reconnect 语义时仍应继续使用 `:refresh-thread` / `:resume`
+- `codex-tui` 的 `AppServerSession` 现在也已把 `thread/loaded/list` 这条 id-only probe 纳入 typed 会话层回归：新增 `thread_loaded_list(...)` 包装，并锁住 loaded ids 与 `next_cursor` 的分页连续性，避免 TUI 中间层只覆盖 `thread/loaded/read` 这条带 mode 的读取面
+- `codex-tui` 的 subagent backfill 现在也已把这层接口分工写回实现：`backfill_loaded_subagent_threads` / `loaded_threads.rs` 明确说明它必须继续消费 `thread/loaded/read`，因为 spawn source、status 和 agent metadata 不在 `thread/loaded/list` 的 id-only probe 里；纯函数回归也锁住了非 spawn metadata 的 loaded thread 不会被误认成子线程
+- `codex-tui` 的 latest-session lookup / resume picker 现在也已继续补上 `--include-non-interactive` 的 resident 回归，并顺手修正了 source filter 语义：app-server 上 `source_kinds: None` 仍表示 interactive-only，所以 TUI 现在会显式传完整 `ThreadSourceKind` 列表；默认 `--last` 仍只看 CLI / VSCode 线程，而显式开启 include-non-interactive 后，更新更晚的 resident non-interactive thread 也会被正确选成恢复目标并保留 `ResidentAssistant`
 - `app-server-test-client` README 里的这段说明也已进一步对齐到真实输出：联调摘要打印的是 wire `thread.mode` 值（如 `interactive` / `residentAssistant`）再附带 `resume/reconnect` 动作
 - `app-server-test-client` README 里的章节标题与示例 seed 文案现在也已继续从旧的 “rejoin” 术语收口到 `resume/reconnect`，避免手工联调入口在帮助/README 已更新后，仍残留一套过时命名
 - `app-server-test-client` README 的流式通知说明现在也已继续补齐：`thread/started` 相关段落会直接写成 `start/resume/reconnect` 命令路径，不再把 resident reconnect 漏在这条通知面描述之外
@@ -333,6 +339,9 @@
 - `docs/observer-event-flow-design.md` 也已同步把这层 observer / status 边界写明：`workspaceChanged` 等 observer 事实可以通过线程状态面暴露，但 `thread/status/changed` 仍只负责 status 增量，不承担重复 `mode`
 - `docs/remote-bridge-consumption.md` 也已同步补上远端消费侧的同一边界：`thread/loaded/read` 负责 loaded 线程的 `mode + status` 摘要，而 `thread/status/changed` 只做后续 status 增量
 - `docs/sqlite-state-convergence.md` 也已同步承认这层协议边界：SQLite 继续收敛稳定线程摘要与元数据，但不把 `thread/status/changed` 这类 status-only 增量误当成完整恢复来源
+- `codex-rs/docs/codex_mcp_interface.md` 也已同步补齐 MCP 侧的同一口径：概览现在直接列出 `thread/loaded/list`、`thread/loaded/read` 和 `thread/status/changed`，并明确 `thread/loaded/list` 只是 id-only probe，`thread/loaded/read` 才是 loaded `mode + status` 摘要，而 `thread/status/changed` 继续只承担 status-only 增量
+- `debug-client` 的默认 thread 列表过滤现在也已补回更贴近联调定位的行为：由于 app-server 上缺省 `source_kinds` 仍表示 interactive-only，`:refresh-thread` 与 `:refresh-loaded` 现在都会显式传完整 `ThreadSourceKind` 列表，并通过 README / 单测锁住“调试客户端默认展示 interactive + non-interactive 线程来源”，避免较新的 `Exec` 等 resident non-interactive thread 在联调时被静默过滤
+- `app-server-test-client` 的默认分页列表过滤现在也已补回同类行为：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 现在同样会显式传完整 `ThreadSourceKind` 列表，并通过 README / 单测锁住“联调客户端默认展示 interactive + non-interactive 线程来源”，避免手工验证 resident non-interactive thread 时继续踩到 app-server 的缺省 interactive-only 过滤
 - 当前这条 README / 设计文档链已经基本收口；下一步更适合把这批改动整理成提交，或切回新的代码闭环，而不是继续扩写同层文档
 
 不要混入：
@@ -427,6 +436,8 @@
 - `codex-state` 也已继续补上状态层边界测试：`set_thread_mode` 对缺失线程只返回 false，不会顺手创建 SQLite 垃圾行；`update_thread_git_info` 在 resident thread 上也不会顺手覆盖 `threads.mode`
 - `app-server/README.md` 的 `thread/metadata/update` 说明也已同步收口：返回的 `thread` 被明确要求保留既有 `mode`，外围客户端不需要再把 metadata-only update 额外视作一次需要 `thread/read` 补 mode 的特殊恢复路径
 - `docs/sqlite-state-convergence.md` 也已同步刷新成“已落地边界 + 后续阶段”的状态文档，开始明确记录 `threads.mode` 和 resident metadata repair 这批已经进入 SQLite 主干路径的最小闭环
+- `debug-client` 的内置 `:help` 也已继续补齐 source-filter 与 loaded-probe 边界：`:refresh-thread` 现在会直接提示它跨 interactive + non-interactive 来源列出带 mode/action 的线程摘要，而 `:refresh-loaded` 会直接提示它只是跨这些来源的 loaded thread id-only probe，避免 README 和请求实现已经 resident-aware，但交互内置帮助仍退回泛化列表文案
+- `app-server-test-client` 的 clap 子命令帮助也已继续对齐到同一消费边界：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 的 `--help` 现在会直接写出默认覆盖 interactive + non-interactive 来源，而 `thread-loaded-list` 还会明确声明自己只是 id-only probe、需要 resident `mode` 时应继续读 `thread-loaded-read`
 - 相关最小行为闭环已可由 `codex-state`、`codex-rollout`、`codex-app-server` 的定向测试覆盖
 - 仍需保持边界，只把稳定元数据和派生摘要入库，不把 loaded 状态、watcher、连接关系一类瞬时运行态塞进 SQLite
 

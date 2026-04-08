@@ -12,6 +12,7 @@ pub enum UserCommand {
     Resume(String),
     Use(String),
     RefreshThread(Option<String>),
+    RefreshLoaded(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +91,9 @@ pub fn parse_input(line: &str) -> Result<Option<InputAction>, ParseError> {
         "refresh-thread" => Ok(Some(InputAction::Command(UserCommand::RefreshThread(
             parts.next().map(ToString::to_string),
         )))),
+        "refresh-loaded" => Ok(Some(InputAction::Command(UserCommand::RefreshLoaded(
+            parts.next().map(ToString::to_string),
+        )))),
         _ => Err(ParseError::UnknownCommand {
             command: command.to_string(),
         }),
@@ -163,6 +167,26 @@ mod tests {
         assert_eq!(
             result,
             Some(InputAction::Command(UserCommand::RefreshThread(Some(
+                "cursor-2".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn parses_refresh_loaded() {
+        let result = parse_input(":refresh-loaded").unwrap();
+        assert_eq!(
+            result,
+            Some(InputAction::Command(UserCommand::RefreshLoaded(None)))
+        );
+    }
+
+    #[test]
+    fn parses_refresh_loaded_with_cursor() {
+        let result = parse_input(":refresh-loaded cursor-2").unwrap();
+        assert_eq!(
+            result,
+            Some(InputAction::Command(UserCommand::RefreshLoaded(Some(
                 "cursor-2".to_string()
             ))))
         );

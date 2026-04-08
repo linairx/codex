@@ -576,8 +576,22 @@ fn latest_session_lookup_params(
         } else {
             Some(vec![config.model_provider_id.clone()])
         },
-        source_kinds: (!include_non_interactive)
-            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: Some(if include_non_interactive {
+            vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ]
+        } else {
+            vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
+        }),
         archived: Some(false),
         cwd: cwd_filter.map(|cwd| cwd.to_string_lossy().to_string()),
         search_term: None,
@@ -1849,6 +1863,10 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
+        );
         assert_eq!(params.cwd, Some(cwd.to_string_lossy().to_string()));
         Ok(())
     }
@@ -1865,6 +1883,10 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, None);
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
+        );
         assert_eq!(params.cwd, None);
         Ok(())
     }
@@ -1884,7 +1906,40 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, None);
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
+        );
         assert_eq!(params.cwd.as_deref(), Some("repo/on/server"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_session_lookup_params_include_non_interactive_source_kinds()
+    -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        let params = latest_session_lookup_params(
+            /*is_remote*/ false, &config, /*cwd_filter*/ None,
+            /*include_non_interactive*/ true,
+        );
+
+        assert_eq!(
+            params.source_kinds,
+            Some(vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ])
+        );
         Ok(())
     }
 
@@ -2091,6 +2146,235 @@ mod tests {
         let target = target.expect("latest lookup should find the saved thread");
         assert_eq!(target.path, Some(rollout_path));
         assert_eq!(target.thread_id, thread_id);
+        assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_session_lookup_ignores_non_interactive_threads_by_default()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let interactive_thread_id = ThreadId::new();
+        let non_interactive_thread_id = ThreadId::new();
+        let interactive_rollout_path = temp_dir.path().join("sessions/2025/02/07").join(format!(
+            "rollout-2025-02-07T10-00-00-{interactive_thread_id}.jsonl"
+        ));
+        let non_interactive_rollout_path = temp_dir.path().join("sessions/2025/02/08").join(
+            format!("rollout-2025-02-08T10-00-00-{non_interactive_thread_id}.jsonl"),
+        );
+        std::fs::create_dir_all(interactive_rollout_path.parent().expect("rollout parent"))?;
+        std::fs::create_dir_all(
+            non_interactive_rollout_path
+                .parent()
+                .expect("rollout parent"),
+        )?;
+        std::fs::write(&interactive_rollout_path, "")?;
+        std::fs::write(&non_interactive_rollout_path, "")?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&interactive_rollout_path)?
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    chrono::DateTime::parse_from_rfc3339("2025-02-07T10:00:00Z")
+                        .expect("timestamp should parse")
+                        .into(),
+                ),
+            )?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&non_interactive_rollout_path)?
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    chrono::DateTime::parse_from_rfc3339("2025-02-08T10:00:00Z")
+                        .expect("timestamp should parse")
+                        .into(),
+                ),
+            )?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let interactive_created_at = chrono::DateTime::parse_from_rfc3339("2025-02-07T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut interactive_builder = codex_state::ThreadMetadataBuilder::new(
+            interactive_thread_id,
+            interactive_rollout_path.clone(),
+            interactive_created_at,
+            SessionSource::Cli,
+        );
+        interactive_builder.cwd = session_cwd.clone();
+        let mut interactive_metadata = interactive_builder.build(config.model_provider_id.as_str());
+        interactive_metadata.title = "Latest interactive thread".to_string();
+        interactive_metadata.first_user_message = Some("preview text".to_string());
+        state_runtime
+            .upsert_thread(&interactive_metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let non_interactive_created_at =
+            chrono::DateTime::parse_from_rfc3339("2025-02-08T10:00:00Z")
+                .expect("timestamp should parse")
+                .with_timezone(&chrono::Utc);
+        let mut non_interactive_builder = codex_state::ThreadMetadataBuilder::new(
+            non_interactive_thread_id,
+            non_interactive_rollout_path.clone(),
+            non_interactive_created_at,
+            SessionSource::Exec,
+        );
+        non_interactive_builder.cwd = session_cwd.clone();
+        let mut non_interactive_metadata =
+            non_interactive_builder.build(config.model_provider_id.as_str());
+        non_interactive_metadata.title = "Latest non-interactive resident thread".to_string();
+        non_interactive_metadata.first_user_message = Some("preview text".to_string());
+        non_interactive_metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&non_interactive_metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config.clone()).await?,
+            ));
+        let target = lookup_latest_session_target_with_app_server(
+            &mut app_server,
+            &config,
+            Some(session_cwd.as_path()),
+            /*include_non_interactive*/ false,
+        )
+        .await?;
+        let target = target.expect("latest lookup should keep CLI-visible thread by default");
+        assert_eq!(target.path, Some(interactive_rollout_path));
+        assert_eq!(target.thread_id, interactive_thread_id);
+        assert_eq!(target.mode, Some(ThreadMode::Interactive));
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_session_lookup_can_include_non_interactive_resident_threads()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let interactive_thread_id = ThreadId::new();
+        let non_interactive_thread_id = ThreadId::new();
+        let interactive_rollout_path = temp_dir.path().join("sessions/2025/02/09").join(format!(
+            "rollout-2025-02-09T10-00-00-{interactive_thread_id}.jsonl"
+        ));
+        let non_interactive_rollout_path = temp_dir.path().join("sessions/2025/02/10").join(
+            format!("rollout-2025-02-10T10-00-00-{non_interactive_thread_id}.jsonl"),
+        );
+        std::fs::create_dir_all(interactive_rollout_path.parent().expect("rollout parent"))?;
+        std::fs::create_dir_all(
+            non_interactive_rollout_path
+                .parent()
+                .expect("rollout parent"),
+        )?;
+        std::fs::write(&interactive_rollout_path, "")?;
+        std::fs::write(&non_interactive_rollout_path, "")?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&interactive_rollout_path)?
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    chrono::DateTime::parse_from_rfc3339("2025-02-09T10:00:00Z")
+                        .expect("timestamp should parse")
+                        .into(),
+                ),
+            )?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&non_interactive_rollout_path)?
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    chrono::DateTime::parse_from_rfc3339("2025-02-10T10:00:00Z")
+                        .expect("timestamp should parse")
+                        .into(),
+                ),
+            )?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let interactive_created_at = chrono::DateTime::parse_from_rfc3339("2025-02-09T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut interactive_builder = codex_state::ThreadMetadataBuilder::new(
+            interactive_thread_id,
+            interactive_rollout_path.clone(),
+            interactive_created_at,
+            SessionSource::Cli,
+        );
+        interactive_builder.cwd = session_cwd.clone();
+        let mut interactive_metadata = interactive_builder.build(config.model_provider_id.as_str());
+        interactive_metadata.title = "Older interactive thread".to_string();
+        interactive_metadata.first_user_message = Some("preview text".to_string());
+        state_runtime
+            .upsert_thread(&interactive_metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let non_interactive_created_at =
+            chrono::DateTime::parse_from_rfc3339("2025-02-10T10:00:00Z")
+                .expect("timestamp should parse")
+                .with_timezone(&chrono::Utc);
+        let mut non_interactive_builder = codex_state::ThreadMetadataBuilder::new(
+            non_interactive_thread_id,
+            non_interactive_rollout_path.clone(),
+            non_interactive_created_at,
+            SessionSource::Exec,
+        );
+        non_interactive_builder.cwd = session_cwd.clone();
+        let mut non_interactive_metadata =
+            non_interactive_builder.build(config.model_provider_id.as_str());
+        non_interactive_metadata.title = "Newest non-interactive resident thread".to_string();
+        non_interactive_metadata.first_user_message = Some("preview text".to_string());
+        non_interactive_metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&non_interactive_metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config.clone()).await?,
+            ));
+        let target = lookup_latest_session_target_with_app_server(
+            &mut app_server,
+            &config,
+            Some(session_cwd.as_path()),
+            /*include_non_interactive*/ true,
+        )
+        .await?;
+        let target =
+            target.expect("latest lookup should include newer non-interactive resident thread");
+        assert_eq!(target.path, Some(non_interactive_rollout_path));
+        assert_eq!(target.thread_id, non_interactive_thread_id);
         assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
 
         app_server.shutdown().await?;

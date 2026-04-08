@@ -21,6 +21,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use serde::Serialize;
@@ -242,6 +243,16 @@ fn handle_response(
             events
                 .send(ReaderEvent::ThreadList {
                     threads,
+                    next_cursor: parsed.next_cursor,
+                })
+                .ok();
+        }
+        PendingRequest::LoadedList => {
+            let parsed = serde_json::from_value::<ThreadLoadedListResponse>(response.result)
+                .context("decode thread/loaded/list response")?;
+            events
+                .send(ReaderEvent::LoadedThreadList {
+                    thread_ids: parsed.data,
                     next_cursor: parsed.next_cursor,
                 })
                 .ok();

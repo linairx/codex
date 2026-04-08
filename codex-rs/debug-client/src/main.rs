@@ -236,6 +236,26 @@ fn handle_command(
             }
             true
         }
+        UserCommand::RefreshLoaded(cursor) => {
+            match client.request_thread_loaded_list(cursor.clone()) {
+                Ok(request_id) => {
+                    output
+                        .client_line(&match cursor {
+                            Some(cursor) => format!(
+                                "requested loaded thread list ({request_id:?}, cursor={cursor})"
+                            ),
+                            None => format!("requested loaded thread list ({request_id:?})"),
+                        })
+                        .ok();
+                }
+                Err(err) => {
+                    output
+                        .client_line(&format!("failed to list loaded threads: {err}"))
+                        .ok();
+                }
+            }
+            true
+        }
     }
 }
 
@@ -274,6 +294,14 @@ fn drain_events(event_rx: &mpsc::Receiver<ReaderEvent>, output: &Output) {
                     output.client_line(&line).ok();
                 }
             }
+            ReaderEvent::LoadedThreadList {
+                thread_ids,
+                next_cursor,
+            } => {
+                for line in loaded_thread_list_lines(&thread_ids, next_cursor.as_deref()) {
+                    output.client_line(&line).ok();
+                }
+            }
         }
     }
 }
@@ -301,6 +329,25 @@ fn thread_list_lines(
     if let Some(next_cursor) = next_cursor {
         lines.push(format!(
             "more threads available, next cursor: {next_cursor}"
+        ));
+    }
+
+    lines
+}
+
+fn loaded_thread_list_lines(thread_ids: &[String], next_cursor: Option<&str>) -> Vec<String> {
+    let mut lines = if thread_ids.is_empty() {
+        vec!["loaded threads: (none)".to_string()]
+    } else {
+        let mut lines = Vec::with_capacity(thread_ids.len() + 1);
+        lines.push("loaded threads:".to_string());
+        lines.extend(thread_ids.iter().map(|thread_id| format!("  {thread_id}")));
+        lines
+    };
+
+    if let Some(next_cursor) = next_cursor {
+        lines.push(format!(
+            "more loaded threads available, next cursor: {next_cursor}"
         ));
     }
 
@@ -364,7 +411,8 @@ fn help_lines() -> &'static [&'static str] {
         "  :new                  start a new thread",
         "  :resume <thread-id>   resume or reconnect to a thread",
         "  :use <thread-id>      switch active thread without resuming/reconnecting",
-        "  :refresh-thread [cursor] list threads with mode, suggested action, and optional pagination cursor",
+        "  :refresh-thread [cursor] list threads with mode/action across interactive and non-interactive sources",
+        "  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources",
         "  :quit                 exit",
         "type a message to send it as a new turn",
     ]
@@ -377,6 +425,7 @@ mod tests {
     use super::active_thread_switch_message;
     use super::connected_thread_message;
     use super::help_lines;
+    use super::loaded_thread_list_lines;
     use super::no_active_thread_message;
     use super::thread_list_lines;
     use super::thread_mode_label;
@@ -469,9 +518,12 @@ mod tests {
         ));
         assert!(
             lines.contains(
-                &"  :refresh-thread [cursor] list threads with mode, suggested action, and optional pagination cursor"
+                &"  :refresh-thread [cursor] list threads with mode/action across interactive and non-interactive sources"
             )
         );
+        assert!(lines.contains(
+            &"  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources"
+        ));
     }
 
     #[test]
@@ -517,6 +569,31 @@ mod tests {
     }
 
     #[test]
+    fn loaded_thread_list_lines_render_ids_and_cursor() {
+        let lines = loaded_thread_list_lines(
+            &["thread-1".to_string(), "thread-2".to_string()],
+            Some("cursor-2"),
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "loaded threads:".to_string(),
+                "  thread-1".to_string(),
+                "  thread-2".to_string(),
+                "more loaded threads available, next cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn loaded_thread_list_lines_render_empty_state_without_cursor() {
+        let lines = loaded_thread_list_lines(&[], None);
+
+        assert_eq!(lines, vec!["loaded threads: (none)".to_string()]);
+    }
+
+    #[test]
     fn refresh_thread_request_message_mentions_cursor_when_present() {
         let request_id = codex_app_server_protocol::RequestId::Integer(7);
         let cursor = "cursor-2".to_string();
@@ -529,6 +606,24 @@ mod tests {
         assert_eq!(
             message,
             "requested thread list (Integer(7), cursor=cursor-2)"
+        );
+    }
+
+    #[test]
+    fn refresh_loaded_request_message_mentions_cursor_when_present() {
+        let request_id = codex_app_server_protocol::RequestId::Integer(8);
+        let cursor = "cursor-2".to_string();
+
+        let message = match Some(cursor) {
+            Some(cursor) => {
+                format!("requested loaded thread list ({request_id:?}, cursor={cursor})")
+            }
+            None => format!("requested loaded thread list ({request_id:?})"),
+        };
+
+        assert_eq!(
+            message,
+            "requested loaded thread list (Integer(8), cursor=cursor-2)"
         );
     }
 }
