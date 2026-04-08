@@ -217,6 +217,7 @@
 - TUI 已开始补齐更多恢复入口的语义一致性，例如新线程切换、fork 后摘要提示以及线程改名确认提示，都已按 `Thread.mode` 区分“continue”与“reconnect”
 - `/resume` 的命令入口说明也已开始从“历史恢复”语义扩成同时覆盖 resident assistant 的 reconnect 语义
 - resume picker 的固定入口标题也已开始从纯 “Resume” 语义扩成同时覆盖 reconnect
+- TUI 的随机启动 tooltip 也已同步收口到同一口径：`codex resume` 不再只提示“恢复历史会话”，而会明确写成 `resume or reconnect`
 - agent thread 在 live attach 失败后退回 transcript replay 时，resident thread 也已改成使用 reconnect 语义，不再统一提示成 resumed live
 - resume 路径在 attach 失败时的错误提示，也已开始按线程模式区分 “after resume” 与 “after reconnect”
 - resume 目标切 cwd 后如果配置重建失败，错误提示也已开始按线程模式区分 “for resume” 与 “for reconnect”
@@ -238,9 +239,29 @@
 - `app-server/README.md` 的 lifecycle overview 总览入口也已补上 reconnect 口径，首屏文案不再落后于细节章节
 - `app-server/README.md` 的 `thread/list`、`thread/loaded/read` 和 `thread/unarchive` 示例结果也已补成显式带 `mode` 的版本，避免示例继续落后于正文契约
 - `app-server/README.md` 的 `thread/start`、`thread/resume` 和 `thread/fork` 顶层示例现在也已显式带上 `mode`，最前面的线程生命周期示例不再把 resident / interactive 语义压在省略号后面
+- `app-server/README.md` 的 lifecycle overview 现在也已把 `mode` / `status` 的职责分工直接写进首屏总览，不再要求读者下钻到详细章节才知道 reconnect 语义来自 `mode`
 - `app-server/README.md` 的 `thread/started` 通知示例现在也已显式带上 `mode`，response / notification 两个消费面都不再靠读者自行脑补 resident 语义
+- `app-server/README.md` 的 Events 总览现在也已明确：生命周期通知里只要附带 `thread` snapshot，外围消费者就应直接信任其中的 `thread.mode`
 - `app-server/README.md` 的 detached review 文案也已同步要求消费 `thread/started` snapshot 里的 `mode`，避免 review fork 这类边缘通知路径重新退回通用 resumed session 心智
-- 仍有剩余消费侧入口需要继续检查，但主路径上的恢复/重连文案已经开始收口
+- `app-server/README.md` 的详细 `thread/status/changed` 说明现在也已明确这只是 status-only 通知；需要 reconnect 语义时，客户端必须保留先前恢复面返回的 `thread.mode`
+- `app-server/README.md` 的 API Overview 顶层摘要现在也已同步写清：`thread/status/changed` 不会重复 `mode`，而 `Thread.mode` 与 `thread.status` 的职责边界也已被直接写成契约
+- `app-server/README.md` 的 `thread/unsubscribe` 说明现在也已明确 resident 连续性：最后一个订阅者断开后，resident thread 的后续 `thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会保留既有 `mode` 与 loaded/runtime 状态
+- `app-server/README.md` 的顶层方法摘要也已同步到同一口径：`thread/unsubscribe` 与 `thread/rollback` 这两条返回/影响 `Thread` 的路径都不再把 resident `mode` 语义留给读者自行推断
+- `app-server/README.md` 的顶层 `thread/unarchive` 摘要现在也已显式写出“保留既有 `mode`”，避免这类恢复路径只在详细示例里才体现 resident 语义
+- `app-server/README.md` 的顶层 `thread/loaded/read` 摘要也已明确写出会返回当前 `mode`，loaded 恢复面不再只靠下方详细章节体现 resident 语义
+- `app-server/README.md` 的顶层 `thread/fork` 摘要现在也已直接写出“默认仍保持 interactive，除非 fork 自己显式进入 resident 模式”，避免顶层说明重新引入来源线程模式继承的误读
+- `app-server/README.md` 的 archive 段落也已同步写清：archived thread 虽然默认不出现在普通 `thread/list`，但在 `thread/list archived=true` 与 `thread/read` 返回时仍会保留既有 `mode`
+- `app-server/README.md` 的详细 `thread/list` 说明现在也已把 archived 列表的模式消费约束写成正文，不再只靠 archive 段落和示例去侧面表达
+- `app-server/README.md` 的详细 `thread/loaded/list` 说明现在也已明确这只是 id-only probe；需要 reconnect 语义时不应停在 loaded ids，而应继续读 `thread/loaded/read`
+- `app-server/README.md` 的详细 `thread/loaded/read` 说明现在也已明确：loaded polling 本身就是带 `thread.mode` 的恢复面，而不只是无模式状态探针
+- `app-server/README.md` 的详细 `thread/fork` 说明现在也已把这条模式边界写成正文契约，而不再只靠示例 JSON 的 `interactive` 值隐含表达
+- `app-server/README.md` 的详细 `thread/unarchive` 说明现在也已明确：恢复 archived resident thread 时，应直接信任返回 `thread.mode`，不需要额外补一次 `thread/read`
+- `docs/app-server-thread-mode-v2.md` 也已同步补上这两条设计侧边界：`thread/loaded/list` 不是模式恢复面，`thread/status/changed` 则继续是 status-only 通知
+- `docs/persistent-assistant-mode-design.md` 也已同步补了这层承接说明，不再让更早的前导草案停留在“接口会返回 mode”但没有说明这些边界已由哪份当前文档接手
+- `docs/observer-event-flow-design.md` 也已同步把这层 observer / status 边界写明：`workspaceChanged` 等 observer 事实可以通过线程状态面暴露，但 `thread/status/changed` 仍只负责 status 增量，不承担重复 `mode`
+- `docs/remote-bridge-consumption.md` 也已同步补上远端消费侧的同一边界：`thread/loaded/read` 负责 loaded 线程的 `mode + status` 摘要，而 `thread/status/changed` 只做后续 status 增量
+- `docs/sqlite-state-convergence.md` 也已同步承认这层协议边界：SQLite 继续收敛稳定线程摘要与元数据，但不把 `thread/status/changed` 这类 status-only 增量误当成完整恢复来源
+- 当前这条 README / 设计文档链已经基本收口；下一步更适合把这批改动整理成提交，或切回新的代码闭环，而不是继续扩写同层文档
 
 不要混入：
 

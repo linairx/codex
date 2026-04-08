@@ -138,7 +138,7 @@
 当前可依赖事实：
 
 - 远端已经可以把 `thread/list` 视为“长期线程与普通线程总览”的主入口
-- 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的状态面
+- 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的状态面，并且这条读取面本身会继续返回 `thread.mode`
 - 对于服务重启后的未加载 resident thread，`thread/list` 不再只能看到普通历史线程语义，而是可以读到持久化回补后的 resident 模式
 
 ### 第 2 层：线程状态通知
@@ -159,7 +159,7 @@
 当前可依赖事实：
 
 - `thread/status/changed` 已适合承担“线程摘要增量刷新”的主通知面
-- 但远端仍应把它视为状态增量，而不是完整线程快照来源
+- 但远端仍应把它视为状态增量，而不是完整线程快照来源；这条通知不会重复 `thread.mode`
 - 对 `workspaceChanged` 的消费应建立在“这是需要关注的外部变化”这一语义上，而不是把它等同于“线程仍在执行”
 
 ### 第 3 层：按需深读
@@ -323,7 +323,7 @@ observer 文档里已经强调，第一阶段最重要的是：
 如果现在就开始做 bridge 或远端控制面，比较稳的做法是：
 
 1. 把 `thread/list` 作为首页线程摘要的主来源，并显式消费 `Thread.mode`
-2. 把 `thread/loaded/read` 和 `thread/status/changed` 组合成 loaded 线程的运行态刷新面
+2. 把 `thread/loaded/read` 和 `thread/status/changed` 组合成 loaded 线程的运行态刷新面，其中 `thread/loaded/read` 负责当前 `mode + status` 摘要，`thread/status/changed` 只负责后续 status 增量
 3. 把 `thread/read` 作为详情页主读取入口，不让首页依赖全量 item 流重建
 4. 把 `thread/resume` 视为长期线程的重新连接入口，而不只是历史恢复入口
 5. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”

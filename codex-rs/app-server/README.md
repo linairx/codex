@@ -76,7 +76,7 @@ Use the thread APIs to create, list, or archive conversations. Drive a conversat
 ## Lifecycle Overview
 
 - Initialize once per connection: Immediately after opening a transport connection, send an `initialize` request with your client metadata, then emit an `initialized` notification. Any other request on that connection before this handshake gets rejected.
-- Start, resume, or reconnect to a thread: Call `thread/start` to open a fresh conversation. The response returns the thread object and you’ll also get a `thread/started` notification. If you’re continuing an existing conversation, call `thread/resume` with its ID instead; use the returned `thread.mode` to distinguish an ordinary interactive resume from reconnecting to a resident assistant. If you want to branch from an existing conversation, call `thread/fork` to create a new thread id with copied history. Like `thread/start`, `thread/fork` also accepts `ephemeral: true` for an in-memory temporary thread.
+- Start, resume, or reconnect to a thread: Call `thread/start` to open a fresh conversation. The response returns the thread object and you’ll also get a `thread/started` notification. If you’re continuing an existing conversation, call `thread/resume` with its ID instead; use the returned `thread.mode` to distinguish an ordinary interactive resume from reconnecting to a resident assistant. If you want to branch from an existing conversation, call `thread/fork` to create a new thread id with copied history. Like `thread/start`, `thread/fork` also accepts `ephemeral: true` for an in-memory temporary thread. Across both responses and `thread/started` snapshots, treat `thread.mode` as the reconnect signal and `thread.status` as the current runtime state rather than inferring one from the other.
   The returned `thread.ephemeral` flag tells you whether the session is intentionally in-memory only; when it is `true`, `thread.path` is `null`.
 - Begin a turn: To send user input, call `turn/start` with the target `threadId` and the user's input. Optional fields let you override model, cwd, sandbox policy, approval policy, approvals reviewer, etc. This immediately returns the new turn object. The app-server emits `turn/started` when that turn actually begins running.
 - Stream events: After `turn/start`, keep reading JSON-RPC notifications on stdout. You’ll see `item/started`, `item/completed`, deltas like `item/agentMessage/delta`, tool progress, etc. These represent streaming model output plus any side effects (commands, tool calls, reasoning notes).
@@ -134,22 +134,22 @@ Example with notification opt-out:
 
 - `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. The returned `thread.mode` is the client-facing signal for whether the thread should behave like an ordinary interactive session (`interactive`) or a reconnectable resident assistant (`residentAssistant`). When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
 - `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. Clients that distinguish ordinary resume from reconnect should consume `thread.mode` from this response.
-- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork and `resident: true` to keep the fork loaded after the last client unsubscribes, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread. As with start/resume, consumers should treat `thread.mode = residentAssistant` as reconnect semantics.
+- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork and `resident: true` to keep the fork loaded after the last client unsubscribes, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread. By default, the forked thread remains `interactive` even when the source thread was resident; as with start/resume, consumers should treat `thread.mode = residentAssistant` as reconnect semantics only when the returned thread actually opts into that mode.
 - `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, plus `mode` (`ThreadMode`) so history UIs can distinguish reconnectable resident assistants from ordinary interactive sessions.
 - `thread/loaded/list` — list the thread ids currently loaded in memory. Supports optional `modelProviders`, `sourceKinds`, and `cwd` filters for the loaded thread's current config snapshot.
-- `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including live `status`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
+- `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including live `status` and current `mode`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, and `mode` (`ThreadMode`) so clients can preserve reconnect semantics even on read-only lookup paths.
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`. The response preserves the thread’s stored `mode`, so reconnect-aware clients do not need to re-read the thread just to recover resident assistant semantics after a metadata-only update.
-- `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
+- `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). This notification is status-only and does not repeat `thread.mode`; clients that need reconnect semantics should retain `mode` from the corresponding thread snapshot. `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
-- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, unless the thread is `resident: true`; non-resident unloads emit `thread/closed`.
+- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, unless the thread is `resident: true`; non-resident unloads emit `thread/closed`, while resident threads stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
-- `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
+- `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success, preserving its existing `mode`, and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
 - `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
-- `Thread.mode` classifies the thread's product-level role. Current values are `interactive` for ordinary sessions and `residentAssistant` for long-lived resident threads. This is separate from `thread.status`, which describes the current runtime state.
-- `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
+- `Thread.mode` classifies the thread's product-level role. Current values are `interactive` for ordinary sessions and `residentAssistant` for long-lived resident threads. This is separate from `thread.status`, which describes the current runtime state; clients should not infer reconnect semantics or role changes from `status` alone.
+- `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success, preserving the thread’s existing `mode`.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode".
 - `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. Review and manual compaction turns reject `turn/steer`.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
@@ -256,7 +256,7 @@ Example:
 { "id": 11, "result": { "thread": { "id": "thr_123", "mode": "residentAssistant", … } } }
 ```
 
-To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it. If the source thread is actively running, the fork snapshots it as if the current turn had been interrupted first. The `thread/started` payload mirrors the copied history snapshot in the response, including copied `thread.turns` when available. Pass `ephemeral: true` when the fork should stay in-memory only:
+To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it. If the source thread is actively running, the fork snapshots it as if the current turn had been interrupted first. The `thread/started` payload mirrors the copied history snapshot in the response, including copied `thread.turns` when available. Even when the source thread was resident, the fork only behaves like a reconnect target if the returned `thread.mode` is actually `residentAssistant`; the default fork remains `interactive`. Pass `ephemeral: true` when the fork should stay in-memory only:
 
 ```json
 { "method": "thread/fork", "id": 12, "params": { "threadId": "thr_123", "ephemeral": true } }
@@ -268,7 +268,7 @@ Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `per
 
 ### Example: List threads (with pagination & filters)
 
-`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary resume targets. Pass any combination of:
+`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive history. Pass any combination of:
 
 - `cursor` — opaque string from a prior response; omit for the first page.
 - `limit` — server defaults to a reasonable page size if unset.
@@ -301,7 +301,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 ### Example: List loaded threads
 
-`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk. You can also filter by the loaded thread's current `modelProviders`, `sourceKinds`, and exact-match `cwd`.
+`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk. It is intentionally an id-only probe: if a client also needs reconnect semantics or the current thread role, it should follow up with `thread/loaded/read` and consume the returned `thread.mode` there. You can also filter by the loaded thread's current `modelProviders`, `sourceKinds`, and exact-match `cwd`.
 
 ```json
 { "method": "thread/loaded/list", "id": 21 }
@@ -312,7 +312,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 ### Example: Read loaded thread summaries
 
-`thread/loaded/read` returns loaded thread summaries for sessions currently resident in memory. This is useful for polling a remote control plane without separately calling `thread/read` for each loaded thread id. It supports the same optional `modelProviders`, `sourceKinds`, and exact-match `cwd` filters as `thread/loaded/list`.
+`thread/loaded/read` returns loaded thread summaries for sessions currently resident in memory. This is useful for polling a remote control plane without separately calling `thread/read` for each loaded thread id. The returned summaries include each loaded thread's current `mode`, so reconnect-aware clients should consume this response directly instead of treating loaded polling as a mode-less status probe. It supports the same optional `modelProviders`, `sourceKinds`, and exact-match `cwd` filters as `thread/loaded/list`.
 
 ```json
 { "method": "thread/loaded/read", "id": 22 }
@@ -332,6 +332,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 `thread/status/changed` is emitted whenever a loaded thread's status changes after it has already been introduced to the client:
 
 - Includes `threadId` and the new `status`.
+- This notification is status-only: if a client also needs reconnect semantics or the thread's product role, it should retain `thread.mode` from `thread/started` / `thread/loaded/read` / `thread/read` rather than expecting this event to repeat it.
 - Status can be `notLoaded`, `idle`, `systemError`, or `active` (with `activeFlags`; `active` implies running).
 - Threads with live unified-exec background terminals remain `active` after the turn completes, with `activeFlags` including `backgroundTerminalRunning`, until those terminals exit or are cleaned.
 - Resident loaded threads also transition to `active` with `activeFlags` including `workspaceChanged` when their working directory changes on disk. Starting the next turn clears that flag.
@@ -356,6 +357,12 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - `notLoaded` when the thread is not loaded.
 
 If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Threads started/resumed/forked with `resident: true` stay loaded instead, so `thread/unsubscribe` only detaches the connection.
+
+For resident threads, that means `thread/unsubscribe` does not downgrade the
+thread back to an ordinary stored session: subsequent `thread/loaded/read`,
+`thread/read`, and `thread/resume` calls continue to surface the resident
+thread’s existing `mode` and loaded/runtime state instead of requiring clients
+to reconstruct reconnect semantics themselves.
 
 ```json
 { "method": "thread/unsubscribe", "id": 22, "params": { "threadId": "thr_123" } }
@@ -435,11 +442,13 @@ Use `thread/archive` to move the persisted rollout (stored as a JSONL file on di
 { "method": "thread/archived", "params": { "threadId": "thr_b" } }
 ```
 
-An archived thread will not appear in `thread/list` unless `archived` is set to `true`.
+An archived thread will not appear in `thread/list` unless `archived` is set
+to `true`. When it is returned through `thread/list archived=true` or
+`thread/read`, the archived thread still preserves its existing `mode`.
 
 ### Example: Unarchive a thread
 
-Use `thread/unarchive` to move an archived rollout back into the sessions directory.
+Use `thread/unarchive` to move an archived rollout back into the sessions directory. The returned `thread` preserves the archived thread's existing `mode`, so reconnect-aware clients can keep treating a restored resident thread as `residentAssistant` without an extra `thread/read`.
 
 ```json
 { "method": "thread/unarchive", "id": 24, "params": { "threadId": "thr_b" } }
@@ -866,7 +875,7 @@ All filesystem paths in this section must be absolute.
 
 ## Events
 
-Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications.
+Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications. When a lifecycle notification includes a `thread` snapshot, clients should treat that snapshot's `thread.mode` the same way they would in a direct RPC response: it is the authoritative signal for reconnectable resident-assistant semantics.
 
 Thread realtime uses a separate thread-scoped notification surface. `thread/realtime/*` notifications are ephemeral transport events, not `ThreadItem`s, and are not returned by `thread/read`, `thread/resume`, or `thread/fork`.
 

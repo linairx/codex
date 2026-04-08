@@ -1,0 +1,5 @@
+---
+source: tui/src/tooltips.rs
+expression: tooltip
+---
+You can resume or reconnect to a previous conversation by running `codex resume`

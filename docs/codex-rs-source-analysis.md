@@ -1003,6 +1003,7 @@ SQLite 在这里不是起点，而是收敛点。
 - `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
 - resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `ResidentAssistant`，`thread/loaded/read` 也会继续把该线程暴露为 `ResidentAssistant + Idle`
 - `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射、`ThreadStartedNotification` 进入 TUI 后的 resident 会话推断路径，以及启动前按名称 lookup、latest-session 选择和按线程 ID 的 `thread/read` 路径对 resident `SessionTarget.mode` 的保留，也都已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
+- `tui` 的随机启动 tooltip 也已开始对齐 resident reconnect 语义：`codex resume` 不再只被描述成“恢复历史会话”，而会明确提示它同时覆盖 `resume or reconnect`，避免最前面的轻提示文案继续落回旧的纯 resume 心智
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
 - `exec` 的 bootstrap 启动摘要也已开始消费 `thread/start` / `thread/resume` 返回的 `Thread.mode`，resident assistant 不再在 CLI 启动横幅里被压平为普通 session，而会显式展示当前是 `resident assistant`
 - `exec --json` 的首个 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，避免下游 JSON 消费方只能拿到 `thread_id`，却继续把 resident session 当成普通 interactive thread
@@ -1019,25 +1020,46 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；除了 metadata-only update 的 resident mode 保留覆盖外，`thread/loaded/read` 也已补上 loaded resident assistant 的 typed request 回归，避免 in-process 集成到了 loaded 恢复面又退回通用线程摘要假设
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
 - `app-server/README.md` 顶部 lifecycle overview 的总览入口也已补上 reconnect 语义，不再在首屏继续把 `thread/resume` 描述成单纯的普通历史恢复
+- `app-server/README.md` 的 lifecycle overview 现在也已把 `mode` / `status` 分工写进首屏：无论是直接响应还是 `thread/started` snapshot，`thread.mode` 都是 reconnect 信号，而 `thread.status` 只描述当前 runtime 状态
 - `app-server/README.md` 的恢复面示例 JSON 也已继续对齐：`thread/list`、`thread/loaded/read` 和 `thread/unarchive` 的示例结果现在显式带上 `mode`，避免正文强调 `Thread.mode` 是权威信号，但示例又把它省掉
 - `app-server/README.md` 的 `thread/start`、`thread/resume` 和 `thread/fork` 主示例也已补成显式带 `mode` 的版本，避免最靠前的线程生命周期示例继续把 resident / interactive 语义藏在省略号里
 - `app-server/README.md` 里的 `thread/started` 通知示例也已继续对齐：`thread/start` 和 `thread/fork` 后续通知现在同样显式带上 `mode`，不再只让响应面体现 resident / interactive 区分
+- `app-server/README.md` 的 Events 总览现在也已把 notification 面的消费契约写明：凡是生命周期通知里附带 `thread` snapshot，都应直接消费其中的 `thread.mode`，而不是只把它当成请求响应侧的约束
 - `app-server/README.md` 的 detached review 说明也已补上 `thread.mode` 消费约束：review fork 发出的 `thread/started` snapshot 同样应该直接读取 `mode`，而不是把这类 review 线程通知继续当成通用 resumed session
+- `app-server/README.md` 的详细 `thread/status/changed` 说明现在也已把边界写清：这条通知只重复 runtime `status`，不会再次携带 `mode`；需要 reconnect 语义时，外围消费者应保留之前从 `thread/started` / `thread/loaded/read` / `thread/read` 拿到的 `thread.mode`
+- `app-server/README.md` 的 API Overview 顶层摘要现在也已同步到同一口径：`thread/status/changed` 被明确标记为 status-only，`Thread.mode` 也被明确声明不能从 `thread.status` 反推
+- `app-server/README.md` 的顶层方法摘要也已继续收口：`thread/unsubscribe` 现在不再只写“resident 不 unload”，而是明确后续读取面仍保留既有 `mode` 与 runtime 状态；`thread/rollback` 也已明确返回的 `thread` 会保留既有 `mode`
+- `app-server/README.md` 的顶层 `thread/unarchive` 摘要也已补上同样口径：这条恢复路径返回的 `thread` 会保留既有 `mode`，不再只在下方详细示例里隐含体现
+- `app-server/README.md` 的顶层 `thread/loaded/read` 摘要现在也已显式写出会返回当前 `mode`，避免 loaded 恢复面只在详细说明里体现 resident 语义
+- `app-server/README.md` 的顶层 `thread/fork` 摘要也已把模式边界写清：源线程是 resident 不代表默认 fork 也变 resident，外围消费者应该以返回的 `thread.mode` 为准，而不是按来源线程心智继承
+- `app-server/README.md` 的详细 `thread/list` 说明现在也已把 archived 列表的模式语义写回正文：即使 `archived: true`，外围消费者也应继续信任返回的 `thread.mode`，而不是把 archived 行默认为普通 interactive 历史
+- `app-server/README.md` 的详细 `thread/loaded/list` 说明现在也已把边界写清：这条接口只是 id-only probe；如果外围还需要 reconnect 语义或线程角色，就应该继续调用 `thread/loaded/read` 并直接消费其中的 `thread.mode`
+- `app-server/README.md` 的详细 `thread/loaded/read` 说明现在也已明确：loaded polling 返回的不是无模式状态探针，而是可直接消费 `thread.mode` 的恢复面
+- `app-server/README.md` 的详细 `thread/fork` 章节现在也已把这条模式边界写回正文，而不再只靠示例里的 `interactive` 值暗示“resident 源线程默认不会把 fork 变成 reconnect 目标”
 - `thread_status.rs` 也已补上 resident workspace watch 迁移/清理回归：同一线程切换 `cwd` 后旧工作区变化不会再重新激活 `workspaceChanged`，切回非 resident 后也会移除 watch，避免 observer 状态被陈旧目录继续污染
 - `thread/unarchive` 也已开始复用 SQLite 稳定元数据来组响应：resident 线程反归档后不再因为只读 rollout 摘要而回退成 `interactive`，`thread/unarchive`、后续 `thread/read` 与 `thread/list` 都会继续保持 `ResidentAssistant`
+- `app-server/README.md` 的详细 `thread/unarchive` 章节现在也已明确要求直接消费返回 `thread.mode`，恢复 resident thread 时不需要再额外补一次 `thread/read` 才能恢复 reconnect 语义
+- `app-server/README.md` 的 `thread/unsubscribe` 说明也已继续补齐 resident 连续性：对 resident thread 来说，这条路径不只是“不会 unload”，而是后续 `thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会继续暴露既有 `mode` 与 loaded/runtime 状态
 - resident thread 的归档读取面也已补上回归：进入 archived 状态后，`thread/read` 与 `thread/list archived=true` 仍会稳定保留 `ResidentAssistant`，不会因为只走 SQLite 摘要路径就掉回普通 interactive 线程
+- `app-server/README.md` 的 archive 段落现在也已把这点写明：虽然 archived thread 默认不会出现在 `thread/list`，但在 `thread/list archived=true` 与 `thread/read` 返回时仍会保留既有 `mode`
 - `thread/metadata/update` 的 resident 回归也已继续扩到 stored + archived 面：未加载 resident thread 走纯 SQLite 稳定元数据路径时，更新响应与后续 `thread/read` / `thread/list` 会继续保持 `ResidentAssistant`；loaded resident thread 在修补元数据行后也不会因为 fallback bootstrap 路径丢掉 `ResidentAssistant`；已归档 resident thread 更新 git metadata 时，响应与后续 `thread/read` / `thread/list archived=true` 同样会继续保持 `ResidentAssistant`
 - `codex-state` 的 SQLite 边界测试也已继续补强：`update_thread_git_info` 在 resident thread 上不会意外覆盖 `threads.mode`，避免元数据补丁把已持久化的 `ResidentAssistant` 降回 interactive
 - `app-server/README.md` 也已把 `thread/metadata/update` 的 resident 语义补齐：API 说明现在明确要求返回的 `thread` 保留既有 `mode`，避免外围集成把 metadata-only update 错当成需要额外 `thread/read` 才能恢复 reconnect 语义的特殊路径
+- `docs/app-server-thread-mode-v2.md` 现在也已同步跟上这些已落地边界：设计稿里明确写出 `thread/loaded/list` 只是 id-only probe，而 `thread/status/changed` 继续保持 status-only，`mode` 仍应来自 `thread/started` / `thread/read` / `thread/list` / `thread/loaded/read`
+- `docs/persistent-assistant-mode-design.md` 这份更早的前导草案现在也已补上承接关系：它明确把 `thread/loaded/list`、`thread/loaded/read`、`thread/status/changed` 这些细边界交给 `app-server-thread-mode-v2.md` 作为当前权威协议说明
+- `docs/observer-event-flow-design.md` 现在也已显式对齐协议边界：observer 事件虽然通过线程状态面进入客户端，但 `thread/status/changed` 继续只是 status-only 增量，线程角色仍应从 `thread/started` / `thread/read` / `thread/list` / `thread/loaded/read` 保留
+- `docs/remote-bridge-consumption.md` 现在也已继续对齐到同一口径：远端控制面应把 `thread/loaded/read` 视为带 `mode + status` 的 loaded 恢复面，而把 `thread/status/changed` 视为不重复 `mode` 的 status-only 增量通知
+- `docs/sqlite-state-convergence.md` 现在也已把这层边界补进状态分层：`thread/loaded/read` 属于当前线程摘要读取面，而 `thread/status/changed` 仍只是后续 status 增量，不应被当成需要落 SQLite 的完整线程恢复来源
 - `docs/sqlite-state-convergence.md` 也已从纯前瞻草案补成“当前状态 + 渐进收敛”视角，明确把 `threads.mode`、archive / unarchive、metadata update resident 连续性这些已落地边界写进 SQLite 文档，不再只停留在泛化设计层
 
-这说明前面文档链的作用已经完成了一半：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
+这说明前面这条文档链已经基本完成当前轮次的收口：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 
 接下来的工作重点不应该再继续膨胀同层设计文档，而应该转向：
 
 - 按 PR 边界收敛已经落地的协议、observer 和 SQLite 最小闭环
 - 继续整理消费侧改动，也就是 TUI 或其他客户端对 `Thread.mode` 的正式使用
-- 再决定是否进入远端消费与 bridge 侧摘要设计，而不是回到同层大文档扩写
+- 在合适时机把这一批 README / 设计稿同步改动整理成提交，而不是继续无边界扩写同层文档
+- 再决定是否进入新的代码闭环，而不是回到同层大文档扩写
 
 换句话说，后续主线已经从“拆文档”切换为“按实现计划逐阶段落代码”。
 

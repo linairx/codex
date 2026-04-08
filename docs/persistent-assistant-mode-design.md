@@ -215,6 +215,12 @@ observer、SQLite、bridge 都不应混进这一阶段 PR。
 
 - `docs/app-server-thread-mode-v2.md`
 
+目前这份 v2 协议文档已经进一步细化了几个实现边界：
+
+- `thread/loaded/list` 只是 id-only probe，不承担模式恢复语义
+- `thread/loaded/read` 是带 `mode + status` 的 loaded 恢复面
+- `thread/status/changed` 继续保持 status-only，不重复 `Thread.mode`
+
 再下一份更底层但仍应独立拆出的文档是：
 
 - `docs/observer-event-flow-design.md`

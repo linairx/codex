@@ -266,6 +266,7 @@ pub(crate) mod announcement {
 mod tests {
     use super::*;
     use crate::tooltips::announcement::parse_announcement_tip_toml;
+    use insta::assert_snapshot;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -311,6 +312,16 @@ mod tests {
         let expected = std::collections::BTreeSet::from([paid_app_tooltip()]);
         assert_eq!(seen, expected);
         assert!(!seen.contains(&FAST_TOOLTIP));
+    }
+
+    #[test]
+    fn tooltips_include_resume_or_reconnect_guidance() {
+        let tooltip = TOOLTIPS
+            .iter()
+            .copied()
+            .find(|tip| tip.contains("codex resume"))
+            .expect("expected a codex resume tooltip");
+        assert_snapshot!("resume_or_reconnect_tooltip", tooltip);
     }
 
     #[test]

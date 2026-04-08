@@ -127,6 +127,10 @@ mode: ThreadMode
 
 这比同时修改多套独立响应字段更稳，也更容易兼容。
 
+与之相对，`thread/loaded/list` 这类只返回线程 id 的接口不应被当成模式恢复面。
+如果客户端既需要 loaded 集合，又需要区分 reconnect 语义，应该继续读取
+`thread/loaded/read`，而不是期待 id-only 接口重复 `Thread.mode`。
+
 ## 7. 请求侧建议
 
 第一阶段有两种可接受路径。
@@ -204,6 +208,13 @@ mode: ThreadMode
 - `mode` 负责线程身份
 - `status` 负责线程当前运行态
 
+这也意味着 `thread/status/changed` 应继续保持 status-only：
+
+- 它负责增量推送运行态变化
+- 不负责重复 `Thread.mode`
+- 客户端需要从前面的 `thread/started`、`thread/read`、`thread/list`、
+  `thread/loaded/read` 等恢复面保留线程角色
+
 ## 11. 返回面影响
 
 第一阶段新增 `Thread.mode` 后，应该统一出现在所有返回 `Thread` 的接口与通知中，包括：
@@ -230,6 +241,9 @@ mode: ThreadMode
 - `Thread.mode` 的语义
 - `resident` 与 `mode` 的区别
 - `thread/resume` 对 `residentAssistant` 更偏“重新连接”
+- `thread/status/changed` 只推送 runtime `status`，不重复 `mode`
+- `thread/loaded/list` 只是 id-only probe；需要 reconnect 语义时应继续读
+  `thread/loaded/read`
 
 ### 客户端
 

@@ -145,6 +145,12 @@
 - `workspaceChanged`
 
 这一步是让客户端和远端控制面可消费的关键。
+但这里的线程状态面仍应保持当前协议边界：
+
+- `thread/status/changed` 只负责推送增量 `status`
+- 不负责重复 `Thread.mode`
+- 客户端和远端控制面应继续从 `thread/started`、`thread/read`、
+  `thread/list`、`thread/loaded/read` 这些恢复面保留线程角色
 
 第一阶段最重要的是：
 
