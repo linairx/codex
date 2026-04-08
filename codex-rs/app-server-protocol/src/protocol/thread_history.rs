@@ -131,7 +131,7 @@ impl ThreadHistoryBuilder {
     }
 
     /// Shared reducer for persisted rollout replay and in-memory current-turn
-    /// tracking used by running thread resume/rejoin.
+    /// tracking used by running thread resume/reconnect.
     ///
     /// This function should handle all EventMsg variants that can be persisted in a rollout file.
     /// See `should_persist_event_msg` in `codex-rs/core/rollout/policy.rs`.

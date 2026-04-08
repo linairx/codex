@@ -2267,6 +2267,41 @@ mod tests {
     }
 
     #[test]
+    fn resume_picker_hint_mentions_reconnect_for_resident_threads() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Investigate resident thread watcher drift"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Remote active thread")),
+            mode: ThreadMode::ResidentAssistant,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+
+        let rendered = picker_hint_line(&state).to_string();
+        assert!(
+            rendered.contains("enter to reconnect"),
+            "resident picker hint should keep reconnect wording: {rendered}"
+        );
+    }
+
+    #[test]
     fn resume_picker_row_renders_assistant_badge_for_resident_threads() {
         use crate::custom_terminal::Terminal;
         use crate::test_backend::VT100Backend;
@@ -2324,178 +2359,6 @@ mod tests {
             "resident picker row should render assistant badge: {snapshot}"
         );
     }
-
-    // TODO(jif) fix
-    // #[tokio::test]
-    // async fn resume_picker_screen_snapshot() {
-    //     use crate::custom_terminal::Terminal;
-    //     use crate::test_backend::VT100Backend;
-    //     use uuid::Uuid;
-    //
-    //     // Create real rollout files so the snapshot uses the actual listing pipeline.
-    //     let tempdir = tempfile::tempdir().expect("tempdir");
-    //     let sessions_root = tempdir.path().join("sessions");
-    //     std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
-    //
-    //     let now = Utc::now();
-    //
-    //     // Helper to write a rollout file with minimal meta + one user message.
-    //     let write_rollout = |ts: DateTime<Utc>, cwd: &str, branch: &str, preview: &str| {
-    //         let dir = sessions_root
-    //             .join(ts.format("%Y").to_string())
-    //             .join(ts.format("%m").to_string())
-    //             .join(ts.format("%d").to_string());
-    //         std::fs::create_dir_all(&dir).expect("mkdir date dirs");
-    //         let filename = format!(
-    //             "rollout-{}-{}.jsonl",
-    //             ts.format("%Y-%m-%dT%H-%M-%S"),
-    //             Uuid::new_v4()
-    //         );
-    //         let path = dir.join(filename);
-    //         let meta = serde_json::json!({
-    //             "timestamp": ts.to_rfc3339(),
-    //             "item": {
-    //                 "SessionMeta": {
-    //                     "meta": {
-    //                         "id": Uuid::new_v4(),
-    //                         "timestamp": ts.to_rfc3339(),
-    //                         "cwd": cwd,
-    //                         "originator": "user",
-    //                         "cli_version": "0.0.0",
-    //                         "source": "Cli",
-    //                         "model_provider": "openai",
-    //                     }
-    //                 }
-    //             }
-    //         });
-    //         let user = serde_json::json!({
-    //             "timestamp": ts.to_rfc3339(),
-    //             "item": {
-    //                 "EventMsg": {
-    //                     "UserMessage": {
-    //                         "message": preview,
-    //                         "images": null
-    //                     }
-    //                 }
-    //             }
-    //         });
-    //         let branch_meta = serde_json::json!({
-    //             "timestamp": ts.to_rfc3339(),
-    //             "item": {
-    //                 "EventMsg": {
-    //                     "SessionMeta": {
-    //                         "meta": {
-    //                             "git_branch": branch
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         });
-    //         std::fs::write(&path, format!("{meta}\n{user}\n{branch_meta}\n"))
-    //             .expect("write rollout");
-    //     };
-    //
-    //     write_rollout(
-    //         now - Duration::seconds(42),
-    //         "/tmp/project",
-    //         "feature/resume",
-    //         "Fix resume picker timestamps",
-    //     );
-    //     write_rollout(
-    //         now - Duration::minutes(35),
-    //         "/tmp/other",
-    //         "main",
-    //         "Investigate lazy pagination cap",
-    //     );
-    //
-    //     let loader: PageLoader = Arc::new(|_| {});
-    //     let mut state = PickerState::new(
-    //         PathBuf::from("/tmp"),
-    //         FrameRequester::test_dummy(),
-    //         loader,
-    //         String::from("openai"),
-    //         true,
-    //         None,
-    //         SessionPickerAction::Resume,
-    //     );
-    //
-    //     let page = RolloutRecorder::list_threads(
-    //         &state.codex_home,
-    //         PAGE_SIZE,
-    //         None,
-    //         ThreadSortKey::CreatedAt,
-    //         INTERACTIVE_SESSION_SOURCES,
-    //         Some(&[String::from("openai")]),
-    //         "openai",
-    //     )
-    //     .await
-    //     .expect("list conversations");
-    //
-    //     let rows = rows_from_items(page.items);
-    //     state.all_rows = rows.clone();
-    //     state.filtered_rows = rows;
-    //     state.view_rows = Some(4);
-    //     state.selected = 0;
-    //     state.scroll_top = 0;
-    //     state.update_view_rows(4);
-    //
-    //     let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
-    //
-    //     let width: u16 = 80;
-    //     let height: u16 = 9;
-    //     let backend = VT100Backend::new(width, height);
-    //     let mut terminal = Terminal::with_options(backend).expect("terminal");
-    //     terminal.set_viewport_area(Rect::new(0, 0, width, height));
-    //
-    //     {
-    //         let mut frame = terminal.get_frame();
-    //         let area = frame.area();
-    //         let [header, search, columns, list, hint] = Layout::vertical([
-    //             Constraint::Length(1),
-    //             Constraint::Length(1),
-    //             Constraint::Length(1),
-    //             Constraint::Min(area.height.saturating_sub(4)),
-    //             Constraint::Length(1),
-    //         ])
-    //         .areas(area);
-    //
-    //         frame.render_widget_ref(
-    //             Line::from(vec![
-    //                 "Resume a previous session".bold().cyan(),
-    //                 "  ".into(),
-    //                 "Sort:".dim(),
-    //                 " ".into(),
-    //                 "Created at".magenta(),
-    //             ]),
-    //             header,
-    //         );
-    //
-    //         frame.render_widget_ref(Line::from("Type to search".dim()), search);
-    //
-    //         render_column_headers(&mut frame, columns, &metrics, state.sort_key);
-    //         render_list(&mut frame, list, &state, &metrics);
-    //
-    //         let hint_line: Line = vec![
-    //             key_hint::plain(KeyCode::Enter).into(),
-    //             " to resume ".dim(),
-    //             "    ".dim(),
-    //             key_hint::plain(KeyCode::Esc).into(),
-    //             " to start new ".dim(),
-    //             "    ".dim(),
-    //             key_hint::ctrl(KeyCode::Char('c')).into(),
-    //             " to quit ".dim(),
-    //             "    ".dim(),
-    //             key_hint::plain(KeyCode::Tab).into(),
-    //             " to toggle sort ".dim(),
-    //         ]
-    //         .into();
-    //         frame.render_widget_ref(hint_line, hint);
-    //     }
-    //     terminal.flush().expect("flush");
-    //
-    //     let snapshot = terminal.backend().to_string();
-    //     assert_snapshot!("resume_picker_screen", snapshot);
-    // }
 
     #[tokio::test]
     async fn resume_picker_thread_names_snapshot() {
@@ -2979,6 +2842,14 @@ mod tests {
         assert_eq!(
             SessionPickerAction::Resume.action_label(Some(ThreadMode::Interactive)),
             "resume"
+        );
+    }
+
+    #[test]
+    fn resume_title_mentions_reconnect_for_resident_threads() {
+        assert_eq!(
+            SessionPickerAction::Resume.title(),
+            "Resume or reconnect to a previous session"
         );
     }
 

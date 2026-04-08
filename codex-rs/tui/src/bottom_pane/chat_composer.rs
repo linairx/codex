@@ -6059,6 +6059,36 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_resume_for_res_includes_reconnect_description() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'r', 'e', 's']);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
+        terminal
+            .draw(|f| composer.render(f.area(), f.buffer_mut()))
+            .expect("draw composer");
+
+        let snapshot = format!("{:?}", terminal.backend());
+        assert!(
+            snapshot.contains("resume chat or reconnect to resident assistant"),
+            "slash popup should keep reconnect wording: {snapshot}"
+        );
+    }
+
+    #[test]
     fn slash_popup_resume_for_res_logic() {
         use super::super::command_popup::CommandItem;
         let (tx, _rx) = unbounded_channel::<AppEvent>();

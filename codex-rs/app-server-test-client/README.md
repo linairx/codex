@@ -27,7 +27,7 @@ Initialize a connection, then print every inbound JSON-RPC message until you sto
 cargo run -p codex-app-server-test-client -- watch
 ```
 
-## Testing Thread Rejoin Behavior
+## Testing Thread Resume/Reconnect Behavior
 
 Build and start an app server using commands above. The app-server log is written to `/tmp/codex-app-server-test-client/app-server.log`
 
@@ -36,7 +36,7 @@ Build and start an app server using commands above. The app-server log is writte
 Create at least one thread, then list threads:
 
 ```bash
-cargo run -p codex-app-server-test-client -- send-message-v2 "seed thread for rejoin test"
+cargo run -p codex-app-server-test-client -- send-message-v2 "seed thread for reconnect test"
 cargo run -p codex-app-server-test-client -- thread-list --limit 5
 ```
 
@@ -69,12 +69,12 @@ cargo run -p codex-app-server-test-client -- thread-unarchive <THREAD_ID>
 cargo run -p codex-app-server-test-client -- thread-rollback <THREAD_ID> --num-turns 1
 ```
 
-When you use the streaming resume/start commands, `thread/started`
+When you use the streaming start/resume/reconnect commands, `thread/started`
 notifications also print the same compact resident-aware summary, so the
 notification path stays aligned with the direct response summaries instead of
 falling back to plain debug output.
 
-### 2) Rejoin while a turn is in progress (two terminals)
+### 2) Resume or reconnect while a turn is in progress (two terminals)
 
 Terminal A:
 

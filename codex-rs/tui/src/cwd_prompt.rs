@@ -312,6 +312,15 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_action_uses_resident_assistant_wording() {
+        assert_eq!(CwdPromptAction::Reconnect.verb(), "reconnect to");
+        assert_eq!(
+            CwdPromptAction::Reconnect.past_participle(),
+            "resident assistant"
+        );
+    }
+
+    #[test]
     fn cwd_prompt_selects_session_by_default() {
         let mut screen = new_prompt();
         screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

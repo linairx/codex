@@ -37,8 +37,8 @@ updatedAt: number,
  */
 status: ThreadStatus, 
 /**
- * Product-level thread mode used by clients to distinguish long-lived
- * assistants from ordinary interactive sessions.
+ * Product-level thread mode used by clients to distinguish resident
+ * assistants from ordinary interactive resume targets.
  */
 mode: ThreadMode, 
 /**

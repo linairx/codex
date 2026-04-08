@@ -10108,7 +10108,7 @@
               "$ref": "#/definitions/ThreadMode"
             }
           ],
-          "description": "Product-level thread mode used by clients to distinguish long-lived assistants from ordinary interactive sessions."
+          "description": "Product-level thread mode used by clients to distinguish resident assistants from ordinary interactive resume targets."
         },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",

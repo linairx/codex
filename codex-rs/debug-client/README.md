@@ -42,13 +42,17 @@ Type a line to send it as a new turn. Commands are prefixed with `:`:
   flattening `:use` / `:refresh-thread` back to generic thread wording.
 - `:new` start a new thread
 - `:resume <thread-id>` resume or reconnect to a thread
-- `:use <thread-id>` switch active thread without resuming; when the thread was
-  already seen via start/resume/list, the client also preserves whether that id
+- `:use <thread-id>` switch active thread without resuming or reconnecting; when the thread was
+  already seen via start, resume/reconnect, or list, the client also preserves whether that id
   is an ordinary thread or a resident assistant thread
 - `:refresh-thread` list available threads, including both the stored thread
   mode (`interactive` vs `resident assistant`) and the suggested action
   (`resume` vs `reconnect`)
 - `:quit` exit
+
+If you have not attached any thread yet, or you switch to an unknown thread id
+with `:use`, the fallback prompts now also keep the same wording and tell you to
+use `:resume <thread-id>` to resume or reconnect.
 
 The prompt shows the active thread id. Client messages (help, errors, approvals)
 print to stderr; raw server JSON prints to stdout so you can pipe/record it

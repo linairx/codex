@@ -3120,6 +3120,14 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    #[test]
+    fn resident_thread_reconnected_without_name_keeps_generic_message() {
+        let cell = new_resident_thread_reconnected(Some("   "));
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+        assert_eq!(rendered, "• Reconnected to resident assistant thread.");
+    }
+
     #[tokio::test]
     async fn session_info_first_event_suppresses_tooltips_and_nux() {
         let config = test_config().await;

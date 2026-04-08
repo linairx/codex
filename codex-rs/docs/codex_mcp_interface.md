@@ -50,7 +50,7 @@ Use the separate `codex mcp` subcommand to manage configured MCP server launcher
 
 ## Threads and turns
 
-Use the v2 thread and turn APIs for all new integrations. `thread/start` creates a thread, `thread/resume` resumes or reconnects one, `turn/start` submits user input, `turn/interrupt` stops an in-flight turn, and `thread/list` / `thread/read` expose persisted history. Integrations that distinguish an ordinary interactive resume target from resident reconnect should consume `thread.mode` from thread responses and `thread/started` notifications; `residentAssistant` means the thread should be presented as a reconnect target rather than a normal interactive resume target.
+Use the v2 thread and turn APIs for all new integrations. `thread/start` creates a thread, `thread/resume` resumes or reconnects one, `turn/start` submits user input, `turn/interrupt` stops an in-flight turn, and `thread/list` / `thread/read` expose persisted history. Integrations that distinguish an ordinary interactive resume target from resident reconnect should consume `thread.mode` from thread responses and `thread/started` notifications; `residentAssistant` means the thread should be presented as a reconnect target rather than an ordinary interactive resume target.
 
 `getConversationSummary` remains as a compatibility helper for clients that still need a summary lookup by `conversationId` or `rolloutPath`.
 

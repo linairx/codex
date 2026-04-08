@@ -325,6 +325,19 @@ mod tests {
     }
 
     #[test]
+    fn resume_tooltip_mentions_reconnect_guidance() {
+        let tooltip = TOOLTIPS
+            .iter()
+            .copied()
+            .find(|tip| tip.contains("codex resume"))
+            .expect("expected a codex resume tooltip");
+        assert_eq!(
+            tooltip,
+            "You can resume or reconnect to a previous conversation by running `codex resume`"
+        );
+    }
+
+    #[test]
     fn announcement_tip_toml_picks_last_matching() {
         let toml = r#"
 [[announcements]]

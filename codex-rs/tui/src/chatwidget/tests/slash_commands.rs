@@ -97,6 +97,23 @@ async fn slash_rename_uses_reconnect_hint_for_resident_threads() {
 }
 
 #[tokio::test]
+async fn slash_rename_confirmation_mentions_resident_reconnect() {
+    let rendered = lines_to_single_string(
+        &ChatWidget::rename_confirmation_cell(
+            "atlas",
+            Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
+            Some(codex_app_server_protocol::ThreadMode::ResidentAssistant),
+        )
+        .display_lines(/*width*/ 120),
+    );
+
+    assert_eq!(
+        rendered.trim_end(),
+        "• Thread renamed to atlas to reconnect to this resident assistant run codex resume atlas"
+    );
+}
+
+#[tokio::test]
 async fn slash_quit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

@@ -17,16 +17,33 @@ pub enum UserCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     EmptyCommand,
-    MissingArgument { name: &'static str },
-    UnknownCommand { command: String },
+    MissingArgument {
+        command: &'static str,
+        name: &'static str,
+    },
+    UnknownCommand {
+        command: String,
+    },
 }
 
 impl ParseError {
     pub fn message(&self) -> String {
         match self {
             Self::EmptyCommand => "empty command after ':'".to_string(),
-            Self::MissingArgument { name } => {
-                format!("missing required argument: {name}")
+            Self::MissingArgument {
+                command: "resume",
+                name,
+            } => format!(
+                "missing required argument: {name} (use :resume <thread-id> to resume or reconnect)"
+            ),
+            Self::MissingArgument {
+                command: "use",
+                name,
+            } => format!(
+                "missing required argument: {name} (use :use <thread-id> to switch the active thread without resuming/reconnecting)"
+            ),
+            Self::MissingArgument { command, name } => {
+                format!("missing required argument for :{command}: {name}")
             }
             Self::UnknownCommand { command } => format!("unknown command: {command}"),
         }
@@ -53,17 +70,19 @@ pub fn parse_input(line: &str) -> Result<Option<InputAction>, ParseError> {
         "quit" | "q" | "exit" => Ok(Some(InputAction::Command(UserCommand::Quit))),
         "new" => Ok(Some(InputAction::Command(UserCommand::NewThread))),
         "resume" => {
-            let thread_id = parts
-                .next()
-                .ok_or(ParseError::MissingArgument { name: "thread-id" })?;
+            let thread_id = parts.next().ok_or(ParseError::MissingArgument {
+                command: "resume",
+                name: "thread-id",
+            })?;
             Ok(Some(InputAction::Command(UserCommand::Resume(
                 thread_id.to_string(),
             ))))
         }
         "use" => {
-            let thread_id = parts
-                .next()
-                .ok_or(ParseError::MissingArgument { name: "thread-id" })?;
+            let thread_id = parts.next().ok_or(ParseError::MissingArgument {
+                command: "use",
+                name: "thread-id",
+            })?;
             Ok(Some(InputAction::Command(UserCommand::Use(
                 thread_id.to_string(),
             ))))
@@ -141,7 +160,10 @@ mod tests {
         let result = parse_input(":resume");
         assert_eq!(
             result,
-            Err(ParseError::MissingArgument { name: "thread-id" })
+            Err(ParseError::MissingArgument {
+                command: "resume",
+                name: "thread-id",
+            })
         );
     }
 
@@ -150,7 +172,34 @@ mod tests {
         let result = parse_input(":use");
         assert_eq!(
             result,
-            Err(ParseError::MissingArgument { name: "thread-id" })
+            Err(ParseError::MissingArgument {
+                command: "use",
+                name: "thread-id",
+            })
+        );
+    }
+
+    #[test]
+    fn missing_resume_arg_message_mentions_resume_or_reconnect_usage() {
+        assert_eq!(
+            ParseError::MissingArgument {
+                command: "resume",
+                name: "thread-id",
+            }
+            .message(),
+            "missing required argument: thread-id (use :resume <thread-id> to resume or reconnect)"
+        );
+    }
+
+    #[test]
+    fn missing_use_arg_message_mentions_switch_usage() {
+        assert_eq!(
+            ParseError::MissingArgument {
+                command: "use",
+                name: "thread-id",
+            }
+            .message(),
+            "missing required argument: thread-id (use :use <thread-id> to switch the active thread without resuming/reconnecting)"
         );
     }
 }

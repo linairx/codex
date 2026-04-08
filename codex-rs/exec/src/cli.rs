@@ -124,12 +124,14 @@ pub enum Command {
 struct ResumeArgsRaw {
     // Note: This is the direct clap shape. We reinterpret the positional when --last is set
     // so "codex resume --last <prompt>" treats the positional as a prompt, not a session id.
-    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if it parses.
-    /// If omitted, use --last to pick the most recent recorded session.
+    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if
+    /// it parses. If omitted, use --last to pick the most recent recorded
+    /// session to resume or reconnect.
     #[arg(value_name = "SESSION_ID")]
     session_id: Option<String>,
 
-    /// Resume or reconnect to the most recent recorded session (newest) without specifying an id.
+    /// Resume or reconnect to the most recent recorded session (newest)
+    /// without specifying an id.
     #[arg(long = "last", default_value_t = false)]
     last: bool,
 
@@ -137,7 +139,7 @@ struct ResumeArgsRaw {
     #[arg(long = "all", default_value_t = false)]
     all: bool,
 
-    /// Optional image(s) to attach to the prompt sent after resuming.
+    /// Optional image(s) to attach to the prompt sent after resuming or reconnecting.
     #[arg(
         long = "image",
         short = 'i',
@@ -147,27 +149,31 @@ struct ResumeArgsRaw {
     )]
     images: Vec<PathBuf>,
 
-    /// Prompt to send after resuming the session. If `-` is used, read from stdin.
+    /// Prompt to send after resuming or reconnecting to the session. If `-` is
+    /// used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     prompt: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct ResumeArgs {
-    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if it parses.
-    /// If omitted, use --last to pick the most recent recorded session.
+    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if
+    /// it parses. If omitted, use --last to pick the most recent recorded
+    /// session to resume or reconnect.
     pub session_id: Option<String>,
 
-    /// Resume or reconnect to the most recent recorded session (newest) without specifying an id.
+    /// Resume or reconnect to the most recent recorded session (newest)
+    /// without specifying an id.
     pub last: bool,
 
     /// Show all sessions (disables cwd filtering).
     pub all: bool,
 
-    /// Optional image(s) to attach to the prompt sent after resuming.
+    /// Optional image(s) to attach to the prompt sent after resuming or reconnecting.
     pub images: Vec<PathBuf>,
 
-    /// Prompt to send after resuming the session. If `-` is used, read from stdin.
+    /// Prompt to send after resuming or reconnecting to the session. If `-` is
+    /// used, read from stdin.
     pub prompt: Option<String>,
 }
 

@@ -1006,10 +1006,15 @@ SQLite 在这里不是起点，而是收敛点。
 - `tui` 的随机启动 tooltip 也已开始对齐 resident reconnect 语义：`codex resume` 不再只被描述成“恢复历史会话”，而会明确提示它同时覆盖 `resume or reconnect`，避免最前面的轻提示文案继续落回旧的纯 resume 心智
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
 - `cli` / `exec` 的命令帮助入口也已继续对齐 resident reconnect 心智：顶层 `resume` 子命令说明和 `exec resume` 帮助摘要都已明确写成 `resume or reconnect`，不再把这条入口继续描述成单纯的历史恢复
+- `tui` / `exec` 的内部 CLI 字段注释现在也已继续收口到同一口径：`resume_session_id`、resume 列表开关，以及 resume 后附带 prompt/image 的字段说明都已改成显式覆盖 `resume or reconnect`，避免维护者继续从结构体注释里读出旧的纯 resume 心智
+- 顶层 `codex` CLI 的 `ResumeCommand` 内部注释现在也已补到同一粒度：session id、`--last` 与 `--include-non-interactive` 的字段说明都已明确写成 `resume or reconnect` / `resume/reconnect picker`，避免壳层注释再次落回旧的纯 resume 表述
 - `app-server` 与 MCP 面向外部集成的顶层说明也已继续收口：Events 总览和 MCP thread 概览都已明确把 `resume/reconnect` 与 `thread.mode` 的关系写到首屏，不再要求外围读者先跳进细节章节再推断 resident reconnect 语义
 - `app-server` 方法摘要和 `app-server-client` README 的 typed bootstrap 说明也已继续收口到同一口径：外围调用方现在会被明确引导去区分“普通 interactive resume 目标”和 resident reconnect，而不是继续使用模糊的普通 resume 表述
+- `app-server-client` README 的 bootstrap 流程现在也已把这层语义写回正文：它会明确说明 resident assistant 上的 `thread/resume` 同时就是 reconnect bootstrap，调用方应直接把立即返回的 typed response 当成 `resume or reconnect` 的权威启动摘要，而不是等后续 legacy 事件再脑补 reconnect 语义
+- `app-server-client` README 的 bootstrap 列表项现在也已继续补齐这层口径：最前面的流程枚举不再只写 `thread/start` 或 `thread/resume`，而会直接标明 `thread/resume` 覆盖 `resume or reconnect`，避免正文已经说明 reconnect bootstrap，但列表项还停留在旧的缩写心智
 - `app-server/README.md` 顶部 lifecycle overview 的总览句子也已跟上这条精确化口径：首屏不再只写泛化的 ordinary resume，而会直接写成 ordinary interactive resume target，对外围集成的 reconnect 心智不再留灰区
 - `docs/codex_mcp_interface.md` 的 thread 概览和 `app-server/README.md` 的 `thread/list` 摘要也已继续补齐到同一粒度：前者不再只笼统罗列 thread API，而会直接点出 `thread/resume` 覆盖 `resume or reconnect`；后者也明确把列表消费目标写成 ordinary interactive resume target，而不是泛化的 ordinary interactive session
+- `docs/codex_mcp_interface.md` 的对照措辞现在也已继续精确化：resident assistant 不再被描述成相对一个 “normal interactive resume target”，而是直接对照成 `ordinary interactive resume target`，让 MCP 文档与 app-server / app-server-client README 保持完全一致的术语
 - `app-server-client` README 的 typed bootstrap 说明和 `app-server/README.md` 的历史列表消费段也已继续收紧术语：前者现在直接写成 resident reconnect，后者也不再把 resident 行只对照成泛化的 ordinary resume targets，避免外围列表 UI 和 in-process 调用侧继续留下模糊空间
 - `app-server-test-client` README 的摘要说明也已继续贴近真实输出：除了 wire `thread.mode` 值外，它现在也明确把派生的 `resume/reconnect` action label 写成输出契约，并说明这是 ordinary interactive resume target 与 resident reconnect target 的对照，不再只让读者自行推断
 - `app-server-test-client` 的 CLI help 入口也已继续对齐 resident reconnect 语义：`resume-message-v2` 与 `thread-resume` 的子命令说明、参数 help 和对应回归测试都已改成 `resume or reconnect`，不再让 `--help` 输出落回旧的纯 resume 心智
@@ -1043,12 +1048,19 @@ SQLite 在这里不是起点，而是收敛点。
 - `exec` 的 `ThreadStartedEvent.thread_mode` 字段注释现在也已补齐到同一粒度：公开类型说明里会直接写清这就是下游区分 ordinary interactive resume target 与 resident reconnect target 的产品信号，不再只靠字段名暗示
 - `codex-rs/README.md` 的顶层 `codex exec` 说明现在也已补上同一层脚本消费语义：README 会直接写明 `codex exec --json` 的首个 `thread.started` 事件会带 bootstrap `thread_id`，fresh start 时给出 `interactive`、resident reconnect 时给出 `residentAssistant`，未知模式时则显式省略该字段；同时也明确这层 bootstrap 元数据只走 JSON 事件面，而不是 stderr 的人类可读摘要
 - `codex-rs/README.md` 的顶层 `codex exec` 说明现在也已把默认 human-readable 输出补齐：README 会直接写出非 `--json` 模式下的 bootstrap stderr 摘要包含 `session mode` / `session action`，用于区分普通 resume 与 resident reconnect
+- `codex-rs/README.md` 的这句 human-readable bootstrap 说明现在也已继续精确化：interactive 一侧不再笼统写成 “ordinary interactive runs”，而会直接写成 ordinary interactive resume flows，让顶层 README 对 `session action = resume` 的解释更贴近当前 thread-mode 语义
 - `debug-client` 也已开始消费 `Thread.mode`：连接成功提示、活跃线程切换提示、线程列表标记和 `:resume` 帮助文案都已按 resident assistant 收口，不再把 reconnect 路径统一描述成普通 resume
 - `debug-client` 的线程列表摘要也已继续补齐：`:refresh-thread` 现在会同时显示线程模式标签和推荐动作，不再只给出模糊的 `resume/reconnect` 动词，让 resident thread 与普通 interactive thread 在联调输出里更容易一眼区分
 - `debug-client` 的已知线程切换提示也已继续补齐：`:use <thread-id>` 在本地已缓存线程模式时，会明确区分 `thread` 与 `resident assistant thread`，不再把已知 resident thread 仍然压平成通用 thread 文案
 - `debug-client` 的这条消费面也已补回到可编译闭环：此前被截断的事件/帮助尾部逻辑已经恢复，并补上 resident reconnect 文案回归，避免这块客户端入口继续停留在“文案方向正确但 crate 本身不工作”的状态
 - `debug-client` 的内置 `:help` 文案现在也已对齐 resident-aware 行为：`:use` 与 `:refresh-thread` 不再在帮助输出里退回旧的泛化 thread 说明，而会明确提示模式保留与 mode/action 摘要语义
 - `debug-client` 的 clap 顶层 `--help` 现在也已补上 resident-aware 回归：`--thread-id` 与相关 override 的命令行帮助说明会稳定体现 `resume or reconnect` 语义，不再只靠交互内置 `:help` 和 README 承担这层收口
+- `debug-client` 的 `:use` 帮助文案现在也已继续精确化：它会明确写成“switch active thread without resuming/reconnecting”，避免本地切换活动线程的纯 selector 行为，被误读成也会立即 attach live thread 或触发 resident reconnect
+- `debug-client` 的 fallback 提示现在也已继续收口到同一口径：当当前没有活跃线程，或只是本地切到一个未知 thread id 时，CLI 会稳定提示 `:resume` 可用于 `resume or reconnect`，不再把这类兜底提示写成模糊的 “load or reconnect” 文案
+- `debug-client` 的 README 现在也已同步跟上这条 fallback 语义：文档会明确说明“尚未 attach 线程”和“`:use` 切到未知 thread id”这两种场景下，同样应通过 `:resume <thread-id>` 去 `resume or reconnect`，避免帮助输出与 README 再次分叉
+- `debug-client` 的 `:resume` 缺参错误现在也已补上 resident-aware 用法提示：当用户只输入 `:resume` 时，CLI 会直接提示 `:resume <thread-id>` 可用于 `resume or reconnect`，不再只返回泛化的 `missing required argument: thread-id`
+- `debug-client` 的 `:use` 缺参错误现在也已继续收口到同一条 selector 边界：当用户只输入 `:use` 时，CLI 会直接提示这是“without resuming/reconnecting”的本地活动线程切换，不再只返回泛化的缺参报错
+- `debug-client` 的 README 现在也已把已知线程来源的口径写得更贴近实现：`:use <thread-id>` 说明不再笼统写成 `start/resume/list`，而会明确写成 `start, resume/reconnect, or list`，避免 resident reconnect 被 README 自己重新压回普通 resume 来源
 - `app-server-test-client` 的 `thread/start`、`thread/resume`、`thread/list` 和 `thread/started` 输出也已补上 resident-aware 摘要，手工联调时不再需要从整段 debug struct 里自己辨认这是不是 reconnect 场景
 - `app-server-test-client` 的最常用恢复入口现在也已各自补上命令级摘要断言：`thread/start`、`thread/resume` 和 `thread/fork` 这三条路径都会稳定打印各自的 resident reconnect label，不再只靠共享 helper 和 README 侧面兜底
 - `app-server-test-client` 的 resident-aware 摘要回归现在也已把 `thread/started` 通知入口单独锁住：除了 `thread/read` 这类响应面外，通知摘要字符串同样会稳定打印 `mode=residentAssistant` 和 `action=reconnect`，避免通知入口在后续重构时悄悄退回普通 resume 文案
@@ -1061,11 +1073,19 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server-test-client` 的 README 说明也已继续对齐到实现现状：loaded / unarchive 这类边缘恢复命令同样会打印紧凑的 `mode` + `resume/reconnect` 摘要，不再只是笼统说“resident-aware”
 - `app-server-test-client` 的 README 说明现在也已把 rollback 补进同一口径：`thread-rollback` 示例会明确说明它和 loaded / unarchive 一样打印 wire `thread.mode` + 派生 `resume/reconnect` action，手工验证 rollback 后的 resident continuity 不再需要读完整 debug struct
 - `app-server-test-client` 的 README 还已补成更贴近实际输出的口径：摘要里打印的是 wire `thread.mode` 值（例如 `interactive` / `residentAssistant`）再配上 `resume/reconnect` 动作，不需要再靠读者自行猜测 mode 文本是不是产品化标签
+- `app-server-test-client` 的 README 章节标题和示例 seed 文案现在也已继续从旧的 “rejoin” 术语收口到 `resume/reconnect`：手工联调说明会直接把这条流程表述成“thread resume/reconnect behavior”，避免外围读者继续把 resident reconnect 当成另一套语义漂移的旧命名
+- `app-server-test-client` 的 README 流式说明现在也已继续补齐同一口径：`thread/started` 相关段落不再只写 `resume/start commands`，而会直接写成 `start/resume/reconnect commands`，让通知面文档和 resident reconnect 主线保持一致
 - `app-server-test-client` 的 clap 顶层 `--help` 现在也已补上 resident-aware 回归：`resume-message-v2` 与 `thread-resume` 这两个恢复入口的子命令说明会稳定体现 `resume or reconnect`，不再只让 README 或联调输出承担这层语义
 - `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；除了 metadata-only update 的 resident mode 保留覆盖外，`thread/loaded/read`、`thread/list`、`thread/unarchive` 和 archived 后的 `thread/read` 这几个只读恢复面也都已补上 resident assistant 的 typed request 回归，而且 archived resident thread 的 `thread/metadata/update` 也已补成专门回归，避免 in-process 集成到了 loaded/history/restore/archived-repair 路径后又退回通用线程摘要假设
 - `codex-app-server-client` 的 in-process typed 回归现在也已把 resident `thread/unsubscribe` 的后续读取面锁住：最后一个订阅者断开后，`thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会稳定保留 `ResidentAssistant + Idle`，避免共享客户端在“已断开但仍常驻”的路径上把 reconnect 目标重新降回普通 interactive 线程
 - `thread/rollback` 的 resident 路径现在也已补上真实 typed 回归，并顺手修掉了实现层的模式回退缺口：rollback 完成后 app-server 不再只按 rollout summary 重建一个默认 interactive `Thread`，而会像其他读取面一样合并持久化 metadata，所以 resident assistant 在 `thread/rollback` 响应里也会继续稳定保留 `ResidentAssistant`
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
+- `app-server/README.md` 的 API Overview 方法行现在也已继续补齐到同一口径：`thread/resume` 不再只写成“reopen an existing thread”，而会直接写成 `resume or reconnect`，避免最常读的接口摘要再次落回旧的纯 resume 心智
+- `app-server/README.md` 的 `thread/start` 摘要措辞现在也已继续统一：interactive 一侧不再笼统写成 “ordinary interactive session”，而会直接对齐到 `ordinary interactive resume target`，让 `thread/start`、`thread/resume` 与列表/通知面使用完全一致的 mode 对照术语
+- `app-server/README.md` 的详细 `thread/resume` 章节现在也已补齐同一口径：正文不再写成 “normal interactive resume target”，而会统一对齐到 `ordinary interactive resume target`，避免 overview 和详细说明之间继续出现双轨术语
+- `app-server-protocol` 里 `thread_history` 的源码注释现在也已把旧的 `resume/rejoin` 术语收口到 `resume/reconnect`：底层 replay reducer 的职责说明不再残留过时命名，避免协议实现层和对外文档继续使用两套词汇
+- `codex-app-server` 的 `thread_resume` 集成测试命名现在也已继续去掉旧的 `rejoin` 术语：running-thread override mismatch 这条 resident continuity 回归已经改成显式使用 `reconnects`，避免测试层继续保留和产品/API 口径不一致的旧命名
+- `app-server-protocol` 的 `Thread.mode` 源码注释与生成 schema 描述现在也已继续统一术语：它不再把 interactive 对照项泛化成 ordinary interactive session，而会直接写成 `ordinary interactive resume target`，让协议层的字段说明和 README / MCP 文档保持一致
 - `app-server/README.md` 顶部 lifecycle overview 的总览入口也已补上 reconnect 语义，不再在首屏继续把 `thread/resume` 描述成单纯的普通历史恢复
 - `app-server/README.md` 的 lifecycle overview 现在也已把 `mode` / `status` 分工写进首屏：无论是直接响应还是 `thread/started` snapshot，`thread.mode` 都是 reconnect 信号，而 `thread.status` 只描述当前 runtime 状态
 - `app-server/README.md` 的恢复面示例 JSON 也已继续对齐：`thread/list`、`thread/loaded/read` 和 `thread/unarchive` 的示例结果现在显式带上 `mode`，避免正文强调 `Thread.mode` 是权威信号，但示例又把它省掉
@@ -1096,7 +1116,16 @@ SQLite 在这里不是起点，而是收敛点。
 - `codex-tui` 的 `resume_picker` 现在也已把 resident 标签分支单独锁住：`thread_mode_label(ThreadMode::ResidentAssistant)` 会稳定返回 `"[assistant]"`，避免 picker 列表在继续保留 reconnect 动作文案的同时，模式徽标却在后续重构里静默消失
 - `codex-tui` 的 `resume_picker` 上游 row 映射现在也已补上 resident 回归：`row_from_app_server_thread(...)` 在消费 app-server 线程摘要时，会继续保留 `mode = ResidentAssistant`，避免 picker 只是标签 helper 还在，但真正落到列表行模型时又退回普通 interactive 模式
 - `codex-tui` 的 `resume_picker` 列表渲染面现在也已把 resident 徽标单独锁住：resident row 实际 render 到终端时会继续显示 `"[assistant]"`，避免 row 模型和 helper 都还保留 resident 语义，但最终列表展示在重构里静默丢 badge
+- `codex-tui` 的 `resume_picker` 入口标题现在也已补上 resident 回归：`SessionPickerAction::Resume.title()` 会稳定保留 `"Resume or reconnect to a previous session"`，避免列表页最外层标题在后续重构里退回旧的纯 resume 心智
+- `codex-tui` 的 `resume_picker` hint 行现在也已补上 resident 回归：最终提示会稳定保留 `"enter to reconnect"`，避免 action label helper 仍然正确，但底部操作提示在重构里静默退回泛化的 resume 文案
+- `codex-tui` 里一份停用的 `resume_picker` 旧 snapshot 残留也已一并清掉：被注释掉的示例测试文案和遗留 `.snap` 文件不再继续保留 `"Resume a previous session"` / `"enter to resume"` 这类旧口径，避免维护者从废弃测试资产里重新抄回过时措辞
+- `codex-tui` 的 `resume_picker.rs` 里那整段长期注释掉的 `resume_picker_screen_snapshot` 草稿也已一并删除：这类既不运行、又重复手写 UI 布局的死代码不再继续滞留在测试模块里，避免后续维护者把它误当成仍待恢复的权威覆盖
+- `codex-tui` 的 tooltip 提示现在也已补上 resident 回归：`codex resume` 相关提示会稳定保留 `"resume or reconnect"` 措辞，避免最外围新手引导在后续调整里重新退回纯 resume 心智
+- `codex-tui` 的底部 slash popup 现在也已补上 resident 回归：输入 `/res` 后 `/resume` 条目的渲染会稳定保留 `"resume chat or reconnect to resident assistant"`，避免底部命令选择器继续沿用旧的纯 resume 帮助文案
+- `codex-tui` 的 rename 确认文案现在也已补上 resident 回归：线程重命名后的确认提示会稳定保留 `"to reconnect to this resident assistant run codex resume ..."`，避免聊天视图里的后续引导在重构里退回普通 thread resume 心智
 - `codex-tui` 的 slash command 文案现在也已补上 resident 回归：`SlashCommand::Resume.description()` 会稳定保留 “resume chat or reconnect to resident assistant”，避免最外层帮助文案在重构时退回旧的纯 resume 心智
+- `codex-tui` 的 resident reconnect history cell 现在也已补上无名字边界回归：`new_resident_thread_reconnected(...)` 在 thread name 为空时仍会保留通用的 resident assistant reconnect 文案，不会因为空白名字把提示渲染坏掉
+- `codex-tui` 的 cwd prompt resident 文案现在也已补上最小回归：`CwdPromptAction::Reconnect` 的核心措辞会稳定保留 `"reconnect to"` 和 `"resident assistant"`，避免切目录提示在后续重构里退回普通 resume/fork 心智
 - `thread_loaded_read.rs` 现在也已把 loaded polling 自己的 observer 连续性单独锁住：resident thread 命中工作区变化后，直接调用 `thread/loaded/read` 也会稳定返回带 `workspaceChanged` 的摘要，不再只靠 `thread_read.rs` 里的顺带覆盖来证明这条读取面成立
 - `codex-app-server-client` 的 in-process typed 回归也已补到 observer 连续性：resident thread 命中工作区变化后，`thread/read`、`thread/loaded/read` 与 `thread/resume` 这三条 typed 请求都会继续保留同一个 `workspaceChanged` 状态，避免共享客户端在 reconnect 路径上只保留 `mode` 却丢掉 observer 脏标记
 - `thread/unarchive` 也已开始复用 SQLite 稳定元数据来组响应：resident 线程反归档后不再因为只读 rollout 摘要而回退成 `interactive`，而且 `codex-app-server-client` 的 typed 回归现在也已把 `thread/unarchive`、后续 `thread/read` 与 `thread/list` 一起锁住，避免共享客户端只在反归档响应面保留 `ResidentAssistant`、却在随后的 stored 列表恢复面重新退回通用 interactive 摘要

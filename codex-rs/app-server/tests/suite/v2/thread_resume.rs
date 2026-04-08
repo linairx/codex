@@ -1341,7 +1341,7 @@ async fn thread_resume_rejects_mismatched_path_when_thread_is_running() -> Resul
 }
 
 #[tokio::test]
-async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> Result<()> {
+async fn thread_resume_reconnects_running_thread_even_with_override_mismatch() -> Result<()> {
     let server = responses::start_mock_server().await;
     let first_response = responses::sse_response(responses::sse(vec![
         responses::ev_response_created("resp-1"),

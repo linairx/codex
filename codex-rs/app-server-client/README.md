@@ -48,10 +48,15 @@ boundary, not to introduce a second response contract.
 The client facade starts an already-initialized in-process runtime, but
 thread bootstrap still follows normal app-server flow:
 
-- caller sends `thread/start` or `thread/resume`
+- caller sends `thread/start` or `thread/resume` (`resume or reconnect`)
 - app-server returns the immediate typed response
 - richer session metadata may arrive later as a `SessionConfigured`
   legacy event
+
+For resident assistants, that `thread/resume` bootstrap step is also the
+reconnect path. Callers should therefore treat the immediate typed response as
+the authoritative `resume or reconnect` bootstrap summary rather than assuming
+all reconnect semantics arrive later via legacy events.
 
 Surfaces such as TUI and exec may therefore need a short bootstrap
 phase where they reconcile startup response data with later events.

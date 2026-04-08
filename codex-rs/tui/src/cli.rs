@@ -23,8 +23,9 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_last: bool,
 
-    /// Internal: resume a specific recorded session by id (UUID). Set by the
-    /// top-level `codex resume <SESSION_ID>` wrapper; not exposed as a public flag.
+    /// Internal: resume or reconnect to a specific recorded session by id (UUID).
+    /// Set by the top-level `codex resume <SESSION_ID>` wrapper; not exposed as
+    /// a public flag.
     #[clap(skip)]
     pub resume_session_id: Option<String>,
 
@@ -32,7 +33,7 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_show_all: bool,
 
-    /// Internal: include non-interactive sessions in resume listings.
+    /// Internal: include non-interactive sessions in resume/reconnect listings.
     #[clap(skip)]
     pub resume_include_non_interactive: bool,
 

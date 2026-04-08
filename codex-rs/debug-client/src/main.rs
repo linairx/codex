@@ -128,9 +128,7 @@ fn main() -> Result<()> {
             Ok(None) => continue,
             Ok(Some(InputAction::Message(message))) => {
                 let Some(active_thread) = client.thread_id() else {
-                    output
-                        .client_line("no active thread; use :new or :resume <id>")
-                        .ok();
+                    output.client_line(no_active_thread_message()).ok();
                     continue;
                 };
                 if let Err(err) = client.send_turn(&active_thread, message) {
@@ -301,6 +299,10 @@ fn connected_thread_message(thread_connection: &ThreadConnection) -> &'static st
     }
 }
 
+fn no_active_thread_message() -> &'static str {
+    "no active thread; use :new or :resume <id> to resume or reconnect"
+}
+
 fn active_thread_switch_message(thread_id: &str, thread_mode: Option<ThreadMode>) -> String {
     match thread_mode {
         Some(ThreadMode::Interactive) => format!("switched active thread to thread {thread_id}"),
@@ -308,7 +310,7 @@ fn active_thread_switch_message(thread_id: &str, thread_mode: Option<ThreadMode>
             format!("switched active thread to resident assistant thread {thread_id}")
         }
         None => format!(
-            "switched active thread to {thread_id} (unknown; use :resume to load or reconnect)"
+            "switched active thread to {thread_id} (unknown; use :resume to resume or reconnect)"
         ),
     }
 }
@@ -346,7 +348,7 @@ fn help_lines() -> &'static [&'static str] {
         "  :help                 show this help",
         "  :new                  start a new thread",
         "  :resume <thread-id>   resume or reconnect to a thread",
-        "  :use <thread-id>      switch active thread and preserve known mode",
+        "  :use <thread-id>      switch active thread without resuming/reconnecting",
         "  :refresh-thread       list threads with mode and suggested action",
         "  :quit                 exit",
         "type a message to send it as a new turn",
@@ -360,6 +362,7 @@ mod tests {
     use super::active_thread_switch_message;
     use super::connected_thread_message;
     use super::help_lines;
+    use super::no_active_thread_message;
     use super::thread_mode_label;
     use super::thread_ready_label;
     use super::thread_resume_label;
@@ -415,7 +418,15 @@ mod tests {
         );
         assert_eq!(
             active_thread_switch_message("thread-1", None),
-            "switched active thread to thread-1 (unknown; use :resume to load or reconnect)"
+            "switched active thread to thread-1 (unknown; use :resume to resume or reconnect)"
+        );
+    }
+
+    #[test]
+    fn no_active_thread_message_mentions_resume_or_reconnect() {
+        assert_eq!(
+            no_active_thread_message(),
+            "no active thread; use :new or :resume <id> to resume or reconnect"
         );
     }
 
@@ -436,9 +447,9 @@ mod tests {
     #[test]
     fn help_text_mentions_mode_aware_thread_commands() {
         let lines = help_lines();
-        assert!(
-            lines.contains(&"  :use <thread-id>      switch active thread and preserve known mode")
-        );
+        assert!(lines.contains(
+            &"  :use <thread-id>      switch active thread without resuming/reconnecting"
+        ));
         assert!(
             lines.contains(&"  :refresh-thread       list threads with mode and suggested action")
         );

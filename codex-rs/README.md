@@ -54,8 +54,8 @@ To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the p
 Use `codex exec --ephemeral ...` to run without persisting session rollout files to disk.
 
 In the default human-readable mode, the bootstrap stderr summary includes
-`session mode` and `session action` so ordinary interactive runs show `resume`
-while resident-assistant reconnect flows show `reconnect`.
+`session mode` and `session action` so ordinary interactive resume flows show
+`resume` while resident-assistant reconnect flows show `reconnect`.
 
 For script consumers, `codex exec --json` emits a `thread.started` event first. That
 event includes the bootstrap `thread_id`, and when available also includes

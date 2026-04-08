@@ -212,12 +212,14 @@ struct DebugPromptInputCommand {
 
 #[derive(Debug, Parser)]
 struct ResumeCommand {
-    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if it parses.
-    /// If omitted, use --last to pick the most recent recorded session.
+    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if
+    /// it parses. If omitted, use --last to pick the most recent recorded
+    /// session to resume or reconnect.
     #[arg(value_name = "SESSION_ID")]
     session_id: Option<String>,
 
-    /// Resume or reconnect to the most recent session without showing the picker.
+    /// Resume or reconnect to the most recent recorded session without showing
+    /// the picker.
     #[arg(long = "last", default_value_t = false)]
     last: bool,
 
@@ -225,7 +227,8 @@ struct ResumeCommand {
     #[arg(long = "all", default_value_t = false)]
     all: bool,
 
-    /// Include non-interactive sessions in the resume picker and --last selection.
+    /// Include non-interactive sessions in the resume/reconnect picker and
+    /// --last selection.
     #[arg(long = "include-non-interactive", default_value_t = false)]
     include_non_interactive: bool,
 
