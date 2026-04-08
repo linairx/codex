@@ -220,4 +220,12 @@ mod tests {
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
     }
+
+    #[test]
+    fn resume_description_mentions_reconnect_for_resident_assistant() {
+        assert_eq!(
+            SlashCommand::Resume.description(),
+            "resume chat or reconnect to resident assistant"
+        );
+    }
 }

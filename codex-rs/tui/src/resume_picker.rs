@@ -2266,6 +2266,65 @@ mod tests {
         assert_snapshot!("resume_picker_resident_reconnect_hint", snapshot);
     }
 
+    #[test]
+    fn resume_picker_row_renders_assistant_badge_for_resident_threads() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+        use ratatui::layout::Constraint;
+        use ratatui::layout::Layout;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Investigate resident thread watcher drift"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Remote active thread")),
+            mode: ThreadMode::ResidentAssistant,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+        state.selected = 0;
+        state.scroll_top = 0;
+
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
+
+        let width: u16 = 90;
+        let height: u16 = 3;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            let segments =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
+            render_list(&mut frame, segments[1], &state, &metrics);
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert!(
+            snapshot.contains("[assistant]"),
+            "resident picker row should render assistant badge: {snapshot}"
+        );
+    }
+
     // TODO(jif) fix
     // #[tokio::test]
     // async fn resume_picker_screen_snapshot() {
@@ -2924,6 +2983,15 @@ mod tests {
     }
 
     #[test]
+    fn thread_mode_label_marks_resident_threads_as_assistant() {
+        assert_eq!(
+            thread_mode_label(ThreadMode::ResidentAssistant),
+            Some("[assistant]")
+        );
+        assert_eq!(thread_mode_label(ThreadMode::Interactive), None);
+    }
+
+    #[test]
     fn app_server_row_keeps_pathless_threads() {
         let thread_id = ThreadId::new();
         let thread = Thread {
@@ -2996,6 +3064,35 @@ mod tests {
             ]
         );
         assert!(!row.has_system_error);
+    }
+
+    #[test]
+    fn app_server_row_preserves_resident_thread_mode() {
+        let thread = Thread {
+            id: ThreadId::new().to_string(),
+            forked_from_id: None,
+            preview: String::from("resident thread"),
+            ephemeral: false,
+            model_provider: String::from("openai"),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Idle,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: None,
+            cwd: PathBuf::from("/tmp"),
+            cli_version: String::from("0.0.0"),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        };
+
+        let row = row_from_app_server_thread(thread).expect("row should be preserved");
+
+        assert_eq!(row.mode, ThreadMode::ResidentAssistant);
     }
 
     #[tokio::test]

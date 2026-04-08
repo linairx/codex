@@ -2,6 +2,36 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn handle_thread_session_preserves_resident_thread_mode() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+
+    chat.handle_thread_session(crate::app_server_session::ThreadSessionState {
+        thread_id,
+        forked_from_id: None,
+        thread_name: Some("Atlas".to_string()),
+        thread_mode: Some(codex_app_server_protocol::ThreadMode::ResidentAssistant),
+        model: "gpt-5".to_string(),
+        model_provider_id: "openai".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        cwd: PathBuf::from("/tmp/project"),
+        reasoning_effort: None,
+        history_log_id: 0,
+        history_entry_count: 0,
+        network_proxy: None,
+        rollout_path: None,
+    });
+
+    assert_eq!(
+        chat.thread_mode(),
+        Some(codex_app_server_protocol::ThreadMode::ResidentAssistant)
+    );
+}
+
+#[tokio::test]
 async fn collab_spawn_end_shows_requested_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     let sender_thread_id = ThreadId::new();

@@ -378,6 +378,14 @@
 - resident thread 的 archive 读取面也已补上回归：进入 archived 状态后，`thread/read` 和 `thread/list archived=true` 仍会继续保留 `ResidentAssistant`
 - `codex-app-server-client` 的 typed archived 消费面现在也已补上同层回归：纯 archived read 与 archived `thread/metadata/update` 之后，`thread/list archived=true` 都会继续保留 `ResidentAssistant`，避免共享客户端在 archived 列表面退回通用 interactive 历史摘要
 - `codex-tui` 的 `AppServerSession` archived 读取面现在也已补上同层回归：归档后的 `thread/read` 与 `thread/list archived=true` 都会继续保留 `ResidentAssistant`，避免 TUI 会话层只在普通 stored/loaded 路径上覆盖 resident continuity
+- `codex-tui` 的 `AppServerSession` live attach 路径现在也已补上同层回归：`resume_thread(...)` 直接走 `thread/resume` reconnect resident thread 时，返回的 `ThreadSessionState.thread_mode` 仍会继续保留 `ResidentAssistant`
+- `codex-tui` 更靠近 UI 的 thread-read fallback 映射现在也已补上同层回归：`session_state_for_thread_read(...)` 在把 app-server 的线程摘要落成本地 `ThreadSessionState` 时，仍会继续保留 `ResidentAssistant`
+- `codex-tui` 的最终展示面现在也已补上最小 resident label 回归：`chatwidget.thread_mode_label()` 在 resident thread 上仍会稳定返回 `"Resident assistant"`
+- `codex-tui` 的 chatwidget 会话注入路径现在也已补上最小 resident 回归：`handle_thread_session(...)` 在消费 `ThreadSessionState` 时，仍会继续保留 `ResidentAssistant`
+- `codex-tui` 的 resume picker 模式徽标现在也已补上最小 resident 回归：`thread_mode_label(ThreadMode::ResidentAssistant)` 仍会稳定返回 `"[assistant]"`
+- `codex-tui` 的 resume picker row 映射现在也已补上同层回归：`row_from_app_server_thread(...)` 在消费 app-server 线程摘要时，仍会继续保留 `ResidentAssistant`
+- `codex-tui` 的 resume picker 列表渲染面现在也已补上最小 resident 回归：resident row render 到终端时，仍会继续显示 `"[assistant]"`
+- `codex-tui` 的 slash command 帮助文案现在也已补上最小 resident 回归：`SlashCommand::Resume.description()` 仍会继续保留 reconnect 提示
 - `codex-tui` 的更上层 session lookup 也已补上 archived resident id 恢复回归：按 thread id 查 archived thread 时，lookup 结果仍会继续保留 `ResidentAssistant`，避免 selector 层在 archived 路径上把 reconnect 目标降回普通 session target
 - `thread/metadata/update` 的 resident 覆盖也已继续扩到 stored + archived 面：纯 SQLite 稳定元数据路径不会把未加载 resident thread 的更新响应与后续读取面降成 interactive；缺失 SQLite 行修复也不会把 loaded resident thread 的稳定 `mode` 重建成普通 interactive，而 archived resident thread 更新 metadata 后的响应与后续读取面同样会继续保持 `ResidentAssistant`
 - `codex-state` 也已继续补上状态层边界测试：`set_thread_mode` 对缺失线程只返回 false，不会顺手创建 SQLite 垃圾行；`update_thread_git_info` 在 resident thread 上也不会顺手覆盖 `threads.mode`

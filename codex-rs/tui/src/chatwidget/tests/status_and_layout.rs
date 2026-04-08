@@ -64,6 +64,15 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
 }
 
 #[tokio::test]
+async fn thread_mode_label_reports_resident_assistant() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.thread_mode = Some(codex_app_server_protocol::ThreadMode::ResidentAssistant);
+
+    assert_eq!(chat.thread_mode_label(), Some("Resident assistant"));
+}
+
+#[tokio::test]
 async fn turn_started_uses_runtime_context_window_before_first_token_count() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 

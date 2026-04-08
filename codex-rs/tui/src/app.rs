@@ -7975,6 +7975,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_state_for_thread_read_preserves_resident_thread_mode() {
+        let app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        let thread = Thread {
+            id: thread_id.to_string(),
+            forked_from_id: None,
+            preview: "resident agent thread".to_string(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Idle,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: None,
+            cwd: PathBuf::from("/tmp/agent"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli.into(),
+            agent_nickname: Some("Atlas".to_string()),
+            agent_role: Some("worker".to_string()),
+            git_info: None,
+            name: Some("resident agent thread".to_string()),
+            turns: Vec::new(),
+        };
+
+        let session = app.session_state_for_thread_read(thread_id, &thread).await;
+
+        assert_eq!(session.thread_id, thread_id);
+        assert_eq!(session.thread_mode, Some(ThreadMode::ResidentAssistant));
+        assert_eq!(
+            session.thread_name,
+            Some("resident agent thread".to_string())
+        );
+        assert_eq!(session.model_provider_id, "openai".to_string());
+        assert_eq!(session.cwd, PathBuf::from("/tmp/agent"));
+    }
+
+    #[tokio::test]
     async fn refresh_agent_picker_thread_liveness_prunes_closed_metadata_only_threads() -> Result<()>
     {
         let mut app = make_test_app().await;

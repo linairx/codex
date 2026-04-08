@@ -1170,7 +1170,11 @@ mod tests {
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
     use codex_core::config::ConfigBuilder;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
+    use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
     use tempfile::TempDir;
 
     async fn build_config(temp_dir: &TempDir) -> Config {
@@ -1226,6 +1230,61 @@ mod tests {
                 network_access: false,
             },
         )
+    }
+
+    fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
+        let conversation_id = ThreadId::from_string(thread_id).expect("valid thread id");
+        let timestamp = "2025-01-05T12:00:00Z";
+        let meta = SessionMeta {
+            id: conversation_id,
+            forked_from_id: None,
+            timestamp: timestamp.to_string(),
+            cwd: std::env::temp_dir(),
+            originator: "codex".to_string(),
+            cli_version: "0.0.0-test".to_string(),
+            source: ProtocolSessionSource::Cli,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            model_provider: Some(model_provider.to_string()),
+            base_instructions: None,
+            dynamic_tools: None,
+            memory_mode: None,
+        };
+        let payload = serde_json::to_value(SessionMetaLine { meta, git: None })
+            .expect("session meta payload should serialize");
+        let lines = [
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": payload,
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "resident resume"}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "resident resume",
+                    "kind": "plain"
+                }
+            })
+            .to_string(),
+        ];
+
+        std::fs::create_dir_all(path.parent().expect("rollout path should have parent"))
+            .expect("rollout directory should exist");
+        std::fs::write(path, lines.join("\n") + "\n").expect("rollout should be writable");
     }
 
     #[tokio::test]
@@ -1651,6 +1710,56 @@ mod tests {
             .find(|thread| thread.id == response.thread.id)
             .expect("thread/loaded/read should include resident thread");
         assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn resume_thread_preserves_resident_thread_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let request_id = app_server.next_request_id();
+
+        let response: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let thread_id = ThreadId::from_string(&response.thread.id)
+            .expect("thread/start should return thread id");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        let rollout_path = response
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &response.thread.id,
+            &response.thread.model_provider,
+        );
+
+        let resumed = app_server
+            .resume_thread(config.clone(), thread_id)
+            .await
+            .expect("thread/resume should succeed");
+        assert_eq!(resumed.session.thread_id, thread_id);
+        assert_eq!(
+            resumed.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
+        );
 
         app_server
             .shutdown()
