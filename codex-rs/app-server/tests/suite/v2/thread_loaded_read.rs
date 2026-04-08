@@ -4,6 +4,7 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadSourceKind;
@@ -186,6 +187,67 @@ async fn thread_loaded_read_filters_by_model_provider_and_source_kind() -> Resul
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].id, thread_id);
     assert_eq!(next_cursor, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_loaded_read_reports_workspace_changed_for_resident_threads() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let req_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("gpt-5.1".to_string()),
+            cwd: Some(workspace.path().display().to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
+
+    std::fs::write(workspace.path().join("watched.txt"), "changed")?;
+
+    let loaded_status = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let read_id = mcp
+                .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+                .await?;
+            let resp: JSONRPCResponse = mcp
+                .read_stream_until_response_message(RequestId::Integer(read_id))
+                .await?;
+            let ThreadLoadedReadResponse { data, .. } =
+                to_response::<ThreadLoadedReadResponse>(resp)?;
+            let loaded_thread = data
+                .iter()
+                .find(|loaded_thread| loaded_thread.id == thread.id)
+                .expect("thread/loaded/read should include the resident thread");
+            if let ThreadStatus::Active { active_flags } = &loaded_thread.status
+                && active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+            {
+                return Ok::<ThreadStatus, anyhow::Error>(loaded_thread.status.clone());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    assert_eq!(
+        loaded_status,
+        ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+        }
+    );
 
     Ok(())
 }

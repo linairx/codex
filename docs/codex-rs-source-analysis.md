@@ -1084,10 +1084,20 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server/README.md` 的详细 `thread/loaded/read` 说明现在也已明确：loaded polling 返回的不是无模式状态探针，而是可直接消费 `thread.mode` 的恢复面
 - `app-server/README.md` 的详细 `thread/fork` 章节现在也已把这条模式边界写回正文，而不再只靠示例里的 `interactive` 值暗示“resident 源线程默认不会把 fork 变成 reconnect 目标”
 - `thread_status.rs` 也已补上 resident workspace watch 迁移/清理回归：同一线程切换 `cwd` 后旧工作区变化不会再重新激活 `workspaceChanged`，切回非 resident 后也会移除 watch，避免 observer 状态被陈旧目录继续污染
-- `thread/unarchive` 也已开始复用 SQLite 稳定元数据来组响应：resident 线程反归档后不再因为只读 rollout 摘要而回退成 `interactive`，`thread/unarchive`、后续 `thread/read` 与 `thread/list` 都会继续保持 `ResidentAssistant`
+- observer 的读取面回归也已继续补齐：resident thread 发生工作区变化后，后续 `thread/read` 与 `thread/loaded/read` 都会稳定返回带 `workspaceChanged` 的 `status`，不再只有 `thread/status/changed` 通知面单独暴露这层 observer 事实
+- observer 的摘要列表面也已补上同层回归：resident thread 命中工作区变化后，`thread/list` 返回的线程摘要同样会继续保留 `workspaceChanged`，避免列表面和 `thread/read` / `thread/loaded/read` 的状态入口重新分叉
+- reconnect 响应面也已补上 observer 连续性回归：resident thread 保持 loaded 时命中工作区变化，后续 `thread/resume` 响应同样会继续返回带 `workspaceChanged` 的 `status`，避免 reconnect 入口重新退回成只会恢复 `mode`、却丢掉当前 observer 脏标记的半状态摘要
+- `thread_status.rs` 现在也已把 `thread/status/changed` 的负向协议边界单独锁住：resident thread 命中 `workspaceChanged` 时，测试直接检查原始 notification payload 只带 `threadId + status`，不会偷偷重复 `mode`，避免 README 已写明的 status-only 契约在后续重构里被破坏
+- `codex-tui` 的 `app_server_session.rs` 现在也已把 typed 读取面单独锁住：除了更上层的 latest/by-name/by-id lookup 回归外，`thread/read`、`thread/list` 与 `thread/loaded/read` 这三个直接供 TUI 会话层调用的恢复入口也都已有 resident 模式断言，避免中间层在后续重构里把 `ResidentAssistant` 静默压回通用线程摘要
+- `thread_loaded_read.rs` 现在也已把 loaded polling 自己的 observer 连续性单独锁住：resident thread 命中工作区变化后，直接调用 `thread/loaded/read` 也会稳定返回带 `workspaceChanged` 的摘要，不再只靠 `thread_read.rs` 里的顺带覆盖来证明这条读取面成立
+- `codex-app-server-client` 的 in-process typed 回归也已补到 observer 连续性：resident thread 命中工作区变化后，`thread/read`、`thread/loaded/read` 与 `thread/resume` 这三条 typed 请求都会继续保留同一个 `workspaceChanged` 状态，避免共享客户端在 reconnect 路径上只保留 `mode` 却丢掉 observer 脏标记
+- `thread/unarchive` 也已开始复用 SQLite 稳定元数据来组响应：resident 线程反归档后不再因为只读 rollout 摘要而回退成 `interactive`，而且 `codex-app-server-client` 的 typed 回归现在也已把 `thread/unarchive`、后续 `thread/read` 与 `thread/list` 一起锁住，避免共享客户端只在反归档响应面保留 `ResidentAssistant`、却在随后的 stored 列表恢复面重新退回通用 interactive 摘要
 - `app-server/README.md` 的详细 `thread/unarchive` 章节现在也已明确要求直接消费返回 `thread.mode`，恢复 resident thread 时不需要再额外补一次 `thread/read` 才能恢复 reconnect 语义
 - `app-server/README.md` 的 `thread/unsubscribe` 说明也已继续补齐 resident 连续性：对 resident thread 来说，这条路径不只是“不会 unload”，而是后续 `thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会继续暴露既有 `mode` 与 loaded/runtime 状态
 - resident thread 的归档读取面也已补上回归：进入 archived 状态后，`thread/read` 与 `thread/list archived=true` 仍会稳定保留 `ResidentAssistant`，不会因为只走 SQLite 摘要路径就掉回普通 interactive 线程
+- `codex-app-server-client` 的 typed archived 消费面现在也已跟上这条契约：无论是纯 archived read，还是 archived `thread/metadata/update` 之后的后续读取，`thread/list archived=true` 都会继续保留 `ResidentAssistant`，避免共享客户端只在 `thread/read` 上看见 resident continuity、却在 archived 列表面退回通用历史摘要
+- `codex-tui` 的 `AppServerSession` 现在也已把 archived resident 读取面单独锁住：归档后的 `thread/read` 与 `thread/list archived=true` 都会继续保留 `ResidentAssistant`，避免 TUI 会话层只在普通 stored/loaded 路径上证明模式连续性，却在 archived 恢复面退回通用线程摘要
+- `codex-tui` 更上层的 session lookup 现在也已把 archived resident 的 id 恢复路径锁住：按 thread id 查 archived thread 时，`lookup_session_target_with_app_server(...)` 仍会继续返回 `ResidentAssistant`，避免上层 selector 在 archived 路径上重新把 reconnect 目标压回普通 session target
 - `app-server/README.md` 的 archive 段落现在也已把这点写明：虽然 archived thread 默认不会出现在 `thread/list`，但在 `thread/list archived=true` 与 `thread/read` 返回时仍会保留既有 `mode`
 - `thread/metadata/update` 的 resident 回归也已继续扩到 stored + archived 面：未加载 resident thread 走纯 SQLite 稳定元数据路径时，更新响应与后续 `thread/read` / `thread/list` 会继续保持 `ResidentAssistant`；loaded resident thread 在修补元数据行后也不会因为 fallback bootstrap 路径丢掉 `ResidentAssistant`；已归档 resident thread 更新 git metadata 时，响应与后续 `thread/read` / `thread/list archived=true` 同样会继续保持 `ResidentAssistant`
 - `codex-state` 的 SQLite 边界测试也已继续补强：`update_thread_git_info` 在 resident thread 上不会意外覆盖 `threads.mode`，避免元数据补丁把已持久化的 `ResidentAssistant` 降回 interactive

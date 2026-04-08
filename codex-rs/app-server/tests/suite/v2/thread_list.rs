@@ -13,6 +13,7 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
@@ -281,6 +282,71 @@ async fn thread_list_reports_system_error_idle_flag_after_failed_turn() -> Resul
         .find(|candidate| candidate.id == thread.id)
         .expect("expected started thread to be listed");
     assert_eq!(listed.status, ThreadStatus::SystemError,);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_list_reports_workspace_changed_for_resident_threads() -> Result<()> {
+    let server = create_mock_responses_server_sequence(vec![]).await;
+
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    create_runtime_config(codex_home.path(), &server.uri())?;
+    let mut mcp = init_mcp(codex_home.path()).await?;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.path().display().to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    std::fs::write(workspace.path().join("watched.txt"), "changed")?;
+
+    let listed_status = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let ThreadListResponse { data, .. } = list_threads(
+                &mut mcp,
+                /*cursor*/ None,
+                Some(10),
+                Some(vec!["mock_provider".to_string()]),
+                Some(vec![
+                    ThreadSourceKind::AppServer,
+                    ThreadSourceKind::Cli,
+                    ThreadSourceKind::VsCode,
+                ]),
+                /*archived*/ None,
+            )
+            .await?;
+            let listed = data
+                .iter()
+                .find(|candidate| candidate.id == thread.id)
+                .expect("expected resident thread to be listed");
+            if let ThreadStatus::Active { active_flags } = &listed.status
+                && active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+            {
+                return Ok::<ThreadStatus, anyhow::Error>(listed.status.clone());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    assert_eq!(
+        listed_status,
+        ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+        }
+    );
 
     Ok(())
 }

@@ -1157,10 +1157,15 @@ fn app_server_credits_snapshot_to_core(
 mod tests {
     use super::*;
     use codex_app_server_protocol::ApprovalsReviewer;
+    use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::ReadOnlyAccess;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
+    use codex_app_server_protocol::ThreadListParams;
+    use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadStartParams;
+    use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1440,6 +1445,217 @@ mod tests {
             forked.session.thread_mode,
             Some(ThreadMode::ResidentAssistant)
         );
+    }
+
+    #[tokio::test]
+    async fn read_and_list_preserve_resident_thread_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/04")
+            .join(format!("rollout-2025-02-04T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir).expect("rollout dir should exist");
+        std::fs::write(&rollout_path, "").expect("empty rollout should write");
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .expect("state runtime should init");
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .expect("backfill marker should persist");
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd).expect("session cwd should exist");
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-04T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            codex_protocol::protocol::SessionSource::Cli,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Resident thread in typed reads".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("thread metadata should persist");
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+
+        let thread = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .expect("thread/read should succeed");
+        assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+        let listed = app_server
+            .thread_list(ThreadListParams {
+                cursor: None,
+                limit: Some(20),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: Some(false),
+                cwd: None,
+                search_term: None,
+            })
+            .await
+            .expect("thread/list should succeed");
+        let listed_thread = listed
+            .data
+            .into_iter()
+            .find(|thread| thread.id == thread_id.to_string())
+            .expect("thread/list should include stored thread");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn archived_read_and_list_preserve_resident_thread_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join(codex_core::ARCHIVED_SESSIONS_SUBDIR)
+            .join(format!("rollout-2025-02-05T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir).expect("rollout dir should exist");
+        std::fs::write(&rollout_path, "").expect("empty rollout should write");
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .expect("state runtime should init");
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .expect("backfill marker should persist");
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd).expect("session cwd should exist");
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-05T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            codex_protocol::protocol::SessionSource::Cli,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Archived resident thread in typed reads".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("thread metadata should persist");
+        state_runtime
+            .mark_archived(thread_id, rollout_path.as_path(), chrono::Utc::now())
+            .await
+            .expect("thread should be marked archived");
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+
+        let thread = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .expect("thread/read should succeed");
+        assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+        let listed = app_server
+            .thread_list(ThreadListParams {
+                cursor: None,
+                limit: Some(20),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: Some(true),
+                cwd: None,
+                search_term: None,
+            })
+            .await
+            .expect("thread/list should succeed");
+        let listed_thread = listed
+            .data
+            .into_iter()
+            .find(|thread| thread.id == thread_id.to_string())
+            .expect("thread/list archived=true should include stored thread");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn loaded_read_preserves_resident_thread_mode() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let request_id = app_server.next_request_id();
+
+        let response: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+
+        let loaded = app_server
+            .thread_loaded_read(ThreadLoadedReadParams {
+                cursor: None,
+                limit: Some(20),
+                model_providers: None,
+                source_kinds: None,
+                cwd: None,
+            })
+            .await
+            .expect("thread/loaded/read should succeed");
+        let loaded_thread = loaded
+            .data
+            .into_iter()
+            .find(|thread| thread.id == response.thread.id)
+            .expect("thread/loaded/read should include resident thread");
+        assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
     }
 
     #[tokio::test]

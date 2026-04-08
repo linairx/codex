@@ -336,6 +336,13 @@
 - resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `mode = residentAssistant`，`thread/loaded/read` 里该线程也会继续保持 `mode = residentAssistant` 且 `status = idle`
 - 下一次 turn 完成后会按既有状态机清理 `workspaceChanged`，避免脏标记长期滞留
 - resident workspace watch 的迁移/清理边界也已补上单测：同一线程切换 `cwd` 后旧目录变化不会再触发 `workspaceChanged`，切回非 resident 后会移除 watch，避免 observer 状态持续受陈旧工作区干扰
+- observer 的读取面也已补上集成回归：resident thread 命中工作区变化后，`thread/read` 与 `thread/loaded/read` 都会继续返回带 `workspaceChanged` 的 `status`，避免 observer 事实只在 `thread/status/changed` 通知里短暂可见
+- observer 的列表摘要面也已补上集成回归：resident thread 命中工作区变化后，`thread/list` 里的线程摘要同样会继续保留 `workspaceChanged`，把列表、读取面和通知面的状态入口继续收敛到同一语义
+- `thread/status/changed` 的 status-only 边界现在也已补上原始 payload 回归：resident thread 命中 `workspaceChanged` 时，测试会直接检查通知 JSON 里只有 `threadId + status` 而不会重复 `mode`，避免后续有人把 reconnect 语义重新塞回增量通知里
+- `codex-tui` 的 `AppServerSession` 读取面现在也已补上 resident 模式回归：`thread/read`、`thread/list` 与 `thread/loaded/read` 这三条 typed 恢复入口都会稳定保留 `ResidentAssistant`，避免 TUI 只靠更上层 lookup/selector 测试侧面覆盖这层契约
+- reconnect 响应面也已补上集成回归：resident thread 保持 loaded 时命中工作区变化后，`thread/resume` 响应同样会继续返回带 `workspaceChanged` 的 `status`，避免 reconnect 入口只恢复 `mode` 却丢掉当前 observer 状态
+- `thread_loaded_read.rs` 现在也已补上 loaded polling 自己的 observer 集成回归：resident thread 命中工作区变化后，直接调用 `thread/loaded/read` 就会稳定返回带 `workspaceChanged` 的摘要，不再只靠 `thread_read.rs` 侧面覆盖 loaded 读取面
+- `codex-app-server-client` 的 in-process typed 回归也已补到 observer 连续性：resident thread 命中工作区变化后，`thread/read`、`thread/loaded/read` 与 `thread/resume` 都会继续保留同一个 `workspaceChanged` 状态，避免共享客户端在 reconnect 路径上只保留 `mode` 而丢掉 observer 脏标记
 
 不要混入：
 
@@ -367,8 +374,11 @@
 - resident `thread/start` 的边界也已补上回归覆盖：返回 `mode = residentAssistant` 时，在线程真正物化前仍不会提前写入 SQLite
 - 服务重启后，未加载线程的 `thread/read` / `thread/list` 以及后续 `thread/resume` 都会消费 SQLite 中持久化的 resident 模式
 - 从 resident thread 派生出的 fork 线程也已补上回归覆盖：默认仍保持 `interactive`，并且重启后不会从 SQLite 误恢复成 `residentAssistant`
-- resident thread 的 unarchive 路径也已补上回归：`thread/unarchive` 响应不会再因为只读 rollout 摘要而丢掉稳定 `mode`，后续 `thread/read` / `thread/list` 也会继续保持 `ResidentAssistant`
+- resident thread 的 unarchive 路径也已补上回归：`thread/unarchive` 响应不会再因为只读 rollout 摘要而丢掉稳定 `mode`，而 `codex-app-server-client` 的 typed follow-up 读取也已锁住后续 `thread/read` / `thread/list` 继续保持 `ResidentAssistant`
 - resident thread 的 archive 读取面也已补上回归：进入 archived 状态后，`thread/read` 和 `thread/list archived=true` 仍会继续保留 `ResidentAssistant`
+- `codex-app-server-client` 的 typed archived 消费面现在也已补上同层回归：纯 archived read 与 archived `thread/metadata/update` 之后，`thread/list archived=true` 都会继续保留 `ResidentAssistant`，避免共享客户端在 archived 列表面退回通用 interactive 历史摘要
+- `codex-tui` 的 `AppServerSession` archived 读取面现在也已补上同层回归：归档后的 `thread/read` 与 `thread/list archived=true` 都会继续保留 `ResidentAssistant`，避免 TUI 会话层只在普通 stored/loaded 路径上覆盖 resident continuity
+- `codex-tui` 的更上层 session lookup 也已补上 archived resident id 恢复回归：按 thread id 查 archived thread 时，lookup 结果仍会继续保留 `ResidentAssistant`，避免 selector 层在 archived 路径上把 reconnect 目标降回普通 session target
 - `thread/metadata/update` 的 resident 覆盖也已继续扩到 stored + archived 面：纯 SQLite 稳定元数据路径不会把未加载 resident thread 的更新响应与后续读取面降成 interactive；缺失 SQLite 行修复也不会把 loaded resident thread 的稳定 `mode` 重建成普通 interactive，而 archived resident thread 更新 metadata 后的响应与后续读取面同样会继续保持 `ResidentAssistant`
 - `codex-state` 也已继续补上状态层边界测试：`set_thread_mode` 对缺失线程只返回 false，不会顺手创建 SQLite 垃圾行；`update_thread_git_info` 在 resident thread 上也不会顺手覆盖 `threads.mode`
 - `app-server/README.md` 的 `thread/metadata/update` 说明也已同步收口：返回的 `thread` 被明确要求保留既有 `mode`，外围客户端不需要再把 metadata-only update 额外视作一次需要 `thread/read` 补 mode 的特殊恢复路径
