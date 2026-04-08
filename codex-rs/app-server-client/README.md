@@ -62,10 +62,26 @@ The same rule applies to metadata-only thread operations such as
 `thread/metadata/update`: callers should trust the returned `thread.mode`
 directly instead of assuming a follow-up `thread/read` is required to recover
 resident assistant semantics.
+That guarantee now has explicit typed coverage for archived resident threads
+too, so the archived metadata-repair path cannot silently fall back to an
+ordinary interactive thread summary.
+Archived read-only lookup is also locked down directly: after archive, a plain
+`thread/read` typed request must still surface `residentAssistant` without
+requiring an extra unarchive step.
 The in-process typed request tests now lock this boundary down across more
-than bootstrap and metadata repair: `thread/loaded/read` must continue to
-surface resident mode for loaded assistants instead of dropping back to a
-generic loaded-thread summary.
+than bootstrap and metadata repair: `thread/list`, `thread/loaded/read`,
+`thread/unsubscribe`, and `thread/unarchive` must continue to surface resident
+mode for reconnectable assistants instead of dropping back to generic history,
+loaded-thread, detached-reader, or restore summaries.
+That resident continuity now also covers the post-unsubscribe path directly:
+after the last subscriber detaches from a resident thread, follow-up
+`thread/loaded/read`, `thread/read`, and `thread/resume` typed requests must
+still preserve `residentAssistant` instead of degrading to an ordinary
+interactive session.
+The same resident continuity is now locked down for `thread/rollback`: after a
+resident assistant completes a turn, the rollback response must preserve
+`thread.mode = residentAssistant` instead of reconstructing a generic
+interactive history summary from the rollout.
 
 ## Backpressure and shutdown
 

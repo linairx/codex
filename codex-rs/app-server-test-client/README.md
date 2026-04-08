@@ -59,14 +59,20 @@ fork, and metadata-only update paths.
 
 If you need to inspect other recovery paths without reading the full debug
 struct, the test client now also exposes resident-aware summaries for loaded
-threads and archived-thread restore, with the same compact `mode` plus
-`resume`/`reconnect` action labels for ordinary interactive resume targets vs
-resident reconnect targets:
+threads, archived-thread restore, and rollback responses, with the same compact
+`mode` plus `resume`/`reconnect` action labels for ordinary interactive resume
+targets vs resident reconnect targets:
 
 ```bash
 cargo run -p codex-app-server-test-client -- thread-loaded-read --limit 5
 cargo run -p codex-app-server-test-client -- thread-unarchive <THREAD_ID>
+cargo run -p codex-app-server-test-client -- thread-rollback <THREAD_ID> --num-turns 1
 ```
+
+When you use the streaming resume/start commands, `thread/started`
+notifications also print the same compact resident-aware summary, so the
+notification path stays aligned with the direct response summaries instead of
+falling back to plain debug output.
 
 ### 2) Rejoin while a turn is in progress (two terminals)
 

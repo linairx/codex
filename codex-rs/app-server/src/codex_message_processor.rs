@@ -440,6 +440,7 @@ pub(crate) enum ApiVersion {
 
 #[derive(Clone)]
 struct ListenerTaskContext {
+    config: Arc<Config>,
     thread_manager: Arc<ThreadManager>,
     thread_state_manager: ThreadStateManager,
     outgoing: Arc<OutgoingMessageSender>,
@@ -2109,6 +2110,7 @@ impl CodexMessageProcessor {
         let cloud_requirements = self.current_cloud_requirements();
         let cli_overrides = self.current_cli_overrides();
         let listener_task_context = ListenerTaskContext {
+            config: Arc::clone(&self.config),
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
@@ -2949,6 +2951,9 @@ impl CodexMessageProcessor {
                 )));
             };
 
+            // Metadata updates are explicit durable mutations, so materialize the rollout
+            // before reconciling state-db rows for a still-loaded thread.
+            thread.ensure_rollout_materialized().await;
             reconcile_rollout(
                 Some(state_db_ctx),
                 rollout_path.as_path(),
@@ -3436,6 +3441,11 @@ impl CodexMessageProcessor {
             .map(|value| value as usize)
             .unwrap_or(THREAD_LIST_DEFAULT_LIMIT)
             .clamp(1, THREAD_LIST_MAX_LIMIT);
+        let archived = archived.unwrap_or(false);
+        let model_providers_filter = model_providers.clone();
+        let source_kinds_filter = source_kinds.clone();
+        let cwd_filter = cwd.clone();
+        let search_term_filter = search_term.clone();
         let core_sort_key = match sort_key.unwrap_or(ThreadSortKey::CreatedAt) {
             ThreadSortKey::CreatedAt => CoreThreadSortKey::CreatedAt,
             ThreadSortKey::UpdatedAt => CoreThreadSortKey::UpdatedAt,
@@ -3448,7 +3458,7 @@ impl CodexMessageProcessor {
                 ThreadListFilters {
                     model_providers,
                     source_kinds,
-                    archived: archived.unwrap_or(false),
+                    archived,
                     cwd,
                     search_term,
                 },
@@ -3506,6 +3516,65 @@ impl CodexMessageProcessor {
                 apply_persisted_thread_mode(&mut thread, &metadata);
             }
             data.push(thread);
+        }
+
+        if !archived && search_term_filter.is_none() && data.len() < requested_page_size {
+            for thread_id in self.thread_manager.list_thread_ids().await {
+                if thread_ids.contains(&thread_id) {
+                    continue;
+                }
+
+                let Ok(loaded_thread) = self.thread_manager.get_thread(thread_id).await else {
+                    continue;
+                };
+                let Some(rollout_path) = loaded_thread.rollout_path() else {
+                    continue;
+                };
+
+                let config_snapshot = loaded_thread.config_snapshot().await;
+                if let Some(model_providers) = model_providers_filter.as_ref()
+                    && !model_providers.is_empty()
+                    && !model_providers.contains(&config_snapshot.model_provider_id)
+                {
+                    continue;
+                }
+                if let Some(source_kinds) = source_kinds_filter.as_ref()
+                    && !source_kinds.is_empty()
+                    && !source_kinds.contains(&thread_source_kind_from_session_source(
+                        &config_snapshot.session_source,
+                    ))
+                {
+                    continue;
+                }
+                if let Some(cwd) = cwd_filter.as_ref()
+                    && config_snapshot.cwd != *cwd
+                {
+                    continue;
+                }
+
+                let mut thread =
+                    build_thread_from_snapshot(thread_id, &config_snapshot, Some(rollout_path));
+                self.attach_runtime_thread_metadata(thread_id, &mut thread)
+                    .await;
+                thread.name = names.get(&thread_id).cloned();
+                let loaded_status = self
+                    .thread_watch_manager
+                    .loaded_status_for_thread(&thread.id)
+                    .await;
+                let has_live_in_progress_turn =
+                    matches!(loaded_thread.agent_status().await, AgentStatus::Running);
+                set_thread_status_and_interrupt_stale_turns(
+                    &mut thread,
+                    loaded_status,
+                    has_live_in_progress_turn,
+                );
+
+                data.push(thread);
+                thread_ids.insert(thread_id);
+                if data.len() == requested_page_size {
+                    break;
+                }
+            }
         }
         let response = ThreadListResponse { data, next_cursor };
         self.outgoing.send_response(request_id, response).await;
@@ -5702,6 +5771,26 @@ impl CodexMessageProcessor {
         }
 
         if !self.thread_state_manager.has_subscribers(thread_id).await
+            && self
+                .thread_state_manager
+                .is_thread_resident(thread_id)
+                .await
+        {
+            thread.ensure_rollout_materialized().await;
+            thread.flush_rollout().await;
+            if let Some(rollout_path) = thread.rollout_path() {
+                ensure_thread_mode_persisted_in_state_db(
+                    self.config.as_ref(),
+                    thread_id,
+                    rollout_path.as_path(),
+                    &thread.config_snapshot().await,
+                    /*resident*/ true,
+                )
+                .await;
+            }
+        }
+
+        if !self.thread_state_manager.has_subscribers(thread_id).await
             && !self
                 .thread_state_manager
                 .is_thread_resident(thread_id)
@@ -7508,6 +7597,7 @@ impl CodexMessageProcessor {
     ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
         Self::ensure_conversation_listener_task(
             ListenerTaskContext {
+                config: Arc::clone(&self.config),
                 thread_manager: Arc::clone(&self.thread_manager),
                 thread_state_manager: self.thread_state_manager.clone(),
                 outgoing: Arc::clone(&self.outgoing),
@@ -7597,6 +7687,7 @@ impl CodexMessageProcessor {
     ) {
         Self::ensure_listener_task_running_task(
             ListenerTaskContext {
+                config: Arc::clone(&self.config),
                 thread_manager: Arc::clone(&self.thread_manager),
                 thread_state_manager: self.thread_state_manager.clone(),
                 outgoing: Arc::clone(&self.outgoing),
@@ -7630,6 +7721,7 @@ impl CodexMessageProcessor {
             thread_state.set_listener(cancel_tx, &conversation)
         };
         let ListenerTaskContext {
+            config,
             outgoing,
             thread_manager,
             thread_state_manager,
@@ -7686,6 +7778,7 @@ impl CodexMessageProcessor {
                             thread_watch_manager.clone(),
                             api_version,
                             fallback_model_provider.clone(),
+                            config.as_ref(),
                             codex_home.as_path(),
                         )
                         .await;
@@ -9118,7 +9211,7 @@ fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     }
 }
 
-async fn load_thread_summary_for_rollout(
+pub(crate) async fn load_thread_summary_for_rollout(
     config: &Config,
     thread_id: ThreadId,
     rollout_path: &Path,

@@ -1466,12 +1466,15 @@ dependencies = [
 name = "codex-app-server-client"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "codex-app-server",
  "codex-app-server-protocol",
  "codex-arg0",
  "codex-core",
  "codex-feedback",
  "codex-protocol",
+ "codex-state",
+ "core_test_support",
  "futures",
  "pretty_assertions",
  "serde",

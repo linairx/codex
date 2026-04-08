@@ -73,6 +73,8 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadRollbackParams;
+use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
@@ -304,6 +306,15 @@ enum CliCommand {
         /// Archived thread id to restore.
         thread_id: String,
     },
+    /// Roll back the last N turns of a stored thread.
+    #[command(name = "thread-rollback")]
+    ThreadRollback {
+        /// Existing thread id to roll back.
+        thread_id: String,
+        /// Number of most recent turns to remove.
+        #[arg(long, default_value_t = 1)]
+        num_turns: u32,
+    },
     /// Increment the out-of-band elicitation pause counter for a thread.
     #[command(name = "thread-increment-elicitation")]
     ThreadIncrementElicitation {
@@ -502,6 +513,14 @@ pub async fn run() -> Result<()> {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-unarchive")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
             thread_unarchive(&endpoint, &config_overrides, thread_id).await
+        }
+        CliCommand::ThreadRollback {
+            thread_id,
+            num_turns,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-rollback")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_rollback(&endpoint, &config_overrides, thread_id, num_turns).await
         }
         CliCommand::ThreadIncrementElicitation { thread_id } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-increment-elicitation")?;
@@ -1376,6 +1395,28 @@ async fn thread_unarchive(
     .await
 }
 
+async fn thread_rollback(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    thread_id: String,
+    num_turns: u32,
+) -> Result<()> {
+    with_client("thread-rollback", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_rollback(ThreadRollbackParams {
+            thread_id,
+            num_turns,
+        })?;
+        println!("< thread/rollback response: {response:?}");
+        print_thread_response_summary("thread/rollback", &response.thread);
+
+        Ok(())
+    })
+    .await
+}
+
 async fn with_client<T>(
     command_name: &'static str,
     endpoint: &Endpoint,
@@ -1407,19 +1448,28 @@ fn print_thread_list_summary(response: &ThreadListResponse) {
 }
 
 fn print_thread_collection_summary(label: &str, threads: &[AppServerThread]) {
-    if threads.is_empty() {
-        println!("< {label} summary: no threads");
-        return;
-    }
-
-    println!("< {label} summary:");
-    for thread in threads {
-        println!("  - {}", thread_summary_fields(thread));
+    for line in thread_collection_summary_lines(label, threads) {
+        println!("{line}");
     }
 }
 
 fn thread_response_summary_line(label: &str, thread: &AppServerThread) -> String {
     format!("< {label} summary: {}", thread_summary_fields(thread))
+}
+
+fn thread_collection_summary_lines(label: &str, threads: &[AppServerThread]) -> Vec<String> {
+    if threads.is_empty() {
+        return vec![format!("< {label} summary: no threads")];
+    }
+
+    let mut lines = vec![format!("< {label} summary:")];
+    lines.extend(
+        threads
+            .iter()
+            .map(thread_summary_fields)
+            .map(|summary| format!("  - {summary}")),
+    );
+    lines
 }
 
 fn thread_summary_fields(thread: &AppServerThread) -> String {
@@ -1452,6 +1502,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Cli;
+    use super::thread_collection_summary_lines;
     use super::thread_mode_label;
     use super::thread_response_summary_line;
     use super::thread_resume_action_label;
@@ -1527,6 +1578,166 @@ mod tests {
         assert_eq!(
             thread_response_summary_line("thread/read", &resident_thread),
             "< thread/read summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_start_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/start", &resident_thread),
+            "< thread/start summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_resume_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/resume", &resident_thread),
+            "< thread/resume summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_started_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/started", &resident_thread),
+            "< thread/started summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_fork_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/fork", &resident_thread),
+            "< thread/fork summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_metadata_update_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/metadata/update", &resident_thread),
+            "< thread/metadata/update summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_unarchive_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/unarchive", &resident_thread),
+            "< thread/unarchive summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_rollback_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/rollback", &resident_thread),
+            "< thread/rollback summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_collection_summary_lines_cover_mode_resident_status_and_action() {
+        let threads = vec![
+            make_thread(
+                "thread-1",
+                ThreadMode::ResidentAssistant,
+                true,
+                ThreadStatus::Idle,
+            ),
+            make_thread(
+                "thread-2",
+                ThreadMode::Interactive,
+                false,
+                ThreadStatus::NotLoaded,
+            ),
+        ];
+
+        assert_eq!(
+            thread_collection_summary_lines("thread/list", &threads),
+            vec![
+                "< thread/list summary:".to_string(),
+                "  - id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
+                "  - id=thread-2, mode=interactive, resident=false, status=NotLoaded, action=resume".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_loaded_read_summary_lines_cover_mode_resident_status_and_action() {
+        let threads = vec![make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Active {
+                active_flags: Vec::new(),
+            },
+        )];
+
+        assert_eq!(
+            thread_collection_summary_lines("thread/loaded/read", &threads),
+            vec![
+                "< thread/loaded/read summary:".to_string(),
+                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active { active_flags: [] }, action=reconnect".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_thread_collection_summary_lines_use_no_threads_marker() {
+        assert_eq!(
+            thread_collection_summary_lines("thread/list", &[]),
+            vec!["< thread/list summary: no threads".to_string()]
         );
     }
 
@@ -2100,6 +2311,16 @@ impl CodexClient {
         };
 
         self.send_request(request, request_id, "thread/unarchive")
+    }
+
+    fn thread_rollback(&mut self, params: ThreadRollbackParams) -> Result<ThreadRollbackResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadRollback {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/rollback")
     }
 
     fn thread_increment_elicitation(

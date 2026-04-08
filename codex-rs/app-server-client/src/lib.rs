@@ -849,6 +849,7 @@ pub(crate) fn request_method_name(request: &ClientRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::GetAccountResponse;
@@ -864,15 +865,25 @@ mod tests {
     use codex_app_server_protocol::ThreadMetadataUpdateParams;
     use codex_app_server_protocol::ThreadMetadataUpdateResponse;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadResumeResponse;
+    use codex_app_server_protocol::ThreadRollbackResponse;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
+    use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::ThreadUnsubscribeStatus;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
+    use codex_app_server_protocol::TurnStartParams;
+    use codex_app_server_protocol::TurnStatus;
+    use codex_app_server_protocol::UserInput;
     use codex_core::config::ConfigBuilder;
+    use codex_core::state_db_bridge::open_if_present;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
+    use codex_state::ThreadMetadataBuilder;
+    use core_test_support::responses;
     use futures::SinkExt;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
@@ -906,6 +917,45 @@ mod tests {
             .expect("test config should load")
     }
 
+    async fn build_mock_responses_test_config(server_uri: &str) -> Config {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let codex_home_path = std::env::temp_dir().join(format!(
+            "codex-app-server-client-mock-test-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&codex_home_path).expect("temp codex home should exist");
+        std::fs::write(
+            codex_home_path.join("config.toml"),
+            format!(
+                r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+"#
+            ),
+        )
+        .expect("mock config.toml should be writable");
+
+        ConfigBuilder::default()
+            .codex_home(codex_home_path)
+            .build()
+            .await
+            .expect("mock test config should load")
+    }
+
     async fn start_test_client_with_capacity(
         session_source: SessionSource,
         channel_capacity: usize,
@@ -932,6 +982,44 @@ mod tests {
 
     async fn start_test_client(session_source: SessionSource) -> InProcessAppServerClient {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+    }
+
+    async fn persist_thread_mode_in_state_db(
+        config: &Config,
+        started: &ThreadStartResponse,
+        mode: &str,
+    ) {
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let state_db = open_if_present(&config.codex_home, "openai")
+            .await
+            .expect("state db should exist");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        let mut metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            ProtocolSessionSource::Cli,
+        );
+        metadata.mode = mode.to_string();
+        metadata.model_provider = Some(started.thread.model_provider.clone());
+        metadata.cwd = started.thread.cwd.clone();
+        metadata.cli_version = Some(started.thread.cli_version.clone());
+        let inserted = state_db
+            .insert_thread_if_absent(&metadata.build("openai"))
+            .await
+            .expect("insert_thread_if_absent should succeed");
+        let updated = state_db
+            .set_thread_mode(metadata.id, mode)
+            .await
+            .expect("set_thread_mode should succeed");
+        assert!(
+            inserted || updated,
+            "thread metadata setup should insert or update an existing row"
+        );
     }
 
     fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
@@ -1361,6 +1449,479 @@ mod tests {
             .expect("loaded thread list should include the started resident thread");
         assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
         assert!(loaded_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn list_preserves_resident_thread_mode_through_typed_requests() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(11),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let listed: codex_app_server_protocol::ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(12),
+                params: codex_app_server_protocol::ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: None,
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("thread/list should succeed");
+
+        let listed_thread = listed
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/list should include the started resident thread");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert!(listed_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn unarchive_preserves_resident_thread_mode_through_typed_requests() {
+        let config = Arc::new(build_test_config().await);
+        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(13),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(14),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let unarchived: codex_app_server_protocol::ThreadUnarchiveResponse = client
+            .request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(15),
+                params: codex_app_server_protocol::ThreadUnarchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unarchive should succeed");
+
+        assert_eq!(unarchived.thread.id, started.thread.id);
+        assert_eq!(unarchived.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(unarchived.thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn archived_metadata_update_preserves_resident_thread_mode_through_typed_requests() {
+        let config = Arc::new(build_test_config().await);
+        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(16),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(17),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let updated: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(18),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: None,
+                        branch: Some(Some("archived-main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should succeed for archived resident thread");
+
+        assert_eq!(updated.thread.id, started.thread.id);
+        assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(
+            updated.thread.git_info,
+            Some(GitInfo {
+                sha: None,
+                branch: Some("archived-main".to_string()),
+                origin_url: None,
+            })
+        );
+
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(19),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: started.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the archived resident thread");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn archived_read_preserves_resident_thread_mode_through_typed_requests() {
+        let config = Arc::new(build_test_config().await);
+        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(20),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(21),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(22),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: started.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the archived resident thread");
+        assert_eq!(read.thread.id, started.thread.id);
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(read.thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn resident_unsubscribe_preserves_mode_on_followup_reads_and_resume() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(23),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let unsubscribed: codex_app_server_protocol::ThreadUnsubscribeResponse = client
+            .request_typed(ClientRequest::ThreadUnsubscribe {
+                request_id: RequestId::Integer(24),
+                params: codex_app_server_protocol::ThreadUnsubscribeParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unsubscribe should succeed");
+        assert_eq!(unsubscribed.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+        let loaded: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(25),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("thread/loaded/read should still include resident thread");
+        let loaded_thread = loaded
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("resident thread should stay loaded after unsubscribe");
+        assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert!(loaded_thread.resident);
+        assert_eq!(loaded_thread.status, ThreadStatus::Idle);
+
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(26),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: started.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should preserve resident mode after unsubscribe");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(read.thread.resident);
+        assert_eq!(read.thread.status, ThreadStatus::Idle);
+
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(27),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("thread/resume should reconnect to resident thread after unsubscribe");
+        assert_eq!(resumed.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(resumed.thread.resident);
+        assert_eq!(resumed.thread.status, ThreadStatus::Idle);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn rollback_preserves_resident_thread_mode_through_typed_requests() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(28),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(29),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "rollback resident turn".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        loop {
+            let event = timeout(Duration::from_secs(5), client.next_event())
+                .await
+                .expect("turn completion event should arrive before timeout")
+                .expect("event stream should stay open");
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification,
+            )) = event
+                && notification.thread_id == started.thread.id
+                && notification.turn.status == TurnStatus::Completed
+            {
+                break;
+            }
+        }
+
+        let rollback: ThreadRollbackResponse = client
+            .request_typed(ClientRequest::ThreadRollback {
+                request_id: RequestId::Integer(30),
+                params: codex_app_server_protocol::ThreadRollbackParams {
+                    thread_id: started.thread.id.clone(),
+                    num_turns: 1,
+                },
+            })
+            .await
+            .expect("thread/rollback should succeed");
+        assert_eq!(rollback.thread.id, started.thread.id);
+        assert_eq!(rollback.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(rollback.thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
     }

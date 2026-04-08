@@ -1,7 +1,6 @@
 use crate::codex_message_processor::ApiVersion;
+use crate::codex_message_processor::load_thread_summary_for_rollout;
 use crate::codex_message_processor::read_rollout_items_from_rollout;
-use crate::codex_message_processor::read_summary_from_rollout;
-use crate::codex_message_processor::summary_to_thread;
 use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::ClientRequestResult;
@@ -104,6 +103,7 @@ use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_app_server_protocol::convert_patch_changes;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
+use codex_core::config::Config;
 use codex_core::find_thread_name_by_id;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
@@ -243,6 +243,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     thread_watch_manager: ThreadWatchManager,
     api_version: ApiVersion,
     fallback_model_provider: String,
+    config: &Config,
     codex_home: &Path,
 ) {
     let Event {
@@ -1798,14 +1799,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                     outgoing.send_error(request_id, error).await;
                     return;
                 };
-                let response = match read_summary_from_rollout(
+                let response = match load_thread_summary_for_rollout(
+                    config,
+                    conversation_id,
                     rollout_path.as_path(),
                     fallback_model_provider.as_str(),
+                    None,
                 )
                 .await
                 {
-                    Ok(summary) => {
-                        let mut thread = summary_to_thread(summary);
+                    Ok(mut thread) => {
                         match read_rollout_items_from_rollout(rollout_path.as_path()).await {
                             Ok(items) => {
                                 thread.turns = build_turns_from_rollout_items(&items);
@@ -1841,10 +1844,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     Err(err) => {
                         let error = JSONRPCErrorError {
                             code: INTERNAL_ERROR_CODE,
-                            message: format!(
-                                "failed to load rollout `{}`: {err}",
-                                rollout_path.display()
-                            ),
+                            message: err,
                             data: None,
                         };
                         outgoing.send_error(request_id.clone(), error).await;

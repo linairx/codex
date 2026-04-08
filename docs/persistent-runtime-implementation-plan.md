@@ -251,6 +251,8 @@
 - `exec resume --json` 的 resident 路径也已补到真实命令输出层：当线程模式先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = residentAssistant`
 - `exec resume --last --json` 的 resident 路径也已补上同层端到端回归：当最近会话先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，stdout 首个 `thread.started` 事件同样会稳定带出 `thread_mode = residentAssistant`
 - `exec resume --last` 的 resident 路径也已补上人类可读端到端回归：当最近会话先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，真实 stderr 摘要同样会稳定包含 `session mode: resident assistant` 与 `session action: reconnect`
+- `exec resume --last --all --json` 的 resident 路径也已补上同层端到端回归：当跨 cwd 选择最终命中一个先通过 SQLite 稳定元数据恢复成 `residentAssistant` 的最近会话时，stdout 首个 `thread.started` 事件同样会稳定带出 `thread_mode = residentAssistant`
+- `exec resume --last --all` 的 resident 路径也已补上人类可读端到端回归：当跨 cwd 选择最终命中一个先通过 SQLite 稳定元数据恢复成 `residentAssistant` 的最近会话时，真实 stderr 摘要同样会稳定包含 `session mode: resident assistant` 与 `session action: reconnect`
 - `exec resume <thread-id>` 的 resident 路径也已补上人类可读端到端回归：当线程模式先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，真实 stderr 摘要会稳定包含 `session mode: resident assistant` 与 `session action: reconnect`
 - `exec` 这两条真实 `--json` 首事件回归现在也已收敛到同一个 stdout 首行解析 helper，减少端到端测试各自手写 JSONL 首事件提取逻辑的漂移
 - `exec` 的 `thread.started` 事件注释也已同步收口：公开类型说明现在明确这是 bootstrap 后的首事件，覆盖 fresh start 与 resume/reconnect，而不再只写成“新线程 started”
@@ -265,12 +267,21 @@
 - `debug-client` 的内置 `:help` 也已同步收口到 resident-aware 语义，避免帮助面继续把 `:use` / `:refresh-thread` 描述成泛化 thread 操作
 - `debug-client` 的 clap 顶层 `--help` 也已继续对齐到同一口径：除了交互内置 `:help` 外，`--thread-id` 和相关 override 的命令行帮助说明现在同样稳定写成 `resume or reconnect`，并补上顶层 help 回归测试
 - `app-server-test-client` 的 thread 响应/通知输出也已补上 resident-aware 摘要，方便手工联调时直接识别 reconnect 场景；`thread-read` 与 `thread-metadata-update` 的联调命令也已补齐，同样会把 resident `mode` 打进摘要输出
+- `app-server-test-client` 的最常用恢复入口现在也已各自补上命令级摘要断言：`thread/start`、`thread/resume` 和 `thread/fork` 这三条路径都会稳定打印各自的 resident reconnect label
+- `app-server-test-client` 的 resident-aware 摘要回归现在也已把 `thread/started` 通知入口单独锁住：除了 `thread/read` 这类响应面外，通知摘要字符串同样会稳定打印 `mode=residentAssistant` 和 `action=reconnect`
+- `app-server-test-client` 的 README 也已同步补上这条通知侧契约：`thread/started` 在流式 start/resume 过程中同样会打印与响应面一致的 compact resident-aware summary
 - `app-server-test-client` 的其余主要 thread 命令也已继续补齐 resident-aware 摘要：`thread-fork`、`thread-loaded-read` 和 `thread-unarchive` 现在同样会把 `mode` 与 `resume/reconnect` 语义直接打到联调输出里
+- `app-server-test-client` 的命令级摘要回归也已继续补细：`thread/metadata/update` 与 `thread/unarchive` 这两条边缘恢复入口现在各自都有独立的 label 级断言
+- `app-server-test-client` 的 rollback 联调入口现在也已补上同层 resident-aware 摘要：新增 `thread-rollback` 命令会直接打印 `thread/rollback` 的 compact `mode + resident + status + action` 输出，并补上专门的 label 级回归，避免 rollback 响应在测试客户端里重新退回只看 debug struct
+- `app-server-test-client` 的列表摘要契约也已补成整串回归：`thread/list` 与 `thread/loaded/read` 的 summary header、每条 `mode + resident + status + action` 行以及空列表时的 `no threads` 标记现在都被单独锁住
 - `app-server-test-client` 的 README 也已同步把这批边缘恢复命令写成显式 `mode` + `resume/reconnect` 摘要输出，不再只停留在模糊的 resident-aware 描述
+- `app-server-test-client` 的 README 现在也已把 `thread-rollback` 纳入同一组边缘恢复示例，确保手工联调 rollback 后的 resident continuity 时也能直接看到 wire `thread.mode` 与派生 action label
 - `app-server-test-client` 的 clap 顶层 `--help` 也已同步收口：`resume-message-v2` 和 `thread-resume` 这两个最常用恢复命令的子命令说明现在同样稳定写成 `resume or reconnect`，并补上 help 回归测试
 - `app-server-test-client` 的 compact summary 输出也已补上整串回归断言：`thread/read` 与列表摘要现在都会稳定覆盖 `mode + resident + status + action` 的完整文本，不再只靠单独的 mode/action 映射测试侧面兜底
 - `app-server-test-client` README 里的这段说明也已进一步对齐到真实输出：联调摘要打印的是 wire `thread.mode` 值（如 `interactive` / `residentAssistant`）再附带 `resume/reconnect` 动作
-- `app-server-client` README、MCP 接口文档和 typed request 回归也已开始把 `Thread.mode` 固定为 bootstrap 阶段区分 reconnect 的主信号，减少外围集成对旧 resume 语义的误读；除了 metadata-only update 的 resident `mode` 保留覆盖外，`thread-loaded-read` 的 typed request 边界也已补齐 resident 模式回归
+- `app-server-client` README、MCP 接口文档和 typed request 回归也已开始把 `Thread.mode` 固定为 bootstrap 阶段区分 reconnect 的主信号，减少外围集成对旧 resume 语义的误读；除了 metadata-only update 的 resident `mode` 保留覆盖外，`thread/list`、`thread-loaded-read`、`thread/unarchive` 和 archived 后的 `thread/read` 的 typed request 边界也都已补齐 resident 模式回归，而 archived resident thread 的 `thread/metadata/update` 也已补成专门 typed 回归
+- `codex-app-server-client` 的 typed request 回归也已继续补到 resident `thread/unsubscribe` 的后续读取面：最后一个订阅者断开后，`thread-loaded-read`、`thread/read` 与 `thread/resume` 仍会稳定保留 `ResidentAssistant + Idle`，避免共享 in-process 客户端在“已断开但仍常驻”的恢复路径上退回普通 interactive 线程
+- `thread/rollback` 的 resident 连续性也已补到 app-server / app-server-client 这层真实 typed 闭环：rollback 完成后返回的 `thread` 不再只按 rollout summary 回建成默认 interactive，而会继续合并持久化 metadata，因此 resident assistant 在 rollback 响应里也会稳定保留 `ResidentAssistant`
 - `app-server/README.md` 也已同步把 `Thread.mode` 固定为 resident reconnect 的主语义，不再只把 `resident: true` 当作实现细节提及
 - `app-server/README.md` 的 lifecycle overview 总览入口也已补上 reconnect 口径，首屏文案不再落后于细节章节
 - `app-server/README.md` 的 `thread/list`、`thread/loaded/read` 和 `thread/unarchive` 示例结果也已补成显式带 `mode` 的版本，避免示例继续落后于正文契约
