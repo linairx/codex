@@ -355,6 +355,7 @@ fn help_lines() -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
+    use super::Cli;
     use super::ThreadConnection;
     use super::active_thread_switch_message;
     use super::connected_thread_message;
@@ -362,6 +363,7 @@ mod tests {
     use super::thread_mode_label;
     use super::thread_ready_label;
     use super::thread_resume_label;
+    use clap::CommandFactory;
     use codex_app_server_protocol::ThreadMode;
     use pretty_assertions::assert_eq;
 
@@ -440,5 +442,13 @@ mod tests {
         assert!(
             lines.contains(&"  :refresh-thread       list threads with mode and suggested action")
         );
+    }
+
+    #[test]
+    fn clap_help_mentions_resume_or_reconnect() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Resume or reconnect to an existing thread"));
+        assert!(help.contains("starting/resuming or reconnecting to a thread"));
     }
 }

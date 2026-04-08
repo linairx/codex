@@ -185,18 +185,18 @@ enum CliCommand {
         /// User message to send to Codex.
         user_message: String,
     },
-    /// Resume a V2 thread by id, then send a user message.
+    /// Resume or reconnect to a V2 thread by id, then send a user message.
     ResumeMessageV2 {
-        /// Existing thread id to resume.
+        /// Existing thread id to resume or reconnect to.
         thread_id: String,
         /// User message to send to Codex.
         user_message: String,
     },
-    /// Resume a V2 thread and continuously stream notifications/events.
+    /// Resume or reconnect to a V2 thread and continuously stream notifications/events.
     ///
     /// This command does not auto-exit; stop it with SIGINT/SIGTERM/SIGKILL.
     ThreadResume {
-        /// Existing thread id to resume.
+        /// Existing thread id to resume or reconnect to.
         thread_id: String,
     },
     /// Initialize the app-server and dump all inbound messages until interrupted.
@@ -1399,14 +1399,7 @@ async fn with_client<T>(
 }
 
 fn print_thread_response_summary(label: &str, thread: &AppServerThread) {
-    println!(
-        "< {label} summary: id={}, mode={}, resident={}, status={:?}, action={}",
-        thread.id,
-        thread_mode_label(thread.mode),
-        thread.resident,
-        thread.status,
-        thread_resume_action_label(thread.mode)
-    );
+    println!("{}", thread_response_summary_line(label, thread));
 }
 
 fn print_thread_list_summary(response: &ThreadListResponse) {
@@ -1421,15 +1414,23 @@ fn print_thread_collection_summary(label: &str, threads: &[AppServerThread]) {
 
     println!("< {label} summary:");
     for thread in threads {
-        println!(
-            "  - id={}, mode={}, resident={}, status={:?}, action={}",
-            thread.id,
-            thread_mode_label(thread.mode),
-            thread.resident,
-            thread.status,
-            thread_resume_action_label(thread.mode)
-        );
+        println!("  - {}", thread_summary_fields(thread));
     }
+}
+
+fn thread_response_summary_line(label: &str, thread: &AppServerThread) -> String {
+    format!("< {label} summary: {}", thread_summary_fields(thread))
+}
+
+fn thread_summary_fields(thread: &AppServerThread) -> String {
+    format!(
+        "id={}, mode={}, resident={}, status={:?}, action={}",
+        thread.id,
+        thread_mode_label(thread.mode),
+        thread.resident,
+        thread.status,
+        thread_resume_action_label(thread.mode)
+    )
 }
 
 fn thread_mode_label(mode: ThreadMode) -> &'static str {
@@ -1448,9 +1449,42 @@ fn thread_resume_action_label(mode: ThreadMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use super::Cli;
     use super::thread_mode_label;
+    use super::thread_response_summary_line;
     use super::thread_resume_action_label;
+    use super::thread_summary_fields;
+    use clap::CommandFactory;
+    use codex_app_server_protocol::SessionSource;
+    use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadStatus;
+
+    fn make_thread(id: &str, mode: ThreadMode, resident: bool, status: ThreadStatus) -> Thread {
+        Thread {
+            id: id.to_string(),
+            forked_from_id: None,
+            preview: "preview".to_string(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status,
+            mode,
+            resident,
+            path: None,
+            cwd: PathBuf::from("/tmp/atlas"),
+            cli_version: "1.0.0".to_string(),
+            source: SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        }
+    }
 
     #[test]
     fn resident_thread_mode_uses_reconnect_label() {
@@ -1470,6 +1504,44 @@ mod tests {
         assert_eq!(
             thread_resume_action_label(ThreadMode::Interactive),
             "resume"
+        );
+    }
+
+    #[test]
+    fn help_mentions_resume_or_reconnect_for_thread_commands() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Resume or reconnect to a V2 thread by id"));
+        assert!(help.contains("Resume or reconnect to a V2 thread and continuously stream"));
+    }
+
+    #[test]
+    fn thread_response_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/read", &resident_thread),
+            "< thread/read summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_summary_fields_mentions_interactive_resume_action() {
+        let interactive_thread = make_thread(
+            "thread-2",
+            ThreadMode::Interactive,
+            false,
+            ThreadStatus::NotLoaded,
+        );
+
+        assert_eq!(
+            thread_summary_fields(&interactive_thread),
+            "id=thread-2, mode=interactive, resident=false, status=NotLoaded, action=resume"
         );
     }
 }

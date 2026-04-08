@@ -114,6 +114,11 @@ SQLite 在这里的定位仍然是：
 - `thread/loaded/read` 是带 `mode + status` 的当前摘要读取面
 - `thread/status/changed` 只负责推送后续 `status` 增量
 - 不应把“status-only 通知”和“完整线程恢复摘要”混成同一层语义
+- 如果客户端还要进一步把线程摘要转成动作文案，也应继续基于读取面
+  拿到的 `Thread.mode` 做映射，而不是从 SQLite 元数据或 status-only
+  通知里临时推断：
+  - `interactive -> resume`
+  - `residentAssistant -> reconnect`
 
 ### 4. SQLite
 

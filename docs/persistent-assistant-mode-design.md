@@ -111,6 +111,9 @@
 
 - `thread/resume` 对普通线程更偏向“恢复”
 - `thread/resume` 对持久助手线程更偏向“重新连接到仍存在的线程”
+- 如果客户端直接展示动作文案，默认映射也应固定为：
+  - `interactive -> resume`
+  - `residentAssistant -> reconnect`
 
 这两个路径底层也许复用同一个 API，但产品语义和客户端展示应不同。
 

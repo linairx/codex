@@ -241,6 +241,7 @@ mode: ThreadMode
 - `Thread.mode` 的语义
 - `resident` 与 `mode` 的区别
 - `thread/resume` 对 `residentAssistant` 更偏“重新连接”
+- 客户端动作文案应直接按 `Thread.mode` 映射：`interactive -> resume`、`residentAssistant -> reconnect`
 - `thread/status/changed` 只推送 runtime `status`，不重复 `mode`
 - `thread/loaded/list` 只是 id-only probe；需要 reconnect 语义时应继续读
   `thread/loaded/read`

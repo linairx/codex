@@ -268,7 +268,7 @@ Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `per
 
 ### Example: List threads (with pagination & filters)
 
-`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive history. Pass any combination of:
+`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary interactive resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive history. Pass any combination of:
 
 - `cursor` — opaque string from a prior response; omit for the first page.
 - `limit` — server defaults to a reasonable page size if unset.

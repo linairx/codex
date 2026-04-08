@@ -151,6 +151,10 @@
 - 不负责重复 `Thread.mode`
 - 客户端和远端控制面应继续从 `thread/started`、`thread/read`、
   `thread/list`、`thread/loaded/read` 这些恢复面保留线程角色
+- 如果客户端需要直接展示动作文案，也应继续从这些恢复面拿到的
+  `Thread.mode` 做稳定映射：
+  - `interactive -> resume`
+  - `residentAssistant -> reconnect`
 
 第一阶段最重要的是：
 

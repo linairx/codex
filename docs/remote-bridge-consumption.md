@@ -198,7 +198,7 @@
 更适合被视为：
 
 - 普通会话
-- 历史恢复对象
+- ordinary interactive resume target
 - 按需打开的详情页对象
 
 ### `residentAssistant`
@@ -207,9 +207,15 @@
 
 - 长期存在的运行时对象
 - 需要持续观察状态变化的对象
+- resident reconnect target
 - 断开后可重新连接的对象
 
 也就是说，远端 bridge 不应把所有线程都当成“历史对话列表项”，而应对 `residentAssistant` 使用更接近运行时控制面的心智。
+
+如果远端首页或线程列表要给每一行直接展示动作文案，更合理的映射也应该是：
+
+- `interactive -> resume`
+- `residentAssistant -> reconnect`
 
 ## 6. observer 摘要在远端的意义
 
@@ -323,9 +329,10 @@ observer 文档里已经强调，第一阶段最重要的是：
 如果现在就开始做 bridge 或远端控制面，比较稳的做法是：
 
 1. 把 `thread/list` 作为首页线程摘要的主来源，并显式消费 `Thread.mode`
+   并直接把它映射成列表动作语义：`interactive` 行默认展示 `resume`，`residentAssistant` 行默认展示 `reconnect`
 2. 把 `thread/loaded/read` 和 `thread/status/changed` 组合成 loaded 线程的运行态刷新面，其中 `thread/loaded/read` 负责当前 `mode + status` 摘要，`thread/status/changed` 只负责后续 status 增量
 3. 把 `thread/read` 作为详情页主读取入口，不让首页依赖全量 item 流重建
-4. 把 `thread/resume` 视为长期线程的重新连接入口，而不只是历史恢复入口
+4. 把 `thread/resume` 视为统一进入入口，但在 `residentAssistant` 上把它产品化为 reconnect，而不只是历史恢复入口
 5. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”
 6. 如果详情页支持 metadata-only 操作（例如 git metadata repair），直接消费 `thread/metadata/update` 返回的 `thread.mode`，不要把这类更新路径额外当成需要再做一次 `thread/read` 才能恢复 resident 语义的特殊情况
 

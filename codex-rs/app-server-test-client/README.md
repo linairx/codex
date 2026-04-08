@@ -53,13 +53,15 @@ cargo run -p codex-app-server-test-client -- \
 
 These commands print the full response plus a compact summary that includes
 wire `thread.mode` values (for example `interactive` or
-`residentAssistant`), so resident assistant reconnect semantics remain visible on
-read-only lookup, fork, and metadata-only update paths.
+`residentAssistant`) plus the derived `resume`/`reconnect` action label, so
+resident assistant reconnect semantics remain visible on read-only lookup,
+fork, and metadata-only update paths.
 
 If you need to inspect other recovery paths without reading the full debug
 struct, the test client now also exposes resident-aware summaries for loaded
 threads and archived-thread restore, with the same compact `mode` plus
-`resume`/`reconnect` action labels:
+`resume`/`reconnect` action labels for ordinary interactive resume targets vs
+resident reconnect targets:
 
 ```bash
 cargo run -p codex-app-server-test-client -- thread-loaded-read --limit 5
