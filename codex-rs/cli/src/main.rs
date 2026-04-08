@@ -133,7 +133,7 @@ enum Subcommand {
     #[clap(visible_alias = "a")]
     Apply(ApplyCommand),
 
-    /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
+    /// Resume or reconnect to a previous session (picker by default; use --last for the most recent).
     Resume(ResumeCommand),
 
     /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
@@ -217,7 +217,7 @@ struct ResumeCommand {
     #[arg(value_name = "SESSION_ID")]
     session_id: Option<String>,
 
-    /// Continue the most recent session without showing the picker.
+    /// Resume or reconnect to the most recent session without showing the picker.
     #[arg(long = "last", default_value_t = false)]
     last: bool,
 
@@ -1476,6 +1476,7 @@ fn print_completion(cmd: CompletionCommand) {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+    use clap::CommandFactory;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::TokenUsage;
     use pretty_assertions::assert_eq;
@@ -1581,6 +1582,15 @@ mod tests {
         );
         assert_eq!(args.session_id.as_deref(), Some("session-123"));
         assert_eq!(args.prompt.as_deref(), Some("re-review"));
+    }
+
+    #[test]
+    fn resume_help_mentions_reconnect() {
+        let help = MultitoolCli::command().render_long_help().to_string();
+
+        assert!(help.contains("Resume or reconnect to a previous session"));
+        assert!(help.contains("--last"));
+        assert!(help.contains("picker by default"));
     }
 
     fn app_server_from_args(args: &[&str]) -> AppServerCommand {

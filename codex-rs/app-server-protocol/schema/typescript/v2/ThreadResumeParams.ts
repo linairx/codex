@@ -10,10 +10,10 @@ import type { AskForApproval } from "./AskForApproval";
 import type { SandboxMode } from "./SandboxMode";
 
 /**
- * There are three ways to resume a thread:
- * 1. By thread_id: load the thread from disk by thread_id and resume it.
- * 2. By history: instantiate the thread from memory and resume it.
- * 3. By path: load the thread from disk by path and resume it.
+ * There are three ways to resume or reconnect to a thread:
+ * 1. By thread_id: load the thread from disk by thread_id and resume or reconnect it.
+ * 2. By history: instantiate the thread from memory and resume or reconnect it.
+ * 3. By path: load the thread from disk by path and resume or reconnect it.
  *
  * The precedence is: history > path > thread_id.
  * If using history or path, the thread_id param will be ignored.

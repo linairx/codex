@@ -223,6 +223,11 @@
 - resume 目标切 cwd 后如果配置重建失败，错误提示也已开始按线程模式区分 “for resume” 与 “for reconnect”
 - session 级恢复失败提示也已继续收口，resident thread 不再只显示通用 resume/session 文案，而会明确提示 reconnect resident assistant
 - CLI 退出后的 resume hint 也已开始消费 `Thread.mode`，resident assistant 不再统一显示成 “continue this session”
+- `codex resume` 与 `codex exec resume` 的帮助摘要也已继续收口到同一口径：入口说明明确写成 `resume or reconnect`，避免外围调用者继续把 resident thread 理解成纯历史恢复
+- `app-server/README.md` 的 Events 总览和 `docs/codex_mcp_interface.md` 的 thread 概览也已继续对齐到首屏语义：外围集成现在可以直接从这些入口读到 `resume/reconnect` 与 `thread.mode` 的关系，而不用先翻到深处章节再自行拼装 resident reconnect 心智
+- `app-server/README.md` 的 `thread/resume` 方法摘要和 `app-server-client` README 的 bootstrap 说明也已继续精确化：文案现在明确写成“ordinary interactive resume target” 对比 resident reconnect，避免 typed/in-process 集成继续把 resident thread 混读成泛化的普通 resume
+- `app-server/README.md` 顶部 lifecycle overview 的首屏总结也已同步改成同一口径：外围集成在最先读到的 overview 里就能看到 ordinary interactive resume target 与 resident reconnect 的区分，不需要再靠后文兜底
+- `docs/codex_mcp_interface.md` 的 thread 概览和 `app-server/README.md` 的 `thread/list` 摘要也已继续精确化：MCP 入口现在直接写明 `thread/resume` 覆盖 resume/reconnect，而列表消费面也明确把 resident assistant 对照项写成 ordinary interactive resume target，避免历史 UI/selector 继续按泛化 interactive session 心智解读
 - `exec` 的启动配置摘要也已开始消费 `Thread.mode`，resident assistant 在 bootstrap 阶段不再被展示成普通 interactive session
 - `exec --json` 的 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，方便脚本和其他 JSON 消费方在首事件就区分 reconnect 与普通 resume
 - `debug-client` 也已开始消费 `Thread.mode`，连接提示、线程列表和 `:resume` 帮助文案都已按 resident assistant 区分 reconnect 语义

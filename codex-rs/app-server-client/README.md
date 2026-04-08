@@ -55,7 +55,7 @@ thread bootstrap still follows normal app-server flow:
 
 Surfaces such as TUI and exec may therefore need a short bootstrap
 phase where they reconcile startup response data with later events.
-Callers that need to distinguish ordinary resume from reconnect should
+Callers that need to distinguish an ordinary interactive resume target from reconnect should
 consume `response.thread.mode` from the immediate typed response instead of
 waiting for later legacy events.
 The same rule applies to metadata-only thread operations such as

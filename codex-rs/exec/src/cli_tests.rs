@@ -1,4 +1,5 @@
 use super::*;
+use clap::CommandFactory;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -52,4 +53,12 @@ fn resume_accepts_output_last_message_flag_after_subcommand() {
     };
     assert_eq!(args.session_id.as_deref(), Some("session-123"));
     assert_eq!(args.prompt.as_deref(), Some(PROMPT));
+}
+
+#[test]
+fn resume_help_mentions_reconnect() {
+    let help = Cli::command().render_long_help().to_string();
+
+    assert!(help.contains("Resume or reconnect to a previous session by id"));
+    assert!(help.contains("pick the most recent with --last"));
 }

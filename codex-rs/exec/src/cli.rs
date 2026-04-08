@@ -113,7 +113,7 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Resume a previous session by id or pick the most recent with --last.
+    /// Resume or reconnect to a previous session by id, or pick the most recent with --last.
     Resume(ResumeArgs),
 
     /// Run a code review against the current repository.
@@ -129,7 +129,7 @@ struct ResumeArgsRaw {
     #[arg(value_name = "SESSION_ID")]
     session_id: Option<String>,
 
-    /// Resume the most recent recorded session (newest) without specifying an id.
+    /// Resume or reconnect to the most recent recorded session (newest) without specifying an id.
     #[arg(long = "last", default_value_t = false)]
     last: bool,
 
@@ -158,7 +158,7 @@ pub struct ResumeArgs {
     /// If omitted, use --last to pick the most recent recorded session.
     pub session_id: Option<String>,
 
-    /// Resume the most recent recorded session (newest) without specifying an id.
+    /// Resume or reconnect to the most recent recorded session (newest) without specifying an id.
     pub last: bool,
 
     /// Show all sessions (disables cwd filtering).

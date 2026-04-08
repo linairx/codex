@@ -1005,6 +1005,11 @@ SQLite 在这里不是起点，而是收敛点。
 - `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射、`ThreadStartedNotification` 进入 TUI 后的 resident 会话推断路径，以及启动前按名称 lookup、latest-session 选择和按线程 ID 的 `thread/read` 路径对 resident `SessionTarget.mode` 的保留，也都已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
 - `tui` 的随机启动 tooltip 也已开始对齐 resident reconnect 语义：`codex resume` 不再只被描述成“恢复历史会话”，而会明确提示它同时覆盖 `resume or reconnect`，避免最前面的轻提示文案继续落回旧的纯 resume 心智
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
+- `cli` / `exec` 的命令帮助入口也已继续对齐 resident reconnect 心智：顶层 `resume` 子命令说明和 `exec resume` 帮助摘要都已明确写成 `resume or reconnect`，不再把这条入口继续描述成单纯的历史恢复
+- `app-server` 与 MCP 面向外部集成的顶层说明也已继续收口：Events 总览和 MCP thread 概览都已明确把 `resume/reconnect` 与 `thread.mode` 的关系写到首屏，不再要求外围读者先跳进细节章节再推断 resident reconnect 语义
+- `app-server` 方法摘要和 `app-server-client` README 的 typed bootstrap 说明也已继续收口到同一口径：外围调用方现在会被明确引导去区分“普通 interactive resume 目标”和 resident reconnect，而不是继续使用模糊的普通 resume 表述
+- `app-server/README.md` 顶部 lifecycle overview 的总览句子也已跟上这条精确化口径：首屏不再只写泛化的 ordinary resume，而会直接写成 ordinary interactive resume target，对外围集成的 reconnect 心智不再留灰区
+- `docs/codex_mcp_interface.md` 的 thread 概览和 `app-server/README.md` 的 `thread/list` 摘要也已继续补齐到同一粒度：前者不再只笼统罗列 thread API，而会直接点出 `thread/resume` 覆盖 `resume or reconnect`；后者也明确把列表消费目标写成 ordinary interactive resume target，而不是泛化的 ordinary interactive session
 - `exec` 的 bootstrap 启动摘要也已开始消费 `thread/start` / `thread/resume` 返回的 `Thread.mode`，resident assistant 不再在 CLI 启动横幅里被压平为普通 session，而会显式展示当前是 `resident assistant`
 - `exec --json` 的首个 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，避免下游 JSON 消费方只能拿到 `thread_id`，却继续把 resident session 当成普通 interactive thread
 - `debug-client` 也已开始消费 `Thread.mode`：连接成功提示、活跃线程切换提示、线程列表标记和 `:resume` 帮助文案都已按 resident assistant 收口，不再把 reconnect 路径统一描述成普通 resume
