@@ -53,6 +53,19 @@ You can enable notifications by configuring a script that is run whenever the ag
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. If you provide both a prompt argument and piped stdin, Codex appends stdin as a `<stdin>` block after the prompt so patterns like `echo "my output" | codex exec "Summarize this concisely"` work naturally. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
 Use `codex exec --ephemeral ...` to run without persisting session rollout files to disk.
 
+In the default human-readable mode, the bootstrap stderr summary includes
+`session mode` and `session action` so ordinary interactive runs show `resume`
+while resident-assistant reconnect flows show `reconnect`.
+
+For script consumers, `codex exec --json` emits a `thread.started` event first. That
+event includes the bootstrap `thread_id`, and when available also includes
+`thread_mode`; fresh starts emit `interactive`, while resident reconnect flows
+emit `residentAssistant`. When the mode is unknown, the field is omitted.
+Downstream consumers can use `thread_mode` to distinguish an ordinary
+interactive resume target from a resident-assistant reconnect target. In
+`--json` mode this bootstrap metadata is carried by JSON events, not by the
+human-readable stderr session summary.
+
 ### Experimenting with the Codex Sandbox
 
 To test to see what happens when a command is run under the sandbox provided by Codex, we provide the following subcommands in Codex CLI:

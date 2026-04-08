@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use anyhow::Context;
+use codex_core::state_db_bridge::open_if_present;
+use codex_protocol::ThreadId;
 use codex_utils_cargo_bin::find_resource;
 use core_test_support::test_codex_exec::test_codex_exec;
 use pretty_assertions::assert_eq;
@@ -71,6 +73,26 @@ fn extract_conversation_id(path: &std::path::Path) -> String {
         .to_string()
 }
 
+fn mark_thread_mode_in_state_db(
+    codex_home: &std::path::Path,
+    thread_id: &str,
+    mode: &str,
+) -> anyhow::Result<()> {
+    let thread_id = ThreadId::from_string(thread_id).context("parse thread id")?;
+    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    runtime.block_on(async move {
+        let state_db = open_if_present(codex_home, "openai")
+            .await
+            .context("open state db")?;
+        let updated = state_db
+            .set_thread_mode(thread_id, mode)
+            .await
+            .context("persist thread mode")?;
+        anyhow::ensure!(updated, "thread mode update should affect an existing row");
+        Ok(())
+    })
+}
+
 fn last_user_image_count(path: &std::path::Path) -> usize {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut last_count = 0;
@@ -110,6 +132,48 @@ fn exec_fixture() -> anyhow::Result<std::path::PathBuf> {
 
 fn exec_repo_root() -> anyhow::Result<std::path::PathBuf> {
     Ok(codex_utils_cargo_bin::repo_root()?)
+}
+
+fn first_stdout_json_event(output: &[u8]) -> anyhow::Result<Value> {
+    let stdout = String::from_utf8(output.to_vec()).context("stdout should be valid utf-8")?;
+    let first_line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("expected at least one json line")?;
+    serde_json::from_str(first_line).context("parse first stdout json line")
+}
+
+fn assert_json_mode_omits_human_session_summary(stderr: &str) {
+    assert!(
+        !stderr.contains("session mode:"),
+        "json mode should not emit human session mode summary: {stderr}"
+    );
+    assert!(
+        !stderr.contains("session action:"),
+        "json mode should not emit human session action summary: {stderr}"
+    );
+}
+
+fn assert_interactive_session_summary(stderr: &str) {
+    assert!(
+        stderr.contains("session mode: interactive"),
+        "stderr missing session mode summary: {stderr}"
+    );
+    assert!(
+        stderr.contains("session action: resume"),
+        "stderr missing session action summary: {stderr}"
+    );
+}
+
+fn assert_resident_session_summary(stderr: &str) {
+    assert!(
+        stderr.contains("session mode: resident assistant"),
+        "stderr missing resident session mode summary: {stderr}"
+    );
+    assert!(
+        stderr.contains("session action: reconnect"),
+        "stderr missing resident session action summary: {stderr}"
+    );
 }
 
 #[test]
@@ -213,6 +277,388 @@ fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Result<(
     let content = std::fs::read_to_string(&resumed_path)?;
     assert!(content.contains(&marker));
     assert!(content.contains(&marker2));
+    Ok(())
+}
+
+#[test]
+fn exec_resume_json_emits_thread_started_with_interactive_thread_mode() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("resume-json-bootstrap-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt)
+        .assert()
+        .success();
+
+    let marker2 = format!("resume-json-bootstrap-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("--json")
+        .arg("resume")
+        .arg("--last")
+        .arg(&prompt2)
+        .output()
+        .context("resume --json run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resume --json run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_json_mode_omits_human_session_summary(&stderr);
+
+    let first_event = first_stdout_json_event(&output.stdout)?;
+
+    assert_eq!(
+        first_event,
+        serde_json::json!({
+            "type": "thread.started",
+            "thread_id": first_event["thread_id"].as_str().expect("thread id"),
+            "thread_mode": "interactive"
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_resume_last_json_emits_thread_started_with_resident_thread_mode() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("resume-last-json-resident-bootstrap-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt)
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let path = find_session_file_containing_marker(&sessions_dir, &marker)
+        .expect("no session file found after first run");
+    let thread_id = extract_conversation_id(&path);
+    mark_thread_mode_in_state_db(test.home_path(), &thread_id, "residentAssistant")?;
+
+    let marker2 = format!("resume-last-json-resident-bootstrap-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("--json")
+        .arg("resume")
+        .arg("--last")
+        .arg(&prompt2)
+        .output()
+        .context("resident resume --last --json run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resident resume --last --json run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_json_mode_omits_human_session_summary(&stderr);
+
+    let first_event = first_stdout_json_event(&output.stdout)?;
+
+    assert_eq!(
+        first_event,
+        serde_json::json!({
+            "type": "thread.started",
+            "thread_id": thread_id,
+            "thread_mode": "residentAssistant"
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_resume_json_emits_thread_started_with_resident_thread_mode() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("resume-json-resident-bootstrap-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt)
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let path = find_session_file_containing_marker(&sessions_dir, &marker)
+        .expect("no session file found after first run");
+    let thread_id = extract_conversation_id(&path);
+    mark_thread_mode_in_state_db(test.home_path(), &thread_id, "residentAssistant")?;
+
+    let marker2 = format!("resume-json-resident-bootstrap-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("--json")
+        .arg("resume")
+        .arg(&thread_id)
+        .arg(&prompt2)
+        .output()
+        .context("resident resume --json run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resident resume --json run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_json_mode_omits_human_session_summary(&stderr);
+
+    let first_event = first_stdout_json_event(&output.stdout)?;
+
+    assert_eq!(
+        first_event,
+        serde_json::json!({
+            "type": "thread.started",
+            "thread_id": thread_id,
+            "thread_mode": "residentAssistant"
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_json_emits_thread_started_with_interactive_thread_mode() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("exec-json-bootstrap-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("--json")
+        .arg(&prompt)
+        .output()
+        .context("exec --json run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "exec --json run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_json_mode_omits_human_session_summary(&stderr);
+
+    let first_event = first_stdout_json_event(&output.stdout)?;
+
+    assert_eq!(
+        first_event,
+        serde_json::json!({
+            "type": "thread.started",
+            "thread_id": first_event["thread_id"].as_str().expect("thread id"),
+            "thread_mode": "interactive"
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_resume_last_uses_reconnect_summary_for_resident_threads() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("resume-last-resident-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt)
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let path = find_session_file_containing_marker(&sessions_dir, &marker)
+        .expect("no session file found after first run");
+    let thread_id = extract_conversation_id(&path);
+    mark_thread_mode_in_state_db(test.home_path(), &thread_id, "residentAssistant")?;
+
+    let marker2 = format!("resume-last-resident-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt2)
+        .arg("resume")
+        .arg("--last")
+        .output()
+        .context("resident resume --last run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resident resume --last run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_resident_session_summary(&stderr);
+
+    let resumed_path = find_session_file_containing_marker(&sessions_dir, &marker2)
+        .expect("no resumed resident session file containing marker2");
+    assert_eq!(
+        resumed_path, path,
+        "resident resume --last should append to existing file"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_resume_by_id_uses_reconnect_summary_for_resident_threads() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("resume-by-id-resident-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt)
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let path = find_session_file_containing_marker(&sessions_dir, &marker)
+        .expect("no session file found after first run");
+    let thread_id = extract_conversation_id(&path);
+    mark_thread_mode_in_state_db(test.home_path(), &thread_id, "residentAssistant")?;
+
+    let marker2 = format!("resume-by-id-resident-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt2)
+        .arg("resume")
+        .arg(&thread_id)
+        .output()
+        .context("resident resume by id run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resident resume by id run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_resident_session_summary(&stderr);
+
+    let resumed_path = find_session_file_containing_marker(&sessions_dir, &marker2)
+        .expect("no resumed resident session file containing marker2");
+    assert_eq!(
+        resumed_path, path,
+        "resume by id should append to existing file"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_preserves_cli_configuration_overrides_in_human_output() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+    let repo_root = exec_repo_root()?;
+
+    let marker = format!("exec-config-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("--sandbox")
+        .arg("workspace-write")
+        .arg("--model")
+        .arg("gpt-5.1-high")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg(&prompt)
+        .output()
+        .context("exec run should succeed")?;
+
+    assert!(output.status.success(), "exec run failed: {output:?}");
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("model: gpt-5.1-high"),
+        "stderr missing model override: {stderr}"
+    );
+    assert_interactive_session_summary(&stderr);
+    if cfg!(target_os = "windows") {
+        assert!(
+            stderr.contains("sandbox: read-only"),
+            "stderr missing downgraded sandbox note: {stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("sandbox: workspace-write"),
+            "stderr missing sandbox override: {stderr}"
+        );
+    }
+
     Ok(())
 }
 
@@ -324,6 +770,183 @@ fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<()> {
 }
 
 #[test]
+fn exec_resume_last_all_uses_reconnect_summary_for_resident_threads() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+
+    let marker_a = format!("resume-last-all-resident-a-{}", Uuid::new_v4());
+    let prompt_a = format!("echo {marker_a}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_a.path())
+        .arg(&prompt_a)
+        .assert()
+        .success();
+
+    let marker_b = format!("resume-last-all-resident-b-{}", Uuid::new_v4());
+    let prompt_b = format!("echo {marker_b}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_b.path())
+        .arg(&prompt_b)
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let path_b = find_session_file_containing_marker(&sessions_dir, &marker_b)
+        .expect("no session file found for marker_b");
+    let session_id_b = extract_conversation_id(&path_b);
+    mark_thread_mode_in_state_db(test.home_path(), &session_id_b, "residentAssistant")?;
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let marker_b_touch = format!("resume-last-all-resident-touch-{}", Uuid::new_v4());
+    let prompt_b_touch = format!("echo {marker_b_touch}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_b.path())
+        .arg("resume")
+        .arg(&session_id_b)
+        .arg(&prompt_b_touch)
+        .assert()
+        .success();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let marker_b2 = format!("resume-last-all-resident-2-{}", Uuid::new_v4());
+    let prompt_b2 = format!("echo {marker_b2}");
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_a.path())
+        .arg("resume")
+        .arg("--last")
+        .arg("--all")
+        .arg(&prompt_b2)
+        .output()
+        .context("resident resume --last --all run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resident resume --last --all run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_resident_session_summary(&stderr);
+
+    let resumed_path = find_session_file_containing_marker(&sessions_dir, &marker_b2)
+        .expect("no resumed resident session file containing marker_b2");
+    assert_eq!(
+        resumed_path, path_b,
+        "resident resume --last --all should pick newest session"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn exec_resume_last_all_json_emits_thread_started_with_resident_thread_mode() -> anyhow::Result<()>
+{
+    let test = test_codex_exec();
+    let fixture = exec_fixture()?;
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+
+    let marker_a = format!("resume-last-all-json-resident-a-{}", Uuid::new_v4());
+    let prompt_a = format!("echo {marker_a}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_a.path())
+        .arg(&prompt_a)
+        .assert()
+        .success();
+
+    let marker_b = format!("resume-last-all-json-resident-b-{}", Uuid::new_v4());
+    let prompt_b = format!("echo {marker_b}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_b.path())
+        .arg(&prompt_b)
+        .assert()
+        .success();
+
+    let sessions_dir = test.home_path().join("sessions");
+    let path_b = find_session_file_containing_marker(&sessions_dir, &marker_b)
+        .expect("no session file found for marker_b");
+    let session_id_b = extract_conversation_id(&path_b);
+    mark_thread_mode_in_state_db(test.home_path(), &session_id_b, "residentAssistant")?;
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let marker_b_touch = format!("resume-last-all-json-resident-touch-{}", Uuid::new_v4());
+    let prompt_b_touch = format!("echo {marker_b_touch}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_b.path())
+        .arg("resume")
+        .arg(&session_id_b)
+        .arg(&prompt_b_touch)
+        .assert()
+        .success();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let marker_b2 = format!("resume-last-all-json-resident-2-{}", Uuid::new_v4());
+    let prompt_b2 = format!("echo {marker_b2}");
+    let output = test
+        .cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_a.path())
+        .arg("--json")
+        .arg("resume")
+        .arg("--last")
+        .arg("--all")
+        .arg(&prompt_b2)
+        .output()
+        .context("resident resume --last --all --json run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resident resume --last --all --json run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_json_mode_omits_human_session_summary(&stderr);
+
+    let first_event = first_stdout_json_event(&output.stdout)?;
+    assert_eq!(
+        first_event,
+        serde_json::json!({
+            "type": "thread.started",
+            "thread_id": session_id_b,
+            "thread_mode": "residentAssistant"
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
 fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<()> {
     let test = test_codex_exec();
     let fixture = exec_fixture()?;
@@ -387,7 +1010,8 @@ fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
     let marker2 = format!("resume-by-id-2-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
 
-    test.cmd()
+    let output = test
+        .cmd()
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .arg("--skip-git-repo-check")
         .arg("-C")
@@ -395,8 +1019,16 @@ fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
         .arg(&prompt2)
         .arg("resume")
         .arg(&session_id)
-        .assert()
-        .success();
+        .output()
+        .context("resume by id run should succeed")?;
+
+    assert!(
+        output.status.success(),
+        "resume by id run failed: {output:?}"
+    );
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_interactive_session_summary(&stderr);
 
     let resumed_path = find_session_file_containing_marker(&sessions_dir, &marker2)
         .expect("no resumed session file containing marker2");
@@ -462,6 +1094,7 @@ fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
         stderr.contains("model: gpt-5.1-high"),
         "stderr missing model override: {stderr}"
     );
+    assert_interactive_session_summary(&stderr);
     if cfg!(target_os = "windows") {
         assert!(
             stderr.contains("sandbox: read-only"),

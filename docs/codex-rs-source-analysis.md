@@ -1018,8 +1018,29 @@ SQLite 在这里不是起点，而是收敛点。
 - `docs/persistent-assistant-mode-design.md` 与 `docs/app-server-thread-mode-v2.md` 这两份前导设计稿也已补上同一条动作映射边界：虽然 `thread/resume` 仍是统一 API，但产品动作必须按 `Thread.mode` 显式映射成 `interactive -> resume`、`residentAssistant -> reconnect`
 - `docs/observer-event-flow-design.md` 与 `docs/sqlite-state-convergence.md` 这两份状态文档也已继续跟上：它们现在都明确写出动作文案不是从 observer/status-only 通知或 SQLite 直接推断，而应继续从读取面拿到 `Thread.mode` 后稳定映射成 `interactive -> resume`、`residentAssistant -> reconnect`
 - `exec` 的 bootstrap 启动摘要也已开始消费 `thread/start` / `thread/resume` 返回的 `Thread.mode`，resident assistant 不再在 CLI 启动横幅里被压平为普通 session，而会显式展示当前是 `resident assistant`
+- `exec` 的人类可读 bootstrap 摘要现在也已继续补齐产品动作：除了 `session mode` 外，还会显式打印 `session action`，把 `interactive -> resume`、`resident assistant -> reconnect` 直接打到首屏配置摘要里，并补上 resident / interactive 两侧回归
+- `exec` 的这组首屏摘要回归现在也已补上负向约束：当 bootstrap 里拿不到 `thread_mode` 时，`session mode` 和 `session action` 都会一起省略，避免未知线程被误贴上 resume/reconnect 语义
+- `exec resume` 的人类可读 stderr 摘要现在也已补上端到端回归：真实命令输出会稳定带出 `session mode: interactive` 和 `session action: resume`，不再只在 `config_summary_entries` 单元层证明这组提示存在
+- `exec resume <thread-id>` 的人类可读 stderr 摘要现在也已补上对应端到端回归：按显式 thread id 恢复普通 interactive 会话时，真实命令输出同样会稳定带出 `session mode: interactive` 和 `session action: resume`
+- 普通 `codex exec` 的人类可读 stderr 摘要现在也已补上对应的端到端回归：fresh start 场景下，真实命令输出同样会稳定带出 `session mode: interactive` 和 `session action: resume`
+- 普通 `codex exec --json` 的端到端回归现在也已把这层输出边界写死：fresh start 场景下，`thread_mode = interactive` 只通过首个 `thread.started` JSON 事件暴露，不会再额外把 `session mode/session action` 这组人类可读摘要打到 stderr
 - `exec --json` 的首个 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，避免下游 JSON 消费方只能拿到 `thread_id`，却继续把 resident session 当成普通 interactive thread
 - `exec --json` 的这条 bootstrap 语义现在也已补上序列化回归：`thread.started` 在 resident bootstrap 时会稳定输出 `thread_mode = residentAssistant`，而未知模式时仍会省略该字段，避免 JSON 契约在后续重构里悄悄漂移
+- `exec --json` 的 `thread.started` 形状现在也已补到更外层的集成测试：除了内部序列化单测外，面向公开 JSON 输出的集成回归也会直接断言 `type/thread_id/thread_mode` 这三个字段的实际 wire 形状，避免只在内部 helper 上通过却让对外输出悄悄漂移
+- `exec --json` 的这层集成回归现在也已补上负向断言：当 bootstrap 里没有 `thread_mode` 时，公开 JSON 输出同样会稳定省略该字段，不会在未知模式场景下伪造 resident/reconnect 语义
+- `exec resume --json` 的真实命令输出现在也已补上端到端回归：恢复普通 interactive 会话时，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = interactive`，不再只在 helper/集成层证明这条 wire 契约
+- `exec resume --json` 的这条端到端回归现在也已把 stderr 边界写死：和普通 `exec --json` 一样，模式语义只通过首个 `thread.started` JSON 事件暴露，不会再额外把 `session mode/session action` 打到 stderr
+- 普通 `codex exec --json` 的真实命令输出现在也已补上对应的端到端回归：fresh start 场景下，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = interactive`，不再只在 helper/集成层证明这条 wire 语义
+- `exec resume --json` 的 resident 路径现在也已补到真实命令输出层：当线程模式先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = residentAssistant`，不再只在内部序列化单测里证明 resident wire 形状
+- `exec resume --last --json` 的 resident 路径现在也已补上同层端到端回归：当最近会话先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，stdout 首个 `thread.started` 事件同样会稳定带出 `thread_mode = residentAssistant`，避免 `--last` 路径重新退回普通 interactive bootstrap 语义
+- `exec resume --last` 的 resident 路径现在也已补上人类可读端到端回归：当最近会话先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，真实 stderr 摘要同样会稳定打印 `session mode: resident assistant` 和 `session action: reconnect`
+- `exec resume <thread-id>` 的 resident 路径现在也已补上人类可读端到端回归：当线程模式先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，真实 stderr 摘要会稳定打印 `session mode: resident assistant` 和 `session action: reconnect`
+- `exec` 这两条真实 `--json` 首事件回归现在也已共用同一个 stdout 首行解析 helper，测试会更稳定地把“首个非空 JSON 行就是 `thread.started`”这条契约固定下来，而不是在每条用例里各自手写解析逻辑
+- `exec` 的 `thread.started` 事件类型注释现在也已收口到真实行为：它不再只被描述成“new thread started”，而会明确写成 bootstrap 后的首事件，覆盖 fresh start 与 resume/reconnect 两种入口
+- `exec` 的公开 JSON event 类型注释现在也已同步收口：`ThreadStartedEvent.thread_id` 不再只被描述成“later resume the thread”，而会明确写成后续可按 `thread_mode` 用于 `resume or reconnect`
+- `exec` 的 `ThreadStartedEvent.thread_mode` 字段注释现在也已补齐到同一粒度：公开类型说明里会直接写清这就是下游区分 ordinary interactive resume target 与 resident reconnect target 的产品信号，不再只靠字段名暗示
+- `codex-rs/README.md` 的顶层 `codex exec` 说明现在也已补上同一层脚本消费语义：README 会直接写明 `codex exec --json` 的首个 `thread.started` 事件会带 bootstrap `thread_id`，fresh start 时给出 `interactive`、resident reconnect 时给出 `residentAssistant`，未知模式时则显式省略该字段；同时也明确这层 bootstrap 元数据只走 JSON 事件面，而不是 stderr 的人类可读摘要
+- `codex-rs/README.md` 的顶层 `codex exec` 说明现在也已把默认 human-readable 输出补齐：README 会直接写出非 `--json` 模式下的 bootstrap stderr 摘要包含 `session mode` / `session action`，用于区分普通 resume 与 resident reconnect
 - `debug-client` 也已开始消费 `Thread.mode`：连接成功提示、活跃线程切换提示、线程列表标记和 `:resume` 帮助文案都已按 resident assistant 收口，不再把 reconnect 路径统一描述成普通 resume
 - `debug-client` 的线程列表摘要也已继续补齐：`:refresh-thread` 现在会同时显示线程模式标签和推荐动作，不再只给出模糊的 `resume/reconnect` 动词，让 resident thread 与普通 interactive thread 在联调输出里更容易一眼区分
 - `debug-client` 的已知线程切换提示也已继续补齐：`:use <thread-id>` 在本地已缓存线程模式时，会明确区分 `thread` 与 `resident assistant thread`，不再把已知 resident thread 仍然压平成通用 thread 文案

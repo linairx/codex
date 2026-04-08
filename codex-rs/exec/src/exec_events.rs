@@ -10,7 +10,8 @@ use ts_rs::TS;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(tag = "type")]
 pub enum ThreadEvent {
-    /// Emitted when a new thread is started as the first event.
+    /// Emitted as the first event after bootstrap, whether the thread was
+    /// freshly started or resumed/reconnected.
     #[serde(rename = "thread.started")]
     ThreadStarted(ThreadStartedEvent),
     /// Emitted when a turn is started by sending a new prompt to the model.
@@ -39,8 +40,12 @@ pub enum ThreadEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct ThreadStartedEvent {
-    /// The identified of the new thread. Can be used to resume the thread later.
+    /// Identifier of the thread. Can be used to resume or reconnect later,
+    /// depending on `thread_mode`.
     pub thread_id: String,
+    /// Product-facing thread mode for downstream consumers that need to
+    /// distinguish ordinary interactive resume targets from resident-assistant
+    /// reconnect targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_mode: Option<ThreadMode>,
 }

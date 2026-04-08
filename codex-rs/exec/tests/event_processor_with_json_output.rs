@@ -137,6 +137,79 @@ fn session_configured_produces_thread_started_event() {
 }
 
 #[test]
+fn session_configured_serializes_thread_started_event_with_thread_mode() {
+    let session_configured = SessionConfiguredEvent {
+        session_id: ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
+            .expect("thread id should parse"),
+        forked_from_id: None,
+        thread_name: None,
+        model: "codex-mini-latest".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        cwd: PathBuf::from("/tmp/project"),
+        reasoning_effort: None,
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: None,
+    };
+
+    let event = EventProcessorWithJsonOutput::thread_started_event(
+        &session_configured,
+        Some(codex_app_server_protocol::ThreadMode::ResidentAssistant),
+    );
+
+    assert_eq!(
+        serde_json::to_value(event).expect("serialize thread started event"),
+        json!({
+            "type": "thread.started",
+            "thread_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "thread_mode": "residentAssistant"
+        })
+    );
+}
+
+#[test]
+fn session_configured_serializes_thread_started_event_without_thread_mode_when_unknown() {
+    let session_configured = SessionConfiguredEvent {
+        session_id: ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
+            .expect("thread id should parse"),
+        forked_from_id: None,
+        thread_name: None,
+        model: "codex-mini-latest".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        cwd: PathBuf::from("/tmp/project"),
+        reasoning_effort: None,
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: None,
+    };
+
+    let event = EventProcessorWithJsonOutput::thread_started_event(
+        &session_configured,
+        /*thread_mode*/ None,
+    );
+
+    assert_eq!(
+        serde_json::to_value(event).expect("serialize thread started event"),
+        json!({
+            "type": "thread.started",
+            "thread_id": "67e55044-10b1-426f-9247-bb680e5fe0c8"
+        })
+    );
+}
+
+#[test]
 fn turn_started_emits_turn_started_event() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
 

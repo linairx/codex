@@ -443,6 +443,10 @@ fn config_summary_entries(
             "session mode",
             summarize_thread_mode(thread_mode).to_string(),
         ));
+        entries.push((
+            "session action",
+            summarize_thread_action(thread_mode).to_string(),
+        ));
     }
     if config.model_provider.wire_api == WireApi::Responses {
         entries.push((
@@ -471,6 +475,13 @@ fn summarize_thread_mode(thread_mode: ThreadMode) -> &'static str {
     match thread_mode {
         ThreadMode::Interactive => "interactive",
         ThreadMode::ResidentAssistant => "resident assistant",
+    }
+}
+
+fn summarize_thread_action(thread_mode: ThreadMode) -> &'static str {
+    match thread_mode {
+        ThreadMode::Interactive => "resume",
+        ThreadMode::ResidentAssistant => "reconnect",
     }
 }
 

@@ -235,8 +235,29 @@
 - `docs/persistent-assistant-mode-design.md` 与 `docs/app-server-thread-mode-v2.md` 也已继续补齐这条设计侧边界：`thread/resume` 虽然保留统一 API，但客户端动作文案必须按 `Thread.mode` 稳定映射成 `interactive -> resume`、`residentAssistant -> reconnect`
 - `docs/observer-event-flow-design.md` 与 `docs/sqlite-state-convergence.md` 也已继续补齐同一消费边界：observer/status-only 通知和 SQLite 元数据负责状态事实，但产品动作文案仍必须从读取面提供的 `Thread.mode` 稳定映射成 `interactive -> resume`、`residentAssistant -> reconnect`
 - `exec` 的启动配置摘要也已开始消费 `Thread.mode`，resident assistant 在 bootstrap 阶段不再被展示成普通 interactive session
+- `exec` 的人类可读 bootstrap 摘要也已进一步补齐 `session action`：除了 `session mode` 外，现在会直接显示 `interactive -> resume`、`resident assistant -> reconnect`，并补上两侧回归测试
+- `exec` 的这组人类可读 bootstrap 摘要回归也已补上负向覆盖：当 `thread_mode` 未知时，不会错误打印 `session mode` / `session action`
+- `exec resume` 的人类可读 stderr 摘要也已补上端到端回归：真实命令输出会稳定包含 `session mode: interactive` 与 `session action: resume`
+- `exec resume <thread-id>` 的人类可读 stderr 摘要也已补上对应端到端回归：按显式 thread id 恢复普通 interactive 会话时，真实命令输出同样会稳定包含 `session mode: interactive` 与 `session action: resume`
+- 普通 `codex exec` 的人类可读 stderr 摘要也已补上对应的端到端回归：fresh start 场景下，真实命令输出同样会稳定包含 `session mode: interactive` 与 `session action: resume`
+- 普通 `codex exec --json` 的端到端回归也已把这层输出边界写死：fresh start 场景下，`thread_mode = interactive` 只通过首个 `thread.started` JSON 事件暴露，不会再额外把 `session mode/session action` 打到 stderr
 - `exec --json` 的 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，方便脚本和其他 JSON 消费方在首事件就区分 reconnect 与普通 resume
 - `exec --json` 的 bootstrap `thread_mode` 也已补上序列化回归测试：resident assistant 会稳定输出 `thread_mode = residentAssistant`，而未知模式时继续省略该字段，避免 JSON 契约无意漂移
+- `exec --json` 的 `thread.started` wire 形状也已补到集成测试层：除了内部序列化单测外，公开 JSON 输出回归现在也会直接断言 `type/thread_id/thread_mode` 的实际字段形状
+- `exec --json` 的这层集成回归也已补上负向覆盖：当 bootstrap 里拿不到 `thread_mode` 时，公开 JSON 输出会继续省略该字段
+- `exec resume --json` 的真实命令输出也已补上端到端回归：恢复普通 interactive 会话时，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = interactive`
+- `exec resume --json` 的这条端到端回归也已把 stderr 边界写死：模式语义只通过首个 `thread.started` JSON 事件暴露，不会再额外把 `session mode/session action` 打到 stderr
+- 普通 `codex exec --json` 的真实命令输出也已补上对应的端到端回归：fresh start 场景下，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = interactive`
+- `exec resume --json` 的 resident 路径也已补到真实命令输出层：当线程模式先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，stdout 首个 `thread.started` 事件会稳定带出 `thread_mode = residentAssistant`
+- `exec resume --last --json` 的 resident 路径也已补上同层端到端回归：当最近会话先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，stdout 首个 `thread.started` 事件同样会稳定带出 `thread_mode = residentAssistant`
+- `exec resume --last` 的 resident 路径也已补上人类可读端到端回归：当最近会话先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，真实 stderr 摘要同样会稳定包含 `session mode: resident assistant` 与 `session action: reconnect`
+- `exec resume <thread-id>` 的 resident 路径也已补上人类可读端到端回归：当线程模式先通过 SQLite 稳定元数据恢复成 `residentAssistant` 后，真实 stderr 摘要会稳定包含 `session mode: resident assistant` 与 `session action: reconnect`
+- `exec` 这两条真实 `--json` 首事件回归现在也已收敛到同一个 stdout 首行解析 helper，减少端到端测试各自手写 JSONL 首事件提取逻辑的漂移
+- `exec` 的 `thread.started` 事件注释也已同步收口：公开类型说明现在明确这是 bootstrap 后的首事件，覆盖 fresh start 与 resume/reconnect，而不再只写成“新线程 started”
+- `exec` 的公开 JSON event 注释也已同步收口：`ThreadStartedEvent.thread_id` 现在明确写成后续可按 `thread_mode` 用于 `resume or reconnect`，不再把这条 API 注释停留在旧的纯 resume 心智
+- `exec` 的 `ThreadStartedEvent.thread_mode` 字段注释也已同步补齐：公开类型说明现在直接把它定义成下游区分 ordinary interactive resume target 与 resident reconnect target 的主信号
+- `codex-rs/README.md` 的顶层 `codex exec` 说明也已同步补上脚本消费边界：README 现在明确写出 `codex exec --json` 的首个 `thread.started` 事件会带 bootstrap `thread_id`，fresh start 时输出 `interactive`、resident reconnect 时输出 `residentAssistant`，未知模式时则省略该字段；并明确这层元数据只走 JSON 事件面
+- `codex-rs/README.md` 的顶层 `codex exec` 说明现在也已把默认 human-readable 输出补齐：README 会直接写出非 `--json` 模式下的 bootstrap stderr 摘要包含 `session mode` / `session action`
 - `debug-client` 也已开始消费 `Thread.mode`，连接提示、线程列表和 `:resume` 帮助文案都已按 resident assistant 区分 reconnect 语义
 - `debug-client` 的 `:refresh-thread` 摘要也已开始同时展示线程模式与推荐动作，resident thread 不再只显示成模糊的 reconnect/resume 动词，而能直接看出这是 `resident assistant`
 - `debug-client` 的 `:use <thread-id>` 提示也已继续按已知线程模式收口：resident thread 不再显示成通用 thread 切换提示，而会明确提示切到 `resident assistant thread`
