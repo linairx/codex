@@ -11,7 +11,7 @@ pub enum UserCommand {
     NewThread,
     Resume(String),
     Use(String),
-    RefreshThread,
+    RefreshThread(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +87,9 @@ pub fn parse_input(line: &str) -> Result<Option<InputAction>, ParseError> {
                 thread_id.to_string(),
             ))))
         }
-        "refresh-thread" => Ok(Some(InputAction::Command(UserCommand::RefreshThread))),
+        "refresh-thread" => Ok(Some(InputAction::Command(UserCommand::RefreshThread(
+            parts.next().map(ToString::to_string),
+        )))),
         _ => Err(ParseError::UnknownCommand {
             command: command.to_string(),
         }),
@@ -151,7 +153,18 @@ mod tests {
         let result = parse_input(":refresh-thread").unwrap();
         assert_eq!(
             result,
-            Some(InputAction::Command(UserCommand::RefreshThread))
+            Some(InputAction::Command(UserCommand::RefreshThread(None)))
+        );
+    }
+
+    #[test]
+    fn parses_refresh_thread_with_cursor() {
+        let result = parse_input(":refresh-thread cursor-2").unwrap();
+        assert_eq!(
+            result,
+            Some(InputAction::Command(UserCommand::RefreshThread(Some(
+                "cursor-2".to_string()
+            ))))
         );
     }
 

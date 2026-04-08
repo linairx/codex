@@ -1733,6 +1733,14 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use codex_protocol::ThreadId;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::RolloutLine;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::UserMessageEvent;
+    use codex_rollout::RolloutConfig;
 
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
@@ -1776,7 +1784,6 @@ mod tests {
         })
     }
 
-    #[allow(dead_code)]
     fn set_rollout_mtime(path: &Path, updated_at: DateTime<Utc>) {
         let times = FileTimes::new().set_modified(updated_at.into());
         OpenOptions::new()
@@ -1787,92 +1794,149 @@ mod tests {
             .expect("set times");
     }
 
-    // TODO(jif) fix
-    // #[tokio::test]
-    // async fn resume_picker_orders_by_updated_at() {
-    //     use uuid::Uuid;
-    //
-    //     let tempdir = tempfile::tempdir().expect("tempdir");
-    //     let sessions_root = tempdir.path().join("sessions");
-    //     std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
-    //
-    //     let now = Utc::now();
-    //
-    //     let write_rollout = |ts: DateTime<Utc>, preview: &str| -> PathBuf {
-    //         let dir = sessions_root
-    //             .join(ts.format("%Y").to_string())
-    //             .join(ts.format("%m").to_string())
-    //             .join(ts.format("%d").to_string());
-    //         std::fs::create_dir_all(&dir).expect("mkdir date dirs");
-    //         let filename = format!(
-    //             "rollout-{}-{}.jsonl",
-    //             ts.format("%Y-%m-%dT%H-%M-%S"),
-    //             Uuid::new_v4()
-    //         );
-    //         let path = dir.join(filename);
-    //         let meta = SessionMeta {
-    //             id: ThreadId::new(),
-    //             forked_from_id: None,
-    //             timestamp: ts.to_rfc3339(),
-    //             cwd: PathBuf::from("/tmp"),
-    //             originator: String::from("user"),
-    //             cli_version: String::from("0.0.0"),
-    //             source: SessionSource::Cli,
-    //             model_provider: Some(String::from("openai")),
-    //             base_instructions: None,
-    //             dynamic_tools: None,
-    //         };
-    //         let meta_line = RolloutLine {
-    //             timestamp: ts.to_rfc3339(),
-    //             item: RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
-    //         };
-    //         let user_line = RolloutLine {
-    //             timestamp: ts.to_rfc3339(),
-    //             item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-    //                 message: preview.to_string(),
-    //                 images: None,
-    //                 text_elements: Vec::new(),
-    //                 local_images: Vec::new(),
-    //             })),
-    //         };
-    //         let meta_json = serde_json::to_string(&meta_line).expect("serialize meta");
-    //         let user_json = serde_json::to_string(&user_line).expect("serialize user");
-    //         std::fs::write(&path, format!("{meta_json}\n{user_json}\n")).expect("write rollout");
-    //         path
-    //     };
-    //
-    //     let created_a = now - Duration::minutes(1);
-    //     let created_b = now - Duration::minutes(2);
-    //
-    //     let path_a = write_rollout(created_a, "A (created newer)");
-    //     let path_b = write_rollout(created_b, "B (created older)");
-    //
-    //     set_rollout_mtime(&path_a, now - Duration::minutes(10));
-    //     set_rollout_mtime(&path_b, now - Duration::seconds(10));
-    //
-    //     let page = RolloutRecorder::list_threads(
-    //         tempdir.path(),
-    //         PAGE_SIZE,
-    //         None,
-    //         ThreadSortKey::UpdatedAt,
-    //         INTERACTIVE_SESSION_SOURCES,
-    //         Some(&[String::from("openai")]),
-    //         "openai",
-    //     )
-    //     .await
-    //     .expect("list threads");
-    //
-    //     let rows = rows_from_items(page.items);
-    //     let previews: Vec<String> = rows.iter().map(|row| row.preview.clone()).collect();
-    //
-    //     assert_eq!(
-    //         previews,
-    //         vec![
-    //             "B (created older)".to_string(),
-    //             "A (created newer)".to_string()
-    //         ]
-    //     );
-    // }
+    fn test_rollout_config(codex_home: &Path) -> RolloutConfig {
+        RolloutConfig {
+            codex_home: codex_home.to_path_buf(),
+            sqlite_home: codex_home.to_path_buf(),
+            cwd: codex_home.to_path_buf(),
+            model_provider_id: String::from("openai"),
+            generate_memories: true,
+        }
+    }
+
+    fn write_test_rollout(sessions_root: &Path, ts: DateTime<Utc>, preview: &str) -> PathBuf {
+        use uuid::Uuid;
+
+        let dir = sessions_root
+            .join(ts.format("%Y").to_string())
+            .join(ts.format("%m").to_string())
+            .join(ts.format("%d").to_string());
+        std::fs::create_dir_all(&dir).expect("mkdir date dirs");
+        let filename = format!(
+            "rollout-{}-{}.jsonl",
+            ts.format("%Y-%m-%dT%H-%M-%S"),
+            Uuid::new_v4()
+        );
+        let path = dir.join(filename);
+        let meta = SessionMeta {
+            id: ThreadId::new(),
+            forked_from_id: None,
+            timestamp: ts.to_rfc3339(),
+            cwd: PathBuf::from("/tmp"),
+            originator: String::from("user"),
+            cli_version: String::from("0.0.0"),
+            source: SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            agent_path: None,
+            model_provider: Some(String::from("openai")),
+            base_instructions: None,
+            dynamic_tools: None,
+            memory_mode: None,
+        };
+        let meta_line = RolloutLine {
+            timestamp: ts.to_rfc3339(),
+            item: RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
+        };
+        let user_line = RolloutLine {
+            timestamp: ts.to_rfc3339(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: preview.to_string(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+        };
+        let meta_json = serde_json::to_string(&meta_line).expect("serialize meta");
+        let user_json = serde_json::to_string(&user_line).expect("serialize user");
+        std::fs::write(&path, format!("{meta_json}\n{user_json}\n")).expect("write rollout");
+        path
+    }
+
+    #[tokio::test]
+    async fn resume_picker_orders_by_updated_at() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions_root = tempdir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
+
+        let now = Utc::now();
+
+        let created_a = now - Duration::minutes(1);
+        let created_b = now - Duration::minutes(2);
+
+        let path_a = write_test_rollout(&sessions_root, created_a, "A (created newer)");
+        let path_b = write_test_rollout(&sessions_root, created_b, "B (created older)");
+        let config = test_rollout_config(tempdir.path());
+
+        set_rollout_mtime(&path_a, now - Duration::minutes(10));
+        set_rollout_mtime(&path_b, now - Duration::seconds(10));
+
+        let page = RolloutRecorder::list_threads(
+            &config,
+            PAGE_SIZE,
+            None,
+            ThreadSortKey::UpdatedAt,
+            &INTERACTIVE_SESSION_SOURCES,
+            Some(&[String::from("openai")]),
+            "openai",
+            None,
+        )
+        .await
+        .expect("list threads");
+
+        let rows = rows_from_items(page.items);
+        let previews: Vec<String> = rows.iter().map(|row| row.preview.clone()).collect();
+
+        assert_eq!(
+            previews,
+            vec![
+                "B (created older)".to_string(),
+                "A (created newer)".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_picker_orders_by_created_at_even_when_mtime_differs() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions_root = tempdir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).expect("mkdir sessions root");
+
+        let now = Utc::now();
+        let created_a = now - Duration::minutes(1);
+        let created_b = now - Duration::minutes(2);
+
+        let path_a = write_test_rollout(&sessions_root, created_a, "A (created newer)");
+        let path_b = write_test_rollout(&sessions_root, created_b, "B (created older)");
+        let config = test_rollout_config(tempdir.path());
+
+        set_rollout_mtime(&path_a, now - Duration::minutes(10));
+        set_rollout_mtime(&path_b, now - Duration::seconds(10));
+
+        let page = RolloutRecorder::list_threads(
+            &config,
+            PAGE_SIZE,
+            None,
+            ThreadSortKey::CreatedAt,
+            &INTERACTIVE_SESSION_SOURCES,
+            Some(&[String::from("openai")]),
+            "openai",
+            None,
+        )
+        .await
+        .expect("list threads");
+
+        let rows = rows_from_items(page.items);
+        let previews: Vec<String> = rows.iter().map(|row| row.preview.clone()).collect();
+
+        assert_eq!(
+            previews,
+            vec![
+                "A (created newer)".to_string(),
+                "B (created older)".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn head_to_row_uses_first_user_message() {
@@ -2358,6 +2422,62 @@ mod tests {
             snapshot.contains("[assistant]"),
             "resident picker row should render assistant badge: {snapshot}"
         );
+    }
+
+    #[test]
+    fn resume_picker_row_renders_system_error_badge_for_resident_threads() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+        use ratatui::layout::Constraint;
+        use ratatui::layout::Layout;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Recover resident thread after failure"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Remote errored thread")),
+            mode: ThreadMode::ResidentAssistant,
+            active_flags: Vec::new(),
+            has_system_error: true,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+        state.selected = 0;
+        state.scroll_top = 0;
+
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
+
+        let width: u16 = 90;
+        let height: u16 = 3;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            let segments =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
+            render_list(&mut frame, segments[1], &state, &metrics);
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("resume_picker_system_error", snapshot);
     }
 
     #[tokio::test]
@@ -2935,6 +3055,37 @@ mod tests {
             ]
         );
         assert!(!row.has_system_error);
+    }
+
+    #[test]
+    fn app_server_row_marks_system_error_status() {
+        let thread = Thread {
+            id: ThreadId::new().to_string(),
+            forked_from_id: None,
+            preview: String::from("remote thread"),
+            ephemeral: false,
+            model_provider: String::from("openai"),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::SystemError,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: None,
+            cwd: PathBuf::from("/tmp"),
+            cli_version: String::from("0.0.0"),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        };
+
+        let row = row_from_app_server_thread(thread).expect("row should be preserved");
+
+        assert_eq!(row.mode, ThreadMode::ResidentAssistant);
+        assert!(row.active_flags.is_empty());
+        assert!(row.has_system_error);
     }
 
     #[test]

@@ -38,6 +38,7 @@ Create at least one thread, then list threads:
 ```bash
 cargo run -p codex-app-server-test-client -- send-message-v2 "seed thread for reconnect test"
 cargo run -p codex-app-server-test-client -- thread-list --limit 5
+cargo run -p codex-app-server-test-client -- thread-list --cursor <NEXT_CURSOR> --limit 5
 ```
 
 Copy a thread id from the `thread-list` output.
@@ -56,6 +57,9 @@ wire `thread.mode` values (for example `interactive` or
 `residentAssistant`) plus the derived `resume`/`reconnect` action label, so
 resident assistant reconnect semantics remain visible on read-only lookup,
 fork, and metadata-only update paths.
+For paginated `thread/list` calls, the compact summary also prints
+`next_cursor` when present, so you can continue walking history without
+re-reading the full debug struct.
 
 If you need to inspect other recovery paths without reading the full debug
 struct, the test client now also exposes resident-aware summaries for loaded
@@ -65,6 +69,7 @@ targets vs resident reconnect targets:
 
 ```bash
 cargo run -p codex-app-server-test-client -- thread-loaded-read --limit 5
+cargo run -p codex-app-server-test-client -- thread-loaded-read --cursor <NEXT_CURSOR> --limit 5
 cargo run -p codex-app-server-test-client -- thread-unarchive <THREAD_ID>
 cargo run -p codex-app-server-test-client -- thread-rollback <THREAD_ID> --num-turns 1
 ```

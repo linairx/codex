@@ -1019,6 +1019,8 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server-test-client` README 的摘要说明也已继续贴近真实输出：除了 wire `thread.mode` 值外，它现在也明确把派生的 `resume/reconnect` action label 写成输出契约，并说明这是 ordinary interactive resume target 与 resident reconnect target 的对照，不再只让读者自行推断
 - `app-server-test-client` 的 CLI help 入口也已继续对齐 resident reconnect 语义：`resume-message-v2` 与 `thread-resume` 的子命令说明、参数 help 和对应回归测试都已改成 `resume or reconnect`，不再让 `--help` 输出落回旧的纯 resume 心智
 - `app-server-test-client` 的 compact summary 输出现在也已补成完整回归闭环：除了 `thread_mode_label` / action label 的映射断言外，`thread/read` 与列表摘要的整串 `mode + resident + status + action` 输出也已有测试覆盖，避免后续联调摘要在重构时重新丢掉 resident reconnect 语义
+- `app-server-test-client` 的分页列表摘要现在也已继续贴近真实联调需求：`thread/list` 的 compact summary 在有分页时会直接打印 `next_cursor`，并补上有结果/空列表两侧回归，避免继续翻完整 debug struct 才能手动抄出下一页 cursor
+- `app-server-test-client` 的分页列表消费现在也已补成可续页闭环：`thread-list` 与 `thread-loaded-read` 命令都新增了 `--cursor`，对应子命令 `--help` 与 README 示例也已补齐，手工联调分页历史或 loaded 线程时不再只能看到 `next_cursor` 却没法直接继续请求下一页
 - `docs/remote-bridge-consumption.md` 也已继续对齐到同一术语：远端首页/列表现在被明确要求把 `Thread.mode` 直接映射成动作语义，`interactive -> resume`、`residentAssistant -> reconnect`，而不是只停在抽象的“线程模式不同”描述
 - `docs/persistent-assistant-mode-design.md` 与 `docs/app-server-thread-mode-v2.md` 这两份前导设计稿也已补上同一条动作映射边界：虽然 `thread/resume` 仍是统一 API，但产品动作必须按 `Thread.mode` 显式映射成 `interactive -> resume`、`residentAssistant -> reconnect`
 - `docs/observer-event-flow-design.md` 与 `docs/sqlite-state-convergence.md` 这两份状态文档也已继续跟上：它们现在都明确写出动作文案不是从 observer/status-only 通知或 SQLite 直接推断，而应继续从读取面拿到 `Thread.mode` 后稳定映射成 `interactive -> resume`、`residentAssistant -> reconnect`
@@ -1051,6 +1053,8 @@ SQLite 在这里不是起点，而是收敛点。
 - `codex-rs/README.md` 的这句 human-readable bootstrap 说明现在也已继续精确化：interactive 一侧不再笼统写成 “ordinary interactive runs”，而会直接写成 ordinary interactive resume flows，让顶层 README 对 `session action = resume` 的解释更贴近当前 thread-mode 语义
 - `debug-client` 也已开始消费 `Thread.mode`：连接成功提示、活跃线程切换提示、线程列表标记和 `:resume` 帮助文案都已按 resident assistant 收口，不再把 reconnect 路径统一描述成普通 resume
 - `debug-client` 的线程列表摘要也已继续补齐：`:refresh-thread` 现在会同时显示线程模式标签和推荐动作，不再只给出模糊的 `resume/reconnect` 动词，让 resident thread 与普通 interactive thread 在联调输出里更容易一眼区分
+- `debug-client` 的 `:refresh-thread` 文本渲染现在也已补上整串回归：真实列表输出会稳定覆盖 header、每条 `thread-id + (mode, action)` 行以及 `next cursor` 尾行，不再只靠 `thread_mode_label` / `thread_resume_label` 这些 helper 侧面证明 resident reconnect 语义
+- `debug-client` 的分页列表消费现在也已补成最小闭环：`:refresh-thread` 支持可选 cursor 参数，README 和 parser 回归也已同步补齐，看到 `next cursor` 后可以直接用 `:refresh-thread <cursor>` 续页，而不必切到其他联调客户端
 - `debug-client` 的已知线程切换提示也已继续补齐：`:use <thread-id>` 在本地已缓存线程模式时，会明确区分 `thread` 与 `resident assistant thread`，不再把已知 resident thread 仍然压平成通用 thread 文案
 - `debug-client` 的这条消费面也已补回到可编译闭环：此前被截断的事件/帮助尾部逻辑已经恢复，并补上 resident reconnect 文案回归，避免这块客户端入口继续停留在“文案方向正确但 crate 本身不工作”的状态
 - `debug-client` 的内置 `:help` 文案现在也已对齐 resident-aware 行为：`:use` 与 `:refresh-thread` 不再在帮助输出里退回旧的泛化 thread 说明，而会明确提示模式保留与 mode/action 摘要语义
@@ -1077,6 +1081,7 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server-test-client` 的 README 流式说明现在也已继续补齐同一口径：`thread/started` 相关段落不再只写 `resume/start commands`，而会直接写成 `start/resume/reconnect commands`，让通知面文档和 resident reconnect 主线保持一致
 - `app-server-test-client` 的 clap 顶层 `--help` 现在也已补上 resident-aware 回归：`resume-message-v2` 与 `thread-resume` 这两个恢复入口的子命令说明会稳定体现 `resume or reconnect`，不再只让 README 或联调输出承担这层语义
 - `app-server-client` 的 README 与 typed request 回归也已开始明确 `Thread.mode` 是 bootstrap 阶段区分 reconnect 的权威来源；除了 metadata-only update 的 resident mode 保留覆盖外，`thread/loaded/read`、`thread/list`、`thread/unarchive` 和 archived 后的 `thread/read` 这几个只读恢复面也都已补上 resident assistant 的 typed request 回归，而且 archived resident thread 的 `thread/metadata/update` 也已补成专门回归，避免 in-process 集成到了 loaded/history/restore/archived-repair 路径后又退回通用线程摘要假设
+- `app-server-client` 的 typed 分页读取面现在也已继续补齐：`thread/list` 与 `thread/loaded/read` 在 `limit = 1` 的分页场景下，会稳定返回并消费 `next_cursor`，而后续页上的 resident thread 也会继续保留 `ResidentAssistant`，避免 in-process 调用侧只在第一页锁住模式连续性、翻页后又退回通用线程摘要
 - `codex-app-server-client` 的 in-process typed 回归现在也已把 resident `thread/unsubscribe` 的后续读取面锁住：最后一个订阅者断开后，`thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会稳定保留 `ResidentAssistant + Idle`，避免共享客户端在“已断开但仍常驻”的路径上把 reconnect 目标重新降回普通 interactive 线程
 - `thread/rollback` 的 resident 路径现在也已补上真实 typed 回归，并顺手修掉了实现层的模式回退缺口：rollback 完成后 app-server 不再只按 rollout summary 重建一个默认 interactive `Thread`，而会像其他读取面一样合并持久化 metadata，所以 resident assistant 在 `thread/rollback` 响应里也会继续稳定保留 `ResidentAssistant`
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
@@ -1115,11 +1120,14 @@ SQLite 在这里不是起点，而是收敛点。
 - `codex-tui` 的 `chatwidget` 会话注入路径现在也已补上 resident 回归：`handle_thread_session(...)` 在消费 `ThreadSessionState` 时，会继续把 `ResidentAssistant` 写回 widget 自身状态，避免上游会话层已经保留 resident 模式，但真正进入聊天视图时又被清成无模式
 - `codex-tui` 的 `resume_picker` 现在也已把 resident 标签分支单独锁住：`thread_mode_label(ThreadMode::ResidentAssistant)` 会稳定返回 `"[assistant]"`，避免 picker 列表在继续保留 reconnect 动作文案的同时，模式徽标却在后续重构里静默消失
 - `codex-tui` 的 `resume_picker` 上游 row 映射现在也已补上 resident 回归：`row_from_app_server_thread(...)` 在消费 app-server 线程摘要时，会继续保留 `mode = ResidentAssistant`，避免 picker 只是标签 helper 还在，但真正落到列表行模型时又退回普通 interactive 模式
+- `codex-tui` 的 `resume_picker` 现在也已把 app-server `SystemError` 状态映射单独锁住：`row_from_app_server_thread(...)` 在消费 resident thread 的 `SystemError` 时，会继续保留 `ResidentAssistant` 并打上错误标记，避免 picker 列表只保留 reconnect 模式却静默丢掉线程错误态
 - `codex-tui` 的 `resume_picker` 列表渲染面现在也已把 resident 徽标单独锁住：resident row 实际 render 到终端时会继续显示 `"[assistant]"`，避免 row 模型和 helper 都还保留 resident 语义，但最终列表展示在重构里静默丢 badge
+- `codex-tui` 的 `resume_picker` 列表渲染面现在也已把 resident system error badge 单独锁住：resident row 命中 app-server `SystemError` 时，最终 render 到终端会继续显示 `"[error]"`，避免状态读取面还保留错误态，但列表展示在重构里静默丢掉错误提示
 - `codex-tui` 的 `resume_picker` 入口标题现在也已补上 resident 回归：`SessionPickerAction::Resume.title()` 会稳定保留 `"Resume or reconnect to a previous session"`，避免列表页最外层标题在后续重构里退回旧的纯 resume 心智
 - `codex-tui` 的 `resume_picker` hint 行现在也已补上 resident 回归：最终提示会稳定保留 `"enter to reconnect"`，避免 action label helper 仍然正确，但底部操作提示在重构里静默退回泛化的 resume 文案
 - `codex-tui` 里一份停用的 `resume_picker` 旧 snapshot 残留也已一并清掉：被注释掉的示例测试文案和遗留 `.snap` 文件不再继续保留 `"Resume a previous session"` / `"enter to resume"` 这类旧口径，避免维护者从废弃测试资产里重新抄回过时措辞
 - `codex-tui` 的 `resume_picker.rs` 里那整段长期注释掉的 `resume_picker_screen_snapshot` 草稿也已一并删除：这类既不运行、又重复手写 UI 布局的死代码不再继续滞留在测试模块里，避免后续维护者把它误当成仍待恢复的权威覆盖
+- `codex-tui` 的 `resume_picker` 排序回归现在也已把另一条陈旧 TODO 收回来：此前被注释掉的 `resume_picker_orders_by_updated_at` 已恢复成真实测试，并对齐到当前 `RolloutConfig` / `SessionMeta` 接口；同时也补上了对称的 `CreatedAt` 回归，直接锁住 `UpdatedAt` 会按 rollout mtime 排序、而 `CreatedAt` 不会被 mtime 干扰
 - `codex-tui` 的 tooltip 提示现在也已补上 resident 回归：`codex resume` 相关提示会稳定保留 `"resume or reconnect"` 措辞，避免最外围新手引导在后续调整里重新退回纯 resume 心智
 - `codex-tui` 的底部 slash popup 现在也已补上 resident 回归：输入 `/res` 后 `/resume` 条目的渲染会稳定保留 `"resume chat or reconnect to resident assistant"`，避免底部命令选择器继续沿用旧的纯 resume 帮助文案
 - `codex-tui` 的 rename 确认文案现在也已补上 resident 回归：线程重命名后的确认提示会稳定保留 `"to reconnect to this resident assistant run codex resume ..."`，避免聊天视图里的后续引导在重构里退回普通 thread resume 心智

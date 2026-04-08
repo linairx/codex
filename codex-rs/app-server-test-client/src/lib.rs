@@ -253,6 +253,9 @@ enum CliCommand {
     /// List stored threads from the Codex app-server.
     #[command(name = "thread-list")]
     ThreadList {
+        /// Opaque pagination cursor returned by a previous `thread-list` call.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Number of threads to return.
         #[arg(long, default_value_t = 20)]
         limit: u32,
@@ -281,6 +284,9 @@ enum CliCommand {
     /// Read loaded thread summaries currently resident in memory.
     #[command(name = "thread-loaded-read")]
     ThreadLoadedRead {
+        /// Opaque pagination cursor returned by a previous `thread-loaded-read` call.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Number of loaded threads to return.
         #[arg(long, default_value_t = 20)]
         limit: u32,
@@ -464,10 +470,10 @@ pub async fn run() -> Result<()> {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             model_list(&endpoint, &config_overrides).await
         }
-        CliCommand::ThreadList { limit } => {
+        CliCommand::ThreadList { cursor, limit } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-list")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            thread_list(&endpoint, &config_overrides, limit).await
+            thread_list(&endpoint, &config_overrides, cursor, limit).await
         }
         CliCommand::ThreadRead {
             thread_id,
@@ -486,10 +492,10 @@ pub async fn run() -> Result<()> {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             thread_fork(&endpoint, &config_overrides, thread_id, resident, ephemeral).await
         }
-        CliCommand::ThreadLoadedRead { limit } => {
+        CliCommand::ThreadLoadedRead { cursor, limit } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-loaded-read")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            thread_loaded_read(&endpoint, &config_overrides, limit).await
+            thread_loaded_read(&endpoint, &config_overrides, cursor, limit).await
         }
         CliCommand::ThreadMetadataUpdate {
             thread_id,
@@ -1246,13 +1252,18 @@ async fn model_list(endpoint: &Endpoint, config_overrides: &[String]) -> Result<
     .await
 }
 
-async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u32) -> Result<()> {
+async fn thread_list(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    cursor: Option<String>,
+    limit: u32,
+) -> Result<()> {
     with_client("thread-list", endpoint, config_overrides, |client| {
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
 
         let response = client.thread_list(ThreadListParams {
-            cursor: None,
+            cursor,
             limit: Some(limit),
             sort_key: None,
             model_providers: None,
@@ -1319,6 +1330,7 @@ async fn thread_fork(
 async fn thread_loaded_read(
     endpoint: &Endpoint,
     config_overrides: &[String],
+    cursor: Option<String>,
     limit: u32,
 ) -> Result<()> {
     with_client("thread-loaded-read", endpoint, config_overrides, |client| {
@@ -1326,14 +1338,18 @@ async fn thread_loaded_read(
         println!("< initialize response: {initialize:?}");
 
         let response = client.thread_loaded_read(ThreadLoadedReadParams {
-            cursor: None,
+            cursor,
             limit: Some(limit),
             model_providers: None,
             source_kinds: None,
             cwd: None,
         })?;
         println!("< thread/loaded/read response: {response:?}");
-        print_thread_collection_summary("thread/loaded/read", &response.data);
+        print_thread_collection_summary_with_cursor(
+            "thread/loaded/read",
+            &response.data,
+            response.next_cursor.as_deref(),
+        );
 
         Ok(())
     })
@@ -1444,11 +1460,21 @@ fn print_thread_response_summary(label: &str, thread: &AppServerThread) {
 }
 
 fn print_thread_list_summary(response: &ThreadListResponse) {
-    print_thread_collection_summary("thread/list", &response.data);
+    for line in thread_collection_summary_lines_with_cursor(
+        "thread/list",
+        &response.data,
+        response.next_cursor.as_deref(),
+    ) {
+        println!("{line}");
+    }
 }
 
-fn print_thread_collection_summary(label: &str, threads: &[AppServerThread]) {
-    for line in thread_collection_summary_lines(label, threads) {
+fn print_thread_collection_summary_with_cursor(
+    label: &str,
+    threads: &[AppServerThread],
+    next_cursor: Option<&str>,
+) {
+    for line in thread_collection_summary_lines_with_cursor(label, threads, next_cursor) {
         println!("{line}");
     }
 }
@@ -1457,9 +1483,17 @@ fn thread_response_summary_line(label: &str, thread: &AppServerThread) -> String
     format!("< {label} summary: {}", thread_summary_fields(thread))
 }
 
-fn thread_collection_summary_lines(label: &str, threads: &[AppServerThread]) -> Vec<String> {
+fn thread_collection_summary_lines_with_cursor(
+    label: &str,
+    threads: &[AppServerThread],
+    next_cursor: Option<&str>,
+) -> Vec<String> {
     if threads.is_empty() {
-        return vec![format!("< {label} summary: no threads")];
+        let mut lines = vec![format!("< {label} summary: no threads")];
+        if let Some(next_cursor) = next_cursor {
+            lines.push(format!("< {label} next_cursor: {next_cursor}"));
+        }
+        return lines;
     }
 
     let mut lines = vec![format!("< {label} summary:")];
@@ -1469,6 +1503,9 @@ fn thread_collection_summary_lines(label: &str, threads: &[AppServerThread]) -> 
             .map(thread_summary_fields)
             .map(|summary| format!("  - {summary}")),
     );
+    if let Some(next_cursor) = next_cursor {
+        lines.push(format!("< {label} next_cursor: {next_cursor}"));
+    }
     lines
 }
 
@@ -1502,7 +1539,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Cli;
-    use super::thread_collection_summary_lines;
+    use super::thread_collection_summary_lines_with_cursor;
     use super::thread_mode_label;
     use super::thread_response_summary_line;
     use super::thread_resume_action_label;
@@ -1564,6 +1601,32 @@ mod tests {
 
         assert!(help.contains("Resume or reconnect to a V2 thread by id"));
         assert!(help.contains("Resume or reconnect to a V2 thread and continuously stream"));
+    }
+
+    #[test]
+    fn help_mentions_cursor_for_paginated_thread_commands() {
+        let thread_list_help = Cli::command()
+            .find_subcommand_mut("thread-list")
+            .expect("thread-list subcommand")
+            .render_long_help()
+            .to_string();
+        let thread_loaded_read_help = Cli::command()
+            .find_subcommand_mut("thread-loaded-read")
+            .expect("thread-loaded-read subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(thread_list_help.contains("--cursor <CURSOR>"));
+        assert!(
+            thread_list_help
+                .contains("Opaque pagination cursor returned by a previous `thread-list` call")
+        );
+        assert!(thread_loaded_read_help.contains("--cursor <CURSOR>"));
+        assert!(
+            thread_loaded_read_help.contains(
+                "Opaque pagination cursor returned by a previous `thread-loaded-read` call"
+            )
+        );
     }
 
     #[test]
@@ -1704,7 +1767,7 @@ mod tests {
         ];
 
         assert_eq!(
-            thread_collection_summary_lines("thread/list", &threads),
+            thread_collection_summary_lines_with_cursor("thread/list", &threads, None),
             vec![
                 "< thread/list summary:".to_string(),
                 "  - id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
@@ -1725,7 +1788,7 @@ mod tests {
         )];
 
         assert_eq!(
-            thread_collection_summary_lines("thread/loaded/read", &threads),
+            thread_collection_summary_lines_with_cursor("thread/loaded/read", &threads, None),
             vec![
                 "< thread/loaded/read summary:".to_string(),
                 "  - id=thread-1, mode=residentAssistant, resident=true, status=Active { active_flags: [] }, action=reconnect".to_string(),
@@ -1736,8 +1799,78 @@ mod tests {
     #[test]
     fn empty_thread_collection_summary_lines_use_no_threads_marker() {
         assert_eq!(
-            thread_collection_summary_lines("thread/list", &[]),
+            thread_collection_summary_lines_with_cursor("thread/list", &[], None),
             vec!["< thread/list summary: no threads".to_string()]
+        );
+    }
+
+    #[test]
+    fn thread_list_summary_lines_include_next_cursor() {
+        let threads = vec![make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        )];
+
+        assert_eq!(
+            thread_collection_summary_lines_with_cursor("thread/list", &threads, Some("cursor-2")),
+            vec![
+                "< thread/list summary:".to_string(),
+                "  - id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
+                "< thread/list next_cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_loaded_read_summary_lines_include_next_cursor() {
+        let threads = vec![make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Active {
+                active_flags: Vec::new(),
+            },
+        )];
+
+        assert_eq!(
+            thread_collection_summary_lines_with_cursor(
+                "thread/loaded/read",
+                &threads,
+                Some("cursor-2")
+            ),
+            vec![
+                "< thread/loaded/read summary:".to_string(),
+                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active { active_flags: [] }, action=reconnect".to_string(),
+                "< thread/loaded/read next_cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_thread_list_summary_lines_can_still_include_next_cursor() {
+        assert_eq!(
+            thread_collection_summary_lines_with_cursor("thread/list", &[], Some("cursor-2")),
+            vec![
+                "< thread/list summary: no threads".to_string(),
+                "< thread/list next_cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_thread_loaded_read_summary_lines_can_still_include_next_cursor() {
+        assert_eq!(
+            thread_collection_summary_lines_with_cursor(
+                "thread/loaded/read",
+                &[],
+                Some("cursor-2")
+            ),
+            vec![
+                "< thread/loaded/read summary: no threads".to_string(),
+                "< thread/loaded/read next_cursor: cursor-2".to_string(),
+            ]
         );
     }
 

@@ -274,6 +274,8 @@
 - `codex-rs/README.md` 的这句 human-readable bootstrap 说明也已继续收口：interactive 一侧现在直接写成 ordinary interactive resume flows，不再留下一个更模糊的 “ordinary interactive runs” 表述
 - `debug-client` 也已开始消费 `Thread.mode`，连接提示、线程列表和 `:resume` 帮助文案都已按 resident assistant 区分 reconnect 语义
 - `debug-client` 的 `:refresh-thread` 摘要也已开始同时展示线程模式与推荐动作，resident thread 不再只显示成模糊的 reconnect/resume 动词，而能直接看出这是 `resident assistant`
+- `debug-client` 的 `:refresh-thread` 列表输出现在也已补上整串回归：真实渲染会稳定覆盖 header、每条 `thread-id + (mode, action)` 行以及 `next cursor` 尾行，不再只靠 mode/action helper 侧面兜底 resident reconnect 语义
+- `debug-client` 的分页列表消费现在也已补上请求侧闭环：`:refresh-thread` 支持可选 cursor 参数，parser / help / README 都已同步更新，看到 `next cursor` 后可以直接在同一客户端里续页
 - `debug-client` 的 `:use <thread-id>` 提示也已继续按已知线程模式收口：resident thread 不再显示成通用 thread 切换提示，而会明确提示切到 `resident assistant thread`
 - `debug-client` 的 resident 消费面也已重新补回完整工作态：被截断的事件处理和帮助输出已经恢复，并补上 reconnect 文案回归，避免这块最小客户端入口停留在半成品状态
 - `debug-client` 的内置 `:help` 也已同步收口到 resident-aware 语义，避免帮助面继续把 `:use` / `:refresh-thread` 描述成泛化 thread 操作
@@ -290,6 +292,9 @@
 - `app-server-test-client` 的 README 现在也已把 `thread-rollback` 纳入同一组边缘恢复示例，确保手工联调 rollback 后的 resident continuity 时也能直接看到 wire `thread.mode` 与派生 action label
 - `app-server-test-client` 的 clap 顶层 `--help` 也已同步收口：`resume-message-v2` 和 `thread-resume` 这两个最常用恢复命令的子命令说明现在同样稳定写成 `resume or reconnect`，并补上 help 回归测试
 - `app-server-test-client` 的 compact summary 输出也已补上整串回归断言：`thread/read` 与列表摘要现在都会稳定覆盖 `mode + resident + status + action` 的完整文本，不再只靠单独的 mode/action 映射测试侧面兜底
+- `app-server-test-client` 的分页列表摘要现在也已补上 cursor 回归：`thread/list` 的 compact summary 在有分页时会直接打印 `next_cursor`，而空列表 + cursor 的边界也已单独锁住，避免联调分页历史时继续依赖完整 debug struct
+- `app-server-test-client` 的分页列表消费现在也已补上请求侧闭环：`thread-list` 与 `thread-loaded-read` 命令都新增 `--cursor` 参数，并补上对应子命令 help 回归与 README 示例，避免联调时只能手动看到 `next_cursor` 却无法直接续页
+- `codex-app-server-client` 的 typed 分页读取面现在也已补上同层回归：`thread/list` 与 `thread/loaded/read` 在有 `next_cursor` 时，后续页请求仍会稳定保留 resident `mode`，避免共享 in-process 客户端只在首页锁住 `ResidentAssistant`，翻页后却重新退回通用线程摘要
 - `app-server-test-client` README 里的这段说明也已进一步对齐到真实输出：联调摘要打印的是 wire `thread.mode` 值（如 `interactive` / `residentAssistant`）再附带 `resume/reconnect` 动作
 - `app-server-test-client` README 里的章节标题与示例 seed 文案现在也已继续从旧的 “rejoin” 术语收口到 `resume/reconnect`，避免手工联调入口在帮助/README 已更新后，仍残留一套过时命名
 - `app-server-test-client` README 的流式通知说明现在也已继续补齐：`thread/started` 相关段落会直接写成 `start/resume/reconnect` 命令路径，不再把 resident reconnect 漏在这条通知面描述之外
@@ -409,12 +414,14 @@
 - `codex-tui` 的 resume picker hint 行现在也已补上最小 resident 回归：最终操作提示仍会继续保留 `"enter to reconnect"` 的 resident 文案
 - `codex-tui` 里一份停用的 resume picker 旧 snapshot 残留也已一并清掉：被注释掉的示例测试文案和遗留 `.snap` 文件不再继续保留旧的纯 resume 措辞，避免废弃测试资产把维护者重新带回过时心智
 - `codex-tui` 的 `resume_picker.rs` 里那段长期注释掉的 screen snapshot 草稿也已继续清理掉：测试模块不再保留一整块既不执行、又重复手写布局的死代码，减少后续维护时把它误认成仍需修复的待办
+- `codex-tui` 的 `resume_picker` 排序回归也已继续补齐：此前注释掉的 `resume_picker_orders_by_updated_at` 现在已经按现有 rollout/config 协议恢复成真实测试，并额外补上 `CreatedAt` 的对称回归，直接锁住 `UpdatedAt` 依赖 rollout mtime、而 `CreatedAt` 不受 mtime 干扰的排序边界
 - `codex-tui` 的 tooltip 提示现在也已补上最小 resident 回归：`codex resume` 相关提示仍会继续保留 `"resume or reconnect"` 的入口措辞
 - `codex-tui` 的底部 slash popup 现在也已补上最小 resident 回归：输入 `/res` 后 `/resume` 条目的渲染仍会继续保留 resident reconnect 帮助文案
 - `codex-tui` 的 rename 确认文案现在也已补上最小 resident 回归：线程重命名后的 follow-up 提示仍会继续保留 resident reconnect 指引
 - `codex-tui` 的 slash command 帮助文案现在也已补上最小 resident 回归：`SlashCommand::Resume.description()` 仍会继续保留 reconnect 提示
 - `codex-tui` 的 resident reconnect history cell 现在也已补上无名字边界回归：`new_resident_thread_reconnected(...)` 在 thread name 为空时，仍会继续保留通用 resident reconnect 文案
 - `codex-tui` 的 cwd prompt resident 文案现在也已补上最小回归：`CwdPromptAction::Reconnect` 仍会继续保留 resident assistant 的措辞
+- `codex-tui` 的 `resume_picker` 现在也已把 app-server `SystemError` 消费面补成最小回归：resident thread 命中 `SystemError` 时，row 映射仍会继续保留 `ResidentAssistant` 并设置错误标记，而最终列表渲染也会继续显示 `"[error]"` badge，避免 reconnect 模式和错误态在 picker 里只保留其一
 - `codex-tui` 的更上层 session lookup 也已补上 archived resident id 恢复回归：按 thread id 查 archived thread 时，lookup 结果仍会继续保留 `ResidentAssistant`，避免 selector 层在 archived 路径上把 reconnect 目标降回普通 session target
 - `thread/metadata/update` 的 resident 覆盖也已继续扩到 stored + archived 面：纯 SQLite 稳定元数据路径不会把未加载 resident thread 的更新响应与后续读取面降成 interactive；缺失 SQLite 行修复也不会把 loaded resident thread 的稳定 `mode` 重建成普通 interactive，而 archived resident thread 更新 metadata 后的响应与后续读取面同样会继续保持 `ResidentAssistant`
 - `codex-state` 也已继续补上状态层边界测试：`set_thread_mode` 对缺失线程只返回 false，不会顺手创建 SQLite 垃圾行；`update_thread_git_info` 在 resident thread 上也不会顺手覆盖 `threads.mode`

@@ -1486,6 +1486,83 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn loaded_read_preserves_next_cursor_and_resident_mode_across_pages() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started_a: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(110),
+                params: ThreadStartParams {
+                    resident: true,
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("first resident thread/start should succeed");
+        let started_b: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(111),
+                params: ThreadStartParams {
+                    resident: true,
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("second resident thread/start should succeed");
+
+        let first_page: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(112),
+                params: ThreadLoadedReadParams {
+                    cursor: None,
+                    limit: Some(1),
+                    model_providers: None,
+                    source_kinds: None,
+                    cwd: None,
+                },
+            })
+            .await
+            .expect("first thread/loaded/read page should succeed");
+
+        assert_eq!(first_page.data.len(), 1);
+        assert_eq!(first_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert!(first_page.data[0].resident);
+        let next_cursor = first_page
+            .next_cursor
+            .clone()
+            .expect("first thread/loaded/read page should include next_cursor");
+
+        let second_page: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(113),
+                params: ThreadLoadedReadParams {
+                    cursor: Some(next_cursor),
+                    limit: Some(1),
+                    model_providers: None,
+                    source_kinds: None,
+                    cwd: None,
+                },
+            })
+            .await
+            .expect("second thread/loaded/read page should succeed");
+
+        assert_eq!(second_page.data.len(), 1);
+        assert_eq!(second_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert!(second_page.data[0].resident);
+
+        let page_ids = [
+            first_page.data[0].id.clone(),
+            second_page.data[0].id.clone(),
+        ];
+        assert!(page_ids.contains(&started_a.thread.id));
+        assert!(page_ids.contains(&started_b.thread.id));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn list_preserves_resident_thread_mode_through_typed_requests() {
         let client = start_test_client(SessionSource::Cli).await;
 
@@ -1534,6 +1611,108 @@ supports_websockets = false
             .expect("thread/list should include the started resident thread");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
         assert!(listed_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn list_preserves_next_cursor_and_resident_mode_across_pages() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started_a: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(114),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("first resident thread/start should succeed");
+        let rollout_path_a = started_a
+            .thread
+            .path
+            .clone()
+            .expect("first resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path_a.as_path(),
+            &started_a.thread.id,
+            &started_a.thread.model_provider,
+        );
+
+        let started_b: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(115),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("second resident thread/start should succeed");
+        let rollout_path_b = started_b
+            .thread
+            .path
+            .clone()
+            .expect("second resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path_b.as_path(),
+            &started_b.thread.id,
+            &started_b.thread.model_provider,
+        );
+
+        let first_page: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(116),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(1),
+                    sort_key: None,
+                    model_providers: None,
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("first thread/list page should succeed");
+
+        assert_eq!(first_page.data.len(), 1);
+        assert_eq!(first_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert!(first_page.data[0].resident);
+        let next_cursor = first_page
+            .next_cursor
+            .clone()
+            .expect("first thread/list page should include next_cursor");
+
+        let second_page: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(117),
+                params: ThreadListParams {
+                    cursor: Some(next_cursor),
+                    limit: Some(1),
+                    sort_key: None,
+                    model_providers: None,
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("second thread/list page should succeed");
+
+        assert_eq!(second_page.data.len(), 1);
+        assert_eq!(second_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert!(second_page.data[0].resident);
+
+        let page_ids = [
+            first_page.data[0].id.clone(),
+            second_page.data[0].id.clone(),
+        ];
+        assert!(page_ids.contains(&started_a.thread.id));
+        assert!(page_ids.contains(&started_b.thread.id));
 
         client.shutdown().await.expect("shutdown should complete");
     }

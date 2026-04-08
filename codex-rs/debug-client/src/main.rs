@@ -216,11 +216,16 @@ fn handle_command(
                 .ok();
             true
         }
-        UserCommand::RefreshThread => {
-            match client.request_thread_list(/*cursor*/ None) {
+        UserCommand::RefreshThread(cursor) => {
+            match client.request_thread_list(cursor.clone()) {
                 Ok(request_id) => {
                     output
-                        .client_line(&format!("requested thread list ({request_id:?})"))
+                        .client_line(&match cursor {
+                            Some(cursor) => {
+                                format!("requested thread list ({request_id:?}, cursor={cursor})")
+                            }
+                            None => format!("requested thread list ({request_id:?})"),
+                        })
                         .ok();
                 }
                 Err(err) => {
@@ -265,31 +270,41 @@ fn drain_events(event_rx: &mpsc::Receiver<ReaderEvent>, output: &Output) {
                 threads,
                 next_cursor,
             } => {
-                if threads.is_empty() {
-                    output.client_line("threads: (none)").ok();
-                } else {
-                    output.client_line("threads:").ok();
-                    for thread in threads {
-                        output
-                            .client_line(&format!(
-                                "  {} ({}, {})",
-                                thread.thread_id,
-                                thread_mode_label(thread.thread_mode),
-                                thread_resume_label(thread.thread_mode)
-                            ))
-                            .ok();
-                    }
-                }
-                if let Some(next_cursor) = next_cursor {
-                    output
-                        .client_line(&format!(
-                            "more threads available, next cursor: {next_cursor}"
-                        ))
-                        .ok();
+                for line in thread_list_lines(&threads, next_cursor.as_deref()) {
+                    output.client_line(&line).ok();
                 }
             }
         }
     }
+}
+
+fn thread_list_lines(
+    threads: &[crate::state::KnownThread],
+    next_cursor: Option<&str>,
+) -> Vec<String> {
+    let mut lines = if threads.is_empty() {
+        vec!["threads: (none)".to_string()]
+    } else {
+        let mut lines = Vec::with_capacity(threads.len() + 1);
+        lines.push("threads:".to_string());
+        lines.extend(threads.iter().map(|thread| {
+            format!(
+                "  {} ({}, {})",
+                thread.thread_id,
+                thread_mode_label(thread.thread_mode),
+                thread_resume_label(thread.thread_mode)
+            )
+        }));
+        lines
+    };
+
+    if let Some(next_cursor) = next_cursor {
+        lines.push(format!(
+            "more threads available, next cursor: {next_cursor}"
+        ));
+    }
+
+    lines
 }
 
 fn connected_thread_message(thread_connection: &ThreadConnection) -> &'static str {
@@ -349,7 +364,7 @@ fn help_lines() -> &'static [&'static str] {
         "  :new                  start a new thread",
         "  :resume <thread-id>   resume or reconnect to a thread",
         "  :use <thread-id>      switch active thread without resuming/reconnecting",
-        "  :refresh-thread       list threads with mode and suggested action",
+        "  :refresh-thread [cursor] list threads with mode, suggested action, and optional pagination cursor",
         "  :quit                 exit",
         "type a message to send it as a new turn",
     ]
@@ -363,9 +378,11 @@ mod tests {
     use super::connected_thread_message;
     use super::help_lines;
     use super::no_active_thread_message;
+    use super::thread_list_lines;
     use super::thread_mode_label;
     use super::thread_ready_label;
     use super::thread_resume_label;
+    use crate::state::KnownThread;
     use clap::CommandFactory;
     use codex_app_server_protocol::ThreadMode;
     use pretty_assertions::assert_eq;
@@ -451,7 +468,9 @@ mod tests {
             &"  :use <thread-id>      switch active thread without resuming/reconnecting"
         ));
         assert!(
-            lines.contains(&"  :refresh-thread       list threads with mode and suggested action")
+            lines.contains(
+                &"  :refresh-thread [cursor] list threads with mode, suggested action, and optional pagination cursor"
+            )
         );
     }
 
@@ -461,5 +480,55 @@ mod tests {
 
         assert!(help.contains("Resume or reconnect to an existing thread"));
         assert!(help.contains("starting/resuming or reconnecting to a thread"));
+    }
+
+    #[test]
+    fn thread_list_lines_render_mode_and_action_labels() {
+        let lines = thread_list_lines(
+            &[
+                KnownThread {
+                    thread_id: "thread-1".to_string(),
+                    thread_mode: ThreadMode::Interactive,
+                },
+                KnownThread {
+                    thread_id: "thread-2".to_string(),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                },
+            ],
+            Some("cursor-2"),
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "threads:".to_string(),
+                "  thread-1 (interactive, resume)".to_string(),
+                "  thread-2 (resident assistant, reconnect)".to_string(),
+                "more threads available, next cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_list_lines_render_empty_state_without_cursor() {
+        let lines = thread_list_lines(&[], None);
+
+        assert_eq!(lines, vec!["threads: (none)".to_string()]);
+    }
+
+    #[test]
+    fn refresh_thread_request_message_mentions_cursor_when_present() {
+        let request_id = codex_app_server_protocol::RequestId::Integer(7);
+        let cursor = "cursor-2".to_string();
+
+        let message = match Some(cursor) {
+            Some(cursor) => format!("requested thread list ({request_id:?}, cursor={cursor})"),
+            None => format!("requested thread list ({request_id:?})"),
+        };
+
+        assert_eq!(
+            message,
+            "requested thread list (Integer(7), cursor=cursor-2)"
+        );
     }
 }

@@ -78,6 +78,10 @@ than bootstrap and metadata repair: `thread/list`, `thread/loaded/read`,
 `thread/unsubscribe`, and `thread/unarchive` must continue to surface resident
 mode for reconnectable assistants instead of dropping back to generic history,
 loaded-thread, detached-reader, or restore summaries.
+That typed pagination surface is now locked down directly too: when
+`thread/list` or `thread/loaded/read` returns `next_cursor`, follow-up typed
+requests that continue from that cursor must still preserve resident
+`thread.mode` instead of degrading on later pages.
 That resident continuity now also covers the post-unsubscribe path directly:
 after the last subscriber detaches from a resident thread, follow-up
 `thread/loaded/read`, `thread/read`, and `thread/resume` typed requests must
