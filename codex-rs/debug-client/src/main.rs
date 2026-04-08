@@ -211,19 +211,11 @@ fn handle_command(
             true
         }
         UserCommand::Use(thread_id) => {
-            let known = client.use_thread(thread_id.clone());
+            let known_mode = client.use_thread(thread_id.clone());
             output.set_prompt(&thread_id);
-            if known {
-                output
-                    .client_line(&format!("switched active thread to {thread_id}"))
-                    .ok();
-            } else {
-                output
-                    .client_line(&format!(
-                        "switched active thread to {thread_id} (unknown; use :resume to load or reconnect)"
-                    ))
-                    .ok();
-            }
+            output
+                .client_line(&active_thread_switch_message(&thread_id, known_mode))
+                .ok();
             true
         }
         UserCommand::RefreshThread => {
@@ -282,8 +274,9 @@ fn drain_events(event_rx: &mpsc::Receiver<ReaderEvent>, output: &Output) {
                     for thread in threads {
                         output
                             .client_line(&format!(
-                                "  {} ({})",
+                                "  {} ({}, {})",
                                 thread.thread_id,
+                                thread_mode_label(thread.thread_mode),
                                 thread_resume_label(thread.thread_mode)
                             ))
                             .ok();
@@ -308,10 +301,29 @@ fn connected_thread_message(thread_connection: &ThreadConnection) -> &'static st
     }
 }
 
+fn active_thread_switch_message(thread_id: &str, thread_mode: Option<ThreadMode>) -> String {
+    match thread_mode {
+        Some(ThreadMode::Interactive) => format!("switched active thread to thread {thread_id}"),
+        Some(ThreadMode::ResidentAssistant) => {
+            format!("switched active thread to resident assistant thread {thread_id}")
+        }
+        None => format!(
+            "switched active thread to {thread_id} (unknown; use :resume to load or reconnect)"
+        ),
+    }
+}
+
 fn thread_ready_label(thread_mode: ThreadMode) -> &'static str {
     match thread_mode {
         ThreadMode::Interactive => "thread",
         ThreadMode::ResidentAssistant => "resident assistant thread",
+    }
+}
+
+fn thread_mode_label(thread_mode: ThreadMode) -> &'static str {
+    match thread_mode {
+        ThreadMode::Interactive => "interactive",
+        ThreadMode::ResidentAssistant => "resident assistant",
     }
 }
 
@@ -323,20 +335,31 @@ fn thread_resume_label(thread_mode: ThreadMode) -> &'static str {
 }
 
 fn print_help(output: &Output) {
-    let _ = output.client_line("commands:");
-    let _ = output.client_line("  :help                 show this help");
-    let _ = output.client_line("  :new                  start a new thread");
-    let _ = output.client_line("  :resume <thread-id>   resume or reconnect to a thread");
-    let _ = output.client_line("  :use <thread-id>      switch the active thread");
-    let _ = output.client_line("  :refresh-thread       list available threads");
-    let _ = output.client_line("  :quit                 exit");
-    let _ = output.client_line("type a message to send it as a new turn");
+    for line in help_lines() {
+        let _ = output.client_line(line);
+    }
+}
+
+fn help_lines() -> &'static [&'static str] {
+    &[
+        "commands:",
+        "  :help                 show this help",
+        "  :new                  start a new thread",
+        "  :resume <thread-id>   resume or reconnect to a thread",
+        "  :use <thread-id>      switch active thread and preserve known mode",
+        "  :refresh-thread       list threads with mode and suggested action",
+        "  :quit                 exit",
+        "type a message to send it as a new turn",
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::ThreadConnection;
+    use super::active_thread_switch_message;
     use super::connected_thread_message;
+    use super::help_lines;
+    use super::thread_mode_label;
     use super::thread_ready_label;
     use super::thread_resume_label;
     use codex_app_server_protocol::ThreadMode;
@@ -376,5 +399,46 @@ mod tests {
         );
         assert_eq!(thread_ready_label(ThreadMode::Interactive), "thread");
         assert_eq!(thread_resume_label(ThreadMode::Interactive), "resume");
+    }
+
+    #[test]
+    fn active_thread_switch_message_uses_thread_mode_when_known() {
+        assert_eq!(
+            active_thread_switch_message("thread-1", Some(ThreadMode::Interactive)),
+            "switched active thread to thread thread-1"
+        );
+        assert_eq!(
+            active_thread_switch_message("thread-1", Some(ThreadMode::ResidentAssistant)),
+            "switched active thread to resident assistant thread thread-1"
+        );
+        assert_eq!(
+            active_thread_switch_message("thread-1", None),
+            "switched active thread to thread-1 (unknown; use :resume to load or reconnect)"
+        );
+    }
+
+    #[test]
+    fn thread_list_labels_include_mode_and_action() {
+        assert_eq!(thread_mode_label(ThreadMode::Interactive), "interactive");
+        assert_eq!(
+            thread_mode_label(ThreadMode::ResidentAssistant),
+            "resident assistant"
+        );
+        assert_eq!(thread_resume_label(ThreadMode::Interactive), "resume");
+        assert_eq!(
+            thread_resume_label(ThreadMode::ResidentAssistant),
+            "reconnect"
+        );
+    }
+
+    #[test]
+    fn help_text_mentions_mode_aware_thread_commands() {
+        let lines = help_lines();
+        assert!(
+            lines.contains(&"  :use <thread-id>      switch active thread and preserve known mode")
+        );
+        assert!(
+            lines.contains(&"  :refresh-thread       list threads with mode and suggested action")
+        );
     }
 }

@@ -46,13 +46,25 @@ You can also inspect or patch a stored thread directly:
 
 ```bash
 cargo run -p codex-app-server-test-client -- thread-read <THREAD_ID>
+cargo run -p codex-app-server-test-client -- thread-fork <THREAD_ID> --resident
 cargo run -p codex-app-server-test-client -- \
   thread-metadata-update <THREAD_ID> --branch feature/resident-mode
 ```
 
-Both commands print the full response plus a compact summary that includes
-`thread.mode`, so resident assistant reconnect semantics remain visible on
-read-only lookup and metadata-only update paths.
+These commands print the full response plus a compact summary that includes
+wire `thread.mode` values (for example `interactive` or
+`residentAssistant`), so resident assistant reconnect semantics remain visible on
+read-only lookup, fork, and metadata-only update paths.
+
+If you need to inspect other recovery paths without reading the full debug
+struct, the test client now also exposes resident-aware summaries for loaded
+threads and archived-thread restore, with the same compact `mode` plus
+`resume`/`reconnect` action labels:
+
+```bash
+cargo run -p codex-app-server-test-client -- thread-loaded-read --limit 5
+cargo run -p codex-app-server-test-client -- thread-unarchive <THREAD_ID>
+```
 
 ### 2) Rejoin while a turn is in progress (two terminals)
 

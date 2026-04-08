@@ -56,11 +56,15 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDecrementElicitationResponse;
+use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadIncrementElicitationParams;
 use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
+use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
@@ -71,6 +75,8 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadUnarchiveParams;
+use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
@@ -258,6 +264,25 @@ enum CliCommand {
         #[arg(long, default_value_t = false)]
         include_turns: bool,
     },
+    /// Fork a stored thread into a new thread.
+    #[command(name = "thread-fork")]
+    ThreadFork {
+        /// Existing thread id to fork from.
+        thread_id: String,
+        /// Keep the fork loaded after the last client unsubscribes.
+        #[arg(long, default_value_t = false)]
+        resident: bool,
+        /// Keep the fork in memory only.
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
+    },
+    /// Read loaded thread summaries currently resident in memory.
+    #[command(name = "thread-loaded-read")]
+    ThreadLoadedRead {
+        /// Number of loaded threads to return.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
     /// Patch stored git metadata for a thread.
     #[command(name = "thread-metadata-update")]
     ThreadMetadataUpdate {
@@ -272,6 +297,12 @@ enum CliCommand {
         /// Replace the stored git origin URL.
         #[arg(long)]
         origin_url: Option<String>,
+    },
+    /// Restore an archived thread into the active session directory.
+    #[command(name = "thread-unarchive")]
+    ThreadUnarchive {
+        /// Archived thread id to restore.
+        thread_id: String,
     },
     /// Increment the out-of-band elicitation pause counter for a thread.
     #[command(name = "thread-increment-elicitation")]
@@ -435,6 +466,20 @@ pub async fn run() -> Result<()> {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             thread_read(&endpoint, &config_overrides, thread_id, include_turns).await
         }
+        CliCommand::ThreadFork {
+            thread_id,
+            resident,
+            ephemeral,
+        } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-fork")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_fork(&endpoint, &config_overrides, thread_id, resident, ephemeral).await
+        }
+        CliCommand::ThreadLoadedRead { limit } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-loaded-read")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_loaded_read(&endpoint, &config_overrides, limit).await
+        }
         CliCommand::ThreadMetadataUpdate {
             thread_id,
             sha,
@@ -452,6 +497,11 @@ pub async fn run() -> Result<()> {
                 origin_url,
             )
             .await
+        }
+        CliCommand::ThreadUnarchive { thread_id } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-unarchive")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_unarchive(&endpoint, &config_overrides, thread_id).await
         }
         CliCommand::ThreadIncrementElicitation { thread_id } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-increment-elicitation")?;
@@ -1222,6 +1272,55 @@ async fn thread_read(
     .await
 }
 
+async fn thread_fork(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    thread_id: String,
+    resident: bool,
+    ephemeral: bool,
+) -> Result<()> {
+    with_client("thread-fork", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_fork(ThreadForkParams {
+            thread_id,
+            resident,
+            ephemeral,
+            ..Default::default()
+        })?;
+        println!("< thread/fork response: {response:?}");
+        print_thread_response_summary("thread/fork", &response.thread);
+
+        Ok(())
+    })
+    .await
+}
+
+async fn thread_loaded_read(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    limit: u32,
+) -> Result<()> {
+    with_client("thread-loaded-read", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_loaded_read(ThreadLoadedReadParams {
+            cursor: None,
+            limit: Some(limit),
+            model_providers: None,
+            source_kinds: None,
+            cwd: None,
+        })?;
+        println!("< thread/loaded/read response: {response:?}");
+        print_thread_collection_summary("thread/loaded/read", &response.data);
+
+        Ok(())
+    })
+    .await
+}
+
 async fn thread_metadata_update(
     endpoint: &Endpoint,
     config_overrides: &[String],
@@ -1259,6 +1358,24 @@ async fn thread_metadata_update(
     .await
 }
 
+async fn thread_unarchive(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    thread_id: String,
+) -> Result<()> {
+    with_client("thread-unarchive", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_unarchive(ThreadUnarchiveParams { thread_id })?;
+        println!("< thread/unarchive response: {response:?}");
+        print_thread_response_summary("thread/unarchive", &response.thread);
+
+        Ok(())
+    })
+    .await
+}
+
 async fn with_client<T>(
     command_name: &'static str,
     endpoint: &Endpoint,
@@ -1293,13 +1410,17 @@ fn print_thread_response_summary(label: &str, thread: &AppServerThread) {
 }
 
 fn print_thread_list_summary(response: &ThreadListResponse) {
-    if response.data.is_empty() {
-        println!("< thread/list summary: no threads");
+    print_thread_collection_summary("thread/list", &response.data);
+}
+
+fn print_thread_collection_summary(label: &str, threads: &[AppServerThread]) {
+    if threads.is_empty() {
+        println!("< {label} summary: no threads");
         return;
     }
 
-    println!("< thread/list summary:");
-    for thread in &response.data {
+    println!("< {label} summary:");
+    for thread in threads {
         println!(
             "  - id={}, mode={}, resident={}, status={:?}, action={}",
             thread.id,
@@ -1790,6 +1911,16 @@ impl CodexClient {
         self.send_request(request, request_id, "thread/resume")
     }
 
+    fn thread_fork(&mut self, params: ThreadForkParams) -> Result<ThreadForkResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadFork {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/fork")
+    }
+
     fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStartResponse> {
         let request_id = self.request_id();
         let request = ClientRequest::TurnStart {
@@ -1860,6 +1991,19 @@ impl CodexClient {
         self.send_request(request, request_id, "thread/read")
     }
 
+    fn thread_loaded_read(
+        &mut self,
+        params: ThreadLoadedReadParams,
+    ) -> Result<ThreadLoadedReadResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadLoadedRead {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/loaded/read")
+    }
+
     fn thread_metadata_update(
         &mut self,
         params: ThreadMetadataUpdateParams,
@@ -1871,6 +2015,19 @@ impl CodexClient {
         };
 
         self.send_request(request, request_id, "thread/metadata/update")
+    }
+
+    fn thread_unarchive(
+        &mut self,
+        params: ThreadUnarchiveParams,
+    ) -> Result<ThreadUnarchiveResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadUnarchive {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/unarchive")
     }
 
     fn thread_increment_elicitation(

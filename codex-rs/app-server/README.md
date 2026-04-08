@@ -233,10 +233,11 @@ Start a fresh thread when you need a new Codex conversation.
         "id": "thr_123",
         "preview": "",
         "modelProvider": "openai",
-        "createdAt": 1730910000
+        "createdAt": 1730910000,
+        "mode": "interactive"
     }
 } }
-{ "method": "thread/started", "params": { "thread": { … } } }
+{ "method": "thread/started", "params": { "thread": { "id": "thr_123", "mode": "interactive", … } } }
 ```
 
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
@@ -252,15 +253,15 @@ Example:
     "threadId": "thr_123",
     "personality": "friendly"
 } }
-{ "id": 11, "result": { "thread": { "id": "thr_123", … } } }
+{ "id": 11, "result": { "thread": { "id": "thr_123", "mode": "residentAssistant", … } } }
 ```
 
 To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it. If the source thread is actively running, the fork snapshots it as if the current turn had been interrupted first. The `thread/started` payload mirrors the copied history snapshot in the response, including copied `thread.turns` when available. Pass `ephemeral: true` when the fork should stay in-memory only:
 
 ```json
 { "method": "thread/fork", "id": 12, "params": { "threadId": "thr_123", "ephemeral": true } }
-{ "id": 12, "result": { "thread": { "id": "thr_456", … } } }
-{ "method": "thread/started", "params": { "thread": { … } } }
+{ "id": 12, "result": { "thread": { "id": "thr_456", "mode": "interactive", … } } }
+{ "method": "thread/started", "params": { "thread": { "id": "thr_456", "mode": "interactive", … } } }
 ```
 
 Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `persistExtendedHistory: true` to persist a richer subset of ThreadItems for non-lossy history when calling `thread/read`, `thread/resume`, and `thread/fork` later. This does not backfill events that were not persisted previously.
@@ -289,8 +290,8 @@ Example:
 } }
 { "id": 20, "result": {
     "data": [
-        { "id": "thr_a", "preview": "Create a TUI", "modelProvider": "openai", "createdAt": 1730831111, "updatedAt": 1730831111, "status": { "type": "notLoaded" }, "agentNickname": "Atlas", "agentRole": "explorer" },
-        { "id": "thr_b", "preview": "Fix tests", "modelProvider": "openai", "createdAt": 1730750000, "updatedAt": 1730750000, "status": { "type": "notLoaded" } }
+        { "id": "thr_a", "preview": "Create a TUI", "modelProvider": "openai", "createdAt": 1730831111, "updatedAt": 1730831111, "status": { "type": "notLoaded" }, "mode": "residentAssistant", "agentNickname": "Atlas", "agentRole": "explorer" },
+        { "id": "thr_b", "preview": "Fix tests", "modelProvider": "openai", "createdAt": 1730750000, "updatedAt": 1730750000, "status": { "type": "notLoaded" }, "mode": "interactive" }
     ],
     "nextCursor": "opaque-token-or-null"
 } }
@@ -319,6 +320,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
     "data": [
       {
         "id": "thr_123",
+        "mode": "residentAssistant",
         "status": { "type": "idle" }
       }
     ]
@@ -441,7 +443,7 @@ Use `thread/unarchive` to move an archived rollout back into the sessions direct
 
 ```json
 { "method": "thread/unarchive", "id": 24, "params": { "threadId": "thr_b" } }
-{ "id": 24, "result": { "thread": { "id": "thr_b" } } }
+{ "id": 24, "result": { "thread": { "id": "thr_b", "mode": "residentAssistant" } } }
 { "method": "thread/unarchived", "params": { "threadId": "thr_b" } }
 ```
 
@@ -646,7 +648,7 @@ Use `review/start` to run Codex’s reviewer on the currently checked-out projec
 - `{"type":"custom","instructions":"Free-form reviewer instructions"}` — fallback prompt equivalent to the legacy manual review request.
 - `delivery` (`"inline"` or `"detached"`, default `"inline"`) — where the review runs:
   - `"inline"`: run the review as a new turn on the existing thread. The response’s `reviewThreadId` equals the original `threadId`, and no new `thread/started` notification is emitted.
-  - `"detached"`: fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items. That notification carries the copied thread snapshot, including interrupted copied turns when present.
+  - `"detached"`: fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items. That notification carries the copied thread snapshot, including interrupted copied turns when present; clients should consume the snapshot’s `thread.mode` just as they would for any other forked thread.
 
 Example request/response:
 
@@ -669,7 +671,7 @@ Example request/response:
 } }
 ```
 
-For a detached review, use `"delivery": "detached"`. The response is the same shape, but `reviewThreadId` will be the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn, and that notification includes the copied thread snapshot used to seed the detached review thread.
+For a detached review, use `"delivery": "detached"`. The response is the same shape, but `reviewThreadId` will be the id of the new review thread (different from the original `threadId`). The server also emits a `thread/started` notification for that new thread before streaming the review turn, and that notification includes the copied thread snapshot used to seed the detached review thread. Consumers should read `thread.mode` from that notification instead of assuming detached review threads are just generic resumed sessions.
 
 Codex streams the usual `turn/started` notification followed by an `item/started`
 with an `enteredReviewMode` item so clients can show progress:

@@ -225,11 +225,21 @@
 - `exec` 的启动配置摘要也已开始消费 `Thread.mode`，resident assistant 在 bootstrap 阶段不再被展示成普通 interactive session
 - `exec --json` 的 `thread.started` 事件也已开始透出 bootstrap `thread_mode`，方便脚本和其他 JSON 消费方在首事件就区分 reconnect 与普通 resume
 - `debug-client` 也已开始消费 `Thread.mode`，连接提示、线程列表和 `:resume` 帮助文案都已按 resident assistant 区分 reconnect 语义
+- `debug-client` 的 `:refresh-thread` 摘要也已开始同时展示线程模式与推荐动作，resident thread 不再只显示成模糊的 reconnect/resume 动词，而能直接看出这是 `resident assistant`
+- `debug-client` 的 `:use <thread-id>` 提示也已继续按已知线程模式收口：resident thread 不再显示成通用 thread 切换提示，而会明确提示切到 `resident assistant thread`
 - `debug-client` 的 resident 消费面也已重新补回完整工作态：被截断的事件处理和帮助输出已经恢复，并补上 reconnect 文案回归，避免这块最小客户端入口停留在半成品状态
+- `debug-client` 的内置 `:help` 也已同步收口到 resident-aware 语义，避免帮助面继续把 `:use` / `:refresh-thread` 描述成泛化 thread 操作
 - `app-server-test-client` 的 thread 响应/通知输出也已补上 resident-aware 摘要，方便手工联调时直接识别 reconnect 场景；`thread-read` 与 `thread-metadata-update` 的联调命令也已补齐，同样会把 resident `mode` 打进摘要输出
-- `app-server-client` README、MCP 接口文档和 typed request 回归也已开始把 `Thread.mode` 固定为 bootstrap 阶段区分 reconnect 的主信号，减少外围集成对旧 resume 语义的误读；metadata-only update 的 typed request 回归也已补上 resident `mode` 保留覆盖
+- `app-server-test-client` 的其余主要 thread 命令也已继续补齐 resident-aware 摘要：`thread-fork`、`thread-loaded-read` 和 `thread-unarchive` 现在同样会把 `mode` 与 `resume/reconnect` 语义直接打到联调输出里
+- `app-server-test-client` 的 README 也已同步把这批边缘恢复命令写成显式 `mode` + `resume/reconnect` 摘要输出，不再只停留在模糊的 resident-aware 描述
+- `app-server-test-client` README 里的这段说明也已进一步对齐到真实输出：联调摘要打印的是 wire `thread.mode` 值（如 `interactive` / `residentAssistant`）再附带 `resume/reconnect` 动作
+- `app-server-client` README、MCP 接口文档和 typed request 回归也已开始把 `Thread.mode` 固定为 bootstrap 阶段区分 reconnect 的主信号，减少外围集成对旧 resume 语义的误读；除了 metadata-only update 的 resident `mode` 保留覆盖外，`thread-loaded-read` 的 typed request 边界也已补齐 resident 模式回归
 - `app-server/README.md` 也已同步把 `Thread.mode` 固定为 resident reconnect 的主语义，不再只把 `resident: true` 当作实现细节提及
 - `app-server/README.md` 的 lifecycle overview 总览入口也已补上 reconnect 口径，首屏文案不再落后于细节章节
+- `app-server/README.md` 的 `thread/list`、`thread/loaded/read` 和 `thread/unarchive` 示例结果也已补成显式带 `mode` 的版本，避免示例继续落后于正文契约
+- `app-server/README.md` 的 `thread/start`、`thread/resume` 和 `thread/fork` 顶层示例现在也已显式带上 `mode`，最前面的线程生命周期示例不再把 resident / interactive 语义压在省略号后面
+- `app-server/README.md` 的 `thread/started` 通知示例现在也已显式带上 `mode`，response / notification 两个消费面都不再靠读者自行脑补 resident 语义
+- `app-server/README.md` 的 detached review 文案也已同步要求消费 `thread/started` snapshot 里的 `mode`，避免 review fork 这类边缘通知路径重新退回通用 resumed session 心智
 - 仍有剩余消费侧入口需要继续检查，但主路径上的恢复/重连文案已经开始收口
 
 不要混入：

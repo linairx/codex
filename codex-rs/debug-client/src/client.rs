@@ -253,14 +253,15 @@ impl AppServerClient {
         state.thread_id = Some(thread_id);
     }
 
-    pub fn use_thread(&self, thread_id: String) -> bool {
+    pub fn use_thread(&self, thread_id: String) -> Option<ThreadMode> {
         let mut state = self.state.lock().expect("state lock poisoned");
-        let known = state
+        let known_mode = state
             .known_threads
             .iter()
-            .any(|thread| thread.thread_id == thread_id);
+            .find(|thread| thread.thread_id == thread_id)
+            .map(|thread| thread.thread_mode);
         state.thread_id = Some(thread_id);
-        known
+        known_mode
     }
 
     pub fn shutdown(&mut self) {

@@ -62,6 +62,10 @@ The same rule applies to metadata-only thread operations such as
 `thread/metadata/update`: callers should trust the returned `thread.mode`
 directly instead of assuming a follow-up `thread/read` is required to recover
 resident assistant semantics.
+The in-process typed request tests now lock this boundary down across more
+than bootstrap and metadata repair: `thread/loaded/read` must continue to
+surface resident mode for loaded assistants instead of dropping back to a
+generic loaded-thread summary.
 
 ## Backpressure and shutdown
 

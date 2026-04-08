@@ -858,6 +858,8 @@ mod tests {
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadLoadedReadParams;
+    use codex_app_server_protocol::ThreadLoadedReadResponse;
     use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
     use codex_app_server_protocol::ThreadMetadataUpdateParams;
     use codex_app_server_protocol::ThreadMetadataUpdateResponse;
@@ -1324,6 +1326,41 @@ mod tests {
                 origin_url: None,
             })
         );
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn loaded_read_preserves_resident_thread_mode_through_typed_requests() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(9),
+                params: ThreadStartParams {
+                    resident: true,
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let loaded: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(10),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("thread/loaded/read should succeed");
+
+        let loaded_thread = loaded
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("loaded thread list should include the started resident thread");
+        assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert!(loaded_thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
     }
