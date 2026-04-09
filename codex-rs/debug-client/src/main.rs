@@ -587,6 +587,17 @@ mod tests {
     }
 
     #[test]
+    fn loaded_thread_list_lines_do_not_include_mode_or_action_labels() {
+        let lines = loaded_thread_list_lines(&["thread-1".to_string()], Some("cursor-2"));
+        let rendered = lines.join("\n");
+
+        assert!(!rendered.contains("resident assistant"));
+        assert!(!rendered.contains("interactive"));
+        assert!(!rendered.contains("reconnect"));
+        assert!(!rendered.contains("resume"));
+    }
+
+    #[test]
     fn loaded_thread_list_lines_render_empty_state_without_cursor() {
         let lines = loaded_thread_list_lines(&[], None);
 

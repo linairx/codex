@@ -391,3 +391,72 @@ fn send_response<T: Serialize>(
     stdin.flush().context("flush response")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::handle_response;
+    use crate::state::KnownThread;
+    use crate::state::PendingRequest;
+    use crate::state::ReaderEvent;
+    use crate::state::State;
+    use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::RequestId;
+    use codex_app_server_protocol::ThreadLoadedListResponse;
+    use codex_app_server_protocol::ThreadMode;
+    use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::mpsc::channel;
+
+    #[test]
+    fn loaded_list_response_does_not_update_known_thread_modes() {
+        let request_id = RequestId::Integer(7);
+        let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state
+                .pending
+                .insert(request_id.clone(), PendingRequest::LoadedList);
+            state.known_threads.push(KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+            });
+        }
+        let (events_tx, events_rx) = channel();
+
+        handle_response(
+            JSONRPCResponse {
+                id: request_id,
+                result: serde_json::to_value(ThreadLoadedListResponse {
+                    data: vec!["thread-known".to_string(), "thread-unknown".to_string()],
+                    next_cursor: Some("cursor-2".to_string()),
+                })
+                .expect("loaded list response should serialize"),
+            },
+            &state,
+            &events_tx,
+        )
+        .expect("loaded list response should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+            }]
+        );
+        assert!(state.pending.is_empty());
+        drop(state);
+
+        let event = events_rx.recv().expect("loaded list event");
+        assert!(matches!(
+            event,
+            ReaderEvent::LoadedThreadList {
+                thread_ids,
+                next_cursor,
+            } if thread_ids == vec!["thread-known".to_string(), "thread-unknown".to_string()]
+                && next_cursor.as_deref() == Some("cursor-2")
+        ));
+    }
+}

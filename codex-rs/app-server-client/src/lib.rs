@@ -2312,6 +2312,18 @@ supports_websockets = false
             .expect("thread/unsubscribe should succeed");
         assert_eq!(unsubscribed.status, ThreadUnsubscribeStatus::Unsubscribed);
 
+        let loaded_ids: ThreadLoadedListResponse = client
+            .request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(241),
+                params: ThreadLoadedListParams::default(),
+            })
+            .await
+            .expect("thread/loaded/list should still include resident thread");
+        assert!(
+            loaded_ids.data.contains(&started.thread.id),
+            "resident thread id should remain discoverable via thread/loaded/list after unsubscribe"
+        );
+
         let loaded: ThreadLoadedReadResponse = client
             .request_typed(ClientRequest::ThreadLoadedRead {
                 request_id: RequestId::Integer(25),

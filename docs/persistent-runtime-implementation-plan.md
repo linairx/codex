@@ -275,29 +275,39 @@
 - `debug-client` 也已开始消费 `Thread.mode`，连接提示、线程列表和 `:resume` 帮助文案都已按 resident assistant 区分 reconnect 语义
 - `debug-client` 的 `:refresh-thread` 摘要也已开始同时展示线程模式与推荐动作，resident thread 不再只显示成模糊的 reconnect/resume 动词，而能直接看出这是 `resident assistant`
 - `debug-client` 的 `:refresh-thread` 列表输出现在也已补上整串回归：真实渲染会稳定覆盖 header、每条 `thread-id + (mode, action)` 行以及 `next cursor` 尾行，不再只靠 mode/action helper 侧面兜底 resident reconnect 语义
+- `debug-client` 的 `:refresh-thread` 空列表边界也已单独锁住：当当前页没有线程时，最终输出会稳定保留 `threads: (none)`
+- `debug-client` 的 resident 列表行文案也已补上最终字符串级断言：resident thread 现在会稳定渲染成 `thread-... (resident assistant, reconnect)`
 - `debug-client` 的分页列表消费现在也已补上请求侧闭环：`:refresh-thread` 支持可选 cursor 参数，parser / help / README 都已同步更新，看到 `next cursor` 后可以直接在同一客户端里续页
+- `debug-client` 的 `:refresh-thread` 请求侧闭环也已补上 cursor 文案回归：传入续页 cursor 时，客户端请求日志会稳定写成 `requested thread list (..., cursor=...)`
 - `debug-client` 的 `:use <thread-id>` 提示也已继续按已知线程模式收口：resident thread 不再显示成通用 thread 切换提示，而会明确提示切到 `resident assistant thread`
+- `debug-client` 的连接/就绪提示也已继续按 resident 模式收口：已 attach 的 resident thread 现在会稳定显示 `connected to resident assistant thread`，并继续保留 `resident assistant thread` / `reconnect` 这组 ready label
 - `debug-client` 的 resident 消费面也已重新补回完整工作态：被截断的事件处理和帮助输出已经恢复，并补上 reconnect 文案回归，避免这块最小客户端入口停留在半成品状态
 - `debug-client` 的内置 `:help` 也已同步收口到 resident-aware 语义，避免帮助面继续把 `:use` / `:refresh-thread` 描述成泛化 thread 操作
-- `debug-client` 的 clap 顶层 `--help` 也已继续对齐到同一口径：除了交互内置 `:help` 外，`--thread-id` 和相关 override 的命令行帮助说明现在同样稳定写成 `resume or reconnect`，并补上顶层 help 回归测试
+- `debug-client` 的 clap 顶层 `--help` 也已继续对齐到同一口径：除了交互内置 `:help` 外，不仅 `--thread-id` 会稳定写成 `resume or reconnect`，连 `--model` / provider / cwd 这些 override 说明也同样保持 “starting/resuming or reconnecting” 口径，并补上顶层 help 回归测试
 - `app-server-test-client` 的 thread 响应/通知输出也已补上 resident-aware 摘要，方便手工联调时直接识别 reconnect 场景；`thread-read` 与 `thread-metadata-update` 的联调命令也已补齐，同样会把 resident `mode` 打进摘要输出
 - `app-server-test-client` 的最常用恢复入口现在也已各自补上命令级摘要断言：`thread/start`、`thread/resume` 和 `thread/fork` 这三条路径都会稳定打印各自的 resident reconnect label
+- `app-server-test-client` 的 mode/action 摘要 helper 也已把 interactive 对照项单独锁住：普通线程会稳定落成 `mode=interactive + action=resume`
 - `app-server-test-client` 的 resident-aware 摘要回归现在也已把 `thread/started` 通知入口单独锁住：除了 `thread/read` 这类响应面外，通知摘要字符串同样会稳定打印 `mode=residentAssistant` 和 `action=reconnect`
 - `app-server-test-client` 的 README 也已同步补上这条通知侧契约：`thread/started` 在流式 start/resume 过程中同样会打印与响应面一致的 compact resident-aware summary
 - `app-server-test-client` 的其余主要 thread 命令也已继续补齐 resident-aware 摘要：`thread-fork`、`thread-loaded-read` 和 `thread-unarchive` 现在同样会把 `mode` 与 `resume/reconnect` 语义直接打到联调输出里
 - `app-server-test-client` 的命令级摘要回归也已继续补细：`thread/metadata/update` 与 `thread/unarchive` 这两条边缘恢复入口现在各自都有独立的 label 级断言
 - `app-server-test-client` 的 rollback 联调入口现在也已补上同层 resident-aware 摘要：新增 `thread-rollback` 命令会直接打印 `thread/rollback` 的 compact `mode + resident + status + action` 输出，并补上专门的 label 级回归，避免 rollback 响应在测试客户端里重新退回只看 debug struct
-- `app-server-test-client` 的列表摘要契约也已补成整串回归：`thread/list` 与 `thread/loaded/read` 的 summary header、每条 `mode + resident + status + action` 行以及空列表时的 `no threads` 标记现在都被单独锁住
+- `app-server-test-client` 的列表摘要契约也已补成整串回归：`thread/list` 与 `thread/loaded/read` 的 summary header、每条 `mode + resident + status + action` 行、空列表时的 `no threads` 标记以及分页 `next_cursor` 尾行现在都被单独锁住
 - `app-server-test-client` 的 README 也已同步把这批边缘恢复命令写成显式 `mode` + `resume/reconnect` 摘要输出，不再只停留在模糊的 resident-aware 描述
 - `app-server-test-client` 的 README 现在也已把 `thread-rollback` 纳入同一组边缘恢复示例，确保手工联调 rollback 后的 resident continuity 时也能直接看到 wire `thread.mode` 与派生 action label
 - `app-server-test-client` 的 clap 顶层 `--help` 也已同步收口：`resume-message-v2` 和 `thread-resume` 这两个最常用恢复命令的子命令说明现在同样稳定写成 `resume or reconnect`，并补上 help 回归测试
+- `app-server-test-client` 的这条 resident-aware help 回归也已明确覆盖到根帮助层：最外层 `Cli::command().render_long_help()` 现在同样会直接锁住 `resume-message-v2` / `thread-resume` 的 `resume or reconnect` 摘要
 - `app-server-test-client` 的 compact summary 输出也已补上整串回归断言：`thread/read` 与列表摘要现在都会稳定覆盖 `mode + resident + status + action` 的完整文本，不再只靠单独的 mode/action 映射测试侧面兜底
 - `app-server-test-client` 的分页列表摘要现在也已补上 cursor 回归：`thread/list` 的 compact summary 在有分页时会直接打印 `next_cursor`，而空列表 + cursor 的边界也已单独锁住，避免联调分页历史时继续依赖完整 debug struct
 - `app-server-test-client` 的分页列表消费现在也已补上请求侧闭环：`thread-list` 与 `thread-loaded-read` 命令都新增 `--cursor` 参数，并补上对应子命令 help 回归与 README 示例，避免联调时只能手动看到 `next_cursor` 却无法直接续页
 - `app-server-test-client` 的 `thread/loaded/list` 也已补成可直接联调的 id-only probe：新增 `thread-loaded-list --cursor --limit` 命令，compact summary 会稳定打印 loaded thread ids 与 `next_cursor`，并在 help/README/回归里明确这条接口只做 loaded id 探针、需要 reconnect 语义时应继续读 `thread-loaded-read`
+- `app-server-test-client` 的 `thread/loaded/list` 摘要契约也已补上字符串级断言：id-only summary 现在会稳定渲染 header、每条 loaded thread id 行以及分页 `next_cursor` 尾行
+- `app-server-test-client` 的 loaded 分页空态边界也已单独锁住：`thread/loaded/read` 与 `thread/loaded/list` 在空页上仍会继续保留 `no threads + next_cursor`，连 id-only probe 自己也不会把分页尾行吞掉
 - `codex-app-server-client` 的 typed 分页读取面现在也已补上同层回归：`thread/list` 与 `thread/loaded/read` 在有 `next_cursor` 时，后续页请求仍会稳定保留 resident `mode`，避免共享 in-process 客户端只在首页锁住 `ResidentAssistant`，翻页后却重新退回通用线程摘要
 - `codex-app-server-client` 的 typed 请求层现在也已把 `thread/loaded/list` 这条 id-only probe 锁住：in-process 调用会稳定保留 loaded ids 与 `next_cursor` 的分页连续性，而 README 也同步明确需要 reconnect 语义时仍应继续调用 `thread/loaded/read`
 - `debug-client` 现在也已把 `thread/loaded/list` 这条 id-only probe 接到本地调试流里：新增 `:refresh-loaded [cursor]`，会稳定打印 loaded thread ids 与 `next cursor`，并在 help/README/回归中明确需要 reconnect 语义时仍应继续使用 `:refresh-thread` / `:resume`
+- `debug-client` 的 `:refresh-loaded` 摘要契约也已补上字符串级断言：最终输出会稳定渲染 `loaded threads:` header、每条 loaded thread id 行、空列表时的 `loaded threads: (none)` 空态，以及 `more loaded threads available, next cursor: ...` 尾行
+- `debug-client` 的 `:refresh-loaded` 请求侧闭环也已补上 cursor 文案回归：传入续页 cursor 时，客户端请求日志会稳定写成 `requested loaded thread list (..., cursor=...)`
 - `codex-tui` 的 `AppServerSession` 现在也已把 `thread/loaded/list` 这条 id-only probe 纳入 typed 会话层回归：新增 `thread_loaded_list(...)` 包装，并锁住 loaded ids 与 `next_cursor` 的分页连续性，避免 TUI 中间层只覆盖 `thread/loaded/read` 这条带 mode 的读取面
 - `codex-tui` 的 subagent backfill 现在也已把这层接口分工写回实现：`backfill_loaded_subagent_threads` / `loaded_threads.rs` 明确说明它必须继续消费 `thread/loaded/read`，因为 spawn source、status 和 agent metadata 不在 `thread/loaded/list` 的 id-only probe 里；纯函数回归也锁住了非 spawn metadata 的 loaded thread 不会被误认成子线程
 - `codex-tui` 的 latest-session lookup / resume picker 现在也已继续补上 `--include-non-interactive` 的 resident 回归，并顺手修正了 source filter 语义：app-server 上 `source_kinds: None` 仍表示 interactive-only，所以 TUI 现在会显式传完整 `ThreadSourceKind` 列表；默认 `--last` 仍只看 CLI / VSCode 线程，而显式开启 include-non-interactive 后，更新更晚的 resident non-interactive thread 也会被正确选成恢复目标并保留 `ResidentAssistant`
@@ -429,6 +439,7 @@
 - `codex-tui` 的 rename 确认文案现在也已补上最小 resident 回归：线程重命名后的 follow-up 提示仍会继续保留 resident reconnect 指引
 - `codex-tui` 的 slash command 帮助文案现在也已补上最小 resident 回归：`SlashCommand::Resume.description()` 仍会继续保留 reconnect 提示
 - `codex-tui` 的 resident reconnect history cell 现在也已补上无名字边界回归：`new_resident_thread_reconnected(...)` 在 thread name 为空时，仍会继续保留通用 resident reconnect 文案
+- `codex-tui` 的主界面 session summary reconnect hint 现在也已补上快照回归：resident thread 的摘要卡片仍会继续保留 “To reconnect to this resident assistant, run codex resume ...” 这类最终收口提示
 - `codex-tui` 的 cwd prompt resident 文案现在也已补上最小回归：`CwdPromptAction::Reconnect` 仍会继续保留 resident assistant 的措辞
 - `codex-tui` 的 `resume_picker` 现在也已把 app-server `SystemError` 消费面补成最小回归：resident thread 命中 `SystemError` 时，row 映射仍会继续保留 `ResidentAssistant` 并设置错误标记，而最终列表渲染也会继续显示 `"[error]"` badge，避免 reconnect 模式和错误态在 picker 里只保留其一
 - `codex-tui` 的更上层 session lookup 也已补上 archived resident id 恢复回归：按 thread id 查 archived thread 时，lookup 结果仍会继续保留 `ResidentAssistant`，避免 selector 层在 archived 路径上把 reconnect 目标降回普通 session target
@@ -438,7 +449,9 @@
 - `docs/sqlite-state-convergence.md` 也已同步刷新成“已落地边界 + 后续阶段”的状态文档，开始明确记录 `threads.mode` 和 resident metadata repair 这批已经进入 SQLite 主干路径的最小闭环
 - `debug-client` 的内置 `:help` 也已继续补齐 source-filter 与 loaded-probe 边界：`:refresh-thread` 现在会直接提示它跨 interactive + non-interactive 来源列出带 mode/action 的线程摘要，而 `:refresh-loaded` 会直接提示它只是跨这些来源的 loaded thread id-only probe，避免 README 和请求实现已经 resident-aware，但交互内置帮助仍退回泛化列表文案
 - `app-server-test-client` 的 clap 子命令帮助也已继续对齐到同一消费边界：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 的 `--help` 现在会直接写出默认覆盖 interactive + non-interactive 来源，而 `thread-loaded-list` 还会明确声明自己只是 id-only probe、需要 resident `mode` 时应继续读 `thread-loaded-read`
+- 顶层 `codex --help` 也已继续保留 resident-aware 摘要：根命令帮助里的 `resume` 入口现在同样会稳定显示 `resume or reconnect` 与 picker/`--last` 提示，避免只覆盖 `codex resume --help` 后，最外层总览简介再次回退
 - 顶层 `codex resume --help` 也已补上单独回归：子命令帮助现在会稳定保留 `resume or reconnect` 与 `--include-non-interactive` 的说明，避免最外层用户入口只在内部字段注释或总 help 里对齐 resident reconnect 语义
+- `codex-exec --help` 也已继续保留同类 resident-aware 摘要：独立二进制根帮助里的 `resume` 入口现在同样会稳定显示 `resume or reconnect` 与 `--last` 提示，避免只锁住 `codex-exec resume --help` 后，总 help 简介再次漂移
 - `codex-exec resume --help` 也已补上对称回归：`exec` 子命令自己的帮助现在会稳定保留 `resume or reconnect` 与 `--last` 的说明，避免这层入口只靠总 help 或注释层间接约束 resident-aware 语义
 - 多工具包装层 `codex exec resume --help` 也已补上对称回归：顶层 `codex` 内嵌的 `exec resume` 子命令帮助现在同样会稳定保留 `resume or reconnect` 与 `--last` 的说明，避免只覆盖独立 `codex-exec` 二进制后，主入口包装层的 clap 文案重新漂移
 - 多工具包装层 `codex exec --help` 也已补上更上层摘要回归：这层帮助里的 `resume` 子命令简介现在同样会稳定保留 `resume or reconnect` 与 `--last` 提示，避免只锁住最里层子命令帮助后，外层命令列表简介再次回退
@@ -447,6 +460,7 @@
 - `app-server/README.md` 的事件通知总览也已继续统一术语：`thread.mode` 的 reconnect 语义说明不再混用 `resident-assistant semantics`，而改成 `resident assistant semantics`
 - `codex-exec` 的 bootstrap stderr 摘要也已继续由真实进程级回归覆盖：human-readable 模式会直接断言 interactive 路径输出 `session mode/action = interactive + resume`、resident 路径输出 `resident assistant + reconnect`，而 `--json` 模式不会混出这层 human summary
 - 顶层 `codex` 的最终退出提示也已继续锁住 resident-aware 行为：普通 interactive thread 仍显示 “continue this session”，而 resident assistant thread 会稳定切成 “reconnect to this resident assistant”
+- 顶层 `codex-rs/README.md` 对 `codex exec` bootstrap summary 的说明也已与现有回归收成闭环：README 里的 `session mode/session action` 说明直接对应 `exec/tests/suite/resume.rs` 的 interactive/resident stderr 断言和 `--json` 负向断言
 - 相关最小行为闭环已可由 `codex-state`、`codex-rollout`、`codex-app-server` 的定向测试覆盖
 - 仍需保持边界，只把稳定元数据和派生摘要入库，不把 loaded 状态、watcher、连接关系一类瞬时运行态塞进 SQLite
 

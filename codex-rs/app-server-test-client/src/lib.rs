@@ -2011,6 +2011,22 @@ mod tests {
     }
 
     #[test]
+    fn thread_loaded_list_summary_lines_do_not_include_mode_or_action_labels() {
+        let lines = thread_id_collection_summary_lines_with_cursor(
+            "thread/loaded/list",
+            &["thread-1".to_string()],
+            Some("cursor-2"),
+        );
+        let rendered = lines.join("\n");
+
+        assert!(!rendered.contains("residentAssistant"));
+        assert!(!rendered.contains("interactive"));
+        assert!(!rendered.contains("reconnect"));
+        assert!(!rendered.contains("action="));
+        assert!(!rendered.contains("mode="));
+    }
+
+    #[test]
     fn empty_thread_list_summary_lines_can_still_include_next_cursor() {
         assert_eq!(
             thread_collection_summary_lines_with_cursor("thread/list", &[], Some("cursor-2")),
