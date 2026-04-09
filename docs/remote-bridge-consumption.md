@@ -138,7 +138,7 @@
 当前可依赖事实：
 
 - 远端已经可以把 `thread/list` 视为“长期线程与普通线程总览”的主入口
-- 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的状态面，并且这条读取面本身会继续返回 `thread.mode`
+- 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的 `mode + status` 摘要面，并且这条读取面本身会继续返回 `thread.mode`
 - 对于服务重启后的未加载 resident thread，`thread/list` 不再只能看到普通历史线程语义，而是可以读到持久化回补后的 resident 模式
 
 ### 第 2 层：线程状态通知

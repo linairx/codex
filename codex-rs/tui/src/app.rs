@@ -9582,10 +9582,21 @@ guardian_approval = true
             .lock()
             .await;
         let session = store.session.clone().expect("inferred session");
+        drop(store);
 
         assert_eq!(
             session.thread_mode,
             Some(codex_app_server_protocol::ThreadMode::ResidentAssistant)
+        );
+        assert_eq!(
+            app.agent_navigation.get(&agent_thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Atlas".to_string()),
+                agent_role: Some("worker".to_string()),
+                is_closed: false,
+                active_flags: Vec::new(),
+                has_system_error: false,
+            })
         );
 
         Ok(())
@@ -9657,8 +9668,98 @@ guardian_approval = true
             .lock()
             .await;
         let session = store.session.clone().expect("inferred session");
+        drop(store);
 
         assert_eq!(session.thread_mode, Some(ThreadMode::ResidentAssistant));
+        assert_eq!(
+            app.agent_navigation.get(&agent_thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Atlas".to_string()),
+                agent_role: Some("worker".to_string()),
+                is_closed: false,
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                has_system_error: false,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inactive_thread_system_error_notification_preserves_resident_thread_mode() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000413").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000414").expect("valid thread");
+        let primary_session = ThreadSessionState {
+            ..test_thread_session(main_thread_id, PathBuf::from("/tmp/main"))
+        };
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(main_thread_id);
+        app.primary_session_configured = Some(primary_session.clone());
+        app.thread_event_channels.insert(
+            main_thread_id,
+            ThreadEventChannel::new_with_session(/*capacity*/ 4, primary_session, Vec::new()),
+        );
+
+        app.enqueue_thread_notification(
+            agent_thread_id,
+            ServerNotification::ThreadStarted(ThreadStartedNotification {
+                thread: Thread {
+                    id: agent_thread_id.to_string(),
+                    forked_from_id: None,
+                    preview: "resident agent thread".to_string(),
+                    ephemeral: false,
+                    model_provider: "agent-provider".to_string(),
+                    created_at: 1,
+                    updated_at: 2,
+                    status: codex_app_server_protocol::ThreadStatus::Idle,
+                    mode: codex_app_server_protocol::ThreadMode::ResidentAssistant,
+                    resident: true,
+                    path: None,
+                    cwd: PathBuf::from("/tmp/agent"),
+                    cli_version: "0.0.0".to_string(),
+                    source: codex_app_server_protocol::SessionSource::Unknown,
+                    agent_nickname: Some("Atlas".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    git_info: None,
+                    name: Some("resident agent thread".to_string()),
+                    turns: Vec::new(),
+                },
+            }),
+        )
+        .await?;
+
+        app.enqueue_thread_notification(
+            agent_thread_id,
+            thread_status_changed_notification(agent_thread_id, ThreadStatus::SystemError),
+        )
+        .await?;
+
+        let store = app
+            .thread_event_channels
+            .get(&agent_thread_id)
+            .expect("agent thread channel")
+            .store
+            .lock()
+            .await;
+        let session = store.session.clone().expect("inferred session");
+        drop(store);
+
+        assert_eq!(session.thread_mode, Some(ThreadMode::ResidentAssistant));
+        assert_eq!(
+            app.agent_navigation.get(&agent_thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Atlas".to_string()),
+                agent_role: Some("worker".to_string()),
+                is_closed: false,
+                active_flags: Vec::new(),
+                has_system_error: true,
+            })
+        );
 
         Ok(())
     }

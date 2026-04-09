@@ -742,6 +742,21 @@ mod tests {
         assert_snapshot!("agent_picker_active_flag_spans", line.to_string());
     }
 
+    #[test]
+    fn agent_picker_active_flag_helpers_put_system_error_before_active_flags() {
+        let labels = agent_picker_active_flag_labels(
+            &[ThreadActiveFlag::WorkspaceChanged],
+            /*has_system_error*/ true,
+        );
+        assert_eq!(labels, vec!["[error]", "[changed]"]);
+
+        let line = Line::from(agent_picker_active_flag_spans(
+            &[ThreadActiveFlag::WorkspaceChanged],
+            /*has_system_error*/ true,
+        ));
+        assert_eq!(line.to_string(), "[error] [changed] ");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn agent_shortcut_matches_option_arrow_word_motion_fallbacks_only_when_allowed() {

@@ -57,7 +57,7 @@ Integrations that distinguish an ordinary interactive resume target from residen
 
 Two related boundaries matter for MCP consumers:
 
-- `thread/loaded/list` is intentionally only an id probe for currently loaded threads. If the client also needs reconnect semantics or the current thread role, it should follow up with `thread/loaded/read` and consume `thread.mode` there.
+- `thread/loaded/list` is intentionally only an id probe for currently loaded threads. If the client also needs reconnect semantics, the current thread role, or the current runtime status, it should follow up with `thread/loaded/read` and consume `thread.mode` plus `thread.status` there.
 - `thread/status/changed` is a status-only increment. It does not repeat `thread.mode`, so reconnect-aware clients should retain the last `mode` they observed from `thread/started`, `thread/read`, `thread/list`, or `thread/loaded/read`.
 
 `getConversationSummary` remains as a compatibility helper for clients that still need a summary lookup by `conversationId` or `rolloutPath`.

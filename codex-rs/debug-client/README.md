@@ -44,21 +44,29 @@ Type a line to send it as a new turn. Commands are prefixed with `:`:
 - `:resume <thread-id>` resume or reconnect to a thread
 - `:use <thread-id>` switch active thread without resuming or reconnecting; when the thread was
   already seen via start, resume/reconnect, or list, the client also preserves whether that id
-  is an ordinary thread or a resident assistant thread
+  is an ordinary thread or a resident assistant thread, plus the latest known
+  thread status, for the local switch confirmation
 - `:refresh-thread [cursor]` list available threads, including both the stored
-  thread mode (`interactive` vs `resident assistant`) and the suggested action
-  (`resume` vs `reconnect`) across both interactive and non-interactive
-  sources; when the previous output includes `more threads available, next
-  cursor: ...`, pass that cursor back to fetch the next page
+  thread mode (`interactive` vs `resident assistant`), the current status, and
+  the suggested action (`resume` vs `reconnect`) across both interactive and
+  non-interactive sources; when the previous output includes `more threads
+  available, next cursor: ...`, pass that cursor back to fetch the next page
 - `:refresh-loaded [cursor]` list loaded thread ids with pagination; this is
   intentionally an id-only probe across both interactive and non-interactive
-  sources, so if you need resident mode or reconnect semantics for one of those
-  ids, follow up with `:refresh-thread` or `:resume <thread-id>`
+  sources, so if you need mode/status/action labels, resident mode, or
+  reconnect semantics for one of those ids, follow up with `:refresh-thread` or
+  `:resume <thread-id>`
 - `:quit` exit
 
 If you have not attached any thread yet, or you switch to an unknown thread id
 with `:use`, the fallback prompts now also keep the same wording and tell you to
 use `:resume <thread-id>` to resume or reconnect.
+
+When the client later receives `thread/started` or `thread/status/changed`
+notifications for a thread it already knows, it now refreshes the cached
+mode/status for that id as well. This keeps local `:use` confirmations aligned
+with live thread status instead of only updating after the next manual
+`:refresh-thread`.
 
 The prompt shows the active thread id. Client messages (help, errors, approvals)
 print to stderr; raw server JSON prints to stdout so you can pipe/record it

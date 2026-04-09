@@ -127,9 +127,11 @@ mode: ThreadMode
 
 这比同时修改多套独立响应字段更稳，也更容易兼容。
 
-与之相对，`thread/loaded/list` 这类只返回线程 id 的接口不应被当成模式恢复面。
-如果客户端既需要 loaded 集合，又需要区分 reconnect 语义，应该继续读取
-`thread/loaded/read`，而不是期待 id-only 接口重复 `Thread.mode`。
+与之相对，`thread/loaded/list` 这类只返回线程 id 的接口不应被当成完整 loaded
+恢复摘要面。
+如果客户端既需要 loaded 集合，又需要区分 reconnect 语义、线程角色或当前
+runtime status，应该继续读取 `thread/loaded/read`，而不是期待 id-only
+接口重复 `Thread.mode` 或补充当前 `status`。
 
 ## 7. 请求侧建议
 
@@ -243,8 +245,8 @@ mode: ThreadMode
 - `thread/resume` 对 `residentAssistant` 更偏“重新连接”
 - 客户端动作文案应直接按 `Thread.mode` 映射：`interactive -> resume`、`residentAssistant -> reconnect`
 - `thread/status/changed` 只推送 runtime `status`，不重复 `mode`
-- `thread/loaded/list` 只是 id-only probe；需要 reconnect 语义时应继续读
-  `thread/loaded/read`
+- `thread/loaded/list` 只是 id-only probe；需要 reconnect 语义、线程角色或
+  当前 runtime status 时应继续读 `thread/loaded/read`
 
 ### 客户端
 

@@ -56,9 +56,10 @@ cargo run -p codex-app-server-test-client -- \
 
 These commands print the full response plus a compact summary that includes
 wire `thread.mode` values (for example `interactive` or
-`residentAssistant`) plus the derived `resume`/`reconnect` action label, so
-resident assistant reconnect semantics remain visible on read-only lookup,
-fork, and metadata-only update paths.
+`residentAssistant`), the current `status`, plus the derived
+`resume`/`reconnect` action label, so resident assistant reconnect semantics
+remain visible on read-only lookup, fork, metadata-only update, unarchive, and
+rollback paths.
 For paginated `thread/list` calls, the compact summary also prints
 `next_cursor` when present, so you can continue walking history without
 re-reading the full debug struct.
@@ -66,8 +67,8 @@ re-reading the full debug struct.
 If you need to inspect other recovery paths without reading the full debug
 struct, the test client now also exposes resident-aware summaries for loaded
 threads, archived-thread restore, and rollback responses, with the same compact
-`mode` plus `resume`/`reconnect` action labels for ordinary interactive resume
-targets vs resident reconnect targets. These loaded-thread probes also default
+`mode + status + action` summary for ordinary interactive resume targets vs
+resident reconnect targets. These loaded-thread probes also default
 to both interactive and non-interactive sources:
 
 ```bash
@@ -81,12 +82,21 @@ cargo run -p codex-app-server-test-client -- thread-rollback <THREAD_ID> --num-t
 
 `thread-loaded-list` is intentionally an id-only probe. Its compact summary
 prints loaded thread ids plus `next_cursor` when present; if you need resident
-`mode` or reconnect semantics for those ids, continue with `thread-loaded-read`.
+`mode`, status, or reconnect semantics for those ids, continue with
+`thread-loaded-read`.
 
 When you use the streaming start/resume/reconnect commands, `thread/started`
-notifications also print the same compact resident-aware summary, so the
-notification path stays aligned with the direct response summaries instead of
-falling back to plain debug output.
+notifications also print the same compact `mode + status + action` summary, so
+the notification path stays aligned with the direct response summaries instead
+of falling back to plain debug output. Follow-up `thread/status/changed`
+notifications now reuse the locally cached thread summary as well: when the
+client already knows that thread's `mode`, the status change line keeps the
+same compact `mode + status + action` shape; when the thread id is still
+unknown, it deliberately stays status-only instead of guessing reconnect
+semantics. That shared notification handling now covers both turn streaming and
+long-running observation modes such as `thread-resume` / `watch`, so the
+resident-aware summaries stay consistent even when you keep the client attached
+just to watch later runtime state changes.
 
 ### 2) Resume or reconnect while a turn is in progress (two terminals)
 

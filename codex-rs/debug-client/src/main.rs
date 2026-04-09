@@ -13,7 +13,9 @@ use anyhow::Result;
 use clap::ArgAction;
 use clap::Parser;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadMode;
+use codex_app_server_protocol::ThreadStatus;
 
 use crate::client::AppServerClient;
 use crate::client::ThreadConnection;
@@ -209,10 +211,13 @@ fn handle_command(
             true
         }
         UserCommand::Use(thread_id) => {
-            let known_mode = client.use_thread(thread_id.clone());
+            let known_thread = client.use_thread(thread_id.clone());
             output.set_prompt(&thread_id);
             output
-                .client_line(&active_thread_switch_message(&thread_id, known_mode))
+                .client_line(&active_thread_switch_message(
+                    &thread_id,
+                    known_thread.as_ref(),
+                ))
                 .ok();
             true
         }
@@ -317,9 +322,10 @@ fn thread_list_lines(
         lines.push("threads:".to_string());
         lines.extend(threads.iter().map(|thread| {
             format!(
-                "  {} ({}, {})",
+                "  {} ({}, {}, {})",
                 thread.thread_id,
                 thread_mode_label(thread.thread_mode),
+                thread_status_label(&thread.thread_status),
                 thread_resume_label(thread.thread_mode)
             )
         }));
@@ -365,12 +371,16 @@ fn no_active_thread_message() -> &'static str {
     "no active thread; use :new or :resume <id> to resume or reconnect"
 }
 
-fn active_thread_switch_message(thread_id: &str, thread_mode: Option<ThreadMode>) -> String {
-    match thread_mode {
-        Some(ThreadMode::Interactive) => format!("switched active thread to thread {thread_id}"),
-        Some(ThreadMode::ResidentAssistant) => {
-            format!("switched active thread to resident assistant thread {thread_id}")
-        }
+fn active_thread_switch_message(
+    thread_id: &str,
+    known_thread: Option<&crate::state::KnownThread>,
+) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "switched active thread to {} {thread_id} ({})",
+            thread_ready_label(thread.thread_mode),
+            thread_status_label(&thread.thread_status)
+        ),
         None => format!(
             "switched active thread to {thread_id} (unknown; use :resume to resume or reconnect)"
         ),
@@ -398,6 +408,33 @@ fn thread_resume_label(thread_mode: ThreadMode) -> &'static str {
     }
 }
 
+fn thread_status_label(thread_status: &ThreadStatus) -> String {
+    match thread_status {
+        ThreadStatus::NotLoaded => "not loaded".to_string(),
+        ThreadStatus::Idle => "idle".to_string(),
+        ThreadStatus::SystemError => "system error".to_string(),
+        ThreadStatus::Active { active_flags } if active_flags.is_empty() => "active".to_string(),
+        ThreadStatus::Active { active_flags } => format!(
+            "active: {}",
+            active_flags
+                .iter()
+                .copied()
+                .map(thread_active_flag_label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn thread_active_flag_label(active_flag: ThreadActiveFlag) -> &'static str {
+    match active_flag {
+        ThreadActiveFlag::WaitingOnApproval => "waiting on approval",
+        ThreadActiveFlag::WaitingOnUserInput => "waiting on user input",
+        ThreadActiveFlag::BackgroundTerminalRunning => "background terminal running",
+        ThreadActiveFlag::WorkspaceChanged => "workspace changed",
+    }
+}
+
 fn print_help(output: &Output) {
     for line in help_lines() {
         let _ = output.client_line(line);
@@ -410,9 +447,9 @@ fn help_lines() -> &'static [&'static str] {
         "  :help                 show this help",
         "  :new                  start a new thread",
         "  :resume <thread-id>   resume or reconnect to a thread",
-        "  :use <thread-id>      switch active thread without resuming/reconnecting",
-        "  :refresh-thread [cursor] list threads with mode/action across interactive and non-interactive sources",
-        "  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources",
+        "  :use <thread-id>      switch active thread without resuming/reconnecting; preserve known mode/status when available",
+        "  :refresh-thread [cursor] list threads with mode/status/action across interactive and non-interactive sources",
+        "  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources; use :refresh-thread or :resume for mode/status/action",
         "  :quit                 exit",
         "type a message to send it as a new turn",
     ]
@@ -431,9 +468,12 @@ mod tests {
     use super::thread_mode_label;
     use super::thread_ready_label;
     use super::thread_resume_label;
+    use super::thread_status_label;
     use crate::state::KnownThread;
     use clap::CommandFactory;
+    use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadStatus;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -475,12 +515,28 @@ mod tests {
     #[test]
     fn active_thread_switch_message_uses_thread_mode_when_known() {
         assert_eq!(
-            active_thread_switch_message("thread-1", Some(ThreadMode::Interactive)),
-            "switched active thread to thread thread-1"
+            active_thread_switch_message(
+                "thread-1",
+                Some(&KnownThread {
+                    thread_id: "thread-1".to_string(),
+                    thread_mode: ThreadMode::Interactive,
+                    thread_status: ThreadStatus::Idle,
+                })
+            ),
+            "switched active thread to thread thread-1 (idle)"
         );
         assert_eq!(
-            active_thread_switch_message("thread-1", Some(ThreadMode::ResidentAssistant)),
-            "switched active thread to resident assistant thread thread-1"
+            active_thread_switch_message(
+                "thread-1",
+                Some(&KnownThread {
+                    thread_id: "thread-1".to_string(),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Active {
+                        active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                    },
+                })
+            ),
+            "switched active thread to resident assistant thread thread-1 (active: workspace changed)"
         );
         assert_eq!(
             active_thread_switch_message("thread-1", None),
@@ -497,11 +553,26 @@ mod tests {
     }
 
     #[test]
-    fn thread_list_labels_include_mode_and_action() {
+    fn thread_list_labels_include_mode_status_and_action() {
         assert_eq!(thread_mode_label(ThreadMode::Interactive), "interactive");
         assert_eq!(
             thread_mode_label(ThreadMode::ResidentAssistant),
             "resident assistant"
+        );
+        assert_eq!(thread_status_label(&ThreadStatus::Idle), "idle");
+        assert_eq!(thread_status_label(&ThreadStatus::NotLoaded), "not loaded");
+        assert_eq!(
+            thread_status_label(&ThreadStatus::SystemError),
+            "system error"
+        );
+        assert_eq!(
+            thread_status_label(&ThreadStatus::Active {
+                active_flags: vec![
+                    ThreadActiveFlag::WaitingOnApproval,
+                    ThreadActiveFlag::WorkspaceChanged,
+                ],
+            }),
+            "active: waiting on approval, workspace changed"
         );
         assert_eq!(thread_resume_label(ThreadMode::Interactive), "resume");
         assert_eq!(
@@ -514,15 +585,15 @@ mod tests {
     fn help_text_mentions_mode_aware_thread_commands() {
         let lines = help_lines();
         assert!(lines.contains(
-            &"  :use <thread-id>      switch active thread without resuming/reconnecting"
+            &"  :use <thread-id>      switch active thread without resuming/reconnecting; preserve known mode/status when available"
         ));
         assert!(
             lines.contains(
-                &"  :refresh-thread [cursor] list threads with mode/action across interactive and non-interactive sources"
+                &"  :refresh-thread [cursor] list threads with mode/status/action across interactive and non-interactive sources"
             )
         );
         assert!(lines.contains(
-            &"  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources"
+            &"  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources; use :refresh-thread or :resume for mode/status/action"
         ));
     }
 
@@ -535,16 +606,20 @@ mod tests {
     }
 
     #[test]
-    fn thread_list_lines_render_mode_and_action_labels() {
+    fn thread_list_lines_render_mode_status_and_action_labels() {
         let lines = thread_list_lines(
             &[
                 KnownThread {
                     thread_id: "thread-1".to_string(),
                     thread_mode: ThreadMode::Interactive,
+                    thread_status: ThreadStatus::Idle,
                 },
                 KnownThread {
                     thread_id: "thread-2".to_string(),
                     thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Active {
+                        active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                    },
                 },
             ],
             Some("cursor-2"),
@@ -554,8 +629,8 @@ mod tests {
             lines,
             vec![
                 "threads:".to_string(),
-                "  thread-1 (interactive, resume)".to_string(),
-                "  thread-2 (resident assistant, reconnect)".to_string(),
+                "  thread-1 (interactive, idle, resume)".to_string(),
+                "  thread-2 (resident assistant, active: workspace changed, reconnect)".to_string(),
                 "more threads available, next cursor: cursor-2".to_string(),
             ]
         );

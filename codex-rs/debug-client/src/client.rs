@@ -34,6 +34,7 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
 use serde::Serialize;
@@ -138,8 +139,9 @@ impl AppServerClient {
             serde_json::from_value(response.result).context("decode thread/start response")?;
         let thread_id = parsed.thread.id;
         let thread_mode = parsed.thread.mode;
+        let thread_status = parsed.thread.status;
         self.set_thread_id(thread_id.clone());
-        self.remember_thread(thread_id.clone(), thread_mode);
+        self.remember_thread(thread_id.clone(), thread_mode, thread_status);
         Ok(ThreadConnection {
             thread_id,
             thread_mode,
@@ -158,8 +160,9 @@ impl AppServerClient {
             serde_json::from_value(response.result).context("decode thread/resume response")?;
         let thread_id = parsed.thread.id;
         let thread_mode = parsed.thread.mode;
+        let thread_status = parsed.thread.status;
         self.set_thread_id(thread_id.clone());
-        self.remember_thread(thread_id.clone(), thread_mode);
+        self.remember_thread(thread_id.clone(), thread_mode, thread_status);
         Ok(ThreadConnection {
             thread_id,
             thread_mode,
@@ -272,15 +275,15 @@ impl AppServerClient {
         state.thread_id = Some(thread_id);
     }
 
-    pub fn use_thread(&self, thread_id: String) -> Option<ThreadMode> {
+    pub fn use_thread(&self, thread_id: String) -> Option<KnownThread> {
         let mut state = self.state.lock().expect("state lock poisoned");
-        let known_mode = state
+        let known_thread = state
             .known_threads
             .iter()
             .find(|thread| thread.thread_id == thread_id)
-            .map(|thread| thread.thread_mode);
+            .cloned();
         state.thread_id = Some(thread_id);
-        known_mode
+        known_thread
     }
 
     pub fn shutdown(&mut self) {
@@ -295,7 +298,12 @@ impl AppServerClient {
         state.pending.insert(request_id, kind);
     }
 
-    fn remember_thread(&self, thread_id: String, thread_mode: ThreadMode) {
+    fn remember_thread(
+        &self,
+        thread_id: String,
+        thread_mode: ThreadMode,
+        thread_status: ThreadStatus,
+    ) {
         let mut state = self.state.lock().expect("state lock poisoned");
         if let Some(existing) = state
             .known_threads
@@ -303,10 +311,12 @@ impl AppServerClient {
             .find(|thread| thread.thread_id == thread_id)
         {
             existing.thread_mode = thread_mode;
+            existing.thread_status = thread_status;
         } else {
             state.known_threads.push(KnownThread {
                 thread_id,
                 thread_mode,
+                thread_status,
             });
         }
     }
@@ -475,9 +485,44 @@ pub fn build_thread_resume_params(
 
 #[cfg(test)]
 mod tests {
+    use super::AppServerClient;
     use super::all_thread_source_kinds;
+    use crate::output::Output;
+    use crate::state::KnownThread;
+    use crate::state::State;
     use codex_app_server_protocol::ThreadSourceKind;
+    use codex_app_server_protocol::ThreadStatus;
     use pretty_assertions::assert_eq;
+    use std::process::Command;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicI64;
+
+    fn client_with_known_threads(known_threads: Vec<KnownThread>) -> AppServerClient {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat should spawn for debug-client state test");
+
+        let stdin = child.stdin.take().expect("stdin should be piped");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+
+        AppServerClient {
+            child,
+            stdin: Arc::new(Mutex::new(Some(stdin))),
+            stdout: Some(std::io::BufReader::new(stdout)),
+            next_request_id: AtomicI64::new(1),
+            state: Arc::new(Mutex::new(State {
+                pending: Default::default(),
+                thread_id: None,
+                known_threads,
+            })),
+            output: Output::new(),
+            filtered_output: false,
+        }
+    }
 
     #[test]
     fn all_thread_source_kinds_covers_interactive_and_non_interactive_sources() {
@@ -496,5 +541,22 @@ mod tests {
                 ThreadSourceKind::Unknown,
             ]
         );
+    }
+
+    #[test]
+    fn use_thread_returns_cached_mode_and_status_when_known() {
+        let known_thread = KnownThread {
+            thread_id: "thread-1".to_string(),
+            thread_mode: codex_app_server_protocol::ThreadMode::ResidentAssistant,
+            thread_status: ThreadStatus::Active {
+                active_flags: vec![codex_app_server_protocol::ThreadActiveFlag::WorkspaceChanged],
+            },
+        };
+        let mut client = client_with_known_threads(vec![known_thread.clone()]);
+
+        let selected = client.use_thread("thread-1".to_string());
+
+        assert_eq!(selected, Some(known_thread));
+        client.shutdown();
     }
 }

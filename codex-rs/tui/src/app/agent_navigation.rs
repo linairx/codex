@@ -388,4 +388,22 @@ mod tests {
             Some("Main [default]".to_string())
         );
     }
+
+    #[test]
+    fn active_agent_label_includes_system_error_before_active_flags() {
+        let (mut state, main_thread_id, first_agent_id, _) = populated_state();
+        state.upsert(
+            first_agent_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            /*is_closed*/ false,
+            vec![codex_app_server_protocol::ThreadActiveFlag::WorkspaceChanged],
+            /*has_system_error*/ true,
+        );
+
+        assert_eq!(
+            state.active_agent_label(Some(first_agent_id), Some(main_thread_id)),
+            Some("Robie [explorer] [error] [changed]".to_string())
+        );
+    }
 }

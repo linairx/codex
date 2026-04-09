@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadMode;
+use codex_app_server_protocol::ThreadStatus;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnownThread {
     pub thread_id: String,
     pub thread_mode: ThreadMode,
+    pub thread_status: ThreadStatus,
 }
 
 #[derive(Debug, Default)]

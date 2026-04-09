@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
@@ -254,6 +255,9 @@ enum CliCommand {
     #[command(name = "model-list")]
     ModelList,
     /// List stored threads from the Codex app-server across interactive and non-interactive sources.
+    ///
+    /// Prints a compact per-thread summary including `thread.mode`, `status`, and the
+    /// derived `resume`/`reconnect` action label.
     #[command(name = "thread-list")]
     ThreadList {
         /// Opaque pagination cursor returned by a previous `thread-list` call.
@@ -264,6 +268,9 @@ enum CliCommand {
         limit: u32,
     },
     /// Read a stored thread summary by id.
+    ///
+    /// Prints a compact per-thread summary including `thread.mode`, `status`, and the
+    /// derived `resume`/`reconnect` action label.
     #[command(name = "thread-read")]
     ThreadRead {
         /// Existing thread id to read.
@@ -273,6 +280,9 @@ enum CliCommand {
         include_turns: bool,
     },
     /// Fork a stored thread into a new thread.
+    ///
+    /// Prints a compact per-thread summary including `thread.mode`, `status`, and the
+    /// derived `resume`/`reconnect` action label.
     #[command(name = "thread-fork")]
     ThreadFork {
         /// Existing thread id to fork from.
@@ -285,6 +295,9 @@ enum CliCommand {
         ephemeral: bool,
     },
     /// Read loaded thread summaries currently resident in memory across interactive and non-interactive sources.
+    ///
+    /// Prints a compact per-thread summary including `thread.mode`, `status`, and the
+    /// derived `resume`/`reconnect` action label.
     #[command(name = "thread-loaded-read")]
     ThreadLoadedRead {
         /// Opaque pagination cursor returned by a previous `thread-loaded-read` call.
@@ -296,8 +309,8 @@ enum CliCommand {
     },
     /// List loaded thread ids currently resident in memory across interactive and non-interactive sources.
     ///
-    /// This is an id-only probe; use `thread-loaded-read` when you need `thread.mode`
-    /// or status for reconnect-aware consumers.
+    /// This is an id-only probe; use `thread-loaded-read` when you need resident
+    /// `thread.mode`, status, or reconnect semantics.
     #[command(name = "thread-loaded-list")]
     ThreadLoadedList {
         /// Opaque pagination cursor returned by a previous `thread-loaded-list` call.
@@ -323,12 +336,18 @@ enum CliCommand {
         origin_url: Option<String>,
     },
     /// Restore an archived thread into the active session directory.
+    ///
+    /// Prints a compact per-thread summary including `thread.mode`, `status`, and the
+    /// derived `resume`/`reconnect` action label.
     #[command(name = "thread-unarchive")]
     ThreadUnarchive {
         /// Archived thread id to restore.
         thread_id: String,
     },
     /// Roll back the last N turns of a stored thread.
+    ///
+    /// Prints a compact per-thread summary including `thread.mode`, `status`, and the
+    /// derived `resume`/`reconnect` action label.
     #[command(name = "thread-rollback")]
     ThreadRollback {
         /// Existing thread id to roll back.
@@ -1619,6 +1638,45 @@ fn thread_resume_action_label(mode: ThreadMode) -> &'static str {
     }
 }
 
+fn thread_status_changed_summary_line(
+    thread_id: &str,
+    status: &codex_app_server_protocol::ThreadStatus,
+    known_thread: Option<&KnownThreadSummary>,
+) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, mode={}, resident={}, status={status:?}, action={}",
+            thread_mode_label(thread.mode),
+            thread.resident,
+            thread_resume_action_label(thread.mode)
+        ),
+        None => format!("id={thread_id}, status={status:?}"),
+    }
+}
+
+fn thread_started_notification_lines(
+    thread: &AppServerThread,
+    include_raw_debug: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if include_raw_debug {
+        lines.push(format!("< thread/started notification: {thread:?}"));
+    }
+    lines.push(thread_response_summary_line("thread/started", thread));
+    lines
+}
+
+fn thread_status_changed_notification_lines(
+    thread_id: &str,
+    status: &codex_app_server_protocol::ThreadStatus,
+    known_thread: Option<&KnownThreadSummary>,
+) -> Vec<String> {
+    vec![format!(
+        "< thread/status/changed summary: {}",
+        thread_status_changed_summary_line(thread_id, status, known_thread)
+    )]
+}
+
 fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
     vec![
         ThreadSourceKind::Cli,
@@ -1639,12 +1697,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Cli;
+    use super::KnownThreadSummary;
     use super::all_thread_source_kinds;
     use super::thread_collection_summary_lines_with_cursor;
     use super::thread_id_collection_summary_lines_with_cursor;
     use super::thread_mode_label;
     use super::thread_response_summary_line;
     use super::thread_resume_action_label;
+    use super::thread_started_notification_lines;
+    use super::thread_status_changed_notification_lines;
+    use super::thread_status_changed_summary_line;
     use super::thread_summary_fields;
     use clap::CommandFactory;
     use codex_app_server_protocol::SessionSource;
@@ -1727,6 +1789,16 @@ mod tests {
 
     #[test]
     fn help_mentions_cursor_for_paginated_thread_commands() {
+        let thread_read_help = Cli::command()
+            .find_subcommand_mut("thread-read")
+            .expect("thread-read subcommand")
+            .render_long_help()
+            .to_string();
+        let thread_fork_help = Cli::command()
+            .find_subcommand_mut("thread-fork")
+            .expect("thread-fork subcommand")
+            .render_long_help()
+            .to_string();
         let thread_list_help = Cli::command()
             .find_subcommand_mut("thread-list")
             .expect("thread-list subcommand")
@@ -1742,11 +1814,36 @@ mod tests {
             .expect("thread-loaded-list subcommand")
             .render_long_help()
             .to_string();
+        let thread_unarchive_help = Cli::command()
+            .find_subcommand_mut("thread-unarchive")
+            .expect("thread-unarchive subcommand")
+            .render_long_help()
+            .to_string();
+        let thread_rollback_help = Cli::command()
+            .find_subcommand_mut("thread-rollback")
+            .expect("thread-rollback subcommand")
+            .render_long_help()
+            .to_string();
 
+        assert!(thread_read_help.contains(
+            "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
+        ));
+        assert!(thread_read_help.contains("derived"));
+        assert!(thread_read_help.contains("`resume`/`reconnect` action label"));
+        assert!(thread_fork_help.contains(
+            "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
+        ));
+        assert!(thread_fork_help.contains("derived"));
+        assert!(thread_fork_help.contains("`resume`/`reconnect` action label"));
         assert!(thread_list_help.contains("--cursor <CURSOR>"));
         assert!(thread_list_help.contains(
             "List stored threads from the Codex app-server across interactive and non-interactive sources"
         ));
+        assert!(thread_list_help.contains(
+            "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
+        ));
+        assert!(thread_list_help.contains("derived"));
+        assert!(thread_list_help.contains("`resume`/`reconnect` action label"));
         assert!(
             thread_list_help
                 .contains("Opaque pagination cursor returned by a previous `thread-list` call")
@@ -1755,6 +1852,11 @@ mod tests {
         assert!(thread_loaded_read_help.contains(
             "Read loaded thread summaries currently resident in memory across interactive and non-interactive"
         ));
+        assert!(thread_loaded_read_help.contains(
+            "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
+        ));
+        assert!(thread_loaded_read_help.contains("derived"));
+        assert!(thread_loaded_read_help.contains("`resume`/`reconnect` action label"));
         assert!(
             thread_loaded_read_help.contains(
                 "Opaque pagination cursor returned by a previous `thread-loaded-read` call"
@@ -1764,14 +1866,28 @@ mod tests {
         assert!(thread_loaded_list_help.contains(
             "List loaded thread ids currently resident in memory across interactive and non-interactive sources"
         ));
-        assert!(thread_loaded_list_help.contains(
-            "This is an id-only probe; use `thread-loaded-read` when you need `thread.mode`"
-        ));
+        assert!(
+            thread_loaded_list_help.contains(
+                "This is an id-only probe; use `thread-loaded-read` when you need resident"
+            )
+        );
+        assert!(thread_loaded_list_help.contains("`thread.mode`, status,"));
+        assert!(thread_loaded_list_help.contains("reconnect"));
         assert!(
             thread_loaded_list_help.contains(
                 "Opaque pagination cursor returned by a previous `thread-loaded-list` call"
             )
         );
+        assert!(thread_unarchive_help.contains(
+            "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
+        ));
+        assert!(thread_unarchive_help.contains("derived"));
+        assert!(thread_unarchive_help.contains("`resume`/`reconnect` action label"));
+        assert!(thread_rollback_help.contains(
+            "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
+        ));
+        assert!(thread_rollback_help.contains("derived"));
+        assert!(thread_rollback_help.contains("`resume`/`reconnect` action label"));
     }
 
     #[test]
@@ -2081,6 +2197,89 @@ mod tests {
             "id=thread-2, mode=interactive, resident=false, status=NotLoaded, action=resume"
         );
     }
+
+    #[test]
+    fn thread_status_changed_summary_line_uses_known_mode_and_action_when_available() {
+        let known_thread = KnownThreadSummary {
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::Idle,
+        };
+
+        assert_eq!(
+            thread_status_changed_summary_line(
+                "thread-1",
+                &ThreadStatus::SystemError,
+                Some(&known_thread),
+            ),
+            "id=thread-1, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_status_changed_summary_line_stays_status_only_for_unknown_threads() {
+        assert_eq!(
+            thread_status_changed_summary_line("thread-unknown", &ThreadStatus::SystemError, None),
+            "id=thread-unknown, status=SystemError"
+        );
+    }
+
+    #[test]
+    fn thread_started_notification_lines_include_raw_debug_when_requested() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        let lines =
+            thread_started_notification_lines(&resident_thread, /*include_raw_debug*/ true);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("< thread/started notification: Thread {"));
+        assert_eq!(
+            lines[1],
+            "< thread/started summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_started_notification_lines_can_emit_summary_only() {
+        let resident_thread = make_thread(
+            "thread-1",
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        );
+
+        assert_eq!(
+            thread_started_notification_lines(&resident_thread, /*include_raw_debug*/ false),
+            vec![String::from(
+                "< thread/started summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            )]
+        );
+    }
+
+    #[test]
+    fn thread_status_changed_notification_lines_wrap_summary_line() {
+        let known_thread = KnownThreadSummary {
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::Idle,
+        };
+
+        assert_eq!(
+            thread_status_changed_notification_lines(
+                "thread-1",
+                &ThreadStatus::SystemError,
+                Some(&known_thread),
+            ),
+            vec![String::from(
+                "< thread/status/changed summary: id=thread-1, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
+            )]
+        );
+    }
 }
 
 fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
@@ -2317,6 +2516,7 @@ enum ClientTransport {
 struct CodexClient {
     transport: ClientTransport,
     pending_notifications: VecDeque<JSONRPCNotification>,
+    known_threads: BTreeMap<String, KnownThreadSummary>,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
     command_approval_item_ids: Vec<String>,
@@ -2329,6 +2529,13 @@ struct CodexClient {
     unexpected_items_before_helper_done: Vec<ThreadItem>,
     last_turn_status: Option<TurnStatus>,
     last_turn_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct KnownThreadSummary {
+    mode: ThreadMode,
+    resident: bool,
+    status: codex_app_server_protocol::ThreadStatus,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2395,6 +2602,7 @@ impl CodexClient {
                 stdout: BufReader::new(stdout),
             },
             pending_notifications: VecDeque::new(),
+            known_threads: BTreeMap::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -2434,6 +2642,7 @@ impl CodexClient {
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
+            known_threads: BTreeMap::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -2456,6 +2665,149 @@ impl CodexClient {
             .contains("[elicitation-hold] done")
         {
             self.helper_done_seen = true;
+        }
+    }
+
+    fn remember_thread(&mut self, thread: &AppServerThread) {
+        self.known_threads.insert(
+            thread.id.clone(),
+            KnownThreadSummary {
+                mode: thread.mode,
+                resident: thread.resident,
+                status: thread.status.clone(),
+            },
+        );
+    }
+
+    fn remember_threads(&mut self, threads: &[AppServerThread]) {
+        for thread in threads {
+            self.remember_thread(thread);
+        }
+    }
+
+    fn print_stream_notification(
+        &mut self,
+        server_notification: ServerNotification,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> bool {
+        match server_notification {
+            ServerNotification::ThreadStarted(payload) => {
+                self.remember_thread(&payload.thread);
+                if thread_id.is_none_or(|id| payload.thread.id == id) {
+                    for line in thread_started_notification_lines(
+                        &payload.thread,
+                        /*include_raw_debug*/ thread_id.is_some(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                false
+            }
+            ServerNotification::ThreadStatusChanged(payload) => {
+                let known_thread = self
+                    .known_threads
+                    .get_mut(&payload.thread_id)
+                    .map(|thread| {
+                        thread.status = payload.status.clone();
+                        thread.clone()
+                    });
+                if thread_id.is_none_or(|id| payload.thread_id == id) {
+                    for line in thread_status_changed_notification_lines(
+                        &payload.thread_id,
+                        &payload.status,
+                        known_thread.as_ref(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                false
+            }
+            ServerNotification::TurnStarted(payload) => {
+                if turn_id.is_some_and(|id| payload.turn.id == id) {
+                    println!("< turn/started notification: {:?}", payload.turn.status);
+                }
+                false
+            }
+            ServerNotification::AgentMessageDelta(delta) => {
+                print!("{}", delta.delta);
+                std::io::stdout().flush().ok();
+                false
+            }
+            ServerNotification::CommandExecutionOutputDelta(delta) => {
+                self.note_helper_output(&delta.delta);
+                print!("{}", delta.delta);
+                std::io::stdout().flush().ok();
+                false
+            }
+            ServerNotification::TerminalInteraction(delta) => {
+                println!("[stdin sent: {}]", delta.stdin);
+                std::io::stdout().flush().ok();
+                false
+            }
+            ServerNotification::ItemStarted(payload) => {
+                if matches!(payload.item, ThreadItem::CommandExecution { .. }) {
+                    if self.command_item_started && !self.helper_done_seen {
+                        self.unexpected_items_before_helper_done
+                            .push(payload.item.clone());
+                    }
+                    self.command_item_started = true;
+                } else if item_started_before_helper_done_is_unexpected(
+                    &payload.item,
+                    self.command_item_started,
+                    self.helper_done_seen,
+                ) {
+                    self.unexpected_items_before_helper_done
+                        .push(payload.item.clone());
+                }
+                println!("\n< item started: {:?}", payload.item);
+                false
+            }
+            ServerNotification::ItemCompleted(payload) => {
+                if let ThreadItem::CommandExecution {
+                    status,
+                    aggregated_output,
+                    ..
+                } = payload.item.clone()
+                {
+                    self.command_execution_statuses.push(status);
+                    if let Some(aggregated_output) = aggregated_output {
+                        self.note_helper_output(&aggregated_output);
+                        self.command_execution_outputs.push(aggregated_output);
+                    }
+                }
+                println!("< item completed: {:?}", payload.item);
+                false
+            }
+            ServerNotification::TurnCompleted(payload) => {
+                if turn_id.is_some_and(|id| payload.turn.id == id) {
+                    self.last_turn_status = Some(payload.turn.status.clone());
+                    if self.command_item_started && !self.helper_done_seen {
+                        self.turn_completed_before_helper_done = true;
+                    }
+                    self.last_turn_error_message = payload
+                        .turn
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.clone());
+                    println!("\n< turn/completed notification: {:?}", payload.turn.status);
+                    if payload.turn.status == TurnStatus::Failed
+                        && let Some(error) = payload.turn.error
+                    {
+                        println!("[turn error] {}", error.message);
+                    }
+                    return true;
+                }
+                false
+            }
+            ServerNotification::McpToolCallProgress(payload) => {
+                println!("< MCP tool progress: {}", payload.message);
+                false
+            }
+            _ => {
+                println!("[UNKNOWN SERVER NOTIFICATION] {server_notification:?}");
+                false
+            }
         }
     }
 
@@ -2507,7 +2859,10 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/start")
+        let response: ThreadStartResponse =
+            self.send_request(request, request_id, "thread/start")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn thread_resume(&mut self, params: ThreadResumeParams) -> Result<ThreadResumeResponse> {
@@ -2517,7 +2872,10 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/resume")
+        let response: ThreadResumeResponse =
+            self.send_request(request, request_id, "thread/resume")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn thread_fork(&mut self, params: ThreadForkParams) -> Result<ThreadForkResponse> {
@@ -2527,7 +2885,9 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/fork")
+        let response: ThreadForkResponse = self.send_request(request, request_id, "thread/fork")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStartResponse> {
@@ -2587,7 +2947,9 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/list")
+        let response: ThreadListResponse = self.send_request(request, request_id, "thread/list")?;
+        self.remember_threads(&response.data);
+        Ok(response)
     }
 
     fn thread_read(&mut self, params: ThreadReadParams) -> Result<ThreadReadResponse> {
@@ -2597,7 +2959,9 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/read")
+        let response: ThreadReadResponse = self.send_request(request, request_id, "thread/read")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn thread_loaded_read(
@@ -2610,7 +2974,10 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/loaded/read")
+        let response: ThreadLoadedReadResponse =
+            self.send_request(request, request_id, "thread/loaded/read")?;
+        self.remember_threads(&response.data);
+        Ok(response)
     }
 
     fn thread_loaded_list(
@@ -2636,7 +3003,10 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/metadata/update")
+        let response: ThreadMetadataUpdateResponse =
+            self.send_request(request, request_id, "thread/metadata/update")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn thread_unarchive(
@@ -2649,7 +3019,10 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/unarchive")
+        let response: ThreadUnarchiveResponse =
+            self.send_request(request, request_id, "thread/unarchive")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn thread_rollback(&mut self, params: ThreadRollbackParams) -> Result<ThreadRollbackResponse> {
@@ -2659,7 +3032,10 @@ impl CodexClient {
             params,
         };
 
-        self.send_request(request, request_id, "thread/rollback")
+        let response: ThreadRollbackResponse =
+            self.send_request(request, request_id, "thread/rollback")?;
+        self.remember_thread(&response.thread);
+        Ok(response)
     }
 
     fn thread_increment_elicitation(
@@ -2724,89 +3100,8 @@ impl CodexClient {
                 continue;
             };
 
-            match server_notification {
-                ServerNotification::ThreadStarted(payload) => {
-                    if payload.thread.id == thread_id {
-                        println!("< thread/started notification: {:?}", payload.thread);
-                        print_thread_response_summary("thread/started", &payload.thread);
-                    }
-                }
-                ServerNotification::TurnStarted(payload) => {
-                    if payload.turn.id == turn_id {
-                        println!("< turn/started notification: {:?}", payload.turn.status);
-                    }
-                }
-                ServerNotification::AgentMessageDelta(delta) => {
-                    print!("{}", delta.delta);
-                    std::io::stdout().flush().ok();
-                }
-                ServerNotification::CommandExecutionOutputDelta(delta) => {
-                    self.note_helper_output(&delta.delta);
-                    print!("{}", delta.delta);
-                    std::io::stdout().flush().ok();
-                }
-                ServerNotification::TerminalInteraction(delta) => {
-                    println!("[stdin sent: {}]", delta.stdin);
-                    std::io::stdout().flush().ok();
-                }
-                ServerNotification::ItemStarted(payload) => {
-                    if matches!(payload.item, ThreadItem::CommandExecution { .. }) {
-                        if self.command_item_started && !self.helper_done_seen {
-                            self.unexpected_items_before_helper_done
-                                .push(payload.item.clone());
-                        }
-                        self.command_item_started = true;
-                    } else if item_started_before_helper_done_is_unexpected(
-                        &payload.item,
-                        self.command_item_started,
-                        self.helper_done_seen,
-                    ) {
-                        self.unexpected_items_before_helper_done
-                            .push(payload.item.clone());
-                    }
-                    println!("\n< item started: {:?}", payload.item);
-                }
-                ServerNotification::ItemCompleted(payload) => {
-                    if let ThreadItem::CommandExecution {
-                        status,
-                        aggregated_output,
-                        ..
-                    } = payload.item.clone()
-                    {
-                        self.command_execution_statuses.push(status);
-                        if let Some(aggregated_output) = aggregated_output {
-                            self.note_helper_output(&aggregated_output);
-                            self.command_execution_outputs.push(aggregated_output);
-                        }
-                    }
-                    println!("< item completed: {:?}", payload.item);
-                }
-                ServerNotification::TurnCompleted(payload) => {
-                    if payload.turn.id == turn_id {
-                        self.last_turn_status = Some(payload.turn.status.clone());
-                        if self.command_item_started && !self.helper_done_seen {
-                            self.turn_completed_before_helper_done = true;
-                        }
-                        self.last_turn_error_message = payload
-                            .turn
-                            .error
-                            .as_ref()
-                            .map(|error| error.message.clone());
-                        println!("\n< turn/completed notification: {:?}", payload.turn.status);
-                        if payload.turn.status == TurnStatus::Failed
-                            && let Some(error) = payload.turn.error
-                        {
-                            println!("[turn error] {}", error.message);
-                        }
-                        break;
-                    }
-                }
-                ServerNotification::McpToolCallProgress(payload) => {
-                    println!("< MCP tool progress: {}", payload.message);
-                }
-                _ => {
-                    println!("[UNKNOWN SERVER NOTIFICATION] {server_notification:?}");
-                }
+            if self.print_stream_notification(server_notification, Some(thread_id), Some(turn_id)) {
+                break;
             }
         }
 
@@ -2815,7 +3110,13 @@ impl CodexClient {
 
     fn stream_notifications_forever(&mut self) -> Result<()> {
         loop {
-            let _ = self.next_notification()?;
+            let notification = self.next_notification()?;
+
+            let Ok(server_notification) = ServerNotification::try_from(notification) else {
+                continue;
+            };
+
+            let _ = self.print_stream_notification(server_notification, None, None);
         }
     }
 

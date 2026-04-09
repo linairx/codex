@@ -1365,6 +1365,7 @@ supports_websockets = false
             .await
             .expect("resident thread/start should succeed");
         assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
 
         let read = client
             .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
@@ -1380,6 +1381,7 @@ supports_websockets = false
             .expect("thread/read should return the resident thread");
         assert_eq!(read.thread.id, response.thread.id);
         assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::Idle);
 
         client.shutdown().await.expect("shutdown should complete");
     }
@@ -1436,6 +1438,7 @@ supports_websockets = false
 
         assert_eq!(updated.thread.id, started.thread.id);
         assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(updated.thread.status, ThreadStatus::Idle);
         assert_eq!(
             updated.thread.git_info,
             Some(GitInfo {
@@ -1482,6 +1485,7 @@ supports_websockets = false
             .find(|thread| thread.id == started.thread.id)
             .expect("loaded thread list should include the started resident thread");
         assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(loaded_thread.status, ThreadStatus::Idle);
         assert!(loaded_thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
@@ -1530,6 +1534,7 @@ supports_websockets = false
 
         assert_eq!(first_page.data.len(), 1);
         assert_eq!(first_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(first_page.data[0].status, ThreadStatus::Idle);
         assert!(first_page.data[0].resident);
         let next_cursor = first_page
             .next_cursor
@@ -1552,6 +1557,7 @@ supports_websockets = false
 
         assert_eq!(second_page.data.len(), 1);
         assert_eq!(second_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(second_page.data[0].status, ThreadStatus::Idle);
         assert!(second_page.data[0].resident);
 
         let page_ids = [
@@ -1712,6 +1718,7 @@ supports_websockets = false
             .find(|thread| thread.id == started.thread.id)
             .expect("thread/list should include the started resident thread");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::Idle);
         assert!(listed_thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
@@ -1782,6 +1789,7 @@ supports_websockets = false
 
         assert_eq!(first_page.data.len(), 1);
         assert_eq!(first_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(first_page.data[0].status, ThreadStatus::Idle);
         assert!(first_page.data[0].resident);
         let next_cursor = first_page
             .next_cursor
@@ -1807,6 +1815,7 @@ supports_websockets = false
 
         assert_eq!(second_page.data.len(), 1);
         assert_eq!(second_page.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(second_page.data[0].status, ThreadStatus::Idle);
         assert!(second_page.data[0].resident);
 
         let page_ids = [
@@ -1919,6 +1928,7 @@ supports_websockets = false
 
         assert_eq!(unarchived.thread.id, started.thread.id);
         assert_eq!(unarchived.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(unarchived.thread.status, ThreadStatus::NotLoaded);
         assert!(unarchived.thread.resident);
 
         let read: ThreadReadResponse = client
@@ -1933,6 +1943,7 @@ supports_websockets = false
             .expect("thread/read after unarchive should succeed");
         assert_eq!(read.thread.id, started.thread.id);
         assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::NotLoaded);
         assert!(read.thread.resident);
 
         let listed_thread = timeout(Duration::from_secs(5), async {
@@ -1967,6 +1978,7 @@ supports_websockets = false
         .await
         .expect("thread/list should eventually include the unarchived resident thread");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
         assert!(listed_thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
@@ -2077,6 +2089,7 @@ supports_websockets = false
 
         assert_eq!(updated.thread.id, started.thread.id);
         assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(updated.thread.status, ThreadStatus::NotLoaded);
         assert_eq!(
             updated
                 .thread
@@ -2099,6 +2112,7 @@ supports_websockets = false
             .await
             .expect("thread/read should return the archived resident thread");
         assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::NotLoaded);
 
         let listed_thread = timeout(Duration::from_secs(5), async {
             loop {
@@ -2131,6 +2145,7 @@ supports_websockets = false
         .await
         .expect("thread/list archived=true should converge before timeout");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
         assert!(listed_thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
@@ -2238,6 +2253,7 @@ supports_websockets = false
             .expect("thread/read should return the archived resident thread");
         assert_eq!(read.thread.id, started.thread.id);
         assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::NotLoaded);
         assert!(read.thread.resident);
 
         let listed_thread = timeout(Duration::from_secs(5), async {
@@ -2271,6 +2287,7 @@ supports_websockets = false
         .await
         .expect("thread/list archived=true should converge before timeout");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
         assert!(listed_thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
@@ -2473,6 +2490,95 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn resident_thread_events_split_mode_and_status_across_started_and_changed() {
+        let mut client = start_test_client(SessionSource::Cli).await;
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "codex-app-server-client-events-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(35),
+                params: ThreadStartParams {
+                    resident: true,
+                    cwd: Some(workspace.display().to_string()),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let started_notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let InProcessServerEvent::ServerNotification(ServerNotification::ThreadStarted(
+                    notification,
+                )) = event
+                    && notification.thread.id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/started should arrive before timeout");
+        assert_eq!(
+            started_notification.thread.mode,
+            ThreadMode::ResidentAssistant
+        );
+        assert_eq!(started_notification.thread.status, ThreadStatus::Idle);
+
+        std::fs::write(workspace.join("watched.txt"), "changed")
+            .expect("workspace change should write");
+
+        let status_changed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let InProcessServerEvent::ServerNotification(
+                    ServerNotification::ThreadStatusChanged(notification),
+                ) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/status/changed should arrive before timeout");
+        assert_eq!(status_changed.thread_id, started.thread.id);
+        assert_eq!(
+            status_changed.status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            }
+        );
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn rollback_preserves_resident_thread_mode_through_typed_requests() {
         let server = responses::start_mock_server().await;
         let _response = responses::mount_sse_once(
@@ -2561,6 +2667,7 @@ supports_websockets = false
             .expect("thread/rollback should succeed");
         assert_eq!(rollback.thread.id, started.thread.id);
         assert_eq!(rollback.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(rollback.thread.status, ThreadStatus::Idle);
         assert!(rollback.thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");

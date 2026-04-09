@@ -96,11 +96,11 @@ pub fn start_reader(
                     }
                 }
                 JSONRPCMessage::Notification(notification) => {
-                    if filtered_output
-                        && let Err(err) = handle_filtered_notification(notification, &output)
+                    if let Err(err) =
+                        handle_notification(notification, &state, &output, filtered_output)
                     {
                         let _ =
-                            output.client_line(&format!("failed to filter notification: {err}"));
+                            output.client_line(&format!("failed to handle notification: {err}"));
                     }
                 }
                 _ => {}
@@ -164,6 +164,7 @@ fn handle_response(
                 .context("decode thread/start response")?;
             let thread_id = parsed.thread.id;
             let thread_mode = parsed.thread.mode;
+            let thread_status = parsed.thread.status;
             {
                 let mut state = state.lock().expect("state lock poisoned");
                 state.thread_id = Some(thread_id.clone());
@@ -173,10 +174,12 @@ fn handle_response(
                     .find(|thread| thread.thread_id == thread_id)
                 {
                     existing.thread_mode = thread_mode;
+                    existing.thread_status = thread_status;
                 } else {
                     state.known_threads.push(KnownThread {
                         thread_id: thread_id.clone(),
                         thread_mode,
+                        thread_status,
                     });
                 }
             }
@@ -192,6 +195,7 @@ fn handle_response(
                 .context("decode thread/resume response")?;
             let thread_id = parsed.thread.id;
             let thread_mode = parsed.thread.mode;
+            let thread_status = parsed.thread.status;
             {
                 let mut state = state.lock().expect("state lock poisoned");
                 state.thread_id = Some(thread_id.clone());
@@ -201,10 +205,12 @@ fn handle_response(
                     .find(|thread| thread.thread_id == thread_id)
                 {
                     existing.thread_mode = thread_mode;
+                    existing.thread_status = thread_status;
                 } else {
                     state.known_threads.push(KnownThread {
                         thread_id: thread_id.clone(),
                         thread_mode,
+                        thread_status,
                     });
                 }
             }
@@ -224,6 +230,7 @@ fn handle_response(
                 .map(|thread| KnownThread {
                     thread_id: thread.id,
                     thread_mode: thread.mode,
+                    thread_status: thread.status,
                 })
                 .collect();
             {
@@ -235,6 +242,7 @@ fn handle_response(
                         .find(|known| known.thread_id == thread.thread_id)
                     {
                         existing.thread_mode = thread.thread_mode;
+                        existing.thread_status = thread.thread_status.clone();
                     } else {
                         state.known_threads.push(thread.clone());
                     }
@@ -262,17 +270,48 @@ fn handle_response(
     Ok(())
 }
 
-fn handle_filtered_notification(
+fn handle_notification(
     notification: JSONRPCNotification,
+    state: &Arc<Mutex<State>>,
     output: &Output,
+    filtered_output: bool,
 ) -> anyhow::Result<()> {
     let Ok(server_notification) = ServerNotification::try_from(notification) else {
         return Ok(());
     };
 
-    match server_notification {
-        ServerNotification::ItemCompleted(payload) => {
-            emit_filtered_item(payload.item, &payload.thread_id, output)
+    match &server_notification {
+        ServerNotification::ThreadStarted(payload) => {
+            let mut state = state.lock().expect("state lock poisoned");
+            if let Some(existing) = state
+                .known_threads
+                .iter_mut()
+                .find(|thread| thread.thread_id == payload.thread.id)
+            {
+                existing.thread_mode = payload.thread.mode;
+                existing.thread_status = payload.thread.status.clone();
+            } else {
+                state.known_threads.push(KnownThread {
+                    thread_id: payload.thread.id.clone(),
+                    thread_mode: payload.thread.mode,
+                    thread_status: payload.thread.status.clone(),
+                });
+            }
+            Ok(())
+        }
+        ServerNotification::ThreadStatusChanged(payload) => {
+            let mut state = state.lock().expect("state lock poisoned");
+            if let Some(existing) = state
+                .known_threads
+                .iter_mut()
+                .find(|thread| thread.thread_id == payload.thread_id)
+            {
+                existing.thread_status = payload.status.clone();
+            }
+            Ok(())
+        }
+        ServerNotification::ItemCompleted(payload) if filtered_output => {
+            emit_filtered_item(payload.item.clone(), &payload.thread_id, output)
         }
         _ => Ok(()),
     }
@@ -394,19 +433,36 @@ fn send_response<T: Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use super::handle_notification;
     use super::handle_response;
+    use crate::output::Output;
     use crate::state::KnownThread;
     use crate::state::PendingRequest;
     use crate::state::ReaderEvent;
     use crate::state::State;
+    use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::RequestId;
+    use codex_app_server_protocol::SessionSource;
+    use codex_app_server_protocol::Thread;
+    use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadLoadedListResponse;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadStartedNotification;
+    use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::ThreadStatusChangedNotification;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::mpsc::channel;
+
+    fn notification<T: serde::Serialize>(method: &str, params: T) -> JSONRPCNotification {
+        JSONRPCNotification {
+            method: method.to_string(),
+            params: Some(serde_json::to_value(params).expect("notification params serialize")),
+        }
+    }
 
     #[test]
     fn loaded_list_response_does_not_update_known_thread_modes() {
@@ -420,6 +476,7 @@ mod tests {
             state.known_threads.push(KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::Idle,
             });
         }
         let (events_tx, events_rx) = channel();
@@ -444,6 +501,7 @@ mod tests {
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::Idle,
             }]
         );
         assert!(state.pending.is_empty());
@@ -458,5 +516,192 @@ mod tests {
             } if thread_ids == vec!["thread-known".to_string(), "thread-unknown".to_string()]
                 && next_cursor.as_deref() == Some("cursor-2")
         ));
+    }
+
+    #[test]
+    fn thread_list_response_updates_known_thread_statuses() {
+        let request_id = RequestId::Integer(8);
+        let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state
+                .pending
+                .insert(request_id.clone(), PendingRequest::List);
+            state.known_threads.push(KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::Idle,
+            });
+        }
+        let (events_tx, events_rx) = channel();
+
+        handle_response(
+            JSONRPCResponse {
+                id: request_id,
+                result: json!({
+                    "data": [{
+                        "id": "thread-known",
+                        "forkedFromId": null,
+                        "preview": "Resident thread",
+                        "ephemeral": false,
+                        "modelProvider": "openai",
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                        "status": { "type": "systemError" },
+                        "mode": "residentAssistant",
+                        "resident": true,
+                        "path": null,
+                        "cwd": "/tmp",
+                        "cliVersion": "0.0.0",
+                        "source": "cli",
+                        "agentNickname": null,
+                        "agentRole": null,
+                        "gitInfo": null,
+                        "name": null,
+                        "turns": []
+                    }],
+                    "nextCursor": "cursor-2"
+                }),
+            },
+            &state,
+            &events_tx,
+        )
+        .expect("thread list response should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::SystemError,
+            }]
+        );
+        assert!(state.pending.is_empty());
+        drop(state);
+
+        let event = events_rx.recv().expect("thread list event");
+        assert!(matches!(
+            event,
+            ReaderEvent::ThreadList {
+                threads,
+                next_cursor,
+            } if threads == vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::SystemError,
+            }] && next_cursor.as_deref() == Some("cursor-2")
+        ));
+    }
+
+    #[test]
+    fn thread_started_notification_adds_known_thread_with_mode_and_status() {
+        let state = Arc::new(Mutex::new(State::default()));
+
+        handle_notification(
+            notification(
+                "thread/started",
+                ThreadStartedNotification {
+                    thread: Thread {
+                        id: "thread-known".to_string(),
+                        forked_from_id: None,
+                        preview: "Resident thread".to_string(),
+                        ephemeral: false,
+                        model_provider: "openai".to_string(),
+                        created_at: 1,
+                        updated_at: 2,
+                        status: ThreadStatus::Active {
+                            active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                        },
+                        mode: ThreadMode::ResidentAssistant,
+                        resident: true,
+                        path: None,
+                        cwd: "/tmp".into(),
+                        cli_version: "0.0.0".to_string(),
+                        source: SessionSource::Cli,
+                        agent_nickname: None,
+                        agent_role: None,
+                        git_info: None,
+                        name: None,
+                        turns: Vec::new(),
+                    },
+                },
+            ),
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread started notification should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn thread_status_changed_notification_updates_known_thread_status() {
+        let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state.known_threads.push(KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::Idle,
+            });
+        }
+
+        handle_notification(
+            notification(
+                "thread/status/changed",
+                ThreadStatusChangedNotification {
+                    thread_id: "thread-known".to_string(),
+                    status: ThreadStatus::SystemError,
+                },
+            ),
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread status changed notification should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::SystemError,
+            }]
+        );
+    }
+
+    #[test]
+    fn thread_status_changed_notification_does_not_infer_unknown_thread_mode() {
+        let state = Arc::new(Mutex::new(State::default()));
+
+        handle_notification(
+            notification(
+                "thread/status/changed",
+                ThreadStatusChangedNotification {
+                    thread_id: "thread-unknown".to_string(),
+                    status: ThreadStatus::SystemError,
+                },
+            ),
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread status changed notification should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert!(state.known_threads.is_empty());
     }
 }

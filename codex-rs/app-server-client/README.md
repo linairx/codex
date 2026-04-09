@@ -80,8 +80,9 @@ mode for reconnectable assistants instead of dropping back to generic history,
 loaded-thread, detached-reader, or restore summaries.
 The same typed test layer now also locks down `thread/loaded/list` as the
 id-only loaded probe: typed callers must keep `next_cursor` continuity across
-pages without treating loaded ids as a substitute for `thread.mode`, and should
-continue with `thread/loaded/read` whenever reconnect semantics are needed.
+pages without treating loaded ids as a substitute for `thread.mode` or current
+status, and should continue with `thread/loaded/read` whenever reconnect
+semantics or live loaded-thread status are needed.
 That typed pagination surface is now locked down directly too: when
 `thread/list` or `thread/loaded/read` returns `next_cursor`, follow-up typed
 requests that continue from that cursor must still preserve resident
@@ -95,6 +96,13 @@ The same resident continuity is now locked down for `thread/rollback`: after a
 resident assistant completes a turn, the rollback response must preserve
 `thread.mode = residentAssistant` instead of reconstructing a generic
 interactive history summary from the rollout.
+The event stream is now locked down at the same boundary too: in-process
+`next_event()` consumers can rely on `thread/started` as the resident-aware
+snapshot that still carries `thread.mode`, while later
+`thread/status/changed` notifications continue to update only runtime
+`status`. Callers that need reconnect semantics across both events should
+therefore retain the previously observed `mode` instead of expecting the
+status-only increment to repeat it.
 
 ## Backpressure and shutdown
 

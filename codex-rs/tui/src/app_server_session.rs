@@ -1580,6 +1580,7 @@ mod tests {
             .await
             .expect("thread/read should succeed");
         assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(thread.status, ThreadStatus::NotLoaded);
 
         let listed = app_server
             .thread_list(ThreadListParams {
@@ -1600,6 +1601,7 @@ mod tests {
             .find(|thread| thread.id == thread_id.to_string())
             .expect("thread/list should include stored thread");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
 
         app_server
             .shutdown()
@@ -1665,6 +1667,7 @@ mod tests {
             .await
             .expect("thread/read should succeed");
         assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(thread.status, ThreadStatus::NotLoaded);
 
         let listed = app_server
             .thread_list(ThreadListParams {
@@ -1685,6 +1688,7 @@ mod tests {
             .find(|thread| thread.id == thread_id.to_string())
             .expect("thread/list archived=true should include stored thread");
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
 
         app_server
             .shutdown()
@@ -1713,6 +1717,7 @@ mod tests {
             .await
             .expect("resident thread/start should succeed");
         assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
 
         let loaded = app_server
             .thread_loaded_read(ThreadLoadedReadParams {
@@ -1730,6 +1735,7 @@ mod tests {
             .find(|thread| thread.id == response.thread.id)
             .expect("thread/loaded/read should include resident thread");
         assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(loaded_thread.status, ThreadStatus::Idle);
 
         app_server
             .shutdown()
@@ -1872,6 +1878,7 @@ mod tests {
         let thread_id = ThreadId::from_string(&response.thread.id)
             .expect("thread/start should return thread id");
         assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
         let rollout_path = response
             .thread
             .path
