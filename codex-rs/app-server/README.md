@@ -875,7 +875,7 @@ All filesystem paths in this section must be absolute.
 
 ## Events
 
-Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume/reconnect a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications. When a lifecycle notification includes a `thread` snapshot, clients should treat that snapshot's `thread.mode` the same way they would in a direct RPC response: it is the authoritative signal for reconnectable resident-assistant semantics.
+Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume/reconnect a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications. When a lifecycle notification includes a `thread` snapshot, clients should treat that snapshot's `thread.mode` the same way they would in a direct RPC response: it is the authoritative signal for reconnectable resident assistant semantics.
 
 Thread realtime uses a separate thread-scoped notification surface. `thread/realtime/*` notifications are ephemeral transport events, not `ThreadItem`s, and are not returned by `thread/read`, `thread/resume`, or `thread/fork`.
 

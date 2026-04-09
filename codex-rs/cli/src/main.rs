@@ -1596,6 +1596,47 @@ mod tests {
         assert!(help.contains("picker by default"));
     }
 
+    #[test]
+    fn resume_subcommand_help_mentions_reconnect_and_non_interactive_listing() {
+        let help = MultitoolCli::command()
+            .find_subcommand_mut("resume")
+            .expect("resume subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("Resume or reconnect to the most recent recorded session"));
+        assert!(help.contains("--include-non-interactive"));
+        assert!(help.contains("Include non-interactive sessions in the resume/reconnect picker"));
+    }
+
+    #[test]
+    fn exec_resume_subcommand_help_mentions_reconnect_and_last() {
+        let help = MultitoolCli::command()
+            .find_subcommand_mut("exec")
+            .expect("exec subcommand")
+            .find_subcommand_mut("resume")
+            .expect("exec resume subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("Resume or reconnect to a previous session by id"));
+        assert!(help.contains("Resume or reconnect to the most recent recorded session"));
+        assert!(help.contains("--last"));
+    }
+
+    #[test]
+    fn exec_help_mentions_reconnect_summary_for_resume() {
+        let help = MultitoolCli::command()
+            .find_subcommand_mut("exec")
+            .expect("exec subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("resume"));
+        assert!(help.contains("Resume or reconnect to a previous session by id"));
+        assert!(help.contains("pick the most recent with --last"));
+    }
+
     fn app_server_from_args(args: &[&str]) -> AppServerCommand {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let Subcommand::AppServer(app_server) = cli.subcommand.expect("app-server present") else {

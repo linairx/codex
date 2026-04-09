@@ -44,7 +44,7 @@ pub struct ThreadStartedEvent {
     /// depending on `thread_mode`.
     pub thread_id: String,
     /// Product-facing thread mode for downstream consumers that need to
-    /// distinguish ordinary interactive resume targets from resident-assistant
+    /// distinguish ordinary interactive resume targets from resident assistant
     /// reconnect targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_mode: Option<ThreadMode>,

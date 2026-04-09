@@ -55,14 +55,14 @@ Use `codex exec --ephemeral ...` to run without persisting session rollout files
 
 In the default human-readable mode, the bootstrap stderr summary includes
 `session mode` and `session action` so ordinary interactive resume flows show
-`resume` while resident-assistant reconnect flows show `reconnect`.
+`resume` while resident assistant reconnect flows show `reconnect`.
 
 For script consumers, `codex exec --json` emits a `thread.started` event first. That
 event includes the bootstrap `thread_id`, and when available also includes
 `thread_mode`; fresh starts emit `interactive`, while resident reconnect flows
 emit `residentAssistant`. When the mode is unknown, the field is omitted.
 Downstream consumers can use `thread_mode` to distinguish an ordinary
-interactive resume target from a resident-assistant reconnect target. In
+interactive resume target from a resident assistant reconnect target. In
 `--json` mode this bootstrap metadata is carried by JSON events, not by the
 human-readable stderr session summary.
 

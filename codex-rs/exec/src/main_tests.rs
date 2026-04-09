@@ -1,4 +1,5 @@
 use super::*;
+use clap::CommandFactory;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -34,4 +35,13 @@ fn top_cli_parses_resume_prompt_after_config_flag() {
         cli.config_overrides.raw_overrides[0],
         "reasoning_level=xhigh"
     );
+}
+
+#[test]
+fn top_cli_help_mentions_reconnect_summary_for_resume() {
+    let help = TopCli::command().render_long_help().to_string();
+
+    assert!(help.contains("resume"));
+    assert!(help.contains("Resume or reconnect to a previous session by id"));
+    assert!(help.contains("pick the most recent with --last"));
 }

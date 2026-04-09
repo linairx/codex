@@ -1164,6 +1164,15 @@ SQLite 在这里不是起点，而是收敛点。
 - `debug-client` 的内置 `:help` 现在也已继续跟上同一边界：`:refresh-thread` 会明确提示它跨 interactive + non-interactive 来源列出带 mode/action 的线程摘要，而 `:refresh-loaded` 会明确提示它只是跨这两类来源的 loaded thread id-only probe，避免 README 已经收口后，交互内置帮助仍把这两条命令写成泛化列表入口
 - `app-server-test-client` 的默认分页列表过滤现在也已补上同类修正：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 不再依赖 app-server 的缺省 interactive-only `source_kinds` 语义，而会显式传完整 `ThreadSourceKind` 列表，并通过 README / 单测把“联调客户端默认看全量 interactive + non-interactive 线程来源”这层行为写死，避免手工验证 resident non-interactive 线程时被默认过滤误导
 - `app-server-test-client` 的 clap 子命令帮助现在也已继续补齐同一口径：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 的 `--help` 会直接写出它们默认覆盖 interactive + non-interactive 来源，而 `thread-loaded-list` 还会明确提示自己只是 id-only probe、需要 reconnect 语义时应继续读 `thread-loaded-read`，避免 README 已更新但联调入口帮助仍停在泛化列表说明
+- 顶层 `codex resume --help` 现在也已补上单独回归：最外层子命令帮助会稳定保留 `resume or reconnect` 和 `--include-non-interactive` 的说明，避免这条最靠前的用户入口只在结构体注释或总 help 里对齐 resident 语义，却在子命令 help 自己的回归层重新失守
+- `codex-exec resume --help` 现在也已补上对称回归：`exec` 子命令自己的帮助会稳定保留 `resume or reconnect` 与 `--last` 的 resident-aware 说明，避免这层入口只靠总 help 或结构体注释兜底
+- 多工具包装层 `codex exec resume --help` 现在也已补上同类回归：顶层 `codex` 内嵌的 `exec resume` 子命令帮助会稳定保留 `resume or reconnect` 与 `--last` 的说明，避免只锁住独立 `codex-exec` 二进制后，主入口包装层的 clap 帮助在后续重构里悄悄退回旧语义
+- 多工具包装层 `codex exec --help` 现在也已补上更上层摘要回归：这层帮助里 `resume` 子命令的摘要会稳定保留 `resume or reconnect` 与 `--last` 提示，避免只覆盖最里层 `exec resume --help` 后，外层命令列表里的用户可见简介重新漂移
+- `codex-exec` 自己的最外层 `TopCli --help` 现在也已补上对称摘要回归：这层包装 CLI 里的 `resume` 子命令简介会稳定保留 `resume or reconnect` 与 `--last` 提示，避免只锁住 `codex-exec` 内层 `Cli::command()` 后，真正的二进制根入口帮助再次漂移
+- `codex-exec` 的公开 JSON event 注释与顶层 `codex-rs/README.md` 现在也已继续统一术语：对外说明不再混用带连字符的 `resident-assistant` 变体，而会稳定写成 `resident assistant reconnect target`，减少脚本消费说明、README 和事件类型注释之间的措辞漂移
+- `app-server/README.md` 的事件通知总览现在也已补上同一术语收口：`thread.mode` 的 reconnect 语义说明不再写成 `resident-assistant semantics`，而与其他 README / 注释统一成 `resident assistant semantics`
+- `codex-exec` 的 bootstrap stderr 摘要也已在真实进程级回归里继续锁住：`exec/tests/suite/resume.rs` 不只检查 help 文案，而会直接断言 human-readable 模式下 interactive 路径输出 `session mode: interactive` / `session action: resume`，resident 路径输出 `session mode: resident assistant` / `session action: reconnect`，同时 `--json` 模式不会泄露这层 human summary
+- 顶层 `codex` 的退出提示现在也已继续对齐 resident reconnect 语义：`format_exit_messages(...)` 在 thread mode 为 `ResidentAssistant` 时会稳定输出 `"To reconnect to this resident assistant, run codex resume ..."`，而普通 interactive thread 仍保持 `"To continue this session"`，避免主入口在最终收口提示上重新退回泛化 continue 文案
 
 这说明前面这条文档链已经基本完成当前轮次的收口：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 

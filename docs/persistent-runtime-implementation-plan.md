@@ -438,6 +438,15 @@
 - `docs/sqlite-state-convergence.md` 也已同步刷新成“已落地边界 + 后续阶段”的状态文档，开始明确记录 `threads.mode` 和 resident metadata repair 这批已经进入 SQLite 主干路径的最小闭环
 - `debug-client` 的内置 `:help` 也已继续补齐 source-filter 与 loaded-probe 边界：`:refresh-thread` 现在会直接提示它跨 interactive + non-interactive 来源列出带 mode/action 的线程摘要，而 `:refresh-loaded` 会直接提示它只是跨这些来源的 loaded thread id-only probe，避免 README 和请求实现已经 resident-aware，但交互内置帮助仍退回泛化列表文案
 - `app-server-test-client` 的 clap 子命令帮助也已继续对齐到同一消费边界：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 的 `--help` 现在会直接写出默认覆盖 interactive + non-interactive 来源，而 `thread-loaded-list` 还会明确声明自己只是 id-only probe、需要 resident `mode` 时应继续读 `thread-loaded-read`
+- 顶层 `codex resume --help` 也已补上单独回归：子命令帮助现在会稳定保留 `resume or reconnect` 与 `--include-non-interactive` 的说明，避免最外层用户入口只在内部字段注释或总 help 里对齐 resident reconnect 语义
+- `codex-exec resume --help` 也已补上对称回归：`exec` 子命令自己的帮助现在会稳定保留 `resume or reconnect` 与 `--last` 的说明，避免这层入口只靠总 help 或注释层间接约束 resident-aware 语义
+- 多工具包装层 `codex exec resume --help` 也已补上对称回归：顶层 `codex` 内嵌的 `exec resume` 子命令帮助现在同样会稳定保留 `resume or reconnect` 与 `--last` 的说明，避免只覆盖独立 `codex-exec` 二进制后，主入口包装层的 clap 文案重新漂移
+- 多工具包装层 `codex exec --help` 也已补上更上层摘要回归：这层帮助里的 `resume` 子命令简介现在同样会稳定保留 `resume or reconnect` 与 `--last` 提示，避免只锁住最里层子命令帮助后，外层命令列表简介再次回退
+- `codex-exec` 自己的最外层 `TopCli --help` 也已补上同类摘要回归：真正的二进制根入口帮助里的 `resume` 子命令简介现在同样会稳定保留 `resume or reconnect` 与 `--last` 提示，避免只覆盖内层 `Cli::command()` 后，包装层 help 再次漂移
+- `codex-exec` 的公开 JSON event 注释与顶层 `codex-rs/README.md` 也已继续统一术语：对外说明不再混用带连字符的 `resident-assistant` 变体，而会稳定写成 `resident assistant reconnect target`
+- `app-server/README.md` 的事件通知总览也已继续统一术语：`thread.mode` 的 reconnect 语义说明不再混用 `resident-assistant semantics`，而改成 `resident assistant semantics`
+- `codex-exec` 的 bootstrap stderr 摘要也已继续由真实进程级回归覆盖：human-readable 模式会直接断言 interactive 路径输出 `session mode/action = interactive + resume`、resident 路径输出 `resident assistant + reconnect`，而 `--json` 模式不会混出这层 human summary
+- 顶层 `codex` 的最终退出提示也已继续锁住 resident-aware 行为：普通 interactive thread 仍显示 “continue this session”，而 resident assistant thread 会稳定切成 “reconnect to this resident assistant”
 - 相关最小行为闭环已可由 `codex-state`、`codex-rollout`、`codex-app-server` 的定向测试覆盖
 - 仍需保持边界，只把稳定元数据和派生摘要入库，不把 loaded 状态、watcher、连接关系一类瞬时运行态塞进 SQLite
 

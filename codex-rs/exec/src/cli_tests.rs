@@ -62,3 +62,16 @@ fn resume_help_mentions_reconnect() {
     assert!(help.contains("Resume or reconnect to a previous session by id"));
     assert!(help.contains("pick the most recent with --last"));
 }
+
+#[test]
+fn resume_subcommand_help_mentions_reconnect_and_last() {
+    let help = Cli::command()
+        .find_subcommand_mut("resume")
+        .expect("resume subcommand")
+        .render_long_help()
+        .to_string();
+
+    assert!(help.contains("Resume or reconnect to a previous session by id"));
+    assert!(help.contains("Resume or reconnect to the most recent recorded session"));
+    assert!(help.contains("--last"));
+}
