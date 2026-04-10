@@ -8,6 +8,8 @@ use crate::app_server_session::AppServerSession;
 use crate::diff_render::display_path_for;
 use crate::key_hint;
 use crate::text_formatting::truncate_text;
+use crate::thread_source_kinds::all_thread_source_kinds;
+use crate::thread_source_kinds::interactive_thread_source_kinds;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
@@ -18,7 +20,6 @@ use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStatus;
 use codex_core::Cursor;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
@@ -73,7 +74,7 @@ pub enum SessionSelection {
     Exit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPickerAction {
     Resume,
     Fork,
@@ -122,6 +123,7 @@ struct PageLoadRequest {
     search_token: Option<usize>,
     provider_filter: ProviderFilter,
     sort_key: ThreadSortKey,
+    include_non_interactive: bool,
 }
 
 #[derive(Clone)]
@@ -199,7 +201,9 @@ pub async fn run_resume_picker_with_app_server(
         show_all,
         SessionPickerAction::Resume,
         is_remote,
-        spawn_app_server_page_loader(app_server, cwd_filter, include_non_interactive, bg_tx),
+        /*supports_non_interactive_toggle*/ true,
+        include_non_interactive,
+        spawn_app_server_page_loader(app_server, cwd_filter, bg_tx),
         bg_rx,
     )
     .await
@@ -224,9 +228,9 @@ pub async fn run_fork_picker_with_app_server(
         show_all,
         SessionPickerAction::Fork,
         is_remote,
-        spawn_app_server_page_loader(
-            app_server, cwd_filter, /*include_non_interactive*/ false, bg_tx,
-        ),
+        /*supports_non_interactive_toggle*/ false,
+        /*initial_include_non_interactive*/ false,
+        spawn_app_server_page_loader(app_server, cwd_filter, bg_tx),
         bg_rx,
     )
     .await
@@ -246,6 +250,8 @@ async fn run_session_picker(
         show_all,
         action,
         /*is_remote*/ false,
+        /*supports_non_interactive_toggle*/ false,
+        /*initial_include_non_interactive*/ false,
         spawn_rollout_page_loader(config, bg_tx),
         bg_rx,
     )
@@ -258,6 +264,8 @@ async fn run_session_picker_with_loader(
     show_all: bool,
     action: SessionPickerAction,
     is_remote: bool,
+    supports_non_interactive_toggle: bool,
+    initial_include_non_interactive: bool,
     page_loader: PageLoader,
     bg_rx: mpsc::UnboundedReceiver<BackgroundEvent>,
 ) -> Result<SessionSelection> {
@@ -286,6 +294,9 @@ async fn run_session_picker_with_loader(
         filter_cwd,
         action,
     );
+    if action == SessionPickerAction::Resume && supports_non_interactive_toggle {
+        state.enable_non_interactive_toggle(initial_include_non_interactive);
+    }
     state.start_initial_load();
     state.request_frame();
 
@@ -370,7 +381,6 @@ fn spawn_rollout_page_loader(
 fn spawn_app_server_page_loader(
     app_server: AppServerSession,
     cwd_filter: Option<PathBuf>,
-    include_non_interactive: bool,
     bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
 ) -> PageLoader {
     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<PageLoadRequest>();
@@ -389,7 +399,7 @@ fn spawn_app_server_page_loader(
                 cwd_filter.as_deref(),
                 request.provider_filter,
                 request.sort_key,
-                include_non_interactive,
+                request.include_non_interactive,
             )
             .await;
             let _ = bg_tx.send(BackgroundEvent::PageLoaded {
@@ -413,6 +423,14 @@ fn sort_key_label(sort_key: ThreadSortKey) -> &'static str {
     match sort_key {
         ThreadSortKey::CreatedAt => "Created at",
         ThreadSortKey::UpdatedAt => "Updated at",
+    }
+}
+
+fn source_filter_label(include_non_interactive: bool) -> &'static str {
+    if include_non_interactive {
+        "Interactive + non-interactive"
+    } else {
+        "Interactive only"
     }
 }
 
@@ -456,6 +474,8 @@ struct PickerState {
     sort_key: ThreadSortKey,
     thread_name_cache: HashMap<ThreadId, Option<String>>,
     inline_error: Option<String>,
+    supports_non_interactive_toggle: bool,
+    include_non_interactive: bool,
 }
 
 struct PaginationState {
@@ -622,7 +642,14 @@ impl PickerState {
             sort_key: ThreadSortKey::UpdatedAt,
             thread_name_cache: HashMap::new(),
             inline_error: None,
+            supports_non_interactive_toggle: false,
+            include_non_interactive: false,
         }
+    }
+
+    fn enable_non_interactive_toggle(&mut self, include_non_interactive: bool) {
+        self.supports_non_interactive_toggle = true;
+        self.include_non_interactive = include_non_interactive;
     }
 
     fn request_frame(&self) {
@@ -707,6 +734,14 @@ impl PickerState {
                 self.toggle_sort_key();
                 self.request_frame();
             }
+            KeyCode::Char('i') => {
+                if self.action == SessionPickerAction::Resume
+                    && self.supports_non_interactive_toggle
+                {
+                    self.toggle_include_non_interactive();
+                    self.request_frame();
+                }
+            }
             KeyCode::Backspace => {
                 let mut new_query = self.query.clone();
                 new_query.pop();
@@ -758,6 +793,7 @@ impl PickerState {
             search_token,
             provider_filter: self.provider_filter.clone(),
             sort_key: self.sort_key,
+            include_non_interactive: self.include_non_interactive,
         });
     }
 
@@ -1034,6 +1070,7 @@ impl PickerState {
             search_token,
             provider_filter: self.provider_filter.clone(),
             sort_key: self.sort_key,
+            include_non_interactive: self.include_non_interactive,
         });
     }
 
@@ -1059,6 +1096,11 @@ impl PickerState {
             ThreadSortKey::CreatedAt => ThreadSortKey::UpdatedAt,
             ThreadSortKey::UpdatedAt => ThreadSortKey::CreatedAt,
         };
+        self.start_initial_load();
+    }
+
+    fn toggle_include_non_interactive(&mut self) {
+        self.include_non_interactive = !self.include_non_interactive;
         self.start_initial_load();
     }
 }
@@ -1197,20 +1239,9 @@ fn thread_list_params(
             ProviderFilter::MatchDefault(default_provider) => Some(vec![default_provider]),
         },
         source_kinds: Some(if include_non_interactive {
-            vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-                ThreadSourceKind::SubAgent,
-                ThreadSourceKind::SubAgentReview,
-                ThreadSourceKind::SubAgentCompact,
-                ThreadSourceKind::SubAgentThreadSpawn,
-                ThreadSourceKind::SubAgentOther,
-                ThreadSourceKind::Unknown,
-            ]
+            all_thread_source_kinds()
         } else {
-            vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
+            interactive_thread_source_kinds()
         }),
         archived: Some(false),
         cwd: cwd_filter.map(|cwd| cwd.to_string_lossy().to_string()),
@@ -1250,14 +1281,22 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         .areas(area);
 
         // Header
-        let header_line: Line = vec![
+        let mut header_spans = vec![
             state.action.title().bold().cyan(),
             "  ".into(),
             "Sort:".dim(),
             " ".into(),
             sort_key_label(state.sort_key).magenta(),
-        ]
-        .into();
+        ];
+        if state.supports_non_interactive_toggle {
+            header_spans.extend([
+                "  ".into(),
+                "Sources:".dim(),
+                " ".into(),
+                source_filter_label(state.include_non_interactive).magenta(),
+            ]);
+        }
+        let header_line: Line = header_spans.into();
         frame.render_widget_ref(header_line, header);
 
         // Search line
@@ -1281,7 +1320,7 @@ fn picker_hint_line(state: &PickerState) -> Line<'_> {
         .get(state.selected)
         .map(|row| state.action.action_label(Some(row.mode)))
         .unwrap_or_else(|| state.action.action_label(None));
-    vec![
+    let mut spans = vec![
         key_hint::plain(KeyCode::Enter).into(),
         format!(" to {action_label} ").dim(),
         "    ".dim(),
@@ -1293,13 +1332,22 @@ fn picker_hint_line(state: &PickerState) -> Line<'_> {
         "    ".dim(),
         key_hint::plain(KeyCode::Tab).into(),
         " to toggle sort ".dim(),
+    ];
+    if state.supports_non_interactive_toggle {
+        spans.extend([
+            "    ".dim(),
+            key_hint::plain(KeyCode::Char('i')).into(),
+            " to toggle session kinds ".dim(),
+        ]);
+    }
+    spans.extend([
         "    ".dim(),
         key_hint::plain(KeyCode::Up).into(),
         "/".dim(),
         key_hint::plain(KeyCode::Down).into(),
         " to browse".dim(),
-    ]
-    .into()
+    ]);
+    spans.into()
 }
 
 fn search_line(state: &PickerState) -> Line<'_> {
@@ -2042,10 +2090,7 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
-        );
+        assert_eq!(params.source_kinds, Some(interactive_thread_source_kinds()));
         assert_eq!(params.cwd.as_deref(), Some("repo/on/server"));
     }
 
@@ -2061,21 +2106,7 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-                ThreadSourceKind::SubAgent,
-                ThreadSourceKind::SubAgentReview,
-                ThreadSourceKind::SubAgentCompact,
-                ThreadSourceKind::SubAgentThreadSpawn,
-                ThreadSourceKind::SubAgentOther,
-                ThreadSourceKind::Unknown,
-            ])
-        );
+        assert_eq!(params.source_kinds, Some(all_thread_source_kinds()));
     }
 
     #[test]
@@ -2391,6 +2422,58 @@ mod tests {
             rendered.contains("enter to reconnect"),
             "resident picker hint should keep reconnect wording: {rendered}"
         );
+    }
+
+    #[test]
+    fn resume_picker_hint_mentions_session_kind_toggle_when_supported() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.enable_non_interactive_toggle(/*include_non_interactive*/ false);
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Investigate resident thread watcher drift"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Remote active thread")),
+            mode: ThreadMode::ResidentAssistant,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+
+        let width: u16 = 160;
+        let height: u16 = 1;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            let line = picker_hint_line(&state);
+            frame.render_widget_ref(line, frame.area());
+        }
+        terminal.flush().expect("flush");
+
+        let rendered = terminal.backend().to_string();
+        assert_snapshot!(
+            "resume_picker_resident_non_interactive_toggle_hint",
+            rendered
+        );
+        assert!(rendered.contains("i to toggle session kinds"));
     }
 
     #[test]
@@ -2903,6 +2986,42 @@ mod tests {
         let guard = recorded_requests.lock().unwrap();
         assert_eq!(guard.len(), 2);
         assert_eq!(guard[1].sort_key, ThreadSortKey::CreatedAt);
+    }
+
+    #[tokio::test]
+    async fn toggle_include_non_interactive_reloads_with_new_source_filter() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = recorded_requests.clone();
+        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
+            request_sink.lock().expect("record request").push(req);
+        });
+
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.enable_non_interactive_toggle(/*include_non_interactive*/ false);
+
+        state.start_initial_load();
+        {
+            let guard = recorded_requests.lock().expect("recorded requests");
+            assert_eq!(guard.len(), 1);
+            assert!(!guard[0].include_non_interactive);
+        }
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .await
+            .expect("toggle should succeed");
+
+        let guard = recorded_requests.lock().expect("recorded requests");
+        assert_eq!(guard.len(), 2);
+        assert!(guard[1].include_non_interactive);
     }
 
     #[tokio::test]

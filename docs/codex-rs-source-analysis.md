@@ -1195,6 +1195,10 @@ SQLite 在这里不是起点，而是收敛点。
 - `codex-exec` 的 bootstrap stderr 摘要也已在真实进程级回归里继续锁住：`exec/tests/suite/resume.rs` 不只检查 help 文案，而会直接断言 human-readable 模式下 interactive 路径输出 `session mode: interactive` / `session action: resume`，resident 路径输出 `session mode: resident assistant` / `session action: reconnect`，同时 `--json` 模式不会泄露这层 human summary
 - 顶层 `codex` 的退出提示现在也已继续对齐 resident reconnect 语义：`format_exit_messages(...)` 在 thread mode 为 `ResidentAssistant` 时会稳定输出 `"To reconnect to this resident assistant, run codex resume ..."`，而普通 interactive thread 仍保持 `"To continue this session"`，避免主入口在最终收口提示上重新退回泛化 continue 文案
 - 顶层 `codex-rs/README.md` 对 `codex exec` bootstrap summary 的说明现在也已与现有进程级回归形成闭环：README 里写明的 `session mode/session action` 区分，不再只是孤立说明，而是直接对应 `exec/tests/suite/resume.rs` 里 interactive/resident human-readable stderr 断言与 `--json` 负向断言
+- `codex-tui` 的 `AppServerSession` 事件流边界现在也已补上直接回归：这个 typed 会话层自己的 `next_event()` 会继续把 `thread/started` 消费成带 `mode + status` 的 resident-aware snapshot，而后续 `thread/status/changed` 仍只透出 status 增量，避免这层边界只在更底下的 `codex-app-server-client` 或更上面的 `App` 集成测试里间接成立
+- `codex-tui` 的 subagent backfill 现在也已把 source-kinds 边界和实现重新对齐：共享 helper 会统一产出 interactive-only 与全量 `ThreadSourceKind` 列表，`latest`/picker lookup 不会各自漂移，而 `backfill_loaded_subagent_threads(...)` 也会显式用全量 source kinds 调 `thread/loaded/read`，避免 app-server 的 interactive-only 默认过滤把 non-interactive subagent loaded threads 静默漏掉
+- `codex-tui` 的显式名字恢复路径现在也已继续跟上同一条 `include_non_interactive` 边界：`codex resume <SESSION_NAME> --include-non-interactive` 不再只修好 picker / `--last` 两条路径，却在 by-name lookup 上继续落回 interactive-only 过滤；对应回归同时锁住“默认仍忽略 non-interactive named thread，而显式开启后会保留 resident target”
+- `codex-tui` 的应用内 resume picker 现在也已补上同一条显式 source-filter 边界：不只是顶层 `codex resume --include-non-interactive` 能看见 resident / exec 这类 non-interactive 线程，TUI 内部通过 slash command 或快捷入口打开的 app-server picker 也能直接按 `i` 切换 interactive-only 与全量 source kinds；对应回归同时锁住请求参数重载和 hint 文案，避免应用内入口继续悄悄退回成“只有 CLI 包装层能显式包含 non-interactive”
 
 这说明前面这条文档链已经基本完成当前轮次的收口：它不再只是“解释为什么应该做”，而是已经开始约束实现边界。
 

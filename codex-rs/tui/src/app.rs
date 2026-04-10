@@ -49,6 +49,7 @@ use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
 #[cfg(test)]
 use crate::test_support::PathBufExt;
+use crate::thread_source_kinds::all_thread_source_kinds;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -3573,9 +3574,12 @@ impl App {
     /// if the TUI did not witness the original spawn events.
     ///
     /// The loaded-thread summaries are fetched in full (no pagination) via `thread/loaded/read`.
-    /// `thread/loaded/list` is intentionally not enough here: subagent backfill needs each
-    /// thread's `source`, `status`, and agent metadata to rebuild the spawn tree and UI badges,
-    /// not just loaded ids. The spawn tree is then walked by
+    /// This request explicitly opts into both interactive and non-interactive `source_kinds`,
+    /// because subagent threads are non-interactive and the app-server defaults loaded reads to
+    /// interactive-only filters when `source_kinds` is omitted. `thread/loaded/list` is
+    /// intentionally not enough here: subagent backfill needs each thread's `source`, `status`,
+    /// and agent metadata to rebuild the spawn tree and UI badges, not just loaded ids. The spawn
+    /// tree is then walked by
     /// `find_loaded_subagent_threads_for_primary`. Each discovered subagent is registered via
     /// `upsert_agent_picker_thread`, which writes to both `AgentNavigationState` and the
     /// `ChatWidget` metadata map.
@@ -3592,7 +3596,7 @@ impl App {
                 cursor: None,
                 limit: None,
                 model_providers: None,
-                source_kinds: None,
+                source_kinds: Some(all_thread_source_kinds()),
                 cwd: None,
             })
             .await

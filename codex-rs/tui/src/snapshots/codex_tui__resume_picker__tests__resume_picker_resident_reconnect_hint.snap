@@ -2,4 +2,4 @@
 source: tui/src/resume_picker.rs
 expression: snapshot
 ---
-enter to reconnect     esc to start new     ctrl + c to quit     tab to toggle sort     ↑/
+enter to reconnect     esc to start new     ctrl + c to quit     tab to toggle sort     ↑/↓ to browse

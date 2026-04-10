@@ -1,0 +1,6 @@
+---
+source: tui/src/resume_picker.rs
+assertion_line: 2472
+expression: rendered
+---
+enter to reconnect     esc to start new     ctrl + c to quit     tab to toggle sort     i to toggle session kinds     ↑/↓ to browse

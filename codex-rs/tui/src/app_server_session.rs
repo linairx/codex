@@ -1175,11 +1175,14 @@ fn app_server_credits_snapshot_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_client::AppServerEvent;
     use codex_app_server_protocol::ApprovalsReviewer;
     use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::ReadOnlyAccess;
+    use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
+    use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadLoadedListParams;
     use codex_app_server_protocol::ThreadLoadedReadParams;
@@ -1195,7 +1198,9 @@ mod tests {
     use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
     use pretty_assertions::assert_eq;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     async fn build_config(temp_dir: &TempDir) -> Config {
         ConfigBuilder::default()
@@ -1898,6 +1903,98 @@ mod tests {
         assert_eq!(
             resumed.session.thread_mode,
             Some(ThreadMode::ResidentAssistant)
+        );
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn next_event_preserves_resident_thread_mode_boundary() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let request_id = app_server.next_request_id();
+
+        let started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    cwd: Some(workspace.to_string_lossy().into_owned()),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("resident thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let started_notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = app_server
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadStarted(
+                    notification,
+                )) = event
+                    && notification.thread.id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/started should arrive before timeout");
+        assert_eq!(
+            started_notification.thread.mode,
+            ThreadMode::ResidentAssistant
+        );
+        assert_eq!(started_notification.thread.status, ThreadStatus::Idle);
+
+        std::fs::write(workspace.join("watched.txt"), "changed")
+            .expect("workspace change should write");
+
+        let status_changed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = app_server
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadStatusChanged(
+                    notification,
+                )) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/status/changed should arrive before timeout");
+        assert_eq!(status_changed.thread_id, started.thread.id);
+        assert_eq!(
+            status_changed.status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            }
         );
 
         app_server

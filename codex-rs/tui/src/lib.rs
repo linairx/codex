@@ -20,7 +20,6 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
@@ -146,6 +145,7 @@ mod terminal_palette;
 mod terminal_title;
 mod text_formatting;
 mod theme_picker;
+mod thread_source_kinds;
 mod tooltips;
 mod tui;
 mod ui_consts;
@@ -219,6 +219,8 @@ pub(crate) mod test_support;
 
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
+use crate::thread_source_kinds::all_thread_source_kinds;
+use crate::thread_source_kinds::interactive_thread_source_kinds;
 use crate::tui::Tui;
 pub use cli::Cli;
 use codex_arg0::Arg0DispatchPaths;
@@ -474,6 +476,7 @@ fn session_target_from_app_server_thread(
 async fn lookup_session_target_by_name_with_app_server(
     app_server: &mut AppServerSession,
     name: &str,
+    include_non_interactive: bool,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     let mut cursor = None;
     loop {
@@ -483,7 +486,11 @@ async fn lookup_session_target_by_name_with_app_server(
                 limit: Some(100),
                 sort_key: Some(AppServerThreadSortKey::UpdatedAt),
                 model_providers: None,
-                source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+                source_kinds: Some(if include_non_interactive {
+                    all_thread_source_kinds()
+                } else {
+                    interactive_thread_source_kinds()
+                }),
                 archived: Some(false),
                 cwd: None,
                 // Thread names are hydrated after `thread/list` resolves rollout metadata, so
@@ -509,6 +516,7 @@ async fn lookup_session_target_by_name_with_app_server(
 async fn lookup_session_target_with_app_server(
     app_server: &mut AppServerSession,
     id_or_name: &str,
+    include_non_interactive: bool,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     if Uuid::parse_str(id_or_name).is_ok() {
         let thread_id = match ThreadId::from_string(id_or_name) {
@@ -538,7 +546,8 @@ async fn lookup_session_target_with_app_server(
         };
     }
 
-    lookup_session_target_by_name_with_app_server(app_server, id_or_name).await
+    lookup_session_target_by_name_with_app_server(app_server, id_or_name, include_non_interactive)
+        .await
 }
 
 async fn lookup_latest_session_target_with_app_server(
@@ -561,6 +570,18 @@ async fn lookup_latest_session_target_with_app_server(
         .find_map(session_target_from_app_server_thread))
 }
 
+fn missing_session_message(id_str: &str, action: &str, include_non_interactive: bool) -> String {
+    let mut message = format!(
+        "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+    );
+    if action == "resume" && !include_non_interactive && Uuid::parse_str(id_str).is_err() {
+        message.push_str(
+            " If you are trying to resume a non-interactive session by name, retry with `codex resume --include-non-interactive`.",
+        );
+    }
+    message
+}
+
 fn latest_session_lookup_params(
     is_remote: bool,
     config: &Config,
@@ -577,20 +598,9 @@ fn latest_session_lookup_params(
             Some(vec![config.model_provider_id.clone()])
         },
         source_kinds: Some(if include_non_interactive {
-            vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-                ThreadSourceKind::SubAgent,
-                ThreadSourceKind::SubAgentReview,
-                ThreadSourceKind::SubAgentCompact,
-                ThreadSourceKind::SubAgentThreadSpawn,
-                ThreadSourceKind::SubAgentOther,
-                ThreadSourceKind::Unknown,
-            ]
+            all_thread_source_kinds()
         } else {
-            vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
+            interactive_thread_source_kinds()
         }),
         archived: Some(false),
         cwd: cwd_filter.map(|cwd| cwd.to_string_lossy().to_string()),
@@ -1140,8 +1150,10 @@ async fn run_ratatui_app(
             thread_name: None,
             thread_mode: None,
             update_action: None,
-            exit_reason: ExitReason::Fatal(format!(
-                "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+            exit_reason: ExitReason::Fatal(missing_session_message(
+                id_str,
+                action,
+                cli.resume_include_non_interactive,
             )),
         })
     };
@@ -1178,7 +1190,11 @@ async fn run_ratatui_app(
             let Some(app_server) = session_lookup_app_server.as_mut() else {
                 unreachable!("session lookup app server should be initialized for --fork <id>");
             };
-            match lookup_session_target_with_app_server(app_server, id_str).await? {
+            match lookup_session_target_with_app_server(
+                app_server, id_str, /*include_non_interactive*/ false,
+            )
+            .await?
+            {
                 Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
                 None => {
                     shutdown_app_server_if_present(session_lookup_app_server.take()).await;
@@ -1240,7 +1256,13 @@ async fn run_ratatui_app(
         let Some(app_server) = session_lookup_app_server.as_mut() else {
             unreachable!("session lookup app server should be initialized for --resume <id>");
         };
-        match lookup_session_target_with_app_server(app_server, id_str).await? {
+        match lookup_session_target_with_app_server(
+            app_server,
+            id_str,
+            cli.resume_include_non_interactive,
+        )
+        .await?
+        {
             Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
             None => {
                 shutdown_app_server_if_present(session_lookup_app_server.take()).await;
@@ -1863,10 +1885,7 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
-        );
+        assert_eq!(params.source_kinds, Some(interactive_thread_source_kinds()));
         assert_eq!(params.cwd, Some(cwd.to_string_lossy().to_string()));
         Ok(())
     }
@@ -1883,10 +1902,7 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, None);
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
-        );
+        assert_eq!(params.source_kinds, Some(interactive_thread_source_kinds()));
         assert_eq!(params.cwd, None);
         Ok(())
     }
@@ -1906,10 +1922,7 @@ mod tests {
         );
 
         assert_eq!(params.model_providers, None);
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
-        );
+        assert_eq!(params.source_kinds, Some(interactive_thread_source_kinds()));
         assert_eq!(params.cwd.as_deref(), Some("repo/on/server"));
         Ok(())
     }
@@ -1925,22 +1938,46 @@ mod tests {
             /*include_non_interactive*/ true,
         );
 
-        assert_eq!(
-            params.source_kinds,
-            Some(vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-                ThreadSourceKind::SubAgent,
-                ThreadSourceKind::SubAgentReview,
-                ThreadSourceKind::SubAgentCompact,
-                ThreadSourceKind::SubAgentThreadSpawn,
-                ThreadSourceKind::SubAgentOther,
-                ThreadSourceKind::Unknown,
-            ])
-        );
+        assert_eq!(params.source_kinds, Some(all_thread_source_kinds()));
         Ok(())
+    }
+
+    #[test]
+    fn missing_session_message_suggests_non_interactive_flag_for_named_resume_targets() {
+        let message = missing_session_message(
+            "named-resident",
+            "resume",
+            /*include_non_interactive*/ false,
+        );
+
+        assert!(message.contains("No saved session found with ID named-resident."));
+        assert!(message.contains("Run `codex resume` without an ID"));
+        assert!(message.contains("`codex resume --include-non-interactive`"));
+    }
+
+    #[test]
+    fn missing_session_message_omits_non_interactive_hint_for_uuid_targets() {
+        let thread_id = ThreadId::new();
+        let message = missing_session_message(
+            &thread_id.to_string(),
+            "resume",
+            /*include_non_interactive*/ false,
+        );
+
+        assert!(message.contains("No saved session found with ID"));
+        assert!(!message.contains("include-non-interactive"));
+    }
+
+    #[test]
+    fn missing_session_message_omits_non_interactive_hint_when_already_enabled() {
+        let message = missing_session_message(
+            "named-resident",
+            "resume",
+            /*include_non_interactive*/ true,
+        );
+
+        assert!(message.contains("No saved session found with ID named-resident."));
+        assert!(!message.contains("include-non-interactive"));
     }
 
     #[test]
@@ -2076,9 +2113,144 @@ mod tests {
             AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
                 start_test_embedded_app_server(config).await?,
             ));
-        let target =
-            lookup_session_target_by_name_with_app_server(&mut app_server, "saved-session").await?;
+        let target = lookup_session_target_by_name_with_app_server(
+            &mut app_server,
+            "saved-session",
+            /*include_non_interactive*/ false,
+        )
+        .await?;
         let target = target.expect("name lookup should find the saved thread");
+        assert_eq!(target.path, Some(rollout_path));
+        assert_eq!(target.thread_id, thread_id);
+        assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_session_target_by_name_ignores_non_interactive_threads_by_default()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/11")
+            .join(format!("rollout-2025-02-11T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir)?;
+        std::fs::write(&rollout_path, "")?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-11T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Exec,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Named non-interactive resident thread".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        codex_core::append_thread_name(&config.codex_home, thread_id, "named-resident").await?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config).await?,
+            ));
+        let target = lookup_session_target_by_name_with_app_server(
+            &mut app_server,
+            "named-resident",
+            /*include_non_interactive*/ false,
+        )
+        .await?;
+        assert!(target.is_none());
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_session_target_by_name_can_include_non_interactive_threads()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/12")
+            .join(format!("rollout-2025-02-12T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir)?;
+        std::fs::write(&rollout_path, "")?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-12T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Exec,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Named included non-interactive resident thread".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        metadata.mode = "residentAssistant".to_string();
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        codex_core::append_thread_name(&config.codex_home, thread_id, "named-resident").await?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config).await?,
+            ));
+        let target = lookup_session_target_by_name_with_app_server(
+            &mut app_server,
+            "named-resident",
+            /*include_non_interactive*/ true,
+        )
+        .await?;
+        let target = target.expect("name lookup should include non-interactive thread");
         assert_eq!(target.path, Some(rollout_path));
         assert_eq!(target.thread_id, thread_id);
         assert_eq!(target.mode, Some(ThreadMode::ResidentAssistant));
@@ -2431,8 +2603,12 @@ mod tests {
             AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
                 start_test_embedded_app_server(config).await?,
             ));
-        let target =
-            lookup_session_target_with_app_server(&mut app_server, &thread_id.to_string()).await?;
+        let target = lookup_session_target_with_app_server(
+            &mut app_server,
+            &thread_id.to_string(),
+            /*include_non_interactive*/ false,
+        )
+        .await?;
         let target = target.expect("id lookup should find the saved thread");
         assert_eq!(target.path, Some(rollout_path));
         assert_eq!(target.thread_id, thread_id);
@@ -2496,8 +2672,12 @@ mod tests {
             AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
                 start_test_embedded_app_server(config).await?,
             ));
-        let target =
-            lookup_session_target_with_app_server(&mut app_server, &thread_id.to_string()).await?;
+        let target = lookup_session_target_with_app_server(
+            &mut app_server,
+            &thread_id.to_string(),
+            /*include_non_interactive*/ false,
+        )
+        .await?;
         let target = target.expect("id lookup should find the archived thread");
         assert_eq!(target.path, Some(rollout_path));
         assert_eq!(target.thread_id, thread_id);
