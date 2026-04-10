@@ -850,7 +850,8 @@ pub(crate) struct ChatWidget {
     show_welcome_banner: bool,
     // One-shot tooltip override for the primary startup session.
     startup_tooltip_override: Option<String>,
-    // When resuming an existing session (selected via resume picker), avoid an
+    // When resuming or reconnecting to an existing session (selected via the
+    // resume/reconnect picker), avoid an
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
     // During snapshot restore, defer startup prompt submission until replayed
@@ -5883,10 +5884,10 @@ impl ChatWidget {
     }
 
     /// Replay a subset of initial events into the UI to seed the transcript when
-    /// resuming an existing session. This approximates the live event flow and
-    /// is intentionally conservative: only safe-to-replay items are rendered to
-    /// avoid triggering side effects. Event ids are passed as `None` to
-    /// distinguish replayed events from live ones.
+    /// resuming or reconnecting to an existing session. This approximates the
+    /// live event flow and is intentionally conservative: only safe-to-replay
+    /// items are rendered to avoid triggering side effects. Event ids are
+    /// passed as `None` to distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
         for turn in turns {
             let Turn {

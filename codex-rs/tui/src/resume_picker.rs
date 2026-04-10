@@ -213,6 +213,7 @@ pub async fn run_fork_picker_with_app_server(
     tui: &mut Tui,
     config: &Config,
     show_all: bool,
+    include_non_interactive: bool,
     app_server: AppServerSession,
 ) -> Result<SessionSelection> {
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
@@ -228,8 +229,8 @@ pub async fn run_fork_picker_with_app_server(
         show_all,
         SessionPickerAction::Fork,
         is_remote,
-        /*supports_non_interactive_toggle*/ false,
-        /*initial_include_non_interactive*/ false,
+        /*supports_non_interactive_toggle*/ true,
+        include_non_interactive,
         spawn_app_server_page_loader(app_server, cwd_filter, bg_tx),
         bg_rx,
     )
@@ -294,7 +295,7 @@ async fn run_session_picker_with_loader(
         filter_cwd,
         action,
     );
-    if action == SessionPickerAction::Resume && supports_non_interactive_toggle {
+    if supports_non_interactive_toggle {
         state.enable_non_interactive_toggle(initial_include_non_interactive);
     }
     state.start_initial_load();
@@ -735,9 +736,7 @@ impl PickerState {
                 self.request_frame();
             }
             KeyCode::Char('i') => {
-                if self.action == SessionPickerAction::Resume
-                    && self.supports_non_interactive_toggle
-                {
+                if self.supports_non_interactive_toggle {
                     self.toggle_include_non_interactive();
                     self.request_frame();
                 }
@@ -2477,6 +2476,40 @@ mod tests {
     }
 
     #[test]
+    fn fork_picker_hint_mentions_session_kind_toggle_when_supported() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Fork,
+        );
+        state.enable_non_interactive_toggle(/*include_non_interactive*/ true);
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Fork resident thread into a new investigation"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Forkable resident thread")),
+            mode: ThreadMode::ResidentAssistant,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/fork-resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+
+        let rendered = picker_hint_line(&state).to_string();
+        assert!(rendered.contains("enter to fork"));
+        assert!(rendered.contains("i to toggle session kinds"));
+    }
+
+    #[test]
     fn resume_picker_row_renders_assistant_badge_for_resident_threads() {
         use crate::custom_terminal::Terminal;
         use crate::test_backend::VT100Backend;
@@ -3004,6 +3037,42 @@ mod tests {
             /*show_all*/ true,
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
+        );
+        state.enable_non_interactive_toggle(/*include_non_interactive*/ false);
+
+        state.start_initial_load();
+        {
+            let guard = recorded_requests.lock().expect("recorded requests");
+            assert_eq!(guard.len(), 1);
+            assert!(!guard[0].include_non_interactive);
+        }
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .await
+            .expect("toggle should succeed");
+
+        let guard = recorded_requests.lock().expect("recorded requests");
+        assert_eq!(guard.len(), 2);
+        assert!(guard[1].include_non_interactive);
+    }
+
+    #[tokio::test]
+    async fn fork_toggle_include_non_interactive_reloads_with_new_source_filter() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = recorded_requests.clone();
+        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
+            request_sink.lock().expect("record request").push(req);
+        });
+
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Fork,
         );
         state.enable_non_interactive_toggle(/*include_non_interactive*/ false);
 

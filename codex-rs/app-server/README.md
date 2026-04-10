@@ -268,13 +268,13 @@ Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `per
 
 ### Example: List threads (with pagination & filters)
 
-`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary interactive resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive history. Pass any combination of:
+`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary interactive resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive resume targets. Pass any combination of:
 
 - `cursor` — opaque string from a prior response; omit for the first page.
 - `limit` — server defaults to a reasonable page size if unset.
 - `sortKey` — `created_at` (default) or `updated_at`.
 - `modelProviders` — restrict results to specific providers; unset, null, or an empty array will include all providers.
-- `sourceKinds` — restrict results to specific sources; omit or pass `[]` for interactive sessions only (`cli`, `vscode`).
+- `sourceKinds` — restrict results to specific sources; omit or pass `[]` for interactive sessions only (`cli`, `vscode`). Callers that need resident assistants, `exec`, app-server-created threads, or sub-agent threads must pass the corresponding non-interactive kinds explicitly instead of relying on the default.
 - `archived` — when `true`, list archived threads only. When `false` or `null`, list non-archived threads (default).
 - `cwd` — restrict results to threads whose session cwd exactly matches this path. Relative paths are resolved against the app-server process cwd before matching.
 - `searchTerm` — restrict results to threads whose extracted title contains this substring (case-sensitive).
@@ -301,7 +301,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 ### Example: List loaded threads
 
-`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk. It is intentionally an id-only probe: if a client also needs reconnect semantics, the current thread role, or the current runtime status, it should follow up with `thread/loaded/read` and consume the returned `thread.mode` plus `thread.status` there. You can also filter by the loaded thread's current `modelProviders`, `sourceKinds`, and exact-match `cwd`.
+`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk. It is intentionally an id-only probe: if a client also needs reconnect semantics, the current thread role, or the current runtime status, it should follow up with `thread/loaded/read` and consume the returned `thread.mode` plus `thread.status` there. You can also filter by the loaded thread's current `modelProviders`, `sourceKinds`, and exact-match `cwd`. As with `thread/list`, omitting `sourceKinds` (or passing `[]`) keeps the default interactive-only filter (`cli`, `vscode`); callers that need resident assistants, `exec`, app-server-created threads, or sub-agent threads must pass the corresponding non-interactive kinds explicitly.
 
 ```json
 { "method": "thread/loaded/list", "id": 21 }
@@ -312,7 +312,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 ### Example: Read loaded thread summaries
 
-`thread/loaded/read` returns loaded thread summaries for sessions currently resident in memory. This is useful for polling a remote control plane without separately calling `thread/read` for each loaded thread id. The returned summaries include each loaded thread's current `mode` plus live `status`, so reconnect-aware clients should consume this response directly instead of treating loaded polling as a mode-less status probe. It supports the same optional `modelProviders`, `sourceKinds`, and exact-match `cwd` filters as `thread/loaded/list`.
+`thread/loaded/read` returns loaded thread summaries for sessions currently resident in memory. This is useful for polling a remote control plane without separately calling `thread/read` for each loaded thread id. The returned summaries include each loaded thread's current `mode` plus live `status`, so reconnect-aware clients should consume this response directly instead of treating loaded polling as a mode-less status probe. It supports the same optional `modelProviders`, `sourceKinds`, and exact-match `cwd` filters as `thread/loaded/list`, including the same interactive-only default when `sourceKinds` is omitted or `[]`.
 
 ```json
 { "method": "thread/loaded/read", "id": 22 }

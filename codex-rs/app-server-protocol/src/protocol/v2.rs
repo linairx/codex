@@ -3118,7 +3118,8 @@ pub struct ThreadLoadedListParams {
     #[ts(optional = nullable)]
     pub model_providers: Option<Vec<String>>,
     /// Optional source filter; when set, only loaded threads from these source
-    /// kinds are returned. When present but empty, includes all source kinds.
+    /// kinds are returned. When omitted or empty, defaults to interactive
+    /// sources.
     #[ts(optional = nullable)]
     pub source_kinds: Option<Vec<ThreadSourceKind>>,
     /// Optional cwd filter; when set, only loaded threads whose session cwd
@@ -3154,7 +3155,8 @@ pub struct ThreadLoadedReadParams {
     #[ts(optional = nullable)]
     pub model_providers: Option<Vec<String>>,
     /// Optional source filter; when set, only loaded threads from these source
-    /// kinds are returned. When present but empty, includes all source kinds.
+    /// kinds are returned. When omitted or empty, defaults to interactive
+    /// sources.
     #[ts(optional = nullable)]
     pub source_kinds: Option<Vec<ThreadSourceKind>>,
     /// Optional cwd filter; when set, only loaded threads whose session cwd

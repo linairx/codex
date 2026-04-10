@@ -66,6 +66,24 @@ interactive resume target from a resident assistant reconnect target. In
 `--json` mode this bootstrap metadata is carried by JSON events, not by the
 human-readable stderr session summary.
 
+### Resume and fork saved sessions
+
+Use `codex resume` to open the session picker, or `codex resume --last` to
+resume or reconnect to the newest recorded session directly. When you need to
+see resident assistants or other non-interactive sessions in those listings, or
+when you want name-based lookup to consider those saved sessions too, add
+`--include-non-interactive`.
+Use `codex resume <SESSION_ID_OR_NAME>` when you want to target one saved
+session directly.
+
+Use `codex fork` to branch from a previous session, or `codex fork --last` to
+fork the newest recorded session directly. This flow now follows the same
+source-filter boundary as `resume`: add `--include-non-interactive` when you
+want the picker, `--last`, or name-based lookup to include resident assistants
+and other non-interactive sessions.
+Use `codex fork <SESSION_ID_OR_NAME>` when you want to target one saved
+session directly.
+
 ### Experimenting with the Codex Sandbox
 
 To test to see what happens when a command is run under the sandbox provided by Codex, we provide the following subcommands in Codex CLI:

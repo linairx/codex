@@ -2732,7 +2732,7 @@
           ]
         },
         "sourceKinds": {
-          "description": "Optional source filter; when set, only loaded threads from these source kinds are returned. When present but empty, includes all source kinds.",
+          "description": "Optional source filter; when set, only loaded threads from these source kinds are returned. When omitted or empty, defaults to interactive sources.",
           "items": {
             "$ref": "#/definitions/ThreadSourceKind"
           },
@@ -2780,7 +2780,7 @@
           ]
         },
         "sourceKinds": {
-          "description": "Optional source filter; when set, only loaded threads from these source kinds are returned. When present but empty, includes all source kinds.",
+          "description": "Optional source filter; when set, only loaded threads from these source kinds are returned. When omitted or empty, defaults to interactive sources.",
           "items": {
             "$ref": "#/definitions/ThreadSourceKind"
           },

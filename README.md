@@ -28,6 +28,15 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
+Common session flows:
+
+- Start a new interactive session: `codex`
+- Resume or reconnect to a saved session: `codex resume`
+- Resume or reconnect to the newest recorded session directly: `codex resume --last`
+- Fork from a saved session: `codex fork`
+- Target a saved session directly: `codex resume <SESSION_ID_OR_NAME>` or `codex fork <SESSION_ID_OR_NAME>`
+- For `codex resume` or `codex fork`, add `--include-non-interactive` when you need picker, `--last`, or name-based lookup to include resident assistants and other non-interactive sessions
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 
@@ -53,6 +62,7 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
+- [**Getting started**](./docs/getting-started.md)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)

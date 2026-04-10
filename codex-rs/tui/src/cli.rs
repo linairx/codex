@@ -23,11 +23,11 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_last: bool,
 
-    /// Internal: resume or reconnect to a specific recorded session by id (UUID).
-    /// Set by the top-level `codex resume <SESSION_ID>` wrapper; not exposed as
-    /// a public flag.
+    /// Internal: resume or reconnect to a specific recorded session target
+    /// (UUID or thread name). Set by the top-level `codex resume
+    /// <SESSION_ID_OR_NAME>` wrapper; not exposed as a public flag.
     #[clap(skip)]
-    pub resume_session_id: Option<String>,
+    pub resume_session_target: Option<String>,
 
     /// Internal: show all sessions (disables cwd filtering and shows CWD column).
     #[clap(skip)]
@@ -45,14 +45,19 @@ pub struct Cli {
     #[clap(skip)]
     pub fork_last: bool,
 
-    /// Internal: fork a specific recorded session by id (UUID). Set by the
-    /// top-level `codex fork <SESSION_ID>` wrapper; not exposed as a public flag.
+    /// Internal: fork a specific recorded session target (UUID or thread
+    /// name). Set by the top-level `codex fork <SESSION_ID_OR_NAME>` wrapper;
+    /// not exposed as a public flag.
     #[clap(skip)]
-    pub fork_session_id: Option<String>,
+    pub fork_session_target: Option<String>,
 
     /// Internal: show all sessions (disables cwd filtering and shows CWD column).
     #[clap(skip)]
     pub fork_show_all: bool,
+
+    /// Internal: include non-interactive sessions in fork listings.
+    #[clap(skip)]
+    pub fork_include_non_interactive: bool,
 
     /// Model the agent should use.
     #[arg(long, short = 'm')]

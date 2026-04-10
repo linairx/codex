@@ -42,6 +42,5 @@ fn top_cli_help_mentions_reconnect_summary_for_resume() {
     let help = TopCli::command().render_long_help().to_string();
 
     assert!(help.contains("resume"));
-    assert!(help.contains("Resume or reconnect to a previous session by id"));
-    assert!(help.contains("pick the most recent with --last"));
+    assert!(help.contains("Resume or reconnect to a previous session by id or name"));
 }

@@ -113,7 +113,7 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Resume or reconnect to a previous session by id, or pick the most recent with --last.
+    /// Resume or reconnect to a previous session by id or name, or pick the most recent with --last.
     Resume(ResumeArgs),
 
     /// Run a code review against the current repository.
@@ -127,7 +127,7 @@ struct ResumeArgsRaw {
     /// Conversation/session id (UUID) or thread name. UUIDs take precedence if
     /// it parses. If omitted, use --last to pick the most recent recorded
     /// session to resume or reconnect.
-    #[arg(value_name = "SESSION_ID")]
+    #[arg(value_name = "SESSION_ID_OR_NAME")]
     session_id: Option<String>,
 
     /// Resume or reconnect to the most recent recorded session (newest)

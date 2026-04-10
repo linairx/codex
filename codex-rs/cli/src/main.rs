@@ -136,7 +136,7 @@ enum Subcommand {
     /// Resume or reconnect to a previous session (picker by default; use --last for the most recent).
     Resume(ResumeCommand),
 
-    /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
+    /// Fork a previous session (picker by default; use --last to fork the most recent).
     Fork(ForkCommand),
 
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
@@ -215,7 +215,7 @@ struct ResumeCommand {
     /// Conversation/session id (UUID) or thread name. UUIDs take precedence if
     /// it parses. If omitted, use --last to pick the most recent recorded
     /// session to resume or reconnect.
-    #[arg(value_name = "SESSION_ID")]
+    #[arg(value_name = "SESSION_ID_OR_NAME")]
     session_id: Option<String>,
 
     /// Resume or reconnect to the most recent recorded session without showing
@@ -241,18 +241,24 @@ struct ResumeCommand {
 
 #[derive(Debug, Parser)]
 struct ForkCommand {
-    /// Conversation/session id (UUID). When provided, forks this session.
-    /// If omitted, use --last to pick the most recent recorded session.
-    #[arg(value_name = "SESSION_ID")]
+    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if
+    /// it parses. If omitted, use --last to pick the most recent recorded
+    /// session to fork.
+    #[arg(value_name = "SESSION_ID_OR_NAME")]
     session_id: Option<String>,
 
-    /// Fork the most recent session without showing the picker.
+    /// Fork the most recent recorded session without showing the picker.
     #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
     last: bool,
 
     /// Show all sessions (disables cwd filtering and shows CWD column).
     #[arg(long = "all", default_value_t = false)]
     all: bool,
+
+    /// Include non-interactive sessions in the fork picker and --last
+    /// selection.
+    #[arg(long = "include-non-interactive", default_value_t = false)]
+    include_non_interactive: bool,
 
     #[clap(flatten)]
     remote: InteractiveRemoteOptions,
@@ -790,6 +796,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             session_id,
             last,
             all,
+            include_non_interactive,
             remote,
             config_overrides,
         })) => {
@@ -799,6 +806,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 session_id,
                 last,
                 all,
+                include_non_interactive,
                 config_overrides,
             );
             let exit_info = run_interactive_tui(
@@ -1379,10 +1387,10 @@ fn finalize_resume_interactive(
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
     // configuration surface area as `codex` without additional flags.
-    let resume_session_id = session_id;
-    interactive.resume_picker = resume_session_id.is_none() && !last;
+    let resume_session_target = session_id;
+    interactive.resume_picker = resume_session_target.is_none() && !last;
     interactive.resume_last = last;
-    interactive.resume_session_id = resume_session_id;
+    interactive.resume_session_target = resume_session_target;
     interactive.resume_show_all = show_all;
     interactive.resume_include_non_interactive = include_non_interactive;
 
@@ -1402,15 +1410,17 @@ fn finalize_fork_interactive(
     session_id: Option<String>,
     last: bool,
     show_all: bool,
+    include_non_interactive: bool,
     fork_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so fork shares the same
     // configuration surface area as `codex` without additional flags.
-    let fork_session_id = session_id;
-    interactive.fork_picker = fork_session_id.is_none() && !last;
+    let fork_session_target = session_id;
+    interactive.fork_picker = fork_session_target.is_none() && !last;
     interactive.fork_last = last;
-    interactive.fork_session_id = fork_session_id;
+    interactive.fork_session_target = fork_session_target;
     interactive.fork_show_all = show_all;
+    interactive.fork_include_non_interactive = include_non_interactive;
 
     // Merge fork-scoped flags and overrides with highest precedence.
     merge_interactive_cli_flags(&mut interactive, fork_cli);
@@ -1531,6 +1541,7 @@ mod tests {
             session_id,
             last,
             all,
+            include_non_interactive,
             remote: _,
             config_overrides: fork_cli,
         }) = subcommand.expect("fork present")
@@ -1538,7 +1549,15 @@ mod tests {
             unreachable!()
         };
 
-        finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
+        finalize_fork_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all,
+            include_non_interactive,
+            fork_cli,
+        )
     }
 
     #[test]
@@ -1597,6 +1616,14 @@ mod tests {
     }
 
     #[test]
+    fn fork_help_mentions_non_interactive_capability() {
+        let help = MultitoolCli::command().render_long_help().to_string();
+
+        assert!(help.contains("Fork a previous session"));
+        assert!(!help.contains("Fork a previous interactive session"));
+    }
+
+    #[test]
     fn resume_subcommand_help_mentions_reconnect_and_non_interactive_listing() {
         let help = MultitoolCli::command()
             .find_subcommand_mut("resume")
@@ -1610,6 +1637,32 @@ mod tests {
     }
 
     #[test]
+    fn fork_subcommand_help_mentions_non_interactive_listing() {
+        let help = MultitoolCli::command()
+            .find_subcommand_mut("fork")
+            .expect("fork subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("thread name"));
+        assert!(help.contains("Fork the most recent recorded session"));
+        assert!(help.contains("--include-non-interactive"));
+        assert!(help.contains("Include non-interactive sessions in the fork picker"));
+    }
+
+    #[test]
+    fn fork_picker_logic_with_session_name() {
+        let interactive = finalize_fork_from_args(["codex", "fork", "named-thread"].as_ref());
+
+        assert!(!interactive.fork_picker);
+        assert!(!interactive.fork_last);
+        assert_eq!(
+            interactive.fork_session_target.as_deref(),
+            Some("named-thread")
+        );
+    }
+
+    #[test]
     fn exec_resume_subcommand_help_mentions_reconnect_and_last() {
         let help = MultitoolCli::command()
             .find_subcommand_mut("exec")
@@ -1619,7 +1672,7 @@ mod tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("Resume or reconnect to a previous session by id"));
+        assert!(help.contains("Resume or reconnect to a previous session by id or name"));
         assert!(help.contains("Resume or reconnect to the most recent recorded session"));
         assert!(help.contains("--last"));
     }
@@ -1633,8 +1686,7 @@ mod tests {
             .to_string();
 
         assert!(help.contains("resume"));
-        assert!(help.contains("Resume or reconnect to a previous session by id"));
-        assert!(help.contains("pick the most recent with --last"));
+        assert!(help.contains("Resume or reconnect to a previous session by id or name"));
     }
 
     fn app_server_from_args(args: &[&str]) -> AppServerCommand {
@@ -1779,7 +1831,7 @@ mod tests {
         assert_eq!(interactive.model.as_deref(), Some("gpt-5.1-test"));
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
-        assert_eq!(interactive.resume_session_id, None);
+        assert_eq!(interactive.resume_session_target, None);
     }
 
     #[test]
@@ -1787,7 +1839,7 @@ mod tests {
         let interactive = finalize_resume_from_args(["codex", "resume"].as_ref());
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
-        assert_eq!(interactive.resume_session_id, None);
+        assert_eq!(interactive.resume_session_target, None);
         assert!(!interactive.resume_show_all);
     }
 
@@ -1796,7 +1848,7 @@ mod tests {
         let interactive = finalize_resume_from_args(["codex", "resume", "--last"].as_ref());
         assert!(!interactive.resume_picker);
         assert!(interactive.resume_last);
-        assert_eq!(interactive.resume_session_id, None);
+        assert_eq!(interactive.resume_session_target, None);
         assert!(!interactive.resume_show_all);
     }
 
@@ -1805,7 +1857,7 @@ mod tests {
         let interactive = finalize_resume_from_args(["codex", "resume", "1234"].as_ref());
         assert!(!interactive.resume_picker);
         assert!(!interactive.resume_last);
-        assert_eq!(interactive.resume_session_id.as_deref(), Some("1234"));
+        assert_eq!(interactive.resume_session_target.as_deref(), Some("1234"));
         assert!(!interactive.resume_show_all);
     }
 
@@ -1879,7 +1931,7 @@ mod tests {
         assert!(has_a && has_b);
         assert!(!interactive.resume_picker);
         assert!(!interactive.resume_last);
-        assert_eq!(interactive.resume_session_id.as_deref(), Some("sid"));
+        assert_eq!(interactive.resume_session_target.as_deref(), Some("sid"));
     }
 
     #[test]
@@ -1895,7 +1947,7 @@ mod tests {
         assert!(interactive.dangerously_bypass_approvals_and_sandbox);
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
-        assert_eq!(interactive.resume_session_id, None);
+        assert_eq!(interactive.resume_session_target, None);
     }
 
     #[test]
@@ -1903,7 +1955,7 @@ mod tests {
         let interactive = finalize_fork_from_args(["codex", "fork"].as_ref());
         assert!(interactive.fork_picker);
         assert!(!interactive.fork_last);
-        assert_eq!(interactive.fork_session_id, None);
+        assert_eq!(interactive.fork_session_target, None);
         assert!(!interactive.fork_show_all);
     }
 
@@ -1912,7 +1964,7 @@ mod tests {
         let interactive = finalize_fork_from_args(["codex", "fork", "--last"].as_ref());
         assert!(!interactive.fork_picker);
         assert!(interactive.fork_last);
-        assert_eq!(interactive.fork_session_id, None);
+        assert_eq!(interactive.fork_session_target, None);
         assert!(!interactive.fork_show_all);
     }
 
@@ -1921,7 +1973,7 @@ mod tests {
         let interactive = finalize_fork_from_args(["codex", "fork", "1234"].as_ref());
         assert!(!interactive.fork_picker);
         assert!(!interactive.fork_last);
-        assert_eq!(interactive.fork_session_id.as_deref(), Some("1234"));
+        assert_eq!(interactive.fork_session_target.as_deref(), Some("1234"));
         assert!(!interactive.fork_show_all);
     }
 
@@ -1930,6 +1982,15 @@ mod tests {
         let interactive = finalize_fork_from_args(["codex", "fork", "--all"].as_ref());
         assert!(interactive.fork_picker);
         assert!(interactive.fork_show_all);
+    }
+
+    #[test]
+    fn fork_include_non_interactive_flag_sets_source_filter_override() {
+        let interactive =
+            finalize_fork_from_args(["codex", "fork", "--include-non-interactive"].as_ref());
+
+        assert!(interactive.fork_picker);
+        assert!(interactive.fork_include_non_interactive);
     }
 
     #[test]

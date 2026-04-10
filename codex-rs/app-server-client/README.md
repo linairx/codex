@@ -69,7 +69,7 @@ directly instead of assuming a follow-up `thread/read` is required to recover
 resident assistant semantics.
 That guarantee now has explicit typed coverage for archived resident threads
 too, so the archived metadata-repair path cannot silently fall back to an
-ordinary interactive thread summary.
+ordinary interactive resume target summary.
 Archived read-only lookup is also locked down directly: after archive, a plain
 `thread/read` typed request must still surface `residentAssistant` without
 requiring an extra unarchive step.
@@ -91,11 +91,11 @@ That resident continuity now also covers the post-unsubscribe path directly:
 after the last subscriber detaches from a resident thread, follow-up
 `thread/loaded/read`, `thread/read`, and `thread/resume` typed requests must
 still preserve `residentAssistant` instead of degrading to an ordinary
-interactive session.
+interactive resume target.
 The same resident continuity is now locked down for `thread/rollback`: after a
 resident assistant completes a turn, the rollback response must preserve
-`thread.mode = residentAssistant` instead of reconstructing a generic
-interactive history summary from the rollout.
+`thread.mode = residentAssistant` instead of reconstructing the rollout as an
+ordinary interactive resume target summary.
 The event stream is now locked down at the same boundary too: in-process
 `next_event()` consumers can rely on `thread/started` as the resident-aware
 snapshot that still carries `thread.mode`, while later

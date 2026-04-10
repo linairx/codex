@@ -572,11 +572,17 @@ async fn lookup_latest_session_target_with_app_server(
 
 fn missing_session_message(id_str: &str, action: &str, include_non_interactive: bool) -> String {
     let mut message = format!(
-        "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+        "No saved session found with ID or name {id_str}. Run `codex {action}` without a target to choose from existing sessions."
     );
-    if action == "resume" && !include_non_interactive && Uuid::parse_str(id_str).is_err() {
+    if matches!(action, "resume" | "fork")
+        && !include_non_interactive
+        && Uuid::parse_str(id_str).is_err()
+    {
+        let action_phrase = if action == "resume" { "resume" } else { "fork" };
         message.push_str(
-            " If you are trying to resume a non-interactive session by name, retry with `codex resume --include-non-interactive`.",
+            &format!(
+                " If you are trying to {action_phrase} a non-interactive session by name, retry with `codex {action} --include-non-interactive`."
+            ),
         );
     }
     message
@@ -1139,7 +1145,7 @@ async fn run_ratatui_app(
     };
     shutdown_app_server_if_present(onboarding_app_server.take()).await;
 
-    let mut missing_session_exit = |id_str: &str, action: &str| {
+    let mut missing_session_exit = |id_str: &str, action: &str, include_non_interactive: bool| {
         error!("Error finding conversation path: {id_str}");
         terminal_restore_guard.restore_silently();
         session_log::log_session_end();
@@ -1153,15 +1159,15 @@ async fn run_ratatui_app(
             exit_reason: ExitReason::Fatal(missing_session_message(
                 id_str,
                 action,
-                cli.resume_include_non_interactive,
+                include_non_interactive,
             )),
         })
     };
 
     let needs_app_server_session_lookup = cli.resume_last
         || cli.fork_last
-        || cli.resume_session_id.is_some()
-        || cli.fork_session_id.is_some()
+        || cli.resume_session_target.is_some()
+        || cli.fork_session_target.is_some()
         || cli.resume_picker
         || cli.fork_picker;
     let mut session_lookup_app_server = if needs_app_server_session_lookup {
@@ -1184,21 +1190,23 @@ async fn run_ratatui_app(
         None
     };
 
-    let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
+    let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_target.is_some();
     let session_selection = if use_fork {
-        if let Some(id_str) = cli.fork_session_id.as_deref() {
+        if let Some(id_str) = cli.fork_session_target.as_deref() {
             let Some(app_server) = session_lookup_app_server.as_mut() else {
                 unreachable!("session lookup app server should be initialized for --fork <id>");
             };
             match lookup_session_target_with_app_server(
-                app_server, id_str, /*include_non_interactive*/ false,
+                app_server,
+                id_str,
+                cli.fork_include_non_interactive,
             )
             .await?
             {
                 Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
                 None => {
                     shutdown_app_server_if_present(session_lookup_app_server.take()).await;
-                    return missing_session_exit(id_str, "fork");
+                    return missing_session_exit(id_str, "fork", cli.fork_include_non_interactive);
                 }
             }
         } else if cli.fork_last {
@@ -1216,7 +1224,10 @@ async fn run_ratatui_app(
                 unreachable!("session lookup app server should be initialized for --fork --last");
             };
             match lookup_latest_session_target_with_app_server(
-                app_server, &config, filter_cwd, /*include_non_interactive*/ false,
+                app_server,
+                &config,
+                filter_cwd,
+                cli.fork_include_non_interactive,
             )
             .await?
             {
@@ -1231,6 +1242,7 @@ async fn run_ratatui_app(
                 &mut tui,
                 &config,
                 cli.fork_show_all,
+                cli.fork_include_non_interactive,
                 app_server,
             )
             .await?
@@ -1252,7 +1264,7 @@ async fn run_ratatui_app(
         } else {
             resume_picker::SessionSelection::StartFresh
         }
-    } else if let Some(id_str) = cli.resume_session_id.as_deref() {
+    } else if let Some(id_str) = cli.resume_session_target.as_deref() {
         let Some(app_server) = session_lookup_app_server.as_mut() else {
             unreachable!("session lookup app server should be initialized for --resume <id>");
         };
@@ -1266,7 +1278,7 @@ async fn run_ratatui_app(
             Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
             None => {
                 shutdown_app_server_if_present(session_lookup_app_server.take()).await;
-                return missing_session_exit(id_str, "resume");
+                return missing_session_exit(id_str, "resume", cli.resume_include_non_interactive);
             }
         }
     } else if cli.resume_last {
@@ -1950,8 +1962,8 @@ mod tests {
             /*include_non_interactive*/ false,
         );
 
-        assert!(message.contains("No saved session found with ID named-resident."));
-        assert!(message.contains("Run `codex resume` without an ID"));
+        assert!(message.contains("No saved session found with ID or name named-resident."));
+        assert!(message.contains("Run `codex resume` without a target"));
         assert!(message.contains("`codex resume --include-non-interactive`"));
     }
 
@@ -1964,7 +1976,7 @@ mod tests {
             /*include_non_interactive*/ false,
         );
 
-        assert!(message.contains("No saved session found with ID"));
+        assert!(message.contains("No saved session found with ID or name"));
         assert!(!message.contains("include-non-interactive"));
     }
 
@@ -1976,7 +1988,32 @@ mod tests {
             /*include_non_interactive*/ true,
         );
 
-        assert!(message.contains("No saved session found with ID named-resident."));
+        assert!(message.contains("No saved session found with ID or name named-resident."));
+        assert!(!message.contains("include-non-interactive"));
+    }
+
+    #[test]
+    fn missing_session_message_suggests_non_interactive_flag_for_named_fork_targets() {
+        let message = missing_session_message(
+            "named-resident",
+            "fork",
+            /*include_non_interactive*/ false,
+        );
+
+        assert!(message.contains("No saved session found with ID or name named-resident."));
+        assert!(message.contains("Run `codex fork` without a target"));
+        assert!(message.contains("`codex fork --include-non-interactive`"));
+    }
+
+    #[test]
+    fn missing_session_message_omits_non_interactive_hint_when_already_enabled_for_fork() {
+        let message = missing_session_message(
+            "named-resident",
+            "fork",
+            /*include_non_interactive*/ true,
+        );
+
+        assert!(message.contains("No saved session found with ID or name named-resident."));
         assert!(!message.contains("include-non-interactive"));
     }
 

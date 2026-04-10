@@ -59,8 +59,7 @@ fn resume_accepts_output_last_message_flag_after_subcommand() {
 fn resume_help_mentions_reconnect() {
     let help = Cli::command().render_long_help().to_string();
 
-    assert!(help.contains("Resume or reconnect to a previous session by id"));
-    assert!(help.contains("pick the most recent with --last"));
+    assert!(help.contains("Resume or reconnect to a previous session by id or name"));
 }
 
 #[test]
@@ -71,7 +70,7 @@ fn resume_subcommand_help_mentions_reconnect_and_last() {
         .render_long_help()
         .to_string();
 
-    assert!(help.contains("Resume or reconnect to a previous session by id"));
+    assert!(help.contains("Resume or reconnect to a previous session by id or name"));
     assert!(help.contains("Resume or reconnect to the most recent recorded session"));
     assert!(help.contains("--last"));
 }

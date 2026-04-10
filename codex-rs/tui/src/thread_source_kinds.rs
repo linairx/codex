@@ -1,9 +1,14 @@
 use codex_app_server_protocol::ThreadSourceKind;
 
+/// Source kinds to use when the caller wants to preserve app-server's default
+/// interactive-only behavior (`cli` / `vscode`).
 pub(crate) fn interactive_thread_source_kinds() -> Vec<ThreadSourceKind> {
     vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
 }
 
+/// Source kinds to use when the caller must opt into both interactive and
+/// non-interactive threads instead of relying on app-server's interactive-only
+/// default for omitted/empty `sourceKinds`.
 pub(crate) fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
     vec![
         ThreadSourceKind::Cli,

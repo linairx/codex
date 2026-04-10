@@ -49,6 +49,11 @@ just test
 cargo test --all-features
 ```
 
+After the first launch, the quickest session-management references are:
+
+- [`getting-started.md`](./getting-started.md) for `codex`, `codex resume`, `codex fork`, `--last`, and `--include-non-interactive`
+- [`../codex-rs/README.md`](../codex-rs/README.md) for the Rust workspace's interactive and non-interactive CLI flows
+
 ## Tracing / verbose logging
 
 Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.

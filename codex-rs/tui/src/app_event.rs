@@ -102,7 +102,7 @@ pub(crate) enum AppEvent {
     /// previous chat resumable.
     ClearUi,
 
-    /// Open the resume picker inside the running TUI session.
+    /// Open the resume or reconnect picker inside the running TUI session.
     OpenResumePicker,
 
     /// Fork the current session into a new thread.

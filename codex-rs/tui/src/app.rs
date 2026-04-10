@@ -1243,7 +1243,8 @@ impl App {
             config: cfg,
             frame_requester: tui.frame_requester(),
             app_event_tx: self.app_event_tx.clone(),
-            // Fork/resume bootstraps here don't carry any prefilled message content.
+            // Fork/resume/reconnect bootstraps here don't carry any prefilled
+            // message content.
             initial_user_message: None,
             enhanced_keys_supported: self.enhanced_keys_supported,
             has_chatgpt_account: self.chat_widget.has_chatgpt_account(),

@@ -20,7 +20,8 @@ limit?: number | null,
 modelProviders?: Array<string> | null, 
 /**
  * Optional source filter; when set, only loaded threads from these source
- * kinds are returned. When present but empty, includes all source kinds.
+ * kinds are returned. When omitted or empty, defaults to interactive
+ * sources.
  */
 sourceKinds?: Array<ThreadSourceKind> | null, 
 /**

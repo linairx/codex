@@ -55,6 +55,7 @@ use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDecrementElicitationResponse;
 use codex_app_server_protocol::ThreadForkParams;
@@ -1615,11 +1616,11 @@ fn thread_id_collection_summary_lines_with_cursor(
 
 fn thread_summary_fields(thread: &AppServerThread) -> String {
     format!(
-        "id={}, mode={}, resident={}, status={:?}, action={}",
+        "id={}, mode={}, resident={}, status={}, action={}",
         thread.id,
         thread_mode_label(thread.mode),
         thread.resident,
-        thread.status,
+        thread_status_label(&thread.status),
         thread_resume_action_label(thread.mode)
     )
 }
@@ -1638,6 +1639,36 @@ fn thread_resume_action_label(mode: ThreadMode) -> &'static str {
     }
 }
 
+fn thread_status_label(status: &codex_app_server_protocol::ThreadStatus) -> String {
+    match status {
+        codex_app_server_protocol::ThreadStatus::NotLoaded => "NotLoaded".to_string(),
+        codex_app_server_protocol::ThreadStatus::Idle => "Idle".to_string(),
+        codex_app_server_protocol::ThreadStatus::SystemError => "SystemError".to_string(),
+        codex_app_server_protocol::ThreadStatus::Active { active_flags } => {
+            let active_flags = if active_flags.is_empty() {
+                "none".to_string()
+            } else {
+                active_flags
+                    .iter()
+                    .copied()
+                    .map(thread_active_flag_label)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            format!("Active(flags={active_flags})")
+        }
+    }
+}
+
+fn thread_active_flag_label(active_flag: ThreadActiveFlag) -> &'static str {
+    match active_flag {
+        ThreadActiveFlag::WaitingOnApproval => "waitingOnApproval",
+        ThreadActiveFlag::WaitingOnUserInput => "waitingOnUserInput",
+        ThreadActiveFlag::BackgroundTerminalRunning => "backgroundTerminalRunning",
+        ThreadActiveFlag::WorkspaceChanged => "workspaceChanged",
+    }
+}
+
 fn thread_status_changed_summary_line(
     thread_id: &str,
     status: &codex_app_server_protocol::ThreadStatus,
@@ -1645,12 +1676,13 @@ fn thread_status_changed_summary_line(
 ) -> String {
     match known_thread {
         Some(thread) => format!(
-            "id={thread_id}, mode={}, resident={}, status={status:?}, action={}",
+            "id={thread_id}, mode={}, resident={}, status={}, action={}",
             thread_mode_label(thread.mode),
             thread.resident,
+            thread_status_label(status),
             thread_resume_action_label(thread.mode)
         ),
-        None => format!("id={thread_id}, status={status:?}"),
+        None => format!("id={thread_id}, status={}", thread_status_label(status)),
     }
 }
 
@@ -1707,10 +1739,12 @@ mod tests {
     use super::thread_started_notification_lines;
     use super::thread_status_changed_notification_lines;
     use super::thread_status_changed_summary_line;
+    use super::thread_status_label;
     use super::thread_summary_fields;
     use clap::CommandFactory;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
+    use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadSourceKind;
     use codex_app_server_protocol::ThreadStatus;
@@ -2052,7 +2086,7 @@ mod tests {
             thread_collection_summary_lines_with_cursor("thread/loaded/read", &threads, None),
             vec![
                 "< thread/loaded/read summary:".to_string(),
-                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active { active_flags: [] }, action=reconnect".to_string(),
+                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active(flags=none), action=reconnect".to_string(),
             ]
         );
     }
@@ -2103,7 +2137,7 @@ mod tests {
             ),
             vec![
                 "< thread/loaded/read summary:".to_string(),
-                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active { active_flags: [] }, action=reconnect".to_string(),
+                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active(flags=none), action=reconnect".to_string(),
                 "< thread/loaded/read next_cursor: cursor-2".to_string(),
             ]
         );
@@ -2221,6 +2255,25 @@ mod tests {
         assert_eq!(
             thread_status_changed_summary_line("thread-unknown", &ThreadStatus::SystemError, None),
             "id=thread-unknown, status=SystemError"
+        );
+    }
+
+    #[test]
+    fn thread_status_label_expands_active_flags_into_stable_summary_text() {
+        assert_eq!(
+            thread_status_label(&ThreadStatus::Active {
+                active_flags: vec![
+                    ThreadActiveFlag::WaitingOnApproval,
+                    ThreadActiveFlag::WorkspaceChanged,
+                ],
+            }),
+            "Active(flags=waitingOnApproval,workspaceChanged)"
+        );
+        assert_eq!(
+            thread_status_label(&ThreadStatus::Active {
+                active_flags: Vec::new(),
+            }),
+            "Active(flags=none)"
         );
     }
 
