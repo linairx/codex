@@ -23,6 +23,7 @@ use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::interactive_thread_source_kinds;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
@@ -269,11 +270,11 @@ async fn thread_list_reports_system_error_idle_flag_after_failed_turn() -> Resul
         /*cursor*/ None,
         Some(10),
         Some(vec!["mock_provider".to_string()]),
-        Some(vec![
-            ThreadSourceKind::AppServer,
-            ThreadSourceKind::Cli,
-            ThreadSourceKind::VsCode,
-        ]),
+        Some({
+            let mut source_kinds = interactive_thread_source_kinds();
+            source_kinds.push(ThreadSourceKind::AppServer);
+            source_kinds
+        }),
         /*archived*/ None,
     )
     .await?;
@@ -319,11 +320,11 @@ async fn thread_list_reports_workspace_changed_for_resident_threads() -> Result<
                 /*cursor*/ None,
                 Some(10),
                 Some(vec!["mock_provider".to_string()]),
-                Some(vec![
-                    ThreadSourceKind::AppServer,
-                    ThreadSourceKind::Cli,
-                    ThreadSourceKind::VsCode,
-                ]),
+                Some({
+                    let mut source_kinds = interactive_thread_source_kinds();
+                    source_kinds.push(ThreadSourceKind::AppServer);
+                    source_kinds
+                }),
                 /*archived*/ None,
             )
             .await?;

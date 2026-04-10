@@ -38,7 +38,6 @@ use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSortKey;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -48,6 +47,7 @@ use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::all_thread_source_kinds;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
 use codex_core::check_execpolicy_for_warnings;
@@ -1129,21 +1129,6 @@ fn turn_items_for_thread(
         .iter()
         .find(|turn| turn.id == turn_id)
         .map(|turn| turn.items.clone())
-}
-
-fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
-    vec![
-        ThreadSourceKind::Cli,
-        ThreadSourceKind::VsCode,
-        ThreadSourceKind::Exec,
-        ThreadSourceKind::AppServer,
-        ThreadSourceKind::SubAgent,
-        ThreadSourceKind::SubAgentReview,
-        ThreadSourceKind::SubAgentCompact,
-        ThreadSourceKind::SubAgentThreadSpawn,
-        ThreadSourceKind::SubAgentOther,
-        ThreadSourceKind::Unknown,
-    ]
 }
 
 async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {

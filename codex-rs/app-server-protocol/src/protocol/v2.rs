@@ -3084,6 +3084,28 @@ pub enum ThreadSourceKind {
     Unknown,
 }
 
+/// Returns the app-server default source filter for interactive thread listings.
+pub fn interactive_thread_source_kinds() -> Vec<ThreadSourceKind> {
+    vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
+}
+
+/// Returns every known source kind so callers can opt out of the app-server
+/// interactive-only default and include non-interactive threads explicitly.
+pub fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
+    vec![
+        ThreadSourceKind::Cli,
+        ThreadSourceKind::VsCode,
+        ThreadSourceKind::Exec,
+        ThreadSourceKind::AppServer,
+        ThreadSourceKind::SubAgent,
+        ThreadSourceKind::SubAgentReview,
+        ThreadSourceKind::SubAgentCompact,
+        ThreadSourceKind::SubAgentThreadSpawn,
+        ThreadSourceKind::SubAgentOther,
+        ThreadSourceKind::Unknown,
+    ]
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
@@ -8433,5 +8455,32 @@ mod tests {
         let serialized_without_override =
             serde_json::to_value(&without_override).expect("params should serialize");
         assert_eq!(serialized_without_override.get("serviceTier"), None);
+    }
+
+    #[test]
+    fn interactive_thread_source_kinds_remains_interactive_only() {
+        assert_eq!(
+            interactive_thread_source_kinds(),
+            vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]
+        );
+    }
+
+    #[test]
+    fn all_thread_source_kinds_covers_interactive_and_non_interactive_sources() {
+        assert_eq!(
+            all_thread_source_kinds(),
+            vec![
+                ThreadSourceKind::Cli,
+                ThreadSourceKind::VsCode,
+                ThreadSourceKind::Exec,
+                ThreadSourceKind::AppServer,
+                ThreadSourceKind::SubAgent,
+                ThreadSourceKind::SubAgentReview,
+                ThreadSourceKind::SubAgentCompact,
+                ThreadSourceKind::SubAgentThreadSpawn,
+                ThreadSourceKind::SubAgentOther,
+                ThreadSourceKind::Unknown,
+            ]
+        );
     }
 }

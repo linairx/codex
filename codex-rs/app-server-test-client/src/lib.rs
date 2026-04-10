@@ -79,7 +79,6 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadRollbackResponse;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
@@ -88,6 +87,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_app_server_protocol::all_thread_source_kinds;
 use codex_core::config::Config;
 use codex_otel::OtelProvider;
 use codex_otel::current_span_w3c_trace_context;
@@ -1709,21 +1709,6 @@ fn thread_status_changed_notification_lines(
     )]
 }
 
-fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
-    vec![
-        ThreadSourceKind::Cli,
-        ThreadSourceKind::VsCode,
-        ThreadSourceKind::Exec,
-        ThreadSourceKind::AppServer,
-        ThreadSourceKind::SubAgent,
-        ThreadSourceKind::SubAgentReview,
-        ThreadSourceKind::SubAgentCompact,
-        ThreadSourceKind::SubAgentThreadSpawn,
-        ThreadSourceKind::SubAgentOther,
-        ThreadSourceKind::Unknown,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1746,8 +1731,8 @@ mod tests {
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadMode;
-    use codex_app_server_protocol::ThreadSourceKind;
     use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
 
     fn make_thread(id: &str, mode: ThreadMode, resident: bool, status: ThreadStatus) -> Thread {
         Thread {
@@ -1798,18 +1783,7 @@ mod tests {
     fn all_thread_source_kinds_cover_interactive_and_non_interactive_sources() {
         assert_eq!(
             all_thread_source_kinds(),
-            vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-                ThreadSourceKind::SubAgent,
-                ThreadSourceKind::SubAgentReview,
-                ThreadSourceKind::SubAgentCompact,
-                ThreadSourceKind::SubAgentThreadSpawn,
-                ThreadSourceKind::SubAgentOther,
-                ThreadSourceKind::Unknown,
-            ]
+            protocol_all_thread_source_kinds()
         );
     }
 

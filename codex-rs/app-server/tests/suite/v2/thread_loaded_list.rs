@@ -6,9 +6,9 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::interactive_thread_source_kinds;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::TempDir;
@@ -168,7 +168,7 @@ async fn thread_loaded_list_filters_by_model_provider_and_source_kind() -> Resul
             cursor: None,
             limit: None,
             model_providers: Some(vec!["mock_provider".to_string()]),
-            source_kinds: Some(vec![ThreadSourceKind::VsCode]),
+            source_kinds: Some(interactive_thread_source_kinds()),
             cwd: None,
         })
         .await?;

@@ -31,12 +31,12 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::all_thread_source_kinds;
 use serde::Serialize;
 
 use crate::output::Output;
@@ -379,21 +379,6 @@ impl AppServerClient {
     }
 }
 
-fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
-    vec![
-        ThreadSourceKind::Cli,
-        ThreadSourceKind::VsCode,
-        ThreadSourceKind::Exec,
-        ThreadSourceKind::AppServer,
-        ThreadSourceKind::SubAgent,
-        ThreadSourceKind::SubAgentReview,
-        ThreadSourceKind::SubAgentCompact,
-        ThreadSourceKind::SubAgentThreadSpawn,
-        ThreadSourceKind::SubAgentOther,
-        ThreadSourceKind::Unknown,
-    ]
-}
-
 fn handle_server_request(
     request: JSONRPCRequest,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
@@ -490,8 +475,8 @@ mod tests {
     use crate::output::Output;
     use crate::state::KnownThread;
     use crate::state::State;
-    use codex_app_server_protocol::ThreadSourceKind;
     use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
     use pretty_assertions::assert_eq;
     use std::process::Command;
     use std::process::Stdio;
@@ -528,18 +513,7 @@ mod tests {
     fn all_thread_source_kinds_covers_interactive_and_non_interactive_sources() {
         assert_eq!(
             all_thread_source_kinds(),
-            vec![
-                ThreadSourceKind::Cli,
-                ThreadSourceKind::VsCode,
-                ThreadSourceKind::Exec,
-                ThreadSourceKind::AppServer,
-                ThreadSourceKind::SubAgent,
-                ThreadSourceKind::SubAgentReview,
-                ThreadSourceKind::SubAgentCompact,
-                ThreadSourceKind::SubAgentThreadSpawn,
-                ThreadSourceKind::SubAgentOther,
-                ThreadSourceKind::Unknown,
-            ]
+            protocol_all_thread_source_kinds()
         );
     }
 

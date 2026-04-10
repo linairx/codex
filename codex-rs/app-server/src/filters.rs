@@ -84,6 +84,7 @@ pub(crate) fn source_kind_matches(source: &CoreSessionSource, filter: &[ThreadSo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::interactive_thread_source_kinds;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn compute_source_filters_interactive_only_skips_post_filtering() {
-        let source_kinds = vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode];
+        let source_kinds = interactive_thread_source_kinds();
         let (allowed_sources, filter) = compute_source_filters(Some(source_kinds.clone()));
 
         assert_eq!(

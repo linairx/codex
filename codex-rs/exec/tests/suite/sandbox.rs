@@ -126,6 +126,15 @@ async fn python_multiprocessing_lock_works_under_sandbox() {
     #[cfg(target_os = "macos")]
     let writable_roots = Vec::<AbsolutePathBuf>::new();
 
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .status()
+        .is_err()
+    {
+        eprintln!("python3 not found in PATH, skipping test.");
+        return;
+    }
+
     // From https://man7.org/linux/man-pages/man7/sem_overview.7.html
     //
     // > On Linux, named semaphores are created in a virtual filesystem,
