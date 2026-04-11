@@ -10,6 +10,10 @@
 
 目标是把前面几份设计稿收敛成一个可以直接指导实现和拆 PR 的任务清单。
 
+真正开始执行时，建议先从下面这份索引页进入：
+
+- `docs/persistent-runtime-checklists-index.md`
+
 它回答的问题不是：
 
 - “为什么值得做”
@@ -322,9 +326,12 @@
 - `app-server-test-client` 的 `thread/loaded/list` 也已补成可直接联调的 id-only probe：新增 `thread-loaded-list --cursor --limit` 命令，compact summary 会稳定打印 loaded thread ids 与 `next_cursor`，并在 help/README/回归里明确这条接口只做 loaded id 探针；需要 resident `mode`、当前 `status` 或 reconnect 语义时应继续读 `thread-loaded-read`
 - `app-server-test-client` 的 `thread/loaded/list` 摘要契约也已补上字符串级断言：id-only summary 现在会稳定渲染 header、每条 loaded thread id 行以及分页 `next_cursor` 尾行
 - `app-server-test-client` 的 loaded 分页空态边界也已单独锁住：`thread/loaded/read` 与 `thread/loaded/list` 在空页上仍会继续保留 `no threads + next_cursor`，连 id-only probe 自己也不会把分页尾行吞掉
+- `app-server-test-client` 现在也已补上一个更接近最小 bridge 消费者的 `watch-summary` 入口：启动后会先打印一轮 `thread/list` 与 `thread/loaded/read` 的 compact summary，再继续复用现有 resident-aware `thread/started` / `thread/status/changed` / `thread/name/updated` 摘要通知流，让“先拉当前摘要、再消费 status-only 增量”的闭环可以直接在 websocket 客户端里演练，而不必退回 raw `watch` 输出自己手动拼装
 - `codex-app-server-client` 的 typed 分页读取面现在也已补上同层回归：`thread/list` 与 `thread/loaded/read` 在有 `next_cursor` 时，后续页请求仍会稳定保留 resident `mode`，避免共享 in-process 客户端只在首页锁住 `ResidentAssistant`，翻页后却重新退回通用线程摘要
 - `codex-app-server-client` 的 typed 请求层现在也已把 `thread/loaded/list` 这条 id-only probe 锁住：in-process 调用会稳定保留 loaded ids 与 `next_cursor` 的分页连续性，而 README 也同步明确需要 resident `mode`、当前 `status` 或 reconnect 语义时仍应继续调用 `thread/loaded/read`
 - `debug-client` 现在也已把 `thread/loaded/list` 这条 id-only probe 接到本地调试流里：新增 `:refresh-loaded [cursor]`，会稳定打印 loaded thread ids 与 `next cursor`，并在 help/README/回归中明确需要 mode/status/action、resident mode 或 reconnect 语义时仍应继续使用 `:refresh-thread` / `:resume`
+- `debug-client` 的最小远端消费者闭环现在也已继续补到 `thread/loaded/read`：新增 `:refresh-loaded-read [cursor]`，会直接打印 loaded runtime summary 的 `mode + status + action`，而 `reader` / `state` / help / README / 回归也已同步锁住这条“loaded/read 承担当前摘要、loaded/list 仍只是 id-only probe”的消费分工
+- `debug-client` 的 status 增量消费现在也已从“只更新本地缓存”继续补成真实输出：收到 `thread/started`、`thread/status/changed`、`thread/name/updated` 时会打印 compact summary；已知线程继续复用缓存里的 `mode + action`，未知 `thread/status/changed` 则保持 status-only 并提示回到读取面补 summary，避免最小消费者在增量通知里脑补 resident reconnect 语义
 - `debug-client` 的 `:refresh-loaded` 摘要契约也已补上字符串级断言：最终输出会稳定渲染 `loaded threads:` header、每条 loaded thread id 行、空列表时的 `loaded threads: (none)` 空态，以及 `more loaded threads available, next cursor: ...` 尾行
 - `debug-client` 的 `:refresh-loaded` 请求侧闭环也已补上 cursor 文案回归：传入续页 cursor 时，客户端请求日志会稳定写成 `requested loaded thread list (..., cursor=...)`
 - `codex-tui` 的 `AppServerSession` 现在也已把 `thread/loaded/list` 这条 id-only probe 纳入 typed 会话层回归：新增 `thread_loaded_list(...)` 包装，并锁住 loaded ids 与 `next_cursor` 的分页连续性，避免 TUI 中间层只覆盖 `thread/loaded/read` 这条带 mode 的读取面

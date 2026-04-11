@@ -64,9 +64,10 @@ Callers that need to distinguish an ordinary interactive resume target from resi
 consume `response.thread.mode` from the immediate typed response instead of
 waiting for later legacy events.
 The same rule applies to metadata-only thread operations such as
-`thread/metadata/update`: callers should trust the returned `thread.mode`
-directly instead of assuming a follow-up `thread/read` is required to recover
-resident assistant semantics.
+`thread/metadata/update`: callers should trust the returned thread identity
+metadata directly, including `thread.mode` for reconnect semantics and
+`thread.name` for user-visible labels, instead of assuming a follow-up
+`thread/read` is required to recover them.
 That guarantee now has explicit typed coverage for archived resident threads
 too, so the archived metadata-repair path cannot silently fall back to an
 ordinary interactive resume target summary.

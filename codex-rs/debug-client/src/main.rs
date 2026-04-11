@@ -101,7 +101,10 @@ fn main() -> Result<()> {
         .client_line(&format!(
             "{} {}",
             connected_thread_message(&thread_connection),
-            thread_connection.thread_id
+            thread_display_label(
+                thread_connection.thread_id.as_str(),
+                thread_connection.thread_name.as_deref()
+            )
         ))
         .ok();
     output.set_prompt(&thread_connection.thread_id);
@@ -261,6 +264,28 @@ fn handle_command(
             }
             true
         }
+        UserCommand::RefreshLoadedRead(cursor) => {
+            match client.request_thread_loaded_read(cursor.clone()) {
+                Ok(request_id) => {
+                    output
+                        .client_line(&match cursor {
+                            Some(cursor) => format!(
+                                "requested loaded thread summaries ({request_id:?}, cursor={cursor})"
+                            ),
+                            None => {
+                                format!("requested loaded thread summaries ({request_id:?})")
+                            }
+                        })
+                        .ok();
+                }
+                Err(err) => {
+                    output
+                        .client_line(&format!("failed to read loaded thread summaries: {err}"))
+                        .ok();
+                }
+            }
+            true
+        }
     }
 }
 
@@ -307,6 +332,14 @@ fn drain_events(event_rx: &mpsc::Receiver<ReaderEvent>, output: &Output) {
                     output.client_line(&line).ok();
                 }
             }
+            ReaderEvent::LoadedThreadRead {
+                threads,
+                next_cursor,
+            } => {
+                for line in loaded_thread_read_lines(&threads, next_cursor.as_deref()) {
+                    output.client_line(&line).ok();
+                }
+            }
         }
     }
 }
@@ -323,7 +356,7 @@ fn thread_list_lines(
         lines.extend(threads.iter().map(|thread| {
             format!(
                 "  {} ({}, {}, {})",
-                thread.thread_id,
+                thread_display_label(&thread.thread_id, thread.thread_name.as_deref()),
                 thread_mode_label(thread.thread_mode),
                 thread_status_label(&thread.thread_status),
                 thread_resume_label(thread.thread_mode)
@@ -360,6 +393,36 @@ fn loaded_thread_list_lines(thread_ids: &[String], next_cursor: Option<&str>) ->
     lines
 }
 
+fn loaded_thread_read_lines(
+    threads: &[crate::state::KnownThread],
+    next_cursor: Option<&str>,
+) -> Vec<String> {
+    let mut lines = if threads.is_empty() {
+        vec!["loaded thread summaries: (none)".to_string()]
+    } else {
+        let mut lines = Vec::with_capacity(threads.len() + 1);
+        lines.push("loaded thread summaries:".to_string());
+        lines.extend(threads.iter().map(|thread| {
+            format!(
+                "  {} ({}, {}, {})",
+                thread_display_label(&thread.thread_id, thread.thread_name.as_deref()),
+                thread_mode_label(thread.thread_mode),
+                thread_status_label(&thread.thread_status),
+                thread_resume_label(thread.thread_mode)
+            )
+        }));
+        lines
+    };
+
+    if let Some(next_cursor) = next_cursor {
+        lines.push(format!(
+            "more loaded thread summaries available, next cursor: {next_cursor}"
+        ));
+    }
+
+    lines
+}
+
 fn connected_thread_message(thread_connection: &ThreadConnection) -> &'static str {
     match thread_connection.thread_mode {
         ThreadMode::Interactive => "connected to thread",
@@ -377,13 +440,21 @@ fn active_thread_switch_message(
 ) -> String {
     match known_thread {
         Some(thread) => format!(
-            "switched active thread to {} {thread_id} ({})",
+            "switched active thread to {} {} ({})",
             thread_ready_label(thread.thread_mode),
+            thread_display_label(thread_id, thread.thread_name.as_deref()),
             thread_status_label(&thread.thread_status)
         ),
         None => format!(
             "switched active thread to {thread_id} (unknown; use :resume to resume or reconnect)"
         ),
+    }
+}
+
+fn thread_display_label(thread_id: &str, thread_name: Option<&str>) -> String {
+    match thread_name {
+        Some(thread_name) => format!("{thread_name} [{thread_id}]"),
+        None => thread_id.to_string(),
     }
 }
 
@@ -450,6 +521,7 @@ fn help_lines() -> &'static [&'static str] {
         "  :use <thread-id>      switch active thread without resuming/reconnecting; preserve known mode/status when available",
         "  :refresh-thread [cursor] list threads with mode/status/action across interactive and non-interactive sources",
         "  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources; use :refresh-thread or :resume for mode/status/action",
+        "  :refresh-loaded-read [cursor] list loaded thread summaries with mode/status/action across interactive and non-interactive sources",
         "  :quit                 exit",
         "type a message to send it as a new turn",
     ]
@@ -463,7 +535,9 @@ mod tests {
     use super::connected_thread_message;
     use super::help_lines;
     use super::loaded_thread_list_lines;
+    use super::loaded_thread_read_lines;
     use super::no_active_thread_message;
+    use super::thread_display_label;
     use super::thread_list_lines;
     use super::thread_mode_label;
     use super::thread_ready_label;
@@ -480,6 +554,7 @@ mod tests {
     fn resident_thread_messages_use_reconnect_language() {
         let thread_connection = ThreadConnection {
             thread_id: "thread-1".to_string(),
+            thread_name: Some("atlas".to_string()),
             thread_mode: ThreadMode::ResidentAssistant,
         };
 
@@ -501,6 +576,7 @@ mod tests {
     fn interactive_thread_messages_keep_resume_language() {
         let thread_connection = ThreadConnection {
             thread_id: "thread-1".to_string(),
+            thread_name: None,
             thread_mode: ThreadMode::Interactive,
         };
 
@@ -519,24 +595,26 @@ mod tests {
                 "thread-1",
                 Some(&KnownThread {
                     thread_id: "thread-1".to_string(),
+                    thread_name: Some("chat".to_string()),
                     thread_mode: ThreadMode::Interactive,
                     thread_status: ThreadStatus::Idle,
                 })
             ),
-            "switched active thread to thread thread-1 (idle)"
+            "switched active thread to thread chat [thread-1] (idle)"
         );
         assert_eq!(
             active_thread_switch_message(
                 "thread-1",
                 Some(&KnownThread {
                     thread_id: "thread-1".to_string(),
+                    thread_name: Some("atlas".to_string()),
                     thread_mode: ThreadMode::ResidentAssistant,
                     thread_status: ThreadStatus::Active {
                         active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
                     },
                 })
             ),
-            "switched active thread to resident assistant thread thread-1 (active: workspace changed)"
+            "switched active thread to resident assistant thread atlas [thread-1] (active: workspace changed)"
         );
         assert_eq!(
             active_thread_switch_message("thread-1", None),
@@ -595,6 +673,9 @@ mod tests {
         assert!(lines.contains(
             &"  :refresh-loaded [cursor] list loaded thread ids only across interactive and non-interactive sources; use :refresh-thread or :resume for mode/status/action"
         ));
+        assert!(lines.contains(
+            &"  :refresh-loaded-read [cursor] list loaded thread summaries with mode/status/action across interactive and non-interactive sources"
+        ));
     }
 
     #[test]
@@ -611,11 +692,13 @@ mod tests {
             &[
                 KnownThread {
                     thread_id: "thread-1".to_string(),
+                    thread_name: Some("chat".to_string()),
                     thread_mode: ThreadMode::Interactive,
                     thread_status: ThreadStatus::Idle,
                 },
                 KnownThread {
                     thread_id: "thread-2".to_string(),
+                    thread_name: Some("atlas".to_string()),
                     thread_mode: ThreadMode::ResidentAssistant,
                     thread_status: ThreadStatus::Active {
                         active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
@@ -629,11 +712,21 @@ mod tests {
             lines,
             vec![
                 "threads:".to_string(),
-                "  thread-1 (interactive, idle, resume)".to_string(),
-                "  thread-2 (resident assistant, active: workspace changed, reconnect)".to_string(),
+                "  chat [thread-1] (interactive, idle, resume)".to_string(),
+                "  atlas [thread-2] (resident assistant, active: workspace changed, reconnect)"
+                    .to_string(),
                 "more threads available, next cursor: cursor-2".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn thread_display_label_prefers_thread_name_over_id() {
+        assert_eq!(
+            thread_display_label("thread-1", Some("atlas")),
+            "atlas [thread-1]"
+        );
+        assert_eq!(thread_display_label("thread-1", None), "thread-1");
     }
 
     #[test]
@@ -673,10 +766,51 @@ mod tests {
     }
 
     #[test]
+    fn loaded_thread_read_lines_render_mode_status_and_action_labels() {
+        let lines = loaded_thread_read_lines(
+            &[
+                KnownThread {
+                    thread_id: "thread-1".to_string(),
+                    thread_name: Some("chat".to_string()),
+                    thread_mode: ThreadMode::Interactive,
+                    thread_status: ThreadStatus::Idle,
+                },
+                KnownThread {
+                    thread_id: "thread-2".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Active {
+                        active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                    },
+                },
+            ],
+            Some("cursor-2"),
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "loaded thread summaries:".to_string(),
+                "  chat [thread-1] (interactive, idle, resume)".to_string(),
+                "  atlas [thread-2] (resident assistant, active: workspace changed, reconnect)"
+                    .to_string(),
+                "more loaded thread summaries available, next cursor: cursor-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn loaded_thread_list_lines_render_empty_state_without_cursor() {
         let lines = loaded_thread_list_lines(&[], None);
 
         assert_eq!(lines, vec!["loaded threads: (none)".to_string()]);
+    }
+
+    #[test]
+    fn loaded_thread_read_lines_render_empty_state_without_cursor() {
+        let lines = loaded_thread_read_lines(&[], None);
+
+        assert_eq!(lines, vec!["loaded thread summaries: (none)".to_string()]);
     }
 
     #[test]
@@ -710,6 +844,24 @@ mod tests {
         assert_eq!(
             message,
             "requested loaded thread list (Integer(8), cursor=cursor-2)"
+        );
+    }
+
+    #[test]
+    fn refresh_loaded_read_request_message_mentions_cursor_when_present() {
+        let request_id = codex_app_server_protocol::RequestId::Integer(9);
+        let cursor = "cursor-2".to_string();
+
+        let message = match Some(cursor) {
+            Some(cursor) => {
+                format!("requested loaded thread summaries ({request_id:?}, cursor={cursor})")
+            }
+            None => format!("requested loaded thread summaries ({request_id:?})"),
+        };
+
+        assert_eq!(
+            message,
+            "requested loaded thread summaries (Integer(9), cursor=cursor-2)"
         );
     }
 }

@@ -210,6 +210,15 @@ enum CliCommand {
     ///
     /// This command does not auto-exit; stop it with SIGINT/SIGTERM/SIGKILL.
     Watch,
+    /// Initialize the app-server, print thread summaries, then continue streaming summary notifications.
+    ///
+    /// This command does not auto-exit; stop it with SIGINT/SIGTERM/SIGKILL.
+    #[command(name = "watch-summary")]
+    WatchSummary {
+        /// Number of stored and loaded thread summaries to print during bootstrap.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
     /// Start a V2 turn that elicits an ExecCommand approval.
     #[command(name = "trigger-cmd-approval")]
     TriggerCmdApproval {
@@ -448,6 +457,11 @@ pub async fn run() -> Result<()> {
             ensure_dynamic_tools_unused(&dynamic_tools, "watch")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
             watch(&endpoint, &config_overrides).await
+        }
+        CliCommand::WatchSummary { limit } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "watch-summary")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            watch_summary(&endpoint, &config_overrides, limit).await
         }
         CliCommand::TriggerCmdApproval { user_message } => {
             let endpoint = resolve_endpoint(codex_bin, url)?;
@@ -1043,6 +1057,42 @@ async fn watch(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
     .await
 }
 
+async fn watch_summary(endpoint: &Endpoint, config_overrides: &[String], limit: u32) -> Result<()> {
+    with_client("watch-summary", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let thread_list = client.thread_list(ThreadListParams {
+            cursor: None,
+            limit: Some(limit),
+            sort_key: None,
+            model_providers: None,
+            source_kinds: Some(all_thread_source_kinds()),
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })?;
+        print_thread_list_summary(&thread_list);
+
+        let loaded_read = client.thread_loaded_read(ThreadLoadedReadParams {
+            cursor: None,
+            limit: Some(limit),
+            model_providers: None,
+            source_kinds: Some(all_thread_source_kinds()),
+            cwd: None,
+        })?;
+        print_thread_collection_summary_with_cursor(
+            "thread/loaded/read",
+            &loaded_read.data,
+            loaded_read.next_cursor.as_deref(),
+        );
+
+        println!("< streaming summary notifications until process is terminated");
+        client.stream_notifications_forever()
+    })
+    .await
+}
+
 async fn trigger_cmd_approval(
     endpoint: &Endpoint,
     config_overrides: &[String],
@@ -1616,13 +1666,18 @@ fn thread_id_collection_summary_lines_with_cursor(
 
 fn thread_summary_fields(thread: &AppServerThread) -> String {
     format!(
-        "id={}, mode={}, resident={}, status={}, action={}",
+        "id={}, name={}, mode={}, resident={}, status={}, action={}",
         thread.id,
+        thread_name_label(thread.name.as_deref()),
         thread_mode_label(thread.mode),
         thread.resident,
         thread_status_label(&thread.status),
         thread_resume_action_label(thread.mode)
     )
+}
+
+fn thread_name_label(thread_name: Option<&str>) -> &str {
+    thread_name.unwrap_or("-")
 }
 
 fn thread_mode_label(mode: ThreadMode) -> &'static str {
@@ -1676,13 +1731,32 @@ fn thread_status_changed_summary_line(
 ) -> String {
     match known_thread {
         Some(thread) => format!(
-            "id={thread_id}, mode={}, resident={}, status={}, action={}",
+            "id={thread_id}, name={}, mode={}, resident={}, status={}, action={}",
+            thread_name_label(thread.name.as_deref()),
             thread_mode_label(thread.mode),
             thread.resident,
             thread_status_label(status),
             thread_resume_action_label(thread.mode)
         ),
         None => format!("id={thread_id}, status={}", thread_status_label(status)),
+    }
+}
+
+fn thread_name_updated_summary_line(
+    thread_id: &str,
+    thread_name: Option<&str>,
+    known_thread: Option<&KnownThreadSummary>,
+) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, resident={}, status={}, action={}",
+            thread_name_label(thread_name),
+            thread_mode_label(thread.mode),
+            thread.resident,
+            thread_status_label(&thread.status),
+            thread_resume_action_label(thread.mode)
+        ),
+        None => format!("id={thread_id}, name={}", thread_name_label(thread_name)),
     }
 }
 
@@ -1709,6 +1783,17 @@ fn thread_status_changed_notification_lines(
     )]
 }
 
+fn thread_name_updated_notification_lines(
+    thread_id: &str,
+    thread_name: Option<&str>,
+    known_thread: Option<&KnownThreadSummary>,
+) -> Vec<String> {
+    vec![format!(
+        "< thread/name/updated summary: {}",
+        thread_name_updated_summary_line(thread_id, thread_name, known_thread)
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1719,6 +1804,8 @@ mod tests {
     use super::thread_collection_summary_lines_with_cursor;
     use super::thread_id_collection_summary_lines_with_cursor;
     use super::thread_mode_label;
+    use super::thread_name_updated_notification_lines;
+    use super::thread_name_updated_summary_line;
     use super::thread_response_summary_line;
     use super::thread_resume_action_label;
     use super::thread_started_notification_lines;
@@ -1734,7 +1821,13 @@ mod tests {
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
 
-    fn make_thread(id: &str, mode: ThreadMode, resident: bool, status: ThreadStatus) -> Thread {
+    fn make_thread(
+        id: &str,
+        name: Option<&str>,
+        mode: ThreadMode,
+        resident: bool,
+        status: ThreadStatus,
+    ) -> Thread {
         Thread {
             id: id.to_string(),
             forked_from_id: None,
@@ -1753,7 +1846,7 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             git_info: None,
-            name: None,
+            name: name.map(ToString::to_string),
             turns: Vec::new(),
         }
     }
@@ -1793,6 +1886,7 @@ mod tests {
 
         assert!(help.contains("Resume or reconnect to a V2 thread by id"));
         assert!(help.contains("Resume or reconnect to a V2 thread and continuously stream"));
+        assert!(help.contains("watch-summary"));
     }
 
     #[test]
@@ -1820,6 +1914,11 @@ mod tests {
         let thread_loaded_list_help = Cli::command()
             .find_subcommand_mut("thread-loaded-list")
             .expect("thread-loaded-list subcommand")
+            .render_long_help()
+            .to_string();
+        let watch_summary_help = Cli::command()
+            .find_subcommand_mut("watch-summary")
+            .expect("watch-summary subcommand")
             .render_long_help()
             .to_string();
         let thread_unarchive_help = Cli::command()
@@ -1886,6 +1985,14 @@ mod tests {
                 "Opaque pagination cursor returned by a previous `thread-loaded-list` call"
             )
         );
+        assert!(watch_summary_help.contains(
+            "Initialize the app-server, print thread summaries, then continue streaming summary notifications"
+        ));
+        assert!(watch_summary_help.contains("--limit <LIMIT>"));
+        assert!(
+            watch_summary_help
+                .contains("Number of stored and loaded thread summaries to print during bootstrap")
+        );
         assert!(thread_unarchive_help.contains(
             "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
         ));
@@ -1902,6 +2009,7 @@ mod tests {
     fn thread_response_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1909,7 +2017,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/read", &resident_thread),
-            "< thread/read summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/read summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -1917,6 +2025,7 @@ mod tests {
     fn thread_start_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1924,7 +2033,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/start", &resident_thread),
-            "< thread/start summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/start summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -1932,6 +2041,7 @@ mod tests {
     fn thread_resume_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1939,7 +2049,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/resume", &resident_thread),
-            "< thread/resume summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/resume summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -1947,6 +2057,7 @@ mod tests {
     fn thread_started_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1954,7 +2065,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/started", &resident_thread),
-            "< thread/started summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/started summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -1962,6 +2073,7 @@ mod tests {
     fn thread_fork_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1969,7 +2081,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/fork", &resident_thread),
-            "< thread/fork summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/fork summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -1977,6 +2089,7 @@ mod tests {
     fn thread_metadata_update_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1984,7 +2097,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/metadata/update", &resident_thread),
-            "< thread/metadata/update summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/metadata/update summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -1992,6 +2105,7 @@ mod tests {
     fn thread_unarchive_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -1999,7 +2113,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/unarchive", &resident_thread),
-            "< thread/unarchive summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/unarchive summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -2007,6 +2121,7 @@ mod tests {
     fn thread_rollback_summary_line_mentions_resident_reconnect_action() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -2014,7 +2129,7 @@ mod tests {
 
         assert_eq!(
             thread_response_summary_line("thread/rollback", &resident_thread),
-            "< thread/rollback summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/rollback summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -2023,12 +2138,14 @@ mod tests {
         let threads = vec![
             make_thread(
                 "thread-1",
+                Some("atlas"),
                 ThreadMode::ResidentAssistant,
                 true,
                 ThreadStatus::Idle,
             ),
             make_thread(
                 "thread-2",
+                Some("chat"),
                 ThreadMode::Interactive,
                 false,
                 ThreadStatus::NotLoaded,
@@ -2039,8 +2156,8 @@ mod tests {
             thread_collection_summary_lines_with_cursor("thread/list", &threads, None),
             vec![
                 "< thread/list summary:".to_string(),
-                "  - id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
-                "  - id=thread-2, mode=interactive, resident=false, status=NotLoaded, action=resume".to_string(),
+                "  - id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
+                "  - id=thread-2, name=chat, mode=interactive, resident=false, status=NotLoaded, action=resume".to_string(),
             ]
         );
     }
@@ -2049,6 +2166,7 @@ mod tests {
     fn thread_loaded_read_summary_lines_cover_mode_resident_status_and_action() {
         let threads = vec![make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Active {
@@ -2060,7 +2178,7 @@ mod tests {
             thread_collection_summary_lines_with_cursor("thread/loaded/read", &threads, None),
             vec![
                 "< thread/loaded/read summary:".to_string(),
-                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active(flags=none), action=reconnect".to_string(),
+                "  - id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Active(flags=none), action=reconnect".to_string(),
             ]
         );
     }
@@ -2077,6 +2195,7 @@ mod tests {
     fn thread_list_summary_lines_include_next_cursor() {
         let threads = vec![make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -2086,7 +2205,7 @@ mod tests {
             thread_collection_summary_lines_with_cursor("thread/list", &threads, Some("cursor-2")),
             vec![
                 "< thread/list summary:".to_string(),
-                "  - id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
+                "  - id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect".to_string(),
                 "< thread/list next_cursor: cursor-2".to_string(),
             ]
         );
@@ -2096,6 +2215,7 @@ mod tests {
     fn thread_loaded_read_summary_lines_include_next_cursor() {
         let threads = vec![make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Active {
@@ -2111,7 +2231,7 @@ mod tests {
             ),
             vec![
                 "< thread/loaded/read summary:".to_string(),
-                "  - id=thread-1, mode=residentAssistant, resident=true, status=Active(flags=none), action=reconnect".to_string(),
+                "  - id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Active(flags=none), action=reconnect".to_string(),
                 "< thread/loaded/read next_cursor: cursor-2".to_string(),
             ]
         );
@@ -2195,6 +2315,7 @@ mod tests {
     fn thread_summary_fields_mentions_interactive_resume_action() {
         let interactive_thread = make_thread(
             "thread-2",
+            Some("chat"),
             ThreadMode::Interactive,
             false,
             ThreadStatus::NotLoaded,
@@ -2202,13 +2323,14 @@ mod tests {
 
         assert_eq!(
             thread_summary_fields(&interactive_thread),
-            "id=thread-2, mode=interactive, resident=false, status=NotLoaded, action=resume"
+            "id=thread-2, name=chat, mode=interactive, resident=false, status=NotLoaded, action=resume"
         );
     }
 
     #[test]
     fn thread_status_changed_summary_line_uses_known_mode_and_action_when_available() {
         let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
             mode: ThreadMode::ResidentAssistant,
             resident: true,
             status: ThreadStatus::Idle,
@@ -2220,7 +2342,7 @@ mod tests {
                 &ThreadStatus::SystemError,
                 Some(&known_thread),
             ),
-            "id=thread-1, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
+            "id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
         );
     }
 
@@ -2255,6 +2377,7 @@ mod tests {
     fn thread_started_notification_lines_include_raw_debug_when_requested() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -2267,7 +2390,7 @@ mod tests {
         assert!(lines[0].starts_with("< thread/started notification: Thread {"));
         assert_eq!(
             lines[1],
-            "< thread/started summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            "< thread/started summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
         );
     }
 
@@ -2275,6 +2398,7 @@ mod tests {
     fn thread_started_notification_lines_can_emit_summary_only() {
         let resident_thread = make_thread(
             "thread-1",
+            Some("atlas"),
             ThreadMode::ResidentAssistant,
             true,
             ThreadStatus::Idle,
@@ -2283,7 +2407,7 @@ mod tests {
         assert_eq!(
             thread_started_notification_lines(&resident_thread, /*include_raw_debug*/ false),
             vec![String::from(
-                "< thread/started summary: id=thread-1, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+                "< thread/started summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
             )]
         );
     }
@@ -2291,6 +2415,7 @@ mod tests {
     #[test]
     fn thread_status_changed_notification_lines_wrap_summary_line() {
         let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
             mode: ThreadMode::ResidentAssistant,
             resident: true,
             status: ThreadStatus::Idle,
@@ -2303,7 +2428,47 @@ mod tests {
                 Some(&known_thread),
             ),
             vec![String::from(
-                "< thread/status/changed summary: id=thread-1, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
+                "< thread/status/changed summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
+            )]
+        );
+    }
+
+    #[test]
+    fn thread_name_updated_summary_line_uses_known_thread_context_when_available() {
+        let known_thread = KnownThreadSummary {
+            name: Some("old-name".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::Idle,
+        };
+
+        assert_eq!(
+            thread_name_updated_summary_line("thread-1", Some("atlas"), Some(&known_thread)),
+            "id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_name_updated_summary_line_stays_identity_only_for_unknown_threads() {
+        assert_eq!(
+            thread_name_updated_summary_line("thread-unknown", Some("atlas"), None),
+            "id=thread-unknown, name=atlas"
+        );
+    }
+
+    #[test]
+    fn thread_name_updated_notification_lines_wrap_summary_line() {
+        let known_thread = KnownThreadSummary {
+            name: Some("old-name".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::Idle,
+        };
+
+        assert_eq!(
+            thread_name_updated_notification_lines("thread-1", Some("atlas"), Some(&known_thread)),
+            vec![String::from(
+                "< thread/name/updated summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
             )]
         );
     }
@@ -2560,6 +2725,7 @@ struct CodexClient {
 
 #[derive(Debug, Clone, PartialEq)]
 struct KnownThreadSummary {
+    name: Option<String>,
     mode: ThreadMode,
     resident: bool,
     status: codex_app_server_protocol::ThreadStatus,
@@ -2699,6 +2865,7 @@ impl CodexClient {
         self.known_threads.insert(
             thread.id.clone(),
             KnownThreadSummary {
+                name: thread.name.clone(),
                 mode: thread.mode,
                 resident: thread.resident,
                 status: thread.status.clone(),
@@ -2743,6 +2910,25 @@ impl CodexClient {
                     for line in thread_status_changed_notification_lines(
                         &payload.thread_id,
                         &payload.status,
+                        known_thread.as_ref(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                false
+            }
+            ServerNotification::ThreadNameUpdated(payload) => {
+                let known_thread = self
+                    .known_threads
+                    .get_mut(&payload.thread_id)
+                    .map(|thread| {
+                        thread.name = payload.thread_name.clone();
+                        thread.clone()
+                    });
+                if thread_id.is_none_or(|id| payload.thread_id == id) {
+                    for line in thread_name_updated_notification_lines(
+                        &payload.thread_id,
+                        payload.thread_name.as_deref(),
                         known_thread.as_ref(),
                     ) {
                         println!("{line}");

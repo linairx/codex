@@ -5914,12 +5914,22 @@ impl CodexMessageProcessor {
         }
 
         let mut state_db_ctx = None;
+        let mut archived_thread_mode = None;
 
         // If the thread is active, request shutdown and wait briefly.
         let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
         if let Some(conversation) = removed_conversation {
             if let Some(ctx) = conversation.state_db() {
                 state_db_ctx = Some(ctx);
+            }
+            if let Some(conversation_rollout_path) = conversation.rollout_path() {
+                archived_thread_mode = Some((
+                    conversation_rollout_path.to_path_buf(),
+                    conversation.config_snapshot().await,
+                    self.thread_state_manager
+                        .is_thread_resident(thread_id)
+                        .await,
+                ));
             }
             info!("thread {thread_id} was active; shutting down");
             match Self::wait_for_thread_shutdown(&conversation).await {
@@ -5938,6 +5948,19 @@ impl CodexMessageProcessor {
 
         if state_db_ctx.is_none() {
             state_db_ctx = get_state_db(&self.config).await;
+        }
+        if let Some(ctx) = state_db_ctx.as_ref()
+            && let Some((conversation_rollout_path, config_snapshot, resident)) =
+                archived_thread_mode.as_ref()
+        {
+            ensure_thread_mode_with_state_db(
+                ctx.as_ref(),
+                thread_id,
+                conversation_rollout_path.as_path(),
+                config_snapshot,
+                *resident,
+            )
+            .await;
         }
 
         // Move the rollout file to archived.

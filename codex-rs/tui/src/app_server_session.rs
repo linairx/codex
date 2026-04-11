@@ -1186,6 +1186,9 @@ mod tests {
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadLoadedListParams;
     use codex_app_server_protocol::ThreadLoadedReadParams;
+    use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
+    use codex_app_server_protocol::ThreadMetadataUpdateParams;
+    use codex_app_server_protocol::ThreadMetadataUpdateResponse;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
@@ -1982,6 +1985,86 @@ mod tests {
         assert_eq!(
             resumed.session.thread_name.as_deref(),
             Some("Loaded typed name")
+        );
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn metadata_update_preserves_thread_name_for_tui_reads_and_resume() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let start_request_id = app_server.next_request_id();
+
+        let started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: start_request_id,
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let thread_id =
+            ThreadId::from_string(&started.thread.id).expect("thread/start should return id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let thread_name = "Resident metadata name for TUI";
+        app_server
+            .thread_set_name(thread_id, thread_name.to_string())
+            .await
+            .expect("thread/set_name should succeed");
+
+        let metadata_update_request_id = app_server.next_request_id();
+        let updated: ThreadMetadataUpdateResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: metadata_update_request_id,
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: None,
+                        branch: Some(Some("resident-metadata-main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should succeed");
+        assert_eq!(updated.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+
+        let read = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .expect("thread/read should preserve thread name after metadata update");
+        assert_eq!(read.name.as_deref(), Some(thread_name));
+
+        let resumed = app_server
+            .resume_thread(config.clone(), thread_id)
+            .await
+            .expect("thread/resume should preserve thread name after metadata update");
+        assert_eq!(resumed.session.thread_name.as_deref(), Some(thread_name));
+        assert_eq!(
+            resumed.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
         );
 
         app_server

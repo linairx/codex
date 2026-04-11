@@ -28,6 +28,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
@@ -48,6 +49,7 @@ use crate::state::State;
 
 pub struct ThreadConnection {
     pub thread_id: String,
+    pub thread_name: Option<String>,
     pub thread_mode: ThreadMode,
 }
 
@@ -138,12 +140,19 @@ impl AppServerClient {
         let parsed: ThreadStartResponse =
             serde_json::from_value(response.result).context("decode thread/start response")?;
         let thread_id = parsed.thread.id;
+        let thread_name = parsed.thread.name;
         let thread_mode = parsed.thread.mode;
         let thread_status = parsed.thread.status;
         self.set_thread_id(thread_id.clone());
-        self.remember_thread(thread_id.clone(), thread_mode, thread_status);
+        self.remember_thread(
+            thread_id.clone(),
+            thread_name.clone(),
+            thread_mode,
+            thread_status,
+        );
         Ok(ThreadConnection {
             thread_id,
+            thread_name,
             thread_mode,
         })
     }
@@ -159,12 +168,19 @@ impl AppServerClient {
         let parsed: ThreadResumeResponse =
             serde_json::from_value(response.result).context("decode thread/resume response")?;
         let thread_id = parsed.thread.id;
+        let thread_name = parsed.thread.name;
         let thread_mode = parsed.thread.mode;
         let thread_status = parsed.thread.status;
         self.set_thread_id(thread_id.clone());
-        self.remember_thread(thread_id.clone(), thread_mode, thread_status);
+        self.remember_thread(
+            thread_id.clone(),
+            thread_name.clone(),
+            thread_mode,
+            thread_status,
+        );
         Ok(ThreadConnection {
             thread_id,
+            thread_name,
             thread_mode,
         })
     }
@@ -217,6 +233,23 @@ impl AppServerClient {
         let request = ClientRequest::ThreadLoadedList {
             request_id: request_id.clone(),
             params: ThreadLoadedListParams {
+                cursor,
+                limit: None,
+                model_providers: None,
+                source_kinds: Some(all_thread_source_kinds()),
+                cwd: None,
+            },
+        };
+        self.send(&request)?;
+        Ok(request_id)
+    }
+
+    pub fn request_thread_loaded_read(&self, cursor: Option<String>) -> Result<RequestId> {
+        let request_id = self.next_request_id();
+        self.track_pending(request_id.clone(), PendingRequest::LoadedRead);
+        let request = ClientRequest::ThreadLoadedRead {
+            request_id: request_id.clone(),
+            params: ThreadLoadedReadParams {
                 cursor,
                 limit: None,
                 model_providers: None,
@@ -301,6 +334,7 @@ impl AppServerClient {
     fn remember_thread(
         &self,
         thread_id: String,
+        thread_name: Option<String>,
         thread_mode: ThreadMode,
         thread_status: ThreadStatus,
     ) {
@@ -310,11 +344,13 @@ impl AppServerClient {
             .iter_mut()
             .find(|thread| thread.thread_id == thread_id)
         {
+            existing.thread_name = thread_name;
             existing.thread_mode = thread_mode;
             existing.thread_status = thread_status;
         } else {
             state.known_threads.push(KnownThread {
                 thread_id,
+                thread_name,
                 thread_mode,
                 thread_status,
             });
@@ -521,6 +557,7 @@ mod tests {
     fn use_thread_returns_cached_mode_and_status_when_known() {
         let known_thread = KnownThread {
             thread_id: "thread-1".to_string(),
+            thread_name: Some("atlas".to_string()),
             thread_mode: codex_app_server_protocol::ThreadMode::ResidentAssistant,
             thread_status: ThreadStatus::Active {
                 active_flags: vec![codex_app_server_protocol::ThreadActiveFlag::WorkspaceChanged],

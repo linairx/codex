@@ -1235,6 +1235,1099 @@ SQLite 在这里不是起点，而是收敛点。
 
 换句话说，后续主线已经从“拆文档”切换为“按实现计划逐阶段落代码”。
 
+## 31. 从源码分析走向执行计划
+
+如果把前面的源码分析和后续 resident / mode / observer / SQLite 文档链合起来看，当前最合理的判断是：
+
+- `codex-rs` 已经不缺“再解释一遍线程模式”的文档
+- 它真正缺的是把这些文档约束收成几个边界明确、彼此不纠缠的代码闭环
+
+因此，下一阶段更适合采用下面这种节奏：
+
+1. 先把现有已落地边界做提交级收敛
+2. 再挑一个最短的新增闭环进入实现
+3. 每次只推进一个主轴，避免再次把协议、客户端、observer、SQLite 和 bridge 混到一个超大分支里
+
+从价值和风险比来看，下一阶段最值得进入实现的不是重新改 `Thread.mode`，而是下面三条主线。
+
+## 32. 下一阶段最值得做的三条主线
+
+### 1. 远程 bridge 的最小消费闭环
+
+这是下一阶段最值得优先推进的方向。
+
+原因很直接：
+
+- `app-server` 已经是天然控制面
+- `Thread.mode + Thread.status` 的读取边界已经被文档和测试收得比较清楚
+- 远程 bridge 是最能把这些语义变成真实产品能力的一层
+
+这条线的第一阶段不需要做完整网页产品，也不需要先做复杂 transport。
+
+更合理的最小目标是：
+
+- 有一个远端消费者可以稳定列出线程
+- 能区分 `interactive` 和 `residentAssistant`
+- 能对 resident thread 执行 reconnect
+- 能消费 status-only 的增量通知
+- 能在断连后重新拉一遍 summary 恢复状态
+
+换句话说，先证明：
+
+- `app-server` 现在这套线程语义已经足以支撑一个最小远端控制面
+
+而不是继续停留在“理论上可以支持”。
+
+### 2. observer 进入正式事件源，而不是只是状态附着物
+
+现在的 `workspaceChanged` 已经开始形成线程级事实，但它还更像“挂在 status 里的一个 flag”，而不是正式事件流的一部分。
+
+下一步更值得补的是：
+
+- observer 触发源的生命周期
+- watch 的注册、迁移、清理边界
+- 多线程/多工作区下的去重策略
+- 哪些变化只更新当前状态，哪些变化需要形成单独通知或审计事实
+
+这里的重点不是“多加几个 active flag”，而是把 observer 从“UI 看见的脏标记”推进成“运行时里的正式事件源”。
+
+这对下面几条能力都会有直接帮助：
+
+- resident assistant 的长期上下文刷新
+- 后台任务的变化感知
+- 远程 bridge 的状态同步
+- 将来多 agent 对共享工作区变化的统一认知
+
+### 3. SQLite 收敛从“补洞”升级为“正式状态层”
+
+现在的 SQLite 工作更像是：
+
+- 给 stored summary 补稳定元数据
+- 给 archive / unarchive / metadata update 提供持久化底座
+- 用最小字段保证 resident continuity
+
+这已经很有价值，但还不等于“线程状态真的收敛到了 SQLite”。
+
+如果继续往前走，更合适的方向是：
+
+- 明确哪些字段属于稳定身份元数据
+- 明确哪些字段属于当前运行时快照
+- 明确哪些字段只适合事件流，不适合落库
+- 明确 archive / unarchive / repair / reconnect 过程中谁是权威来源
+
+真正值得避免的是这种状态：
+
+- rollout、SQLite、loaded thread snapshot、notification payload 都能回答同一个问题
+- 但每个地方都只回答一半
+
+这会让后续 bridge、TUI 和 app-server-client 都越来越难维护。
+
+## 33. 建议的 PR 顺序
+
+如果把后续工作真的转成工程计划，我更建议按下面顺序拆。
+
+### PR 1：整理并提交当前 thread mode 文档链与回归闭环
+
+目标不是新增能力，而是把已经分散落地的东西真正收住。
+
+这个 PR 应优先包含：
+
+- `app-server`
+- `app-server-client`
+- `tui`
+- 相关 README / docs
+- 已经存在的 resident continuity / observer continuity / metadata continuity 回归
+
+它的价值在于：
+
+- 先把当前语义基线稳定下来
+- 避免后续新功能开发又把 mode/status/source-filter 这些边界打散
+
+### PR 2：远程 bridge 最小线程消费闭环
+
+这个 PR 不该一上来做成完整产品，而应聚焦：
+
+- 列表
+- reconnect
+- status 增量
+- 断连后重拉 summary
+
+如果这个闭环做不顺，说明当前 app-server 线程面仍有真实缺口。
+那时再回头补协议或状态边界，收益会比现在继续文档推演更高。
+
+### PR 3：observer 正式化
+
+这一阶段不要和 bridge 同时起飞。
+
+原因是：
+
+- 如果 bridge 和 observer 同时大改，很难分清问题来自 transport、状态面还是 watcher 生命周期
+
+更好的做法是：
+
+- 先用当前 observer 能力证明 bridge 消费面成立
+- 再独立补 observer 的正式事件源与状态收敛
+
+### PR 4：SQLite 状态分层与权威来源收敛
+
+这一步适合在前两个方向都更稳定后再做。
+
+因为只有当你真正有了：
+
+- 本地 TUI 消费面
+- app-server-client typed 消费面
+- 远程 bridge 消费面
+
+你才更容易判断：
+
+- 哪些状态必须稳定持久化
+- 哪些状态只适合做 loaded runtime snapshot
+- 哪些状态应该继续作为 event-only 信息存在
+
+## 34. 推荐阅读顺序也该升级
+
+前面第 14 节给的是“读懂 `codex-rs` 基本架构”的顺序。
+如果现在的目标已经从“理解仓库”切换到“推进下一阶段实现”，那么阅读顺序也应该跟着变。
+
+更合适的后续阅读顺序是：
+
+1. `docs/app-server-thread-mode-v2.md`
+2. `docs/persistent-assistant-mode-design.md`
+3. `docs/observer-event-flow-design.md`
+4. `docs/sqlite-state-convergence.md`
+5. `docs/remote-bridge-consumption.md`
+6. `codex-rs/app-server/src/codex_message_processor.rs`
+7. `codex-rs/app-server/src/thread_status.rs`
+8. `codex-rs/app-server-client/`
+9. `codex-rs/tui/src/app_server_session.rs`
+10. `codex-rs/tui/src/resume_picker.rs`
+
+这个顺序和前面的“源码入门顺序”不同，它的目标不是建大图，而是：
+
+- 先看已经确定的边界
+- 再看这些边界在哪些代码路径里被消费
+- 最后再决定下一步切哪条实现主线
+
+## 35. 现在最不该做的事
+
+从当前状态看，下面几件事都不适合作为下一步主任务。
+
+### 1. 继续扩一份更大的总设计文档
+
+原因不是文档没价值，而是当前同层文档已经足够多：
+
+- 源码分析
+- thread mode
+- persistent assistant
+- observer
+- SQLite
+- remote bridge
+
+继续写一份更大的总文档，收益已经明显低于继续落实现。
+
+### 2. 一次性同时推进 bridge + observer + SQLite
+
+这三条线强相关，但不适合同一个大分支一起推进。
+
+因为一旦行为不对，很难判断问题是：
+
+- transport 消费错了
+- status 面定义不清
+- observer 事件模型有洞
+- SQLite 权威来源冲突
+
+### 3. 过早进入多 agent 平台化重构
+
+多 agent 仍然是高价值方向，但它更依赖下面这些东西先变稳：
+
+- resident thread 语义
+- observer 事实源
+- 远端控制闭环
+- 稳定状态收敛层
+
+否则很容易在不稳定的线程基础设施上继续叠复杂度。
+
+## 36. 当前阶段的最终判断
+
+如果只用一句话概括当前 `codex-rs` 的后续方向，我会这样判断：
+
+- 架构上，`codex-rs` 已经有能力承接“长期线程 + 远端控制面 + 状态事件流”这条产品主线
+- 工程上，当前最重要的工作已经不是证明这件事“理论上成立”，而是把它拆成几个短闭环逐个落地
+
+因此，这份文档到这里更适合作为：
+
+- 源码结构分析
+- 已落地 resident / mode 主线的阶段总结
+- 下一阶段实现路线图
+
+而不是继续扩成一份无限增长的综合设计档。
+
+## 37. 可执行任务清单
+
+如果后续要按这份文档真正推进实现，最实用的方式不是再写一份总设计，而是把任务拆成几个可以独立完成和验证的小包。
+
+下面这份 checklist 更适合作为后续开发顺序。
+
+### A. 先收口当前 resident / mode 基线
+
+- 整理现有 `app-server`、`app-server-client`、`tui`、README、设计稿里的 resident continuity 改动
+- 把 mode / status / source-kinds 默认值这三组边界再做一次交叉检查
+- 确认现有 typed 测试、集成测试和 README 示例没有继续残留旧的纯 resume 心智
+- 以“当前语义已经稳定”为目标整理成一个可提交 PR，而不是继续在脏工作区里滚动扩写
+
+这一包的完成标志是：
+
+- `Thread.mode` 的消费边界不再在不同入口间漂移
+- README / help / typed tests / 集成测试说的是同一套话
+
+### B. 做 remote bridge 的最小线程消费闭环
+
+- 选一个最小远端消费者形态，不要求完整产品
+- 只实现 thread list / read / loaded-read / resume 这几条最关键路径
+- 明确把 `interactive -> resume`、`residentAssistant -> reconnect` 做成真实动作映射
+- 只把 `thread/status/changed` 当 status-only 增量消费
+- 断连后通过重新读取 summary 恢复，而不是依赖本地缓存脑补
+
+这一包的完成标志是：
+
+- 一个远端消费者已经能稳定消费 resident thread
+- 如果消费不顺，可以明确定位是协议缺口还是实现缺口
+
+### C. 把 observer 从“标记”推进成“事件源”
+
+- 梳理 watcher 的注册、切换 cwd、shutdown、resident 保活清理边界
+- 划清哪些变化只更新当前 `ThreadStatus`，哪些变化需要形成独立事件
+- 给多线程共享工作区时的去重和节流加明确策略
+- 把 observer 与 TUI / bridge / app-server-client 的消费路径画清
+
+这一包的完成标志是：
+
+- `workspaceChanged` 不再只是一个偶然暴露出来的 UI 脏标记
+- 它已经成为可解释、可消费、可测试的正式事件来源
+
+### D. 再做 SQLite 的状态分层与权威来源收敛
+
+- 列出哪些字段是稳定身份元数据
+- 列出哪些字段只是当前 loaded runtime snapshot
+- 列出哪些字段更适合保留在 event stream，不应该直接落库
+- 明确 archive / unarchive / repair / reconnect 时每一步的权威来源
+
+这一包的完成标志是：
+
+- 回答同一个线程问题时，不再需要 rollout、SQLite、runtime snapshot 四处拼答案
+- 状态来源已经开始有清晰层次
+
+### E. 最后再考虑更上层产品模式
+
+- 多 agent 协调器
+- 长时规划模式
+- 更完整的远端控制面
+- 后台任务面板和通知中心
+
+这些方向都值得做，但它们应该建立在前面四包已经稳定的前提上。
+
+### 一个最务实的执行建议
+
+如果只能选一个立刻开始的动作，我建议是：
+
+1. 先把当前 resident / mode 基线整理成可提交 PR
+2. 然后直接做 remote bridge 的最小线程消费闭环
+
+因为这两个动作最能快速验证：
+
+- 现有线程语义是否已经足够支撑真实消费方
+- 哪些缺口是真问题，哪些只是文档层面的担忧
+
+到这一步，这份文档就已经足够承担“分析 + 路线图 + 实施 checklist”的作用，后续更合适的动作应该回到代码与 PR，而不是继续扩写同层总文档。
+
+## 38. 目录级任务映射
+
+如果后续真的要按第 37 节开工，最实用的补充不是再写抽象说明，而是把任务包和仓库目录直接对上。
+
+这样做的价值是：
+
+- 任务一启动就知道先读哪里
+- 改动一落地就知道测试先跑哪里
+- 更容易把工作拆成真正的 PR，而不是继续停留在讨论层
+
+### A 包：resident / mode 基线收口
+
+优先关注这些目录和文件：
+
+- `codex-rs/app-server/src/`
+- `codex-rs/app-server/tests/suite/v2/`
+- `codex-rs/app-server-client/`
+- `codex-rs/tui/src/app_server_session.rs`
+- `codex-rs/tui/src/resume_picker.rs`
+- `codex-rs/tui/src/chatwidget.rs`
+- `codex-rs/cli/src/`
+- `codex-rs/exec/`
+- `codex-rs/app-server/README.md`
+- `codex-rs/README.md`
+- `docs/app-server-thread-mode-v2.md`
+
+这一包最值得先确认的点：
+
+- `Thread.mode` 是否在所有主要读取面保持一致
+- `thread/status/changed` 是否继续严格保持 status-only
+- `thread/loaded/list` 是否继续严格保持 id-only probe
+- CLI / TUI / test-client / debug-client 的 `resume or reconnect` 文案是否一致
+- source-kinds 的 interactive-only 默认值是否仍在所有入口被正确表达
+
+这一包最先跑的测试应偏向：
+
+- `cargo test -p codex-app-server`
+- `cargo test -p codex-app-server-client`
+- `cargo test -p codex-tui`
+- `cargo test -p codex-exec`
+
+### B 包：remote bridge 最小线程消费闭环
+
+优先关注这些文档和代码入口：
+
+- `docs/remote-bridge-consumption.md`
+- `codex-rs/app-server/`
+- `codex-rs/app-server-client/`
+- `codex-rs/debug-client/`
+- `codex-rs/app-server-test-client/`
+
+这条线第一阶段更像“先做一个最小消费者”，所以重点不在 UI 丰富度，而在消费契约是否闭环。
+
+最值得先锁住的能力是：
+
+- 列表摘要来自 `thread/list`
+- loaded 运行态刷新来自 `thread/loaded/read`
+- 增量刷新只来自 `thread/status/changed`
+- reconnect 入口来自 `thread/resume`
+- 动作文案直接从 `Thread.mode` 映射，而不是靠历史或 source 猜
+
+更适合作为第一批验证的不是大集成测试，而是：
+
+- `app-server-test-client` 的命令输出与 help
+- `debug-client` 的线程摘要和观察模式
+- `app-server-client` 的 typed 请求回归
+
+### C 包：observer 正式事件源
+
+优先关注这些目录和文件：
+
+- `docs/observer-event-flow-design.md`
+- `codex-rs/app-server/src/thread_status.rs`
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/tui/src/app_server_session.rs`
+- `codex-rs/app-server/tests/suite/v2/`
+
+这条线里最值得先整理的不是“新增多少状态”，而是状态来源。
+
+应该先回答清楚的几个问题是：
+
+- watcher 是谁注册的
+- resident thread 切换 cwd 时 watcher 怎么迁移
+- thread unload / shutdown / unsubscribe 时 watcher 怎么清理
+- `workspaceChanged` 在何时置位、何时清理、何时只作为历史事实保留
+- 哪些 observer 变化只改 status，哪些将来值得升级成单独事件
+
+这条线的测试应优先覆盖：
+
+- cwd 迁移
+- shutdown 清理
+- resident unsubscribe 后的连续性
+- `thread/read` / `thread/list` / `thread/loaded/read` / `thread/resume` 的 observer 一致性
+
+### D 包：SQLite 状态分层与权威来源
+
+优先关注这些目录和文件：
+
+- `docs/sqlite-state-convergence.md`
+- `codex-rs/state/`
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/tests/suite/v2/`
+- `codex-rs/app-server-client/`
+
+这条线最需要避免的是“看起来在收敛，实际在多处重复维护”。
+
+因此第一批问题应该直接按状态来源来问：
+
+- 哪些字段必须由 SQLite 持久保存
+- 哪些字段只应该存在于 loaded runtime snapshot
+- 哪些字段只应该从 rollout 或 event stream 派生
+- archive / unarchive / repair / metadata update / reconnect 时到底谁是权威来源
+
+这条线的代码改动一旦开始，最值得优先保护的路径是：
+
+- `thread/read`
+- `thread/list`
+- `thread/resume`
+- `thread/unarchive`
+- `thread/metadata/update`
+
+因为这些路径最容易暴露“SQLite、rollout、runtime 各说各话”的问题。
+
+### E 包：上层产品模式
+
+这部分目前更适合放在文档和轻量原型里，先不要作为主开发面。
+
+更适合继续沉淀在这些文档里：
+
+- `docs/persistent-assistant-mode-design.md`
+- `docs/remote-bridge-consumption.md`
+- 后续如果需要，再补多 agent / planner 的独立设计稿
+
+只有在 A-D 四包更稳之后，这些方向才适合进入正式实现。
+
+## 39. 一份更接近 PR 的执行模板
+
+如果后续要真正按文档推进，我建议每个 PR 都按同一个模板组织，而不是自由发挥。
+
+最合适的模板大致是：
+
+### 1. 先定义本 PR 只解决一个主问题
+
+例如：
+
+- resident mode 文案与 typed 消费统一
+- observer 的 cwd 迁移与清理
+- SQLite 在 metadata repair 路径上的权威来源收敛
+- remote bridge 最小列表/重连闭环
+
+不要在同一个 PR 同时解决两个主问题。
+
+### 2. 明确本 PR 涉及的层
+
+建议显式标记这次只改哪些层：
+
+- 协议层
+- app-server 实现层
+- client / TUI 消费层
+- 文档层
+- 状态层
+
+如果一个 PR 横跨太多层，通常就说明拆分还不够。
+
+### 3. 明确读取面和通知面的契约有没有变化
+
+对这条线程主线来说，最容易漂移的地方永远是：
+
+- 读取面
+- 通知面
+- CLI / UI 文案面
+
+所以每个 PR 都值得单独回答：
+
+- `thread/read` 有没有变
+- `thread/list` 有没有变
+- `thread/loaded/read` 有没有变
+- `thread/loaded/list` 有没有变
+- `thread/status/changed` 有没有变
+- 用户看到的动作语义有没有变
+
+### 4. 每个 PR 都要带最小文档同步
+
+这里说的不是大设计稿，而是最小同步：
+
+- README
+- help 文案
+- 相关设计稿里一两句已经过时的边界
+
+否则实现和外围说明很快又会分叉。
+
+### 5. 每个 PR 都应该有“负向边界测试”
+
+例如：
+
+- `thread/status/changed` 不重复 `mode`
+- `thread/loaded/list` 不偷偷变成完整摘要
+- unknown thread 不凭空猜 resident mode
+- observer 不在 shutdown 后被陈旧 watcher 重新激活
+
+这类负向测试对这条主线特别重要，因为它们最容易在后续重构里被悄悄破坏。
+
+## 40. 这份文档接下来最合理的终点
+
+沿着这份文档继续推进到现在，最合理的状态已经不是无限续写，而是把它稳定在下面这个角色上：
+
+- 前半部分负责解释 `codex-rs` 的架构和主干
+- 中段负责总结 resident / mode / observer / SQLite 这条主线的已落地边界
+- 尾部负责提供路线图、checklist、目录级任务映射和 PR 模板
+
+如果继续追加内容，更适合追加的是：
+
+- 某个新主线已经真实落地后的阶段总结
+
+而不是继续给现有主线叠更多抽象段落。
+
+也就是说，这份文档现在已经接近“可停止扩写、转而服务实现”的状态了。
+
+## 41. 首个建议 PR 蓝图
+
+如果要沿着这份文档真正开始做实现，而不是继续补说明，我会建议第一个 PR 不要做 remote bridge，也不要再碰新的协议字段，而是先做一个更容易 review、也更能稳定基线的收口 PR。
+
+这个 PR 的目标可以直接定义为：
+
+- 把当前 resident / mode / status / source-kinds 这条已落地主线整理成一个“语义基线 PR”
+
+### 为什么首个 PR 应该先做这个
+
+原因有三个：
+
+- 这条线已经有大量零散落地内容，继续叠新能力前，先把基线收住更划算
+- 现在最容易出问题的不是“完全没实现”，而是不同入口说法和行为开始轻微漂移
+- 一旦这条基线不稳，后面的 remote bridge、observer、SQLite 收敛都会建立在松动前提上
+
+换句话说，第一个 PR 的意义不是“带来最大新功能”，而是：
+
+- 给后续所有 PR 提供一个稳定的线程语义地板
+
+### 这个 PR 最适合只包含什么
+
+最合理的范围是：
+
+- `app-server`
+- `app-server-client`
+- `tui`
+- `cli` / `exec` 的用户可见 help 或 summary
+- 相关 README / docs
+- 已经存在的 resident continuity / status-only / id-only probe 回归测试
+
+它应避免包含：
+
+- 新的 bridge transport
+- 新的 observer 事件类型
+- 新的 SQLite schema 设计
+- 多 agent 或 planner 新功能
+
+### 这个 PR 要显式检查的契约
+
+最值得逐条确认的是：
+
+- `Thread.mode` 是否继续作为 resident reconnect 的唯一主信号
+- `thread/status/changed` 是否继续只承担 status-only 增量
+- `thread/loaded/list` 是否继续只是 id-only probe
+- `thread/loaded/read` 是否继续承担 loaded `mode + status` 恢复面
+- `thread/resume` 的用户可见动作是否始终按 `interactive -> resume`、`residentAssistant -> reconnect` 映射
+- source-kinds 的 omit / `[]` 是否继续表示 interactive-only 默认
+
+只要这六条里有一条在不同入口上说法不一致，这个 PR 就还没真正收住。
+
+### 这个 PR 最值得先读和先改的文件
+
+建议直接从这些地方开始：
+
+- `codex-rs/app-server/README.md`
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/src/thread_status.rs`
+- `codex-rs/app-server/tests/suite/v2/`
+- `codex-rs/app-server-client/README.md`
+- `codex-rs/tui/src/app_server_session.rs`
+- `codex-rs/tui/src/resume_picker.rs`
+- `codex-rs/tui/src/chatwidget.rs`
+- `codex-rs/cli/src/`
+- `codex-rs/exec/`
+
+这份列表的特点是：
+
+- 它们分别对应协议消费、服务端实现、状态面、typed client、TUI 会话层、最终用户文案
+
+也就是最容易漂移的六个位置。
+
+### 这个 PR 最值得先跑的测试
+
+如果真要把它作为“语义基线 PR”，最先跑的测试不应该是全仓全量，而应先跑最直接的几个面：
+
+- `cargo test -p codex-app-server`
+- `cargo test -p codex-app-server-client`
+- `cargo test -p codex-tui`
+- `cargo test -p codex-exec`
+
+如果其中一包改动很小，也可以先跑更聚焦的测试子集；但对这条线程主线来说，上面四个 crate 是最容易立刻暴露语义漂移的地方。
+
+### 这个 PR 最适合带哪些负向测试
+
+第一批最值得带上的负向边界是：
+
+- `thread/status/changed` 不重复 `mode`
+- `thread/loaded/list` 不补完整摘要
+- 未知 thread id 的状态通知不猜 resident mode
+- resident thread 在只读读取面和 reconnect 面上不会退回 interactive
+- observer 不会在 shutdown 后被陈旧 watcher 重新激活
+
+这些测试价值高，是因为它们都在防止“看起来更方便，但其实破坏边界”的回归。
+
+### 这个 PR 合并后的最佳下一步
+
+只有当这个基线 PR 合并后，下一步才适合切到：
+
+- remote bridge 的最小线程消费闭环
+
+因为那时你能更有把握地区分：
+
+- 是远端消费做错了
+- 还是本地线程语义本身还没收稳
+
+如果跳过这个基线 PR 直接做 bridge，很容易在消费侧踩到一堆本该先在本地收口的细碎问题。
+
+## 42. 首个 PR 的 review 清单
+
+如果第 41 节真的被拿来开第一个 PR，那么 review 阶段最重要的不是“改动多不多”，而是这条线程主线的关键边界有没有继续保持一致。
+
+更具体地说，这个 PR 值得按下面清单 review。
+
+### 1. 先看它有没有偷换主问题
+
+这个 PR 的主问题应该始终是：
+
+- resident / mode / status / source-kinds 语义基线收口
+
+如果 review 时发现它顺手又开始做下面这些事，就说明范围已经失控：
+
+- 新 bridge transport
+- 新 observer API
+- 新 SQLite schema 设计
+- 多 agent 或 planner 新能力
+- 与线程主线无关的 UI 重排
+
+对这类 PR，最重要的 review 动作通常不是继续讨论实现细节，而是先要求重新拆分。
+
+### 2. 再看读取面是否还在说同一套话
+
+这一类问题最值得逐条对照：
+
+- `thread/read` 是否仍把 `Thread.mode` 当作线程角色主信号
+- `thread/list` 是否仍保持和 `thread/read` 一致的 resident / interactive 语义
+- `thread/loaded/read` 是否仍承担 loaded `mode + status` 恢复面
+- `thread/loaded/list` 是否仍只是 id-only probe
+- `thread/resume` 是否在 resident thread 上继续表达 reconnect 语义
+
+如果这些路径里有任意一个开始“说另一套话”，那就是高优先级 review 问题。
+
+### 3. 再看通知面有没有破坏分层
+
+这条主线里最容易被顺手破坏的通知就是：
+
+- `thread/status/changed`
+
+review 时应该明确检查：
+
+- 它是否继续只承载 status-only 增量
+- 它是否没有偷偷重复 `mode`
+- 它是否没有开始承担 loaded summary 恢复职责
+
+如果通知面开始重复更多摘要字段，短期看似方便，长期几乎一定会把读取面与通知面再次搅乱。
+
+### 4. 再看 source-kinds 默认值有没有重新漂移
+
+这也是一条很容易被忽略、但实际影响很大的边界。
+
+review 时值得直接问：
+
+- omit / `[]` 是否仍表示 interactive-only
+- 是否有某个入口偷偷改成了“空值 = 全量 source kinds”
+- CLI / TUI / debug-client / test-client 的帮助文案是否仍和真实过滤逻辑一致
+
+如果这层边界开始漂移，后面所有 resident / non-interactive 线程的消费体验都会重新变得不可靠。
+
+### 5. 再看用户可见动作语义有没有统一
+
+这个 PR 虽然不是“只改文案”，但文案恰恰最容易暴露底层语义有没有真的统一。
+
+review 时最值得检查的是：
+
+- `interactive -> resume`
+- `residentAssistant -> reconnect`
+
+这条映射是否在下面这些地方都一致：
+
+- CLI help
+- CLI exit summary
+- TUI resume picker
+- TUI session / status 文案
+- app-server README
+- app-server-client README
+- test-client / debug-client 输出
+
+如果有地方继续写成泛化的 resume、continue、reopen，而其他地方已经写 reconnect，说明这条主线还没有真正收口。
+
+### 6. 再看负向边界测试有没有跟上
+
+这个 PR 最值得被要求带上的，不是更多 happy path，而是最容易被悄悄打破的反向测试：
+
+- `thread/status/changed` 不重复 `mode`
+- `thread/loaded/list` 不补完整摘要
+- unknown thread id 不猜 resident mode
+- resident thread 不会在 repair / read / resume 路径上退回 interactive
+- observer 不会在 shutdown 后被陈旧 watcher 重新激活
+
+如果改动碰到了这些边界，却没有对应测试，review 时应直接把这视为缺口，而不是“以后再补”。
+
+### 7. 再看文档同步是不是最小但完整
+
+这个 PR 不需要再带一份大设计稿，但应至少同步下面这些东西里已经过时的部分：
+
+- README
+- help 文案
+- 相关设计稿里一两句关键边界
+
+review 时可以接受“文档量很小”，但不应接受“实现已经变了，外围入口还在说旧语义”。
+
+### 8. 最后看这个 PR 合并后，后续 PR 是否更容易切开
+
+这是这类基线 PR 最关键的评审标准之一。
+
+review 时最值得问的不是：
+
+- “这个 PR 一次做了多少”
+
+而是：
+
+- “它合并后，remote bridge / observer / SQLite 收敛是不是更容易各自独立推进”
+
+如果答案是否定的，说明这个 PR 还没把基线真正铺平。
+
+### 一个最简洁的 review 结论模板
+
+如果以后真的要 review 这类 PR，我会建议直接按下面这个模板写结论：
+
+1. 这个 PR 是否只解决一个主问题
+2. 读取面是否仍一致
+3. 通知面是否仍保持分层
+4. source-kinds 默认值是否仍一致
+5. 用户动作语义是否仍一致
+6. 负向边界测试是否充分
+7. 文档同步是否完成
+
+这比泛泛地说“改动看起来没问题”更适合这条线程主线。
+
+## 43. 首个 PR 的完成定义
+
+如果第 41 节和第 42 节分别回答了：
+
+- 这个 PR 应该怎么开
+- 这个 PR 应该怎么 review
+
+那么还差最后一个问题：
+
+- 什么情况下，这个 PR 真的算完成，可以提交或合并
+
+对这条线程主线来说，“差不多能用”通常不够，因为最容易出问题的恰恰是跨入口的小漂移。
+
+因此，更合理的完成定义应直接按下面几类标准判断。
+
+### 1. 语义完成
+
+这类标准回答的是：
+
+- resident / mode 主线有没有真正收口
+
+至少应满足：
+
+- `Thread.mode` 在主要读取面上已经稳定一致
+- `thread/status/changed` 仍严格保持 status-only
+- `thread/loaded/list` 仍严格保持 id-only probe
+- `thread/loaded/read` 仍承担 loaded `mode + status` 恢复面
+- `thread/resume` 在 resident thread 上的产品语义仍明确是 reconnect
+
+如果这些条件里还有任何一条需要靠“读代码猜一下”，那这个 PR 还不应算完成。
+
+### 2. 消费完成
+
+这类标准回答的是：
+
+- 外围调用方是不是已经能稳定消费这套语义
+
+至少应满足：
+
+- `app-server-client` 的 typed 调用没有继续残留旧语义假设
+- `tui` 的会话层、picker 和最终用户文案没有继续互相打架
+- `cli` / `exec` 的 help、summary 或 reconnect 提示不再落回纯 resume 心智
+- `debug-client` / `app-server-test-client` 这些调试入口没有继续展示另一套动作语义
+
+这一层很重要，因为这条线的大量问题都不是出在协议字段本身，而是消费方各自偏了一点点。
+
+### 3. 测试完成
+
+这类标准回答的是：
+
+- 这次改动是否不仅“看起来没问题”，而是真的被锁住了
+
+至少应满足：
+
+- 正向路径测试在主要读取面和恢复面上都有覆盖
+- 负向边界测试覆盖了最容易被破坏的契约
+- 新增或调整的帮助文案、摘要输出、typed 映射有对应回归
+- 改动触及多个 crate 时，相关 crate 至少各有一层回归在保护这条语义
+
+对这条主线来说，最需要避免的情况是：
+
+- 服务端测试绿了
+- 但 TUI / client / 调试入口仍在说旧话
+
+这类情况不能算完成，只能算“局部完成”。
+
+### 4. 文档完成
+
+这类标准回答的是：
+
+- 外围读者是否还能从最常见入口读到过时语义
+
+至少应满足：
+
+- 主 README 或相关子 README 已同步
+- 主要 help 文案已同步
+- 与本 PR 直接相关的设计稿或协议说明没有继续保留反向表述
+
+这里不要求“文档全仓大扫除”，但要求：
+
+- 与本 PR 直接接壤的入口，不再说旧语义
+
+### 5. 拆分完成
+
+这类标准回答的是：
+
+- 这个 PR 合并后，后续工作是不是更容易拆开
+
+至少应满足：
+
+- remote bridge 可以基于当前基线独立往前推进
+- observer 不必再顺手修同一批 resident / mode 文案问题
+- SQLite 收敛不必再顺手补同一批读取面语义缺口
+
+如果一个 PR 合并后，后续主线仍然必须继续先回头修相同基础问题，那这个 PR 就还没真正完成它的铺路职责。
+
+### 一个最实用的提交前检查表
+
+如果要把上面的“完成定义”压成真正的提交前检查，我建议至少逐条确认：
+
+1. 读取面契约已统一
+2. 通知面契约未被破坏
+3. source-kinds 默认值未漂移
+4. `resume/reconnect` 动作语义已统一
+5. 相关 crate 的测试已覆盖
+6. 主要 README / help 已同步
+7. 后续 PR 依赖面已经更清晰而不是更混乱
+
+只有这七条都能明确回答“是”，这个首个基线 PR 才真的算完成。
+
+## 44. 这份文档在当前阶段的最佳用法
+
+继续沿这份文档补到现在，它最适合的用途已经非常明确：
+
+- 新加入这条主线的维护者，用它快速建立全局图
+- 准备开 resident / mode / observer / SQLite 相关 PR 的开发者，用它对照任务包和目录映射
+- review 这条线程主线 PR 的维护者，用它对照 `41-43` 节检查边界、测试和完成定义
+
+也就是说，这份文档现在最像的是：
+
+- 一份面向实现的长期跟踪文档
+
+而不是：
+
+- 一份需要继续不断膨胀的总设计稿
+
+从这个角度看，后续如果还要继续沿它推进，更合理的动作应该是：
+
+- 只在某个新阶段真实落地后，再追加一小节“阶段总结”
+
+而不是继续往尾部叠更多抽象的“应该如何做”。
+
+## 45. 可复制的 PR / Handoff 速查表
+
+如果有人不想通读第 37-44 节，而只想快速接手这条主线，那么下面这份速查表就够用了。
+
+### 这条主线当前在做什么
+
+- 收口 resident / mode / observer / SQLite 这条线程语义主线
+- 把 `Thread.mode`、`ThreadStatus`、source-kinds 默认值和 `resume/reconnect` 动作语义固定下来
+- 为后续 remote bridge、observer 正式化和 SQLite 收敛铺稳定地板
+
+### 首个 PR 最适合做什么
+
+- 做 resident / mode / status / source-kinds 的语义基线 PR
+- 不要在第一个 PR 里混入新的 bridge、observer API、SQLite schema 或多 agent 能力
+
+### 首个 PR 最值得检查什么
+
+- `Thread.mode` 仍是 resident reconnect 的主信号
+- `thread/status/changed` 仍是 status-only
+- `thread/loaded/list` 仍是 id-only probe
+- `thread/loaded/read` 仍是 loaded `mode + status` 恢复面
+- `thread/resume` 在 resident thread 上仍明确表示 reconnect
+- source-kinds 的 omit / `[]` 仍表示 interactive-only
+
+### 首个 PR 最值得先看哪些文件
+
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/src/thread_status.rs`
+- `codex-rs/app-server/tests/suite/v2/`
+- `codex-rs/app-server-client/`
+- `codex-rs/tui/src/app_server_session.rs`
+- `codex-rs/tui/src/resume_picker.rs`
+- `codex-rs/app-server/README.md`
+- `codex-rs/README.md`
+
+### 首个 PR 最值得先跑哪些测试
+
+- `cargo test -p codex-app-server`
+- `cargo test -p codex-app-server-client`
+- `cargo test -p codex-tui`
+- `cargo test -p codex-exec`
+
+### 首个 PR 最值得带哪些负向测试
+
+- `thread/status/changed` 不重复 `mode`
+- `thread/loaded/list` 不补完整摘要
+- unknown thread 不猜 resident mode
+- resident thread 不在 read / resume / repair 路径上退回 interactive
+- observer 不在 shutdown 后被陈旧 watcher 重新激活
+
+### 首个 PR 在什么情况下算完成
+
+- 读取面契约已统一
+- 通知面契约未被破坏
+- source-kinds 默认值未漂移
+- `resume/reconnect` 动作语义已统一
+- 相关 crate 的测试已覆盖
+- 主要 README / help 已同步
+- 后续 remote bridge / observer / SQLite PR 更容易独立拆开
+
+### 首个 PR 合并后下一步最适合做什么
+
+- remote bridge 的最小线程消费闭环
+
+### 这份文档后续还要怎么维护
+
+- 不再继续无限扩写抽象路线图
+- 只在某个新阶段真实落地后补一小节阶段总结
+- 其余具体执行细节更适合沉淀到独立 checklist、PR 描述或专门实现计划文档
+
+## 46. 停止继续扩写这份文档的条件
+
+沿着这份文档一路补到现在，最后还需要明确一件事：
+
+- 在什么情况下，最合理的动作已经不是继续写文档，而是回到代码、测试和 PR
+
+如果没有这条“停止条件”，这份文档很容易继续变成一个无限增长的总跟踪文件。
+
+更合理的停止条件是下面这些。
+
+### 1. 当前主线的问题已经不是“方向不清”，而是“实现还没整理成 PR”
+
+一旦出现下面这种状态，就不该继续补总文档：
+
+- 方向已经明确
+- 任务包已经拆好
+- 目录映射已经补齐
+- PR 模板、review 清单和完成定义都已经写出来
+
+这时继续写总文档，通常只会重复前面已经说过的话。
+
+### 2. 新增内容已经开始只是改写同一个判断
+
+如果后续再写的内容主要是在重复这些结论：
+
+- `Thread.mode` 是 resident reconnect 的主信号
+- `thread/status/changed` 是 status-only
+- `thread/loaded/list` 是 id-only probe
+- `thread/loaded/read` 是 loaded `mode + status` 恢复面
+
+那说明这份文档已经到了应该停止扩写的时候。
+
+这些判断更适合被实现、测试和 README 固化，而不是继续在总文档里换一种说法重写一遍。
+
+### 3. 后续问题已经开始变成具体代码问题
+
+例如：
+
+- 某个 repair 路径是否还在重复 overlay resident mode
+- 某个 watcher 清理路径是否还会重新激活 `workspaceChanged`
+- 某个 typed client 是否还残留旧的 `resume` 心智
+
+这类问题最好的载体已经不是总文档，而是：
+
+- 代码
+- 测试
+- PR 描述
+- 单独的实现计划或 checklist
+
+### 4. 后续受众已经从“理解方向”变成“执行任务”
+
+这份文档最适合帮助人：
+
+- 建立全局理解
+- 对齐主线边界
+- 快速接手 resident / mode 这条线
+
+但如果受众已经是：
+
+- 正在写代码的人
+- 正在 review PR 的人
+- 正在补测试的人
+
+那他们更需要的是：
+
+- checklist
+- PR 模板
+- 测试入口
+- 文件清单
+
+而不是继续扩大的总分析文档。
+
+### 5. 一个简单的判断规则
+
+如果准备往这份文档再补一段内容，可以先问一句：
+
+- 这段内容是不是能直接转成代码改动、测试、PR checklist 或单独设计稿？
+
+如果答案是“能”，通常就不该再写进这份总文档。
+
+更合理的动作应该是：
+
+- 去改代码
+- 去补测试
+- 去写 PR 描述
+- 或者把它落到更窄的专门文档里
+
+### 结论
+
+到目前为止，这份文档已经满足“可以停止继续扩写”的条件。
+
+从现在往后，更合适的默认动作应该是：
+
+- 只有在某个新阶段已经真实落地后，再回来补一小段阶段总结
+
+而不是继续把所有后续思考都堆进这一个总文档。
+
+## 47. 后续任务应转移到独立执行清单
+
+沿着这份文档继续推进到这里，最合理的下一步已经不是在本文件里再补更多“应该怎么做”，而是把首个基线 PR 的动作单独落成执行清单。
+
+因此，后续真正要用来开工的入口应切换到：
+
+- `docs/persistent-runtime-checklists-index.md`
+
+默认第一站仍然是：
+
+- `docs/resident-mode-baseline-pr-checklist.md`
+
+这份清单更适合承载：
+
+- 提交前检查
+- review 对照项
+- 测试入口
+- 文档同步入口
+- 完成定义
+
+而这份 `codex-rs-source-analysis.md` 更适合保留为：
+
+- 架构分析
+- 主线总结
+- 路线图与 handoff 总入口
+
+如果后续还要继续修改本文件，最合理的触发条件应是：
+
+- 某个新阶段已经真实落地，需要补一段阶段总结
+
+而不是继续把执行细节堆回来。
+
 ## 附：本分析的依据
 
 - `codex-rs/Cargo.toml`

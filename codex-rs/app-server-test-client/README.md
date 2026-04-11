@@ -27,6 +27,16 @@ Initialize a connection, then print every inbound JSON-RPC message until you sto
 cargo run -p codex-app-server-test-client -- watch
 ```
 
+If you want a closer approximation of a minimal bridge consumer, use
+`watch-summary` instead. It bootstraps with one `thread/list` pass plus one
+`thread-loaded/read` pass, prints the compact summary view for both, then keeps
+streaming resident-aware `thread/started`, `thread/status/changed`, and
+`thread/name/updated` summaries until interrupted:
+
+```bash
+cargo run -p codex-app-server-test-client -- watch-summary --limit 20
+```
+
 ## Testing Thread Resume/Reconnect Behavior
 
 Build and start an app server using commands above. The app-server log is written to `/tmp/codex-app-server-test-client/app-server.log`
@@ -57,9 +67,10 @@ cargo run -p codex-app-server-test-client -- \
 These commands print the full response plus a compact summary that includes
 wire `thread.mode` values (for example `interactive` or
 `residentAssistant`), the current `status`, plus the derived
-`resume`/`reconnect` action label, so resident assistant reconnect semantics
-remain visible on read-only lookup, fork, metadata-only update, unarchive, and
-rollback paths.
+`resume`/`reconnect` action label. When a thread already has a stored
+`thread.name`, that compact summary now prints it too, so resident assistant
+reconnect semantics stay visible alongside the user-facing thread label on
+read-only lookup, fork, metadata-only update, unarchive, and rollback paths.
 For paginated `thread/list` calls, the compact summary also prints
 `next_cursor` when present, so you can continue walking history without
 re-reading the full debug struct.
@@ -93,7 +104,9 @@ notifications now reuse the locally cached thread summary as well: when the
 client already knows that thread's `mode`, the status change line keeps the
 same compact `mode + status + action` shape; when the thread id is still
 unknown, it deliberately stays status-only instead of guessing reconnect
-semantics. That shared notification handling now covers both turn streaming and
+semantics. `thread/name/updated` now follows the same rule: known threads reuse
+cached mode/status/action context while unknown thread ids stay identity-only.
+That shared notification handling now covers both turn streaming and
 long-running observation modes such as `thread-resume` / `watch`, so the
 resident-aware summaries stay consistent even when you keep the client attached
 just to watch later runtime state changes.

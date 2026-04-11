@@ -1458,6 +1458,68 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn metadata_update_preserves_resident_thread_name_through_typed_requests() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(71),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let thread_name = "Named resident metadata thread";
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(72),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: thread_name.to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let updated: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(73),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("def456".to_string())),
+                        branch: Some(Some("named-main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should preserve thread name");
+
+        assert_eq!(updated.thread.id, started.thread.id);
+        assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(updated.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(updated.thread.status, ThreadStatus::Idle);
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(74),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read should preserve thread name after metadata update");
+        assert_eq!(read.thread.name.as_deref(), Some(thread_name));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn loaded_read_preserves_resident_thread_mode_through_typed_requests() {
         let client = start_test_client(SessionSource::Cli).await;
 

@@ -7,6 +7,7 @@ use codex_app_server_protocol::ThreadStatus;
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnownThread {
     pub thread_id: String,
+    pub thread_name: Option<String>,
     pub thread_mode: ThreadMode,
     pub thread_status: ThreadStatus,
 }
@@ -24,6 +25,7 @@ pub enum PendingRequest {
     Resume,
     List,
     LoadedList,
+    LoadedRead,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,10 @@ pub enum ReaderEvent {
     },
     LoadedThreadList {
         thread_ids: Vec<String>,
+        next_cursor: Option<String>,
+    },
+    LoadedThreadRead {
+        threads: Vec<KnownThread>,
         next_cursor: Option<String>,
     },
 }

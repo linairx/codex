@@ -49,13 +49,20 @@ Type a line to send it as a new turn. Commands are prefixed with `:`:
 - `:refresh-thread [cursor]` list available threads, including both the stored
   thread mode (`interactive` vs `resident assistant`), the current status, and
   the suggested action (`resume` vs `reconnect`) across both interactive and
-  non-interactive sources; when the previous output includes `more threads
-  available, next cursor: ...`, pass that cursor back to fetch the next page
+  non-interactive sources. When a thread already has a stored `thread.name`,
+  the list now prefers that user-visible label while still showing the thread
+  id. When the previous output includes `more threads available, next cursor:
+  ...`, pass that cursor back to fetch the next page
 - `:refresh-loaded [cursor]` list loaded thread ids with pagination; this is
   intentionally an id-only probe across both interactive and non-interactive
   sources, so if you need mode/status/action labels, resident mode, or
   reconnect semantics for one of those ids, follow up with `:refresh-thread` or
   `:resume <thread-id>`
+- `:refresh-loaded-read [cursor]` page through loaded thread summaries across
+  both interactive and non-interactive sources. Unlike `:refresh-loaded`, this
+  directly consumes `thread/loaded/read`, so each row includes the current
+  thread mode, live status, and derived `resume`/`reconnect` action label for
+  the loaded runtime snapshot
 - `:quit` exit
 
 If you have not attached any thread yet, or you switch to an unknown thread id
@@ -67,6 +74,12 @@ notifications for a thread it already knows, it now refreshes the cached
 mode/status for that id as well. This keeps local `:use` confirmations aligned
 with live thread status instead of only updating after the next manual
 `:refresh-thread`.
+
+Those lifecycle notifications now also emit compact stderr summaries. Known
+threads reuse the cached `mode` and action label, while unknown
+`thread/status/changed` notifications intentionally stay status-only and tell
+you to refresh the thread summary instead of guessing resident reconnect
+semantics.
 
 The prompt shows the active thread id. Client messages (help, errors, approvals)
 print to stderr; raw server JSON prints to stdout so you can pipe/record it
