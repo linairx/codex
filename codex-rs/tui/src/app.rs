@@ -639,6 +639,18 @@ impl ThreadEventStore {
     }
 
     fn apply_thread_rollback(&mut self, response: &ThreadRollbackResponse) {
+        if let Some(session) = self.session.as_mut() {
+            session.forked_from_id = response
+                .thread
+                .forked_from_id
+                .clone()
+                .and_then(|thread_id| ThreadId::from_string(&thread_id).ok());
+            session.thread_name = response.thread.name.clone();
+            session.thread_mode = Some(response.thread.mode);
+            session.model_provider_id = response.thread.model_provider.clone();
+            session.cwd = response.thread.cwd.clone();
+            session.rollout_path = response.thread.path.clone();
+        }
         self.turns = response.thread.turns.clone();
         self.buffer.clear();
         self.pending_interactive_replay = PendingInteractiveReplayState::default();
@@ -5806,9 +5818,11 @@ impl App {
         num_turns: u32,
         response: &ThreadRollbackResponse,
     ) {
+        let mut refreshed_session = None;
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             store.apply_thread_rollback(response);
+            refreshed_session = store.snapshot().session;
         }
         if self.current_displayed_thread_id() == Some(thread_id)
             && let Some(mut rx) = self.active_thread_rx.take()
@@ -5830,6 +5844,11 @@ impl App {
             } else {
                 self.clear_active_thread().await;
             }
+        }
+        if self.current_displayed_thread_id() == Some(thread_id)
+            && let Some(session) = refreshed_session
+        {
+            self.chat_widget.handle_thread_session(session);
         }
         self.handle_backtrack_rollback_succeeded(num_turns);
         self.chat_widget.handle_thread_rolled_back();
@@ -12085,6 +12104,137 @@ guardian_approval = true
             .as_mut()
             .expect("displayed receiver should remain attached");
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn thread_rollback_response_preserves_resident_thread_mode_for_store_and_widget() {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        let session = ThreadSessionState {
+            thread_mode: Some(ThreadMode::ResidentAssistant),
+            ..test_thread_session(thread_id, PathBuf::from("/tmp/project"))
+        };
+        app.thread_event_channels.insert(
+            thread_id,
+            ThreadEventChannel::new_with_session(/*capacity*/ 8, session.clone(), Vec::new()),
+        );
+        app.chat_widget.handle_thread_session(session.clone());
+
+        app.handle_thread_rollback_response(
+            thread_id,
+            /*num_turns*/ 1,
+            &ThreadRollbackResponse {
+                thread: Thread {
+                    id: thread_id.to_string(),
+                    forked_from_id: None,
+                    preview: String::new(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                    status: codex_app_server_protocol::ThreadStatus::Idle,
+                    mode: codex_app_server_protocol::ThreadMode::ResidentAssistant,
+                    resident: true,
+                    path: None,
+                    cwd: PathBuf::from("/tmp/project"),
+                    cli_version: "0.0.0".to_string(),
+                    source: SessionSource::Cli.into(),
+                    agent_nickname: None,
+                    agent_role: None,
+                    git_info: None,
+                    name: None,
+                    turns: Vec::new(),
+                },
+            },
+        )
+        .await;
+
+        let store = app
+            .thread_event_channels
+            .get(&thread_id)
+            .expect("thread channel")
+            .store
+            .lock()
+            .await;
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot
+                .session
+                .as_ref()
+                .and_then(|session| session.thread_mode),
+            Some(ThreadMode::ResidentAssistant)
+        );
+        assert_eq!(
+            app.chat_widget.thread_mode(),
+            Some(ThreadMode::ResidentAssistant)
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_rollback_response_refreshes_thread_name_for_store_and_widget() {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        let session = ThreadSessionState {
+            thread_name: Some("Before rollback".to_string()),
+            ..test_thread_session(thread_id, PathBuf::from("/tmp/project"))
+        };
+        app.thread_event_channels.insert(
+            thread_id,
+            ThreadEventChannel::new_with_session(/*capacity*/ 8, session, Vec::new()),
+        );
+        app.chat_widget.handle_thread_session(ThreadSessionState {
+            thread_name: Some("Before rollback".to_string()),
+            ..test_thread_session(thread_id, PathBuf::from("/tmp/project"))
+        });
+
+        app.handle_thread_rollback_response(
+            thread_id,
+            /*num_turns*/ 1,
+            &ThreadRollbackResponse {
+                thread: Thread {
+                    id: thread_id.to_string(),
+                    forked_from_id: None,
+                    preview: String::new(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: 0,
+                    updated_at: 0,
+                    status: codex_app_server_protocol::ThreadStatus::Idle,
+                    mode: codex_app_server_protocol::ThreadMode::Interactive,
+                    resident: false,
+                    path: None,
+                    cwd: PathBuf::from("/tmp/project"),
+                    cli_version: "0.0.0".to_string(),
+                    source: SessionSource::Cli.into(),
+                    agent_nickname: None,
+                    agent_role: None,
+                    git_info: None,
+                    name: Some("After rollback".to_string()),
+                    turns: Vec::new(),
+                },
+            },
+        )
+        .await;
+
+        let store = app
+            .thread_event_channels
+            .get(&thread_id)
+            .expect("thread channel")
+            .store
+            .lock()
+            .await;
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot
+                .session
+                .as_ref()
+                .and_then(|session| session.thread_name.as_deref()),
+            Some("After rollback")
+        );
+        assert_eq!(
+            app.chat_widget.thread_name().as_deref(),
+            Some("After rollback")
+        );
     }
 
     #[tokio::test]

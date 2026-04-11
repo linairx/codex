@@ -874,6 +874,8 @@ mod tests {
     use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadResumeResponse;
     use codex_app_server_protocol::ThreadRollbackResponse;
+    use codex_app_server_protocol::ThreadSetNameParams;
+    use codex_app_server_protocol::ThreadSetNameResponse;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ThreadStatus;
@@ -2152,6 +2154,232 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn named_resident_thread_preserves_name_through_archive_metadata_and_unarchive() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(45),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(46),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "materialize archived named resident thread".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        loop {
+            let event = timeout(Duration::from_secs(5), client.next_event())
+                .await
+                .expect("turn completion event should arrive before timeout")
+                .expect("event stream should stay open");
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification,
+            )) = event
+                && notification.thread_id == started.thread.id
+                && notification.turn.status == TurnStatus::Completed
+            {
+                break;
+            }
+        }
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let thread_name = "Archived named resident thread";
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(47),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: thread_name.to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(48),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let updated: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(49),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: None,
+                        branch: Some(Some("archived-named-main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should succeed for archived resident thread");
+        assert_eq!(updated.thread.name.as_deref(), Some(thread_name));
+
+        let archived_read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(50),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: started.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the archived named resident thread");
+        assert_eq!(archived_read.thread.name.as_deref(), Some(thread_name));
+
+        let archived_listed_thread = timeout(Duration::from_secs(5), async {
+            loop {
+                let listed: codex_app_server_protocol::ThreadListResponse = client
+                    .request_typed(ClientRequest::ThreadList {
+                        request_id: RequestId::Integer(51),
+                        params: codex_app_server_protocol::ThreadListParams {
+                            cursor: None,
+                            limit: Some(10),
+                            sort_key: None,
+                            model_providers: None,
+                            source_kinds: None,
+                            archived: Some(true),
+                            cwd: None,
+                            search_term: None,
+                        },
+                    })
+                    .await
+                    .expect(
+                        "thread/list archived=true should return archived named resident thread",
+                    );
+                if let Some(listed_thread) = listed
+                    .data
+                    .iter()
+                    .find(|thread| thread.id == started.thread.id)
+                {
+                    return listed_thread.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("thread/list archived=true should converge before timeout");
+        assert_eq!(archived_listed_thread.name.as_deref(), Some(thread_name));
+
+        let unarchived: codex_app_server_protocol::ThreadUnarchiveResponse = client
+            .request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(52),
+                params: codex_app_server_protocol::ThreadUnarchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unarchive should succeed");
+        assert_eq!(unarchived.thread.name.as_deref(), Some(thread_name));
+
+        let read_after_unarchive: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(53),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read after unarchive should succeed");
+        assert_eq!(
+            read_after_unarchive.thread.name.as_deref(),
+            Some(thread_name)
+        );
+
+        let listed_after_unarchive = timeout(Duration::from_secs(5), async {
+            loop {
+                let listed: ThreadListResponse = client
+                    .request_typed(ClientRequest::ThreadList {
+                        request_id: RequestId::Integer(54),
+                        params: ThreadListParams {
+                            cursor: None,
+                            limit: Some(10),
+                            sort_key: None,
+                            model_providers: Some(vec![started.thread.model_provider.clone()]),
+                            source_kinds: None,
+                            archived: Some(false),
+                            cwd: None,
+                            search_term: None,
+                        },
+                    })
+                    .await
+                    .expect("thread/list after unarchive should succeed");
+                if let Some(listed_thread) = listed
+                    .data
+                    .into_iter()
+                    .find(|thread| thread.id == started.thread.id)
+                {
+                    break listed_thread;
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("thread/list should eventually include the unarchived named resident thread");
+        assert_eq!(listed_after_unarchive.name.as_deref(), Some(thread_name));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn archived_read_preserves_resident_thread_mode_through_typed_requests() {
         let server = responses::start_mock_server().await;
         let _response = responses::mount_sse_once(
@@ -2391,7 +2619,7 @@ supports_websockets = false
     }
 
     #[tokio::test]
-    async fn resident_workspace_changed_preserves_status_across_typed_reads_and_resume() {
+    async fn resident_workspace_changed_preserves_status_across_typed_reads_list_and_resume() {
         let client = start_test_client(SessionSource::Cli).await;
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2474,9 +2702,32 @@ supports_websockets = false
             .expect("thread/loaded/read should include the resident thread");
         assert_eq!(loaded_thread.status, changed_status);
 
+        let listed: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(31),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: None,
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("thread/list should still include resident thread");
+        let listed_thread = listed
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/list should include the resident thread");
+        assert_eq!(listed_thread.status, changed_status);
+
         let resumed: ThreadResumeResponse = client
             .request_typed(ClientRequest::ThreadResume {
-                request_id: RequestId::Integer(31),
+                request_id: RequestId::Integer(32),
                 params: codex_app_server_protocol::ThreadResumeParams {
                     thread_id: started.thread.id.clone(),
                     ..codex_app_server_protocol::ThreadResumeParams::default()
@@ -2579,7 +2830,7 @@ supports_websockets = false
     }
 
     #[tokio::test]
-    async fn rollback_preserves_resident_thread_mode_through_typed_requests() {
+    async fn rollback_preserves_resident_thread_mode_through_typed_response_and_follow_up_reads() {
         let server = responses::start_mock_server().await;
         let _response = responses::mount_sse_once(
             &server,
@@ -2669,6 +2920,210 @@ supports_websockets = false
         assert_eq!(rollback.thread.mode, ThreadMode::ResidentAssistant);
         assert_eq!(rollback.thread.status, ThreadStatus::Idle);
         assert!(rollback.thread.resident);
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(35),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read after rollback should succeed");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::Idle);
+        assert!(read.thread.resident);
+
+        let listed: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(36),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: None,
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("thread/list after rollback should succeed");
+        let listed_thread = listed
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/list should include rolled back resident thread");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::Idle);
+        assert!(listed_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn named_resident_thread_preserves_name_through_loaded_read_rollback_and_resume() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(37),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let thread_name = "Named resident typed thread";
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(38),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: thread_name.to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(39),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "materialize named resident turn".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        loop {
+            let event = timeout(Duration::from_secs(5), client.next_event())
+                .await
+                .expect("turn completion event should arrive before timeout")
+                .expect("event stream should stay open");
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification,
+            )) = event
+                && notification.thread_id == started.thread.id
+                && notification.turn.status == TurnStatus::Completed
+            {
+                break;
+            }
+        }
+
+        let loaded: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(40),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("thread/loaded/read should include named resident thread");
+        let loaded_thread = loaded
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/loaded/read should include named resident thread");
+        assert_eq!(loaded_thread.name.as_deref(), Some(thread_name));
+
+        let rollback: ThreadRollbackResponse = client
+            .request_typed(ClientRequest::ThreadRollback {
+                request_id: RequestId::Integer(41),
+                params: codex_app_server_protocol::ThreadRollbackParams {
+                    thread_id: started.thread.id.clone(),
+                    num_turns: 1,
+                },
+            })
+            .await
+            .expect("thread/rollback should succeed");
+        assert_eq!(rollback.thread.name.as_deref(), Some(thread_name));
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(42),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read after rollback should succeed");
+        assert_eq!(read.thread.name.as_deref(), Some(thread_name));
+
+        let listed: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(43),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: None,
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("thread/list after rollback should succeed");
+        let listed_thread = listed
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/list should include rolled back named resident thread");
+        assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(44),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("thread/resume should preserve thread name after rollback");
+        assert_eq!(resumed.thread.name.as_deref(), Some(thread_name));
 
         client.shutdown().await.expect("shutdown should complete");
     }

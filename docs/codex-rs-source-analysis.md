@@ -1002,7 +1002,13 @@ SQLite 在这里不是起点，而是收敛点。
 - `thread_status.rs` 已开始收敛 watcher 生命周期，shutdown 会主动清理 resident thread 的工作区 watch
 - `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
 - resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `ResidentAssistant`，`thread/loaded/read` 也会继续把该线程暴露为 `ResidentAssistant + Idle`
+- observer 的读取面和列表面现在也已继续收口到同一状态入口：resident thread 命中工作区变化后，`thread/read`、`thread/list`、`thread/loaded/read` 与 reconnect 用的 `thread/resume` 响应都会继续保留同一个 `workspaceChanged` 状态，不再只在 `thread/status/changed` 通知里短暂可见
+- `thread/status/changed` 的 status-only 边界现在也已被进一步钉实：observer 相关回归会直接检查通知 payload 仍只包含 `threadId + status`，避免后续有人把 resident reconnect 语义重新塞回增量通知，而不是继续从读取面上的 `Thread.mode` 恢复
+- `thread/rollback` 的 resident continuity 也已补到真实恢复路径：rollback 完成后 app-server 不再只按 rollout summary 回建默认 interactive 线程，而会重新合并当前 runtime metadata，因此 resident assistant 在 rollback 响应以及后续 `thread/read` / `thread/list` 里都会稳定保留 `ResidentAssistant`
+- `app-server` 这几条边缘恢复路径也已开始真正收口到共享 helper：resident mode 与 thread name 的 live overlay 不再分散在 rollback、resume history rebuild、`thread/metadata/update` 和 `thread/unarchive` 这些分支里各自手写，而是开始复用同一份 runtime metadata merge 逻辑
+- `thread/metadata/update` 的 loaded-repair 路径现在也已补上 observer 连续性回归：即使先删除 SQLite 行再通过 metadata patch 触发 repair，已加载 resident thread 的 `workspaceChanged` 与 `ResidentAssistant` 仍会一起保留下来，不会修回一条 mode/status 退化的线程摘要
 - `tui` 已继续收敛消费侧语义：除了 resume picker 的入口标题和各类 reconnect 文案外，`app_server_session` 对 `thread/start`、`thread/resume`、`thread/fork` 的 resident `Thread.mode` 映射、`ThreadStartedNotification` 进入 TUI 后的 resident 会话推断路径，以及启动前按名称 lookup、latest-session 选择和按线程 ID 的 `thread/read` 路径对 resident `SessionTarget.mode` 的保留，也都已补上回归覆盖，确保会话态不会把 resident assistant 降回普通 interactive 会话
+- `tui` 和 in-process client 的消费侧回归现在也已继续补齐到 observer / rollback 这两条恢复面：`app_server_session` 会直接锁住 `thread/read` / `thread/list` / `thread/loaded/read` 之间的 `workspaceChanged` 一致性，而 `ThreadRollbackResponse` 进入 TUI store / widget 后也会继续保留 resident mode，不会在 UI 层把 resident assistant 降回普通 interactive 会话
 - `tui` 的随机启动 tooltip 也已开始对齐 resident reconnect 语义：`codex resume` 不再只被描述成“恢复历史会话”，而会明确提示它同时覆盖 `resume or reconnect`，避免最前面的轻提示文案继续落回旧的纯 resume 心智
 - `cli` 的退出摘要提示也已开始消费 `Thread.mode`，resident assistant 不再一律提示 “continue this session”，而会明确给出 reconnect 语义
 - `cli` / `exec` 的命令帮助入口也已继续对齐 resident reconnect 心智：顶层 `resume` 子命令说明和 `exec resume` 帮助摘要都已明确写成 `resume or reconnect`，不再把这条入口继续描述成单纯的历史恢复

@@ -21,6 +21,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::NetworkApprovalProtocol;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadItem;
@@ -350,6 +351,104 @@ async fn thread_fork_from_resident_thread_stays_interactive_after_restart() -> R
     let resume: ThreadResumeResponse = to_response::<ThreadResumeResponse>(resume_resp)?;
     assert!(!resume.thread.resident);
     assert_eq!(resume.thread.mode, ThreadMode::Interactive);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resident_thread_fork_observes_workspace_changes() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.path().display().to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "materialize resident source thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread.id.clone(),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread: forked, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+    assert!(forked.resident);
+    assert_eq!(forked.mode, ThreadMode::ResidentAssistant);
+
+    std::fs::write(workspace.path().join("fork-watched.txt"), "changed")?;
+
+    let changed_status = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let read_id = mcp
+                .send_thread_read_request(ThreadReadParams {
+                    thread_id: forked.id.clone(),
+                    include_turns: false,
+                })
+                .await?;
+            let read_resp: JSONRPCResponse = mcp
+                .read_stream_until_response_message(RequestId::Integer(read_id))
+                .await?;
+            let read: ThreadReadResponse = to_response::<ThreadReadResponse>(read_resp)?;
+            if let ThreadStatus::Active { active_flags } = &read.thread.status
+                && active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
+            {
+                return Ok::<ThreadStatus, anyhow::Error>(read.thread.status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    assert_eq!(
+        changed_status,
+        ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+        }
+    );
 
     Ok(())
 }

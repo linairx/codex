@@ -37,7 +37,7 @@
 
 ## 2. 推荐阶段划分
 
-### 当前进度（2026-04-07）
+### 当前进度（2026-04-11）
 
 这条线已经不再是纯设计状态，阶段 1 到阶段 4 都已有第一批代码落地：
 
@@ -49,8 +49,24 @@
 - `thread_status.rs` 已开始收敛 resident thread 的 watcher 生命周期，shutdown 会主动清理工作区 watch
 - `workspaceChanged` 已限制为只作用于已加载线程，避免 shutdown 之后被陈旧 watcher 事件重新激活状态
 - `state` 已新增 `threads.mode` 稳定元数据列，`thread/read` / `thread/list` / `thread/resume` 可在服务重启后回补 resident 模式
+- `ThreadSourceKind` 的 interactive-only / full-source 辅助列表已开始收敛到 `app-server-protocol`，`tui`、`exec`、`debug-client` 和 `app-server-test-client` 不再各自手写全量 source kinds 列表
+- 顶层 session-management 入口文档也已收口到同一口径：仓库根 `README.md`、`docs/getting-started.md`、`docs/exec.md` 与 `docs/slash_commands.md` 都已直接覆盖 `resume` / `fork` / `resume or reconnect` / `SESSION_ID_OR_NAME` / `--include-non-interactive`
+- `thread/rollback` 的 live resident 路径已继续补齐：rollback 响应在从 rollout 重建线程摘要后，会重新合并当前 loaded resident 状态，不再把仍然存活的 resident assistant 回退成 `interactive`
+- `app-server` / `app-server-client` / `tui` 已继续补 observer 读取面与 rollback repair 回归：`workspaceChanged` 的 `thread/read` / `thread/list` / `thread/loaded/read` 一致性，以及 resident thread 在 rollback 后经 typed response、follow-up read/list 和 TUI store/widget 映射都保持 resident mode
+- `app-server` 的 rollback / running-resume repair 路径也已继续收口到共享 runtime metadata helper：resident mode 与 thread name 的 live overlay 不再分散在多个边缘恢复分支里各自手写
+- 同一 helper 现在也已覆盖 `thread/metadata/update`、`thread/unarchive` 和 resume history rebuild 路径；resident continuity 的 repair/read surfaces 已开始真正收敛到单点实现，而不是各自维护一份 name/mode overlay
 
 这意味着接下来的工作重点不再是“从零开始补字段”，而是把已经形成闭环的协议、observer 和 SQLite 最小改动收敛成可 review 的 PR，并继续检查消费侧是否还存在遗漏。
+
+按当前进度，下一段更适合切入的新代码闭环不是继续扫 help/README 文案，而是：
+
+- 继续沿 PR 4 收敛 observer 读取面和状态来源一致性
+- 或沿 PR 5 收敛 SQLite 稳定元数据与 repair 路径
+
+优先建议：
+
+1. 先检查 observer 路径里是否还存在“通知、列表、读取面”三者之一仍靠局部推断状态的实现分叉
+2. 再检查 SQLite repair / metadata update / rollback 这类边缘恢复路径是否还有重复的 resident mode 合并逻辑可继续收敛
 
 ### 阶段 1：线程模式字段落地
 

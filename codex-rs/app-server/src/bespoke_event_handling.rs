@@ -1,4 +1,5 @@
 use crate::codex_message_processor::ApiVersion;
+use crate::codex_message_processor::attach_thread_runtime_metadata;
 use crate::codex_message_processor::load_thread_summary_for_rollout;
 use crate::codex_message_processor::read_rollout_items_from_rollout;
 use crate::error_code::INTERNAL_ERROR_CODE;
@@ -8,6 +9,7 @@ use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::server_request_error::is_turn_transition_server_request_error;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
+use crate::thread_state::ThreadStateManager;
 use crate::thread_state::TurnSummary;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
@@ -104,7 +106,6 @@ use codex_app_server_protocol::convert_patch_changes;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::find_thread_name_by_id;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
 use codex_protocol::ThreadId;
@@ -143,7 +144,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::error;
-use tracing::warn;
 
 type JsonValue = serde_json::Value;
 
@@ -239,6 +239,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     conversation: Arc<CodexThread>,
     thread_manager: Arc<ThreadManager>,
     outgoing: ThreadScopedOutgoingMessageSender,
+    thread_state_manager: ThreadStateManager,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
     thread_watch_manager: ThreadWatchManager,
     api_version: ApiVersion,
@@ -1812,19 +1813,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                         match read_rollout_items_from_rollout(rollout_path.as_path()).await {
                             Ok(items) => {
                                 thread.turns = build_turns_from_rollout_items(&items);
+                                attach_thread_runtime_metadata(
+                                    codex_home,
+                                    &thread_state_manager,
+                                    conversation_id,
+                                    &mut thread,
+                                )
+                                .await;
                                 thread.status = thread_watch_manager
                                     .loaded_status_for_thread(&thread.id)
                                     .await;
-                                match find_thread_name_by_id(codex_home, &conversation_id).await {
-                                    Ok(name) => {
-                                        thread.name = name;
-                                    }
-                                    Err(err) => {
-                                        warn!(
-                                            "Failed to read thread name for {conversation_id}: {err}"
-                                        );
-                                    }
-                                }
                                 ThreadRollbackResponse { thread }
                             }
                             Err(err) => {

@@ -2899,7 +2899,8 @@ impl CodexMessageProcessor {
 
         let mut thread = summary_to_thread(summary_from_thread_metadata(&metadata));
         apply_persisted_thread_mode(&mut thread, &metadata);
-        self.attach_thread_name(thread_uuid, &mut thread).await;
+        self.attach_runtime_thread_metadata(thread_uuid, &mut thread)
+            .await;
         thread.status = resolve_thread_status(
             self.thread_watch_manager
                 .loaded_status_for_thread(&thread.id)
@@ -3221,7 +3222,8 @@ impl CodexMessageProcessor {
                         .await,
                     /*has_in_progress_turn*/ false,
                 );
-                self.attach_thread_name(thread_id, &mut thread).await;
+                self.attach_runtime_thread_metadata(thread_id, &mut thread)
+                    .await;
                 let thread_id = thread.id.clone();
                 let response = ThreadUnarchiveResponse { thread };
                 self.outgoing.send_response(request_id, response).await;
@@ -3556,7 +3558,6 @@ impl CodexMessageProcessor {
                     build_thread_from_snapshot(thread_id, &config_snapshot, Some(rollout_path));
                 self.attach_runtime_thread_metadata(thread_id, &mut thread)
                     .await;
-                thread.name = names.get(&thread_id).cloned();
                 let loaded_status = self
                     .thread_watch_manager
                     .loaded_status_for_thread(&thread.id)
@@ -4545,30 +4546,19 @@ impl CodexMessageProcessor {
             /*active_turn*/ None,
         )
         .await?;
-        self.attach_thread_name(thread_id, &mut thread).await;
+        self.attach_runtime_thread_metadata(thread_id, &mut thread)
+            .await;
         Ok(thread)
     }
 
-    async fn attach_thread_name(&self, thread_id: ThreadId, thread: &mut Thread) {
-        match find_thread_name_by_id(&self.config.codex_home, &thread_id).await {
-            Ok(name) => {
-                thread.name = name;
-            }
-            Err(err) => {
-                warn!("Failed to read thread name for {thread_id}: {err}");
-            }
-        }
-    }
-
     async fn attach_runtime_thread_metadata(&self, thread_id: ThreadId, thread: &mut Thread) {
-        if self
-            .thread_state_manager
-            .is_thread_resident(thread_id)
-            .await
-        {
-            set_thread_resident_and_mode(thread, /*resident*/ true);
-        }
-        self.attach_thread_name(thread_id, thread).await;
+        attach_thread_runtime_metadata(
+            self.config.codex_home.as_path(),
+            &self.thread_state_manager,
+            thread_id,
+            thread,
+        )
+        .await;
     }
 
     async fn thread_fork(&mut self, request_id: ConnectionRequestId, params: ThreadForkParams) {
@@ -4779,12 +4769,13 @@ impl CodexMessageProcessor {
             .await;
         }
 
-        let mut thread = match self
+        let thread = match self
             .build_forked_thread_snapshot(
                 thread_id,
                 &forked_thread,
                 session_configured.rollout_path.as_deref(),
                 fallback_model_provider.as_str(),
+                resident,
                 source_thread_id,
                 &source_history_items,
             )
@@ -4796,8 +4787,6 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        set_thread_resident_and_mode(&mut thread, resident);
-
         let response = ThreadForkResponse {
             thread: thread.clone(),
             model: session_configured.model,
@@ -4833,6 +4822,7 @@ impl CodexMessageProcessor {
         forked_thread: &Arc<CodexThread>,
         fork_rollout_path: Option<&Path>,
         fallback_model_provider: &str,
+        resident: bool,
         source_thread_id: Option<ThreadId>,
         source_history_items: &[RolloutItem],
     ) -> std::result::Result<Thread, String> {
@@ -4890,6 +4880,7 @@ impl CodexMessageProcessor {
             .await?;
         }
         overlay_missing_turn_items_from_snapshot(&mut thread.turns, &source_snapshot_turns);
+        set_thread_resident_and_mode(&mut thread, resident);
 
         self.thread_watch_manager
             .upsert_thread_silently(thread.clone())
@@ -7451,6 +7442,7 @@ impl CodexMessageProcessor {
                     &review_thread,
                     Some(rollout_path.as_path()),
                     fallback_provider,
+                    /*resident*/ false,
                     Some(parent_thread_id),
                     &source_history_items,
                 )
@@ -7774,6 +7766,7 @@ impl CodexMessageProcessor {
                             conversation.clone(),
                             thread_manager.clone(),
                             thread_outgoing,
+                            thread_state_manager.clone(),
                             thread_state.clone(),
                             thread_watch_manager.clone(),
                             api_version,
@@ -8342,10 +8335,13 @@ async fn handle_pending_thread_resume_request(
         has_live_in_progress_turn,
     );
 
-    match find_thread_name_by_id(codex_home, &conversation_id).await {
-        Ok(thread_name) => thread.name = thread_name,
-        Err(err) => warn!("Failed to read thread name for {conversation_id}: {err}"),
-    }
+    attach_thread_runtime_metadata(
+        codex_home,
+        thread_state_manager,
+        conversation_id,
+        &mut thread,
+    )
+    .await;
 
     let ThreadConfigSnapshot {
         model,
@@ -9367,6 +9363,21 @@ fn thread_mode_from_resident(resident: bool) -> ThreadMode {
 fn set_thread_resident_and_mode(thread: &mut Thread, resident: bool) {
     thread.resident = resident;
     thread.mode = thread_mode_from_resident(resident);
+}
+
+pub(crate) async fn attach_thread_runtime_metadata(
+    codex_home: &Path,
+    thread_state_manager: &ThreadStateManager,
+    thread_id: ThreadId,
+    thread: &mut Thread,
+) {
+    if thread_state_manager.is_thread_resident(thread_id).await {
+        set_thread_resident_and_mode(thread, /*resident*/ true);
+    }
+    match find_thread_name_by_id(codex_home, &thread_id).await {
+        Ok(thread_name) => thread.name = thread_name,
+        Err(err) => warn!("Failed to read thread name for {thread_id}: {err}"),
+    }
 }
 
 async fn ensure_thread_mode_persisted_in_state_db(

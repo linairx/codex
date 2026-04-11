@@ -40,10 +40,13 @@ use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMode;
+use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadSetNameParams;
+use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -1442,6 +1445,133 @@ async fn thread_resume_reconnects_running_thread_even_with_override_mismatch() -
         ThreadStatus::Idle => {}
         status => panic!("unexpected thread status after running resume: {status:?}"),
     }
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_thread_resume_preserves_thread_name() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let first_response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]));
+    let second_response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-2"),
+        responses::ev_assistant_message("msg-2", "Done"),
+        responses::ev_completed("resp-2"),
+    ]))
+    .set_delay(std::time::Duration::from_millis(500));
+    let _response_mock =
+        responses::mount_response_sequence(&server, vec![first_response, second_response]).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut primary = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+
+    let start_id = primary
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("gpt-5.1-codex-max".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let thread_name = "Running named thread";
+    let set_name_id = primary
+        .send_thread_set_name_request(ThreadSetNameParams {
+            thread_id: thread.id.clone(),
+            name: thread_name.to_string(),
+        })
+        .await?;
+    let set_name_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(set_name_id)),
+    )
+    .await??;
+    let _: ThreadSetNameResponse = to_response::<ThreadSetNameResponse>(set_name_resp)?;
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("thread/name/updated"),
+    )
+    .await??;
+    let notification: ThreadNameUpdatedNotification =
+        serde_json::from_value(notification.params.expect("thread/name/updated params"))?;
+    assert_eq!(notification.thread_id, thread.id);
+    assert_eq!(notification.thread_name.as_deref(), Some(thread_name));
+
+    let seed_turn_id = primary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "seed history".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(seed_turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    primary.clear_message_buffer();
+
+    let running_turn_id = primary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "keep running".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(running_turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    let resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resumed.id, thread.id);
+    assert_eq!(resumed.name.as_deref(), Some(thread_name));
 
     timeout(
         DEFAULT_READ_TIMEOUT,

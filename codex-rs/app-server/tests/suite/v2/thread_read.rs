@@ -413,6 +413,92 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let new_name = "Loaded only thread";
+    let set_id = mcp
+        .send_thread_set_name_request(ThreadSetNameParams {
+            thread_id: thread.id.clone(),
+            name: new_name.to_string(),
+        })
+        .await?;
+    let set_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(set_id)),
+    )
+    .await??;
+    let _: ThreadSetNameResponse = to_response::<ThreadSetNameResponse>(set_resp)?;
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/name/updated"),
+    )
+    .await??;
+    let notification: ThreadNameUpdatedNotification =
+        serde_json::from_value(notification.params.expect("thread/name/updated params"))?;
+    assert_eq!(notification.thread_id, thread.id);
+    assert_eq!(notification.thread_name.as_deref(), Some(new_name));
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let list_result = list_resp.result.clone();
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed = data
+        .iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include the loaded-only thread");
+    assert_eq!(listed.name.as_deref(), Some(new_name));
+    let listed_json = list_result
+        .get("data")
+        .and_then(Value::as_array)
+        .expect("thread/list result.data must be an array")
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(&thread.id))
+        .and_then(Value::as_object)
+        .expect("thread/list should include the loaded-only thread as an object");
+    assert_eq!(
+        listed_json.get("name").and_then(Value::as_str),
+        Some(new_name),
+        "thread/list must serialize `thread.name` for loaded-only thread entries"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn resident_thread_mode_is_consistent_across_read_surfaces() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
