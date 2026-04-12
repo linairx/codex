@@ -41,7 +41,7 @@
 
 ## 2. 推荐阶段划分
 
-### 当前进度（2026-04-11）
+### 当前进度（2026-04-12）
 
 这条线已经不再是纯设计状态，阶段 1 到阶段 4 都已有第一批代码落地：
 
@@ -59,18 +59,26 @@
 - `app-server` / `app-server-client` / `tui` 已继续补 observer 读取面与 rollback repair 回归：`workspaceChanged` 的 `thread/read` / `thread/list` / `thread/loaded/read` 一致性，以及 resident thread 在 rollback 后经 typed response、follow-up read/list 和 TUI store/widget 映射都保持 resident mode
 - `app-server` 的 rollback / running-resume repair 路径也已继续收口到共享 runtime metadata helper：resident mode 与 thread name 的 live overlay 不再分散在多个边缘恢复分支里各自手写
 - 同一 helper 现在也已覆盖 `thread/metadata/update`、`thread/unarchive` 和 resume history rebuild 路径；resident continuity 的 repair/read surfaces 已开始真正收敛到单点实现，而不是各自维护一份 name/mode overlay
+- `app-server` / `app-server-client` / MCP / remote-bridge 相关文档现在也已开始对齐同一条 stored-summary 契约：`thread/read`、`thread/resume`、`thread/metadata/update`、`thread/unarchive` 等返回面应被直接视为权威线程摘要；如果 SQLite row 已存在但 rollout-derived preview 仍残缺，服务端会先 reconcile rollout，再把修补后的 `Thread` 暴露出来，而不是把额外补读责任推回客户端
+- `debug-client` 与 `app-server-test-client` 这两个最小远端消费者现在也已补成自愈闭环：unknown thread 的 `thread/status/changed` 仍先保持 status-only，但随后会主动回到读取面补权威 summary，不再各自脑补 resident reconnect 语义
+- `codex-app-server-client` 的 typed repair 回归现在也已把 `thread/resume` 补齐到与 `thread/read` / `thread/list` / `thread/metadata/update` / `thread/unarchive` 同一条契约上：SQLite 行已存在但 rollout-derived preview 缺失时，resume 返回面本身也会继续直接暴露修补后的 resident summary，而不是要求消费侧在 reconnect 之后再补一次 `thread/read`
+- `codex-app-server-client` 的 remote facade 现在也已补上最小透传回归：当 websocket 远端直接返回 resident repaired `thread/resume` 摘要时，typed remote client 会继续原样保留 `thread.mode + preview + status + name`，避免这条“直接信服务端返回的 Thread”契约只在 in-process 路径上成立
+- `debug-client` 的 unknown-thread 自愈链路现在也已补成完整回收闭环：reader 不再只是验证“会补发一次 thread/loaded/read”，还会在 loaded summary 回来后把 resident `mode + status + name` 写回本地 `known_threads`，让后续 `:use` / 摘要输出真正恢复到权威 resident thread 视图
+- `observer` 相关高风险边界现在也已补到 watcher 生命周期级别：resident thread 的 `cwd` 迁移后旧工作区变化不会再重新置位 `workspaceChanged`，resident unsubscribe / reconnect 之后同一 observer 脏标记也会继续保留
+- SQLite 收敛也已继续补到“SQLite 行存在但 stored summary 仍残缺”的 repair 边界：`thread/read`、`thread/list`、`thread/resume`、`thread/metadata/update` 与 `thread/unarchive` 都开始先 reconcile rollout，再返回修补后的摘要，而不是把半修复状态暴露给消费侧
 
 这意味着接下来的工作重点不再是“从零开始补字段”，而是把已经形成闭环的协议、observer 和 SQLite 最小改动收敛成可 review 的 PR，并继续检查消费侧是否还存在遗漏。
 
 按当前进度，下一段更适合切入的新代码闭环不是继续扫 help/README 文案，而是：
 
-- 继续沿 PR 4 收敛 observer 读取面和状态来源一致性
-- 或沿 PR 5 收敛 SQLite 稳定元数据与 repair 路径
+- 优先沿 PR 5 收敛 SQLite 稳定元数据与 repair 路径
+- 仅在 observer 或 remote bridge 又出现新的实现分叉时，再回到对应 checklist 做补扫
 
 优先建议：
 
-1. 先检查 observer 路径里是否还存在“通知、列表、读取面”三者之一仍靠局部推断状态的实现分叉
-2. 再检查 SQLite repair / metadata update / rollback 这类边缘恢复路径是否还有重复的 resident mode 合并逻辑可继续收敛
+1. 先收口 SQLite / rollout / runtime overlay 的权威来源优先级，把“先信哪一层”写成更短的实现约束和 review 清单
+2. 再检查 `metadata update` / `unarchive` / `resume` / rollback 这些边缘恢复路径是否还有重复的 resident mode 或 stored-summary repair 逻辑可继续收敛
+3. 检查剩余实现计划 / 模板 / checklist 是否都已把“直接信返回的 `Thread`”写成统一契约，避免后续 PR 描述重新退回“metadata-only 更新后再补一次 `thread/read`”的旧心智
 
 ### 阶段 1：线程模式字段落地
 
@@ -265,6 +273,7 @@
 - `docs/remote-bridge-consumption.md` 也已继续精确化远端首页语义：文档现在明确要求把 `Thread.mode` 直接映射成列表动作，`interactive -> resume`、`residentAssistant -> reconnect`，避免远端控制面只消费 mode 却不把产品动作语义定死
 - `docs/persistent-assistant-mode-design.md` 与 `docs/app-server-thread-mode-v2.md` 也已继续补齐这条设计侧边界：`thread/resume` 虽然保留统一 API，但客户端动作文案必须按 `Thread.mode` 稳定映射成 `interactive -> resume`、`residentAssistant -> reconnect`
 - `docs/observer-event-flow-design.md` 与 `docs/sqlite-state-convergence.md` 也已继续补齐同一消费边界：observer/status-only 通知和 SQLite 元数据负责状态事实，但产品动作文案仍必须从读取面提供的 `Thread.mode` 稳定映射成 `interactive -> resume`、`residentAssistant -> reconnect`
+- `docs/persistent-assistant-mode-design.md`、`docs/app-server-thread-mode-v2.md`、`codex-app-server-client` README、`codex app-server` README、`codex_mcp_interface.md` 与 `docs/remote-bridge-consumption.md` 现在也已继续对齐 stored-summary repair 心智：metadata-only / restore / reconnect 路径返回的 `Thread` 本身就是应被直接信任的权威摘要，而不是要求消费侧额外补一次 `thread/read`
 - `exec` 的启动配置摘要也已开始消费 `Thread.mode`，resident assistant 在 bootstrap 阶段不再被展示成普通 interactive session
 - `exec` 的人类可读 bootstrap 摘要也已进一步补齐 `session action`：除了 `session mode` 外，现在会直接显示 `interactive -> resume`、`resident assistant -> reconnect`，并补上两侧回归测试
 - `exec` 的这组人类可读 bootstrap 摘要回归也已补上负向覆盖：当 `thread_mode` 未知时，不会错误打印 `session mode` / `session action`

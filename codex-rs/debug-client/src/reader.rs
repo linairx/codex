@@ -4,11 +4,14 @@ use std::io::BufReader;
 use std::process::ChildStdout;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::thread::JoinHandle;
 
 use anyhow::Context;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::FileChangeApprovalDecision;
@@ -17,16 +20,19 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::all_thread_source_kinds;
 use serde::Serialize;
 use std::io::Write;
 
@@ -37,9 +43,15 @@ use crate::state::PendingRequest;
 use crate::state::ReaderEvent;
 use crate::state::State;
 
+#[derive(Clone)]
+pub(crate) struct ReaderRequestSink {
+    pub(crate) stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    pub(crate) next_request_id: Arc<AtomicI64>,
+}
+
 pub fn start_reader(
     mut stdout: BufReader<ChildStdout>,
-    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    request_sink: ReaderRequestSink,
     state: Arc<Mutex<State>>,
     events: Sender<ReaderEvent>,
     output: Output,
@@ -86,7 +98,7 @@ pub fn start_reader(
                         request,
                         &command_decision,
                         &file_decision,
-                        &stdin,
+                        &request_sink.stdin,
                         &output,
                     ) {
                         let _ =
@@ -99,9 +111,13 @@ pub fn start_reader(
                     }
                 }
                 JSONRPCMessage::Notification(notification) => {
-                    if let Err(err) =
-                        handle_notification(notification, &state, &output, filtered_output)
-                    {
+                    if let Err(err) = handle_notification(
+                        notification,
+                        &request_sink,
+                        &state,
+                        &output,
+                        filtered_output,
+                    ) {
                         let _ =
                             output.client_line(&format!("failed to handle notification: {err}"));
                     }
@@ -177,13 +193,13 @@ fn handle_response(
                     .iter_mut()
                     .find(|thread| thread.thread_id == thread_id)
                 {
-                    existing.thread_name = thread_name.clone();
+                    existing.thread_name = thread_name;
                     existing.thread_mode = thread_mode;
                     existing.thread_status = thread_status;
                 } else {
                     state.known_threads.push(KnownThread {
                         thread_id: thread_id.clone(),
-                        thread_name: thread_name.clone(),
+                        thread_name,
                         thread_mode,
                         thread_status,
                     });
@@ -211,13 +227,13 @@ fn handle_response(
                     .iter_mut()
                     .find(|thread| thread.thread_id == thread_id)
                 {
-                    existing.thread_name = thread_name.clone();
+                    existing.thread_name = thread_name;
                     existing.thread_mode = thread_mode;
                     existing.thread_status = thread_status;
                 } else {
                     state.known_threads.push(KnownThread {
                         thread_id: thread_id.clone(),
-                        thread_name: thread_name.clone(),
+                        thread_name,
                         thread_mode,
                         thread_status,
                     });
@@ -319,6 +335,7 @@ fn handle_response(
 
 fn handle_notification(
     notification: JSONRPCNotification,
+    request_sink: &ReaderRequestSink,
     state: &Arc<Mutex<State>>,
     output: &Output,
     filtered_output: bool,
@@ -356,8 +373,8 @@ fn handle_notification(
             Ok(())
         }
         ServerNotification::ThreadStatusChanged(payload) => {
-            let mut state = state.lock().expect("state lock poisoned");
-            let known_thread = if let Some(existing) = state
+            let mut app_state = state.lock().expect("state lock poisoned");
+            let known_thread = if let Some(existing) = app_state
                 .known_threads
                 .iter_mut()
                 .find(|thread| thread.thread_id == payload.thread_id)
@@ -367,13 +384,47 @@ fn handle_notification(
             } else {
                 None
             };
-            drop(state);
+            let refresh_request_id = if known_thread.is_none()
+                && !app_state
+                    .pending
+                    .values()
+                    .any(|pending| *pending == PendingRequest::LoadedRead)
+            {
+                let request_id =
+                    RequestId::Integer(request_sink.next_request_id.fetch_add(1, Ordering::SeqCst));
+                app_state
+                    .pending
+                    .insert(request_id.clone(), PendingRequest::LoadedRead);
+                Some(request_id)
+            } else {
+                None
+            };
+            drop(app_state);
             for line in thread_status_changed_summary_lines(
                 &payload.thread_id,
                 &payload.status,
                 known_thread.as_ref(),
             ) {
                 output.client_line(&line)?;
+            }
+            if let Some(request_id) = refresh_request_id
+                && let Err(err) = send_client_request(
+                    &request_sink.stdin,
+                    ClientRequest::ThreadLoadedRead {
+                        request_id: request_id.clone(),
+                        params: ThreadLoadedReadParams {
+                            cursor: None,
+                            limit: None,
+                            model_providers: None,
+                            source_kinds: Some(all_thread_source_kinds()),
+                            cwd: None,
+                        },
+                    },
+                )
+            {
+                let mut app_state = state.lock().expect("state lock poisoned");
+                app_state.pending.remove(&request_id);
+                return Err(err);
             }
             Ok(())
         }
@@ -643,8 +694,28 @@ fn send_response<T: Serialize>(
     Ok(())
 }
 
+fn send_client_request(
+    stdin: &Arc<Mutex<Option<std::process::ChildStdin>>>,
+    request: ClientRequest,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string(&request).context("serialize client request")?;
+    let mut line = json;
+    line.push('\n');
+
+    let mut stdin = stdin.lock().expect("stdin lock poisoned");
+    let Some(stdin) = stdin.as_mut() else {
+        anyhow::bail!("stdin already closed");
+    };
+    stdin
+        .write_all(line.as_bytes())
+        .context("write client request")?;
+    stdin.flush().context("flush client request")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::ReaderRequestSink;
     use super::handle_notification;
     use super::handle_response;
     use super::thread_name_updated_summary_line;
@@ -656,22 +727,30 @@ mod tests {
     use crate::state::ReaderEvent;
     use crate::state::State;
     use codex_app_server_protocol::JSONRPCNotification;
+    use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadLoadedListResponse;
+    use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadLoadedReadResponse;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadNameUpdatedNotification;
     use codex_app_server_protocol::ThreadStartedNotification;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
+    use codex_app_server_protocol::all_thread_source_kinds;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::io::BufRead;
+    use std::io::BufReader;
+    use std::process::Command;
+    use std::process::Stdio;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicI64;
     use std::sync::mpsc::channel;
 
     fn notification<T: serde::Serialize>(method: &str, params: T) -> JSONRPCNotification {
@@ -950,6 +1029,10 @@ mod tests {
                     },
                 },
             ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
             &state,
             &Output::new(),
             /*filtered_output*/ false,
@@ -991,6 +1074,10 @@ mod tests {
                     status: ThreadStatus::SystemError,
                 },
             ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
             &state,
             &Output::new(),
             /*filtered_output*/ false,
@@ -1012,6 +1099,12 @@ mod tests {
     #[test]
     fn thread_status_changed_notification_does_not_infer_unknown_thread_mode() {
         let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state
+                .pending
+                .insert(RequestId::Integer(99), PendingRequest::LoadedRead);
+        }
 
         handle_notification(
             notification(
@@ -1021,6 +1114,10 @@ mod tests {
                     status: ThreadStatus::SystemError,
                 },
             ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
             &state,
             &Output::new(),
             /*filtered_output*/ false,
@@ -1029,6 +1126,164 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert!(state.known_threads.is_empty());
+    }
+
+    #[test]
+    fn unknown_thread_status_change_requests_loaded_read_refresh() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let next_request_id = Arc::new(AtomicI64::new(11));
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat should start");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+
+        handle_notification(
+            notification(
+                "thread/status/changed",
+                ThreadStatusChangedNotification {
+                    thread_id: "thread-unknown".to_string(),
+                    status: ThreadStatus::SystemError,
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::clone(&stdin),
+                next_request_id: Arc::clone(&next_request_id),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("unknown thread status change should queue loaded/read refresh");
+
+        let stdout = child.stdout.take().expect("cat stdout should exist");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("cat stdout should receive one request");
+        let request: JSONRPCRequest =
+            serde_json::from_str(line.trim()).expect("request should decode");
+        assert_eq!(request.id, RequestId::Integer(11));
+        assert_eq!(request.method, "thread/loaded/read");
+        assert_eq!(
+            request.params,
+            Some(
+                serde_json::to_value(ThreadLoadedReadParams {
+                    cursor: None,
+                    limit: None,
+                    model_providers: None,
+                    source_kinds: Some(all_thread_source_kinds()),
+                    cwd: None,
+                })
+                .expect("loaded read params should serialize")
+            )
+        );
+
+        let state = state.lock().expect("state lock poisoned");
+        assert!(state.known_threads.is_empty());
+        assert_eq!(
+            state.pending.get(&RequestId::Integer(11)),
+            Some(&PendingRequest::LoadedRead)
+        );
+
+        drop(state);
+        drop(stdin);
+        drop(stdout);
+        child.wait().expect("cat should exit cleanly");
+    }
+
+    #[test]
+    fn unknown_thread_status_change_refresh_round_trip_restores_resident_summary() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let next_request_id = Arc::new(AtomicI64::new(11));
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat should start");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+
+        handle_notification(
+            notification(
+                "thread/status/changed",
+                ThreadStatusChangedNotification {
+                    thread_id: "thread-unknown".to_string(),
+                    status: ThreadStatus::SystemError,
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::clone(&stdin),
+                next_request_id: Arc::clone(&next_request_id),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("unknown thread status change should queue loaded/read refresh");
+
+        let stdout = child.stdout.take().expect("cat stdout should exist");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("cat stdout should receive one request");
+        let request: JSONRPCRequest =
+            serde_json::from_str(line.trim()).expect("request should decode");
+        assert_eq!(request.id, RequestId::Integer(11));
+
+        let (events_tx, _events_rx) = channel();
+        handle_response(
+            JSONRPCResponse {
+                id: RequestId::Integer(11),
+                result: serde_json::to_value(ThreadLoadedReadResponse {
+                    data: vec![Thread {
+                        id: "thread-unknown".to_string(),
+                        forked_from_id: None,
+                        preview: "Resident recovered thread".to_string(),
+                        ephemeral: false,
+                        model_provider: "openai".to_string(),
+                        created_at: 1,
+                        updated_at: 2,
+                        status: ThreadStatus::SystemError,
+                        mode: ThreadMode::ResidentAssistant,
+                        resident: true,
+                        path: None,
+                        cwd: "/tmp".into(),
+                        cli_version: "0.0.0".to_string(),
+                        source: SessionSource::Cli,
+                        agent_nickname: None,
+                        agent_role: None,
+                        git_info: None,
+                        name: Some("atlas".to_string()),
+                        turns: Vec::new(),
+                    }],
+                    next_cursor: None,
+                })
+                .expect("loaded read response should serialize"),
+            },
+            &state,
+            &events_tx,
+        )
+        .expect("loaded read response should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-unknown".to_string(),
+                thread_name: Some("atlas".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::SystemError,
+            }]
+        );
+        assert!(state.pending.is_empty());
+
+        drop(state);
+        drop(stdin);
+        drop(stdout);
+        child.wait().expect("cat should exit cleanly");
     }
 
     #[test]
@@ -1077,6 +1332,10 @@ mod tests {
                     thread_name: Some("atlas".to_string()),
                 },
             ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
             &state,
             &Output::new(),
             /*filtered_output*/ false,
@@ -1107,6 +1366,10 @@ mod tests {
                     thread_name: Some("atlas".to_string()),
                 },
             ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
             &state,
             &Output::new(),
             /*filtered_output*/ false,

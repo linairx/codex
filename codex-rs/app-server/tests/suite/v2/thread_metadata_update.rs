@@ -4,6 +4,7 @@ use app_test_support::create_fake_rollout;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::rollout_path;
 use app_test_support::to_response;
+use chrono::Utc;
 use codex_app_server_protocol::GitInfo;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -34,12 +35,15 @@ use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo as RolloutGitInfo;
+use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::StateRuntime;
+use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -232,6 +236,83 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_stored_thread() -
             origin_url: None,
         })
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_metadata_update_reconciles_missing_summary_for_existing_sqlite_row() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+
+    let preview = "Stored thread preview";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let thread_uuid = ThreadId::from_string(&thread_id)?;
+    let rollout_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &thread_id);
+    let mut metadata = ThreadMetadataBuilder::new(
+        thread_uuid,
+        rollout_path,
+        Utc::now(),
+        ProtocolSessionSource::Cli,
+    );
+    metadata.model_provider = Some("mock_provider".to_string());
+    metadata.cwd = PathBuf::from("/");
+    metadata.cli_version = Some("0.0.0".to_string());
+    let inserted = state_db
+        .insert_thread_if_absent(&metadata.build("mock_provider"))
+        .await?;
+    assert!(
+        inserted,
+        "test setup should insert an incomplete sqlite row"
+    );
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let update_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread_id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: None,
+                branch: Some(Some("feature/stored-thread".to_string())),
+                origin_url: None,
+            }),
+        })
+        .await?;
+    let update_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+    )
+    .await??;
+    let ThreadMetadataUpdateResponse { thread: updated } =
+        to_response::<ThreadMetadataUpdateResponse>(update_resp)?;
+
+    assert_eq!(updated.id, thread_id);
+    assert_eq!(updated.preview, preview);
+    assert_eq!(
+        updated.git_info,
+        Some(GitInfo {
+            sha: None,
+            branch: Some("feature/stored-thread".to_string()),
+            origin_url: None,
+        })
+    );
+
+    let persisted = state_db
+        .get_thread(thread_uuid)
+        .await?
+        .expect("thread metadata should exist after update");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
 
     Ok(())
 }
@@ -1221,6 +1302,148 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_archived_thread()
             origin_url: None,
         })
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_metadata_update_reconciles_missing_summary_for_existing_archived_sqlite_row()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+
+    let preview = "Archived repaired preview";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-06T08-30-00",
+        "2025-01-06T08:30:00Z",
+        preview,
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir_all(&archived_dir)?;
+    let archived_source = rollout_path(codex_home.path(), "2025-01-06T08-30-00", &thread_id);
+    let archived_dest = archived_dir.join(
+        archived_source
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    fs::rename(&archived_source, &archived_dest)?;
+
+    let thread_uuid = ThreadId::from_string(&thread_id)?;
+    let mut metadata = ThreadMetadataBuilder::new(
+        thread_uuid,
+        archived_dest.clone(),
+        Utc::now(),
+        ProtocolSessionSource::Cli,
+    );
+    metadata.model_provider = Some("mock_provider".to_string());
+    metadata.cwd = PathBuf::from("/");
+    metadata.cli_version = Some("0.0.0".to_string());
+    let inserted = state_db
+        .insert_thread_if_absent(&metadata.build("mock_provider"))
+        .await?;
+    assert!(
+        inserted,
+        "test setup should insert an incomplete archived sqlite row"
+    );
+    let updated_mode = state_db
+        .set_thread_mode(thread_uuid, "residentAssistant")
+        .await?;
+    assert!(
+        updated_mode,
+        "test setup should preserve resident mode in sqlite"
+    );
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let update_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread_id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: None,
+                branch: Some(Some("feature/archived-summary-repair".to_string())),
+                origin_url: None,
+            }),
+        })
+        .await?;
+    let update_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+    )
+    .await??;
+    let ThreadMetadataUpdateResponse { thread: updated } =
+        to_response::<ThreadMetadataUpdateResponse>(update_resp)?;
+
+    assert_eq!(updated.id, thread_id);
+    assert_eq!(updated.preview, preview);
+    assert!(updated.resident);
+    assert_eq!(updated.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(updated.status, ThreadStatus::NotLoaded);
+    assert_eq!(
+        updated.git_info,
+        Some(GitInfo {
+            sha: None,
+            branch: Some("feature/archived-summary-repair".to_string()),
+            origin_url: None,
+        })
+    );
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert_eq!(read_thread.preview, preview);
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: Some(true),
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread_id)
+        .expect("thread/list archived=true should include repaired archived thread");
+    assert_eq!(listed_thread.preview, preview);
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+    let persisted = state_db
+        .get_thread(thread_uuid)
+        .await?
+        .expect("thread metadata should exist after archived metadata repair");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
+    assert!(persisted.archived_at.is_some());
 
     Ok(())
 }

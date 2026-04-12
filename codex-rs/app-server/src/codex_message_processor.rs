@@ -2877,7 +2877,13 @@ impl CodexMessageProcessor {
             return;
         }
 
-        let metadata = match state_db_ctx.get_thread(thread_uuid).await {
+        let metadata = match load_persisted_thread_metadata_with_summary_repair(
+            &state_db_ctx,
+            thread_uuid,
+            self.config.model_provider_id.as_str(),
+        )
+        .await
+        {
             Ok(Some(metadata)) => metadata,
             Ok(None) => {
                 self.send_internal_error(
@@ -2890,7 +2896,7 @@ impl CodexMessageProcessor {
             Err(err) => {
                 self.send_internal_error(
                     request_id,
-                    format!("failed to reload updated thread metadata for {thread_uuid}: {err}"),
+                    format!("failed to reload reconciled thread metadata for {thread_uuid}: {err}"),
                 )
                 .await;
                 return;
@@ -2935,7 +2941,13 @@ impl CodexMessageProcessor {
             }
         }
 
-        match state_db_ctx.get_thread(thread_uuid).await {
+        match load_persisted_thread_metadata_with_summary_repair(
+            state_db_ctx,
+            thread_uuid,
+            self.config.model_provider_id.as_str(),
+        )
+        .await
+        {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(err) => {
@@ -2980,7 +2992,13 @@ impl CodexMessageProcessor {
             )
             .await;
 
-            return match state_db_ctx.get_thread(thread_uuid).await {
+            return match load_persisted_thread_metadata_with_summary_repair(
+                state_db_ctx,
+                thread_uuid,
+                self.config.model_provider_id.as_str(),
+            )
+            .await
+            {
                 Ok(Some(_)) => Ok(()),
                 Ok(None) => Err(internal_error(format!(
                     "failed to create thread metadata for {thread_uuid}"
@@ -3019,18 +3037,15 @@ impl CodexMessageProcessor {
                 }
             };
 
-        reconcile_rollout(
-            Some(state_db_ctx),
+        match reconcile_and_load_persisted_thread_metadata(
+            state_db_ctx,
+            thread_uuid,
             rollout_path.as_path(),
             self.config.model_provider_id.as_str(),
-            /*builder*/ None,
-            &[],
             /*archived_only*/ None,
-            /*new_thread_memory_mode*/ None,
         )
-        .await;
-
-        match state_db_ctx.get_thread(thread_uuid).await {
+        .await
+        {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(internal_error(format!(
                 "failed to create thread metadata from rollout for {thread_uuid}"
@@ -3191,10 +3206,16 @@ impl CodexMessageProcessor {
                 data: None,
             })?;
             let persisted_metadata = if let Some(ctx) = state_db_ctx.as_ref() {
-                let _ = ctx
-                    .mark_unarchived(thread_id, restored_path.as_path())
-                    .await;
-                ctx.get_thread(thread_id).await.ok().flatten()
+                reconcile_and_load_persisted_thread_metadata(
+                    ctx,
+                    thread_id,
+                    restored_path.as_path(),
+                    fallback_provider.as_str(),
+                    Some(false),
+                )
+                .await
+                .ok()
+                .flatten()
             } else {
                 None
             };
@@ -3791,11 +3812,30 @@ impl CodexMessageProcessor {
 
         let loaded_thread = self.thread_manager.get_thread(thread_uuid).await.ok();
         let loaded_thread_state_db = loaded_thread.as_ref().and_then(|thread| thread.state_db());
-        let db_summary = if let Some(state_db_ctx) = loaded_thread_state_db.as_ref() {
-            read_summary_from_state_db_context_by_thread_id(Some(state_db_ctx), thread_uuid).await
+        let persisted_metadata = if let Some(state_db_ctx) = loaded_thread_state_db.as_ref() {
+            load_persisted_thread_metadata_with_summary_repair(
+                state_db_ctx,
+                thread_uuid,
+                self.config.model_provider_id.as_str(),
+            )
+            .await
+            .ok()
+            .flatten()
+        } else if let Some(state_db_ctx) = get_state_db(&self.config).await {
+            load_persisted_thread_metadata_with_summary_repair(
+                &state_db_ctx,
+                thread_uuid,
+                self.config.model_provider_id.as_str(),
+            )
+            .await
+            .ok()
+            .flatten()
         } else {
-            read_summary_from_state_db_by_thread_id(&self.config, thread_uuid).await
+            None
         };
+        let db_summary = persisted_metadata
+            .as_ref()
+            .map(summary_from_thread_metadata);
         let mut rollout_path = db_summary.as_ref().map(|summary| summary.path.clone());
         if rollout_path.is_none() || include_turns {
             rollout_path =
@@ -3834,17 +3874,18 @@ impl CodexMessageProcessor {
             summary_to_thread(summary)
         } else if let Some(rollout_path) = rollout_path.as_ref() {
             let fallback_provider = self.config.model_provider_id.as_str();
-            match read_summary_from_rollout(rollout_path, fallback_provider).await {
-                Ok(summary) => summary_to_thread(summary),
+            match load_thread_summary_for_rollout(
+                &self.config,
+                thread_uuid,
+                rollout_path,
+                fallback_provider,
+                /*persisted_metadata*/ None,
+            )
+            .await
+            {
+                Ok(thread) => thread,
                 Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to load rollout `{}` for thread {thread_uuid}: {err}",
-                            rollout_path.display()
-                        ),
-                    )
-                    .await;
+                    self.send_internal_error(request_id, err).await;
                     return;
                 }
             }
@@ -3877,14 +3918,8 @@ impl CodexMessageProcessor {
         {
             thread.forked_from_id = forked_from_id_from_rollout(rollout_path).await;
         }
-        if let Some(state_db_ctx) = loaded_thread_state_db.as_ref() {
-            if let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_uuid).await {
-                apply_persisted_thread_mode(&mut thread, &metadata);
-            }
-        } else if let Some(state_db_ctx) = get_state_db(&self.config).await
-            && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_uuid).await
-        {
-            apply_persisted_thread_mode(&mut thread, &metadata);
+        if let Some(metadata) = persisted_metadata.as_ref() {
+            apply_persisted_thread_mode(&mut thread, metadata);
         }
         self.attach_runtime_thread_metadata(thread_uuid, &mut thread)
             .await;
@@ -4231,11 +4266,14 @@ impl CodexMessageProcessor {
             return None;
         };
         let state_db_ctx = get_state_db(&self.config).await?;
-        let persisted_metadata = state_db_ctx
-            .get_thread(resumed_history.conversation_id)
-            .await
-            .ok()
-            .flatten()?;
+        let persisted_metadata = load_persisted_thread_metadata_with_summary_repair(
+            &state_db_ctx,
+            resumed_history.conversation_id,
+            self.config.model_provider_id.as_str(),
+        )
+        .await
+        .ok()
+        .flatten()?;
         merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
         Some(persisted_metadata)
     }
@@ -6924,7 +6962,6 @@ impl CodexMessageProcessor {
             .into_iter()
             .map(V2UserInput::into_core)
             .collect();
-
         let has_any_overrides = params.cwd.is_some()
             || params.approval_policy.is_some()
             || params.approvals_reviewer.is_some()
@@ -8940,21 +8977,91 @@ async fn read_summary_from_state_db_by_thread_id(
     config: &Config,
     thread_id: ThreadId,
 ) -> Option<ConversationSummary> {
-    let state_db_ctx = get_state_db(config).await;
-    read_summary_from_state_db_context_by_thread_id(state_db_ctx.as_ref(), thread_id).await
+    let state_db_ctx = get_state_db(config).await?;
+    let metadata = load_persisted_thread_metadata_with_summary_repair(
+        &state_db_ctx,
+        thread_id,
+        config.model_provider_id.as_str(),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    Some(summary_from_thread_metadata(&metadata))
 }
 
 async fn read_summary_from_state_db_context_by_thread_id(
     state_db_ctx: Option<&StateDbHandle>,
     thread_id: ThreadId,
+    fallback_provider: &str,
 ) -> Option<ConversationSummary> {
     let state_db_ctx = state_db_ctx?;
 
-    let metadata = match state_db_ctx.get_thread(thread_id).await {
-        Ok(Some(metadata)) => metadata,
-        Ok(None) | Err(_) => return None,
-    };
+    let metadata = load_persisted_thread_metadata_with_summary_repair(
+        state_db_ctx,
+        thread_id,
+        fallback_provider,
+    )
+    .await
+    .ok()
+    .flatten()?;
     Some(summary_from_thread_metadata(&metadata))
+}
+
+async fn reconcile_and_load_persisted_thread_metadata(
+    state_db_ctx: &StateDbHandle,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    fallback_provider: &str,
+    archived_only: Option<bool>,
+) -> Result<Option<ThreadMetadata>, String> {
+    reconcile_rollout(
+        Some(state_db_ctx),
+        rollout_path,
+        fallback_provider,
+        /*builder*/ None,
+        &[],
+        archived_only,
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+
+    state_db_ctx
+        .get_thread(thread_id)
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|metadata| {
+            metadata.ok_or_else(|| {
+                format!("failed to reload reconciled thread metadata for {thread_id}")
+            })
+        })
+        .map(Some)
+}
+
+async fn load_persisted_thread_metadata_with_summary_repair(
+    state_db_ctx: &StateDbHandle,
+    thread_id: ThreadId,
+    fallback_provider: &str,
+) -> Result<Option<ThreadMetadata>, String> {
+    let Some(metadata) = state_db_ctx
+        .get_thread(thread_id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(None);
+    };
+
+    if metadata.first_user_message.is_some() {
+        return Ok(Some(metadata));
+    }
+
+    reconcile_and_load_persisted_thread_metadata(
+        state_db_ctx,
+        thread_id,
+        metadata.rollout_path.as_path(),
+        fallback_provider,
+        Some(metadata.archived_at.is_some()),
+    )
+    .await
 }
 
 async fn summary_from_thread_list_item(
@@ -9002,7 +9109,12 @@ async fn summary_from_thread_list_item(
         });
     }
     if let Some(thread_id) = thread_id_from_rollout_path(it.path.as_path()) {
-        return read_summary_from_state_db_context_by_thread_id(state_db_ctx, thread_id).await;
+        return read_summary_from_state_db_context_by_thread_id(
+            state_db_ctx,
+            thread_id,
+            fallback_provider,
+        )
+        .await;
     }
     None
 }
@@ -9253,13 +9365,19 @@ pub(crate) async fn load_thread_summary_for_rollout(
             summary_to_thread(summary_from_thread_metadata(persisted_metadata)),
         );
         apply_persisted_thread_mode(&mut thread, persisted_metadata);
-    } else if let Some(summary) = read_summary_from_state_db_by_thread_id(config, thread_id).await {
-        merge_mutable_thread_metadata(&mut thread, summary_to_thread(summary));
-        if let Some(state_db_ctx) = get_state_db(config).await
-            && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
-        {
-            apply_persisted_thread_mode(&mut thread, &metadata);
-        }
+    } else if let Some(state_db_ctx) = get_state_db(config).await
+        && let Ok(Some(metadata)) = load_persisted_thread_metadata_with_summary_repair(
+            &state_db_ctx,
+            thread_id,
+            fallback_provider,
+        )
+        .await
+    {
+        merge_mutable_thread_metadata(
+            &mut thread,
+            summary_to_thread(summary_from_thread_metadata(&metadata)),
+        );
+        apply_persisted_thread_mode(&mut thread, &metadata);
     }
     Ok(thread)
 }
@@ -9570,6 +9688,8 @@ mod tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
     use anyhow::Result;
+    use app_test_support::create_fake_rollout_with_text_elements;
+    use app_test_support::rollout_path;
     use codex_app_server_protocol::ServerRequestPayload;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_protocol::openai_models::ReasoningEffort;
@@ -9875,6 +9995,60 @@ mod tests {
 
         assert_eq!(typesafe_overrides.model, None);
         assert_eq!(request_overrides, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_summary_from_state_db_context_repairs_missing_summary_fields() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let preview = "sqlite helper repair";
+        let filename_ts = "2025-01-05T12-00-00";
+        let timestamp_rfc3339 = "2025-01-05T12:00:00Z";
+        let conversation_id = create_fake_rollout_with_text_elements(
+            codex_home.path(),
+            filename_ts,
+            timestamp_rfc3339,
+            preview,
+            vec![],
+            Some("mock_provider"),
+            /*git_info*/ None,
+        )?;
+        let thread_id = ThreadId::from_string(&conversation_id)?;
+        let rollout_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+        let state_db =
+            StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+        let mut builder =
+            ThreadMetadataBuilder::new(thread_id, rollout_path, Utc::now(), SessionSource::Cli);
+        builder.model_provider = Some("mock_provider".to_string());
+        builder.cwd = PathBuf::from("/");
+        builder.cli_version = Some("0.0.0".to_string());
+        assert!(
+            state_db
+                .insert_thread_if_absent(&builder.build("mock_provider"))
+                .await?,
+            "test setup should insert an incomplete sqlite row"
+        );
+
+        let before = state_db
+            .get_thread(thread_id)
+            .await?
+            .expect("thread metadata should exist before repair");
+        assert_eq!(before.first_user_message, None);
+
+        let summary = read_summary_from_state_db_context_by_thread_id(
+            Some(&state_db),
+            thread_id,
+            "mock_provider",
+        )
+        .await
+        .expect("summary helper should reconcile missing summary");
+        assert_eq!(summary.preview, preview);
+
+        let repaired = state_db
+            .get_thread(thread_id)
+            .await?
+            .expect("thread metadata should exist after repair");
+        assert_eq!(repaired.first_user_message.as_deref(), Some(preview));
         Ok(())
     }
 

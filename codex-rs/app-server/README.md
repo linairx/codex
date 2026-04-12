@@ -133,9 +133,9 @@ Example with notification opt-out:
 ## API Overview
 
 - `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. The returned `thread.mode` is the client-facing signal for whether the thread should behave like an ordinary interactive resume target (`interactive`) or a reconnectable resident assistant (`residentAssistant`). When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
-- `thread/resume` — resume or reconnect to an existing thread by id so subsequent `turn/start` calls append to it. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. Clients that distinguish an ordinary interactive resume target from reconnect should consume `thread.mode` from this response.
+- `thread/resume` — resume or reconnect to an existing thread by id so subsequent `turn/start` calls append to it. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. Clients that distinguish an ordinary interactive resume target from reconnect should consume `thread.mode` from this response. If persisted SQLite metadata already exists but rollout-derived summary fields are incomplete, app-server reconciles rollout before returning the thread, so callers should treat this response as the authoritative resumed summary rather than assuming a later `thread/read` is required to recover preview data.
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork and `resident: true` to keep the fork loaded after the last client unsubscribes, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread. By default, the forked thread remains `interactive` even when the source thread was resident; as with start/resume, consumers should treat `thread.mode = residentAssistant` as reconnect semantics only when the returned thread actually opts into that mode.
-- `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, plus `mode` (`ThreadMode`) so history UIs can distinguish reconnectable resident assistants from ordinary interactive resume targets.
+- `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, plus `mode` (`ThreadMode`) so history UIs can distinguish reconnectable resident assistants from ordinary interactive resume targets. If a persisted SQLite row exists but rollout-derived summary fields are incomplete, app-server reconciles rollout before returning the row, so list results should be treated as authoritative thread summaries instead of a lightweight index that needs follow-up repair reads.
 - `thread/loaded/list` — list the thread ids currently loaded in memory. This is an id-only probe; if a client also needs the current `mode` or `status`, it should follow up with `thread/loaded/read`. Supports optional `modelProviders`, `sourceKinds`, and `cwd` filters for the loaded thread's current config snapshot.
 - `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including current `mode` plus live `status`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, and `mode` (`ThreadMode`) so clients can preserve reconnect semantics even on read-only lookup paths.
@@ -149,7 +149,7 @@ Example with notification opt-out:
 - `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
 - `Thread.mode` classifies the thread's product-level role. Current values are `interactive` for ordinary sessions and `residentAssistant` for long-lived resident threads. This is separate from `thread.status`, which describes the current runtime state; clients should not infer reconnect semantics or role changes from `status` alone.
-- `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success, preserving the thread’s existing `mode`.
+- `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success, preserving the thread’s existing `mode`. If the persisted SQLite row already exists but rollout-derived summary fields are incomplete, this response should still be treated as authoritative: app-server reconciles rollout before returning the rolled-back thread instead of leaving callers with a mode-correct but preview-empty summary.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode".
 - `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. Review and manual compaction turns reject `turn/steer`.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
@@ -246,6 +246,13 @@ To resume or reconnect to a stored session, call `thread/resume` with the `threa
 
 By default, resume uses the latest persisted `model` and `reasoningEffort` values associated with the thread. Supplying any of `model`, `modelProvider`, `config.model`, or `config.model_reasoning_effort` disables that persisted fallback and uses the explicit overrides plus normal config resolution instead.
 
+This response should also be treated as authoritative for stored-summary
+repair. If the thread already has a persisted SQLite row but rollout-derived
+summary fields such as preview / first-user-message are incomplete, app-server
+reconciles rollout before returning the resumed thread instead of leaving
+callers with a mode-correct but preview-incomplete summary that still requires
+`thread/read`.
+
 Example:
 
 ```json
@@ -268,7 +275,7 @@ Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `per
 
 ### Example: List threads (with pagination & filters)
 
-`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary interactive resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive resume targets. Pass any combination of:
+`thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Each returned thread includes `mode`, so list consumers can label `residentAssistant` rows as reconnect targets instead of ordinary interactive resume targets. This applies equally to archived listings: when `archived: true`, consumers should still trust the returned `thread.mode` instead of assuming archived rows have fallen back to ordinary interactive resume targets. If a persisted SQLite row already exists but rollout-derived summary fields are incomplete, app-server reconciles rollout before returning that row, so the list response itself should be treated as authoritative for preview/title-style summary fields too. Pass any combination of:
 
 - `cursor` — opaque string from a prior response; omit for the first page.
 - `limit` — server defaults to a reasonable page size if unset.
@@ -378,6 +385,12 @@ to reconstruct reconnect semantics themselves.
 
 Use `thread/read` to fetch a stored thread by id without resuming it. Pass `includeTurns` when you want the rollout history loaded into `thread.turns`. The returned thread includes `agentNickname` and `agentRole` for AgentControl-spawned thread sub-agents when available, plus `mode` so reconnect-aware clients do not have to round-trip through `thread/resume` just to recover resident semantics.
 
+`thread/read` should also be treated as an already-reconciled stored summary
+surface. If the thread already has a SQLite metadata row but rollout-derived
+summary fields such as preview / first-user-message are still missing, the
+server repairs that summary before returning the thread instead of expecting the
+client to reconcile rollout-vs-SQLite state itself.
+
 ```json
 { "method": "thread/read", "id": 22, "params": { "threadId": "thr_123" } }
 { "id": 22, "result": {
@@ -405,6 +418,12 @@ Use `thread/read` to fetch a stored thread by id without resuming it. Pass `incl
 ### Example: Update stored thread metadata
 
 Use `thread/metadata/update` to patch sqlite-backed metadata for a thread without resuming it. Today this supports persisted `gitInfo`; omitted fields are left unchanged, while explicit `null` clears a stored value. The returned `thread` preserves stored thread identity metadata, including `mode = residentAssistant` for resident threads and any existing `name`, across stored, loaded-repair, and archived metadata update paths.
+
+This response should also be treated as authoritative for stored summary
+repair. If the thread already exists in SQLite but rollout-derived summary
+fields are incomplete, app-server reconciles rollout before returning the
+updated thread instead of leaving callers with a metadata-only response that
+still lacks preview data and requires an extra `thread/read`.
 
 ```json
 { "method": "thread/metadata/update", "id": 24, "params": {
@@ -449,6 +468,12 @@ to `true`. When it is returned through `thread/list archived=true` or
 ### Example: Unarchive a thread
 
 Use `thread/unarchive` to move an archived rollout back into the sessions directory. The returned `thread` preserves the archived thread's existing `mode`, so reconnect-aware clients can keep treating a restored resident thread as `residentAssistant` without an extra `thread/read`.
+
+`thread/unarchive` also returns the restored stored summary, not just the moved
+path + archived flag change. If the archived SQLite row is missing rollout-
+derived summary fields, app-server reconciles rollout before returning the
+restored thread so later `thread/list` and the immediate unarchive response stay
+in sync.
 
 ```json
 { "method": "thread/unarchive", "id": 24, "params": { "threadId": "thr_b" } }

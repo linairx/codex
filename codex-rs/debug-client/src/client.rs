@@ -41,6 +41,7 @@ use codex_app_server_protocol::all_thread_source_kinds;
 use serde::Serialize;
 
 use crate::output::Output;
+use crate::reader::ReaderRequestSink;
 use crate::reader::start_reader;
 use crate::state::KnownThread;
 use crate::state::PendingRequest;
@@ -57,7 +58,7 @@ pub struct AppServerClient {
     child: Child,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdout: Option<BufReader<ChildStdout>>,
-    next_request_id: AtomicI64,
+    next_request_id: Arc<AtomicI64>,
     state: Arc<Mutex<State>>,
     output: Output,
     filtered_output: bool,
@@ -96,7 +97,7 @@ impl AppServerClient {
             child,
             stdin: Arc::new(Mutex::new(Some(stdin))),
             stdout: Some(BufReader::new(stdout)),
-            next_request_id: AtomicI64::new(1),
+            next_request_id: Arc::new(AtomicI64::new(1)),
             state: Arc::new(Mutex::new(State::default())),
             output,
             filtered_output,
@@ -288,7 +289,10 @@ impl AppServerClient {
         let stdout = self.stdout.take().context("reader already started")?;
         start_reader(
             stdout,
-            Arc::clone(&self.stdin),
+            ReaderRequestSink {
+                stdin: Arc::clone(&self.stdin),
+                next_request_id: Arc::clone(&self.next_request_id),
+            },
             Arc::clone(&self.state),
             events,
             self.output.clone(),
@@ -534,7 +538,7 @@ mod tests {
             child,
             stdin: Arc::new(Mutex::new(Some(stdin))),
             stdout: Some(std::io::BufReader::new(stdout)),
-            next_request_id: AtomicI64::new(1),
+            next_request_id: Arc::new(AtomicI64::new(1)),
             state: Arc::new(Mutex::new(State {
                 pending: Default::default(),
                 thread_id: None,

@@ -140,6 +140,7 @@
 - 远端已经可以把 `thread/list` 视为“长期线程与普通线程总览”的主入口
 - 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的 `mode + status` 摘要面，并且这条读取面本身会继续返回 `thread.mode`
 - 对于服务重启后的未加载 resident thread，`thread/list` 不再只能看到普通历史线程语义，而是可以读到持久化回补后的 resident 模式
+- 即使 SQLite 中已经有线程行，远端也不应把“有 row”直接等同于“stored summary 已完整”；当前更可靠的契约是继续直接信 `thread/list` / `thread/read` / `thread/resume` / `thread/unarchive` / `thread/metadata/update` 返回的线程摘要，因为服务端会先 reconcile rollout，再把修补后的 summary 暴露出来
 
 ### 第 2 层：线程状态通知
 
@@ -179,6 +180,7 @@
 
 - `thread/read` 已适合用作远端详情页的主读取入口
 - 对长期线程来说，`thread/resume` 已不再只是“从磁盘恢复历史”，而开始具备“重新连接 resident 运行时对象”的语义
+- metadata-only / restore 路径也已开始满足同一条心智：`thread/metadata/update` 与 `thread/unarchive` 返回的 `thread` 已适合直接作为详情或列表刷新摘要，而不需要再额外补一次 `thread/read` 才能恢复 resident 语义或 preview
 
 ### 第 4 层：必要时消费 turn/item 流
 
@@ -335,5 +337,6 @@ observer 文档里已经强调，第一阶段最重要的是：
 4. 把 `thread/resume` 视为统一进入入口，但在 `residentAssistant` 上把它产品化为 reconnect，而不只是历史恢复入口
 5. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”
 6. 如果详情页支持 metadata-only 操作（例如 git metadata repair），直接消费 `thread/metadata/update` 返回的 `thread.mode`，不要把这类更新路径额外当成需要再做一次 `thread/read` 才能恢复 resident 语义的特殊情况
+7. 如果 restore / reconnect / metadata repair 命中了“SQLite 行已存在但 stored summary 仍残缺”的边界，也继续直接信服务端返回的线程摘要，而不是把 rollout-vs-SQLite 的修补职责重新推回 bridge
 
 这样做的好处是，远端消费可以立即开始受益于已经落地的 `Thread.mode`、observer 语义和 SQLite 摘要，而不需要等待完整 bridge 或更大范围的状态重构。

@@ -166,6 +166,14 @@
 
 这意味着客户端应优先消费线程模式和线程状态，而不是试图从零散通知中反推。
 
+即使把第一阶段和后续 SQLite 收敛拆开看，这里也有一条应该尽早固定的读取面心智：
+
+- `thread/read`、`thread/resume`，以及后续的 metadata-only / restore 路径返回的 `thread`
+  都应逐步成为“客户端可直接信”的线程摘要
+- 如果服务端后面需要在 rollout 与 SQLite 之间做 stored-summary repair，这层修补也应尽量停留在服务端返回面，而不是重新推回客户端做额外 `thread/read` 或本地脑补
+
+换句话说，第一阶段虽然不把 SQLite 重构混进同一个 PR，但也不应给客户端留下“以后还得自己修 resident summary 漂移”的心智空档。
+
 ## 9. 实现范围建议
 
 如果按 PR 拆分，第一阶段比较合理的拆法是：
@@ -223,6 +231,7 @@ observer、SQLite、bridge 都不应混进这一阶段 PR。
 - `thread/loaded/list` 只是 id-only probe，不承担完整 loaded 恢复摘要语义
 - `thread/loaded/read` 是带 `mode + status` 的 loaded 恢复面
 - `thread/status/changed` 继续保持 status-only，不重复 `Thread.mode`
+- metadata-only / restore 这类路径返回的 `Thread` 也不应被例外对待；后续即使补上 stored-summary repair，客户端仍应继续直接信这些返回面，而不是额外补一次 `thread/read`
 
 再下一份更底层但仍应独立拆出的文档是：
 

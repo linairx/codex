@@ -494,6 +494,61 @@ Rust 版已经有比 `claude` 更好的基础：
 
 如果目标是解决长期记忆、上下文衰减和文件变化驱动的实时状态，那么 `observer` 和 `sqlite-rs` 都是有价值的，但它们更适合作为中期基础设施增强，而不是最先做的事项。
 
+如果当前不是在继续做高层 roadmap 判断，而是要沿本文直接继续开工，更合适的落点已经不是回到 workspace 总览本身，而是顺着这条实现链往下读：
+
+1. `docs/sqlite-state-convergence.md`
+2. `docs/sqlite-state-convergence-checklist.md`
+3. `docs/sqlite-state-convergence-file-todo.md`
+
+这三个文档承接了本文里关于 `app-server`、线程权威来源、状态持久化和长期运行能力的判断，并已经把当前真正还在收口的工作压成实现级别的边界与文件级待办。
+
+如果需要先确认自己当前是在补哪一包，而不是默认直接进入 SQLite，也更适合先回到：
+
+1. `docs/persistent-runtime-checklists-index.md`
+
+按当前本地工作树和各份 checklist 的阶段快照看：
+
+- resident / mode 基线仍是整条线的地板
+- remote bridge 最小消费与最小远端消费者自愈闭环已经基本站稳
+- observer 读取面边界也已有一批稳定回归
+- 当前默认更值得继续收口的主问题，已经更接近 SQLite / rollout / runtime overlay 的权威来源与 repair 路径
+
+因此，如果不是在补新的基线缺口或新的远端消费分叉，这里更合理的默认下一站仍然是：
+
+1. `docs/sqlite-state-convergence-checklist.md`
+2. `docs/sqlite-state-convergence-file-todo.md`
+
+## 21. 补充执行状态（2026-04-13）
+
+沿着上面的推荐阅读与实现链继续往下看，当前这包工作已经不再只是“方向判断”，而是有一批 SQLite summary repair / resident metadata 收口已经落到代码并能被回归锁住。
+
+本地当前工作树里，至少下面这些读取面和恢复面已经有对应实现与测试覆盖：
+
+- `thread/read`
+- `thread/list`
+- `thread/resume`
+- `thread/metadata/update`
+- `thread/unarchive`
+- `thread/rollback`
+- `getConversationSummary`
+
+这意味着如果 SQLite 行已经存在，但 rollout-derived preview / stored summary 仍然残缺，服务端现在会优先尝试 reconcile rollout，再把修补后的权威摘要暴露给上层，而不是把“再补一次读取”的责任继续推回客户端。
+
+按 2026-04-13 这次本地验证结果看，下面这些针对当前收口面的回归都已经能通过：
+
+- `cargo test -p codex-app-server thread_read`
+- `cargo test -p codex-app-server thread_resume`
+- `cargo test -p codex-app-server thread_metadata_update`
+- `cargo test -p codex-app-server thread_unarchive`
+- `cargo test -p codex-app-server thread_rollback`
+- `cargo test -p codex-app-server conversation_summary`
+
+因此，顺着本文继续做“后续任务”时，更合理的默认动作已经不是回头再补一轮 workspace 总览，而是：
+
+1. 继续检查 `docs/sqlite-state-convergence-file-todo.md` 里是否还有未收口的文件级 repair/helper 分叉
+2. 只在出现新的消费侧分叉或新的恢复路径遗漏时，再补对应服务端 / typed client / README 回归
+3. 如果这批边界已经都稳定，则把下一段工作切到真正消费这层稳定摘要的更高层功能，而不是继续扩写总览文档
+
 ### 先判断结论
 
 - `observer` 有必要
@@ -1095,6 +1150,7 @@ SQLite 在这里不是起点，而是收敛点。
 - `app-server-test-client` 的 README 章节标题和示例 seed 文案现在也已继续从旧的 “rejoin” 术语收口到 `resume/reconnect`：手工联调说明会直接把这条流程表述成“thread resume/reconnect behavior”，避免外围读者继续把 resident reconnect 当成另一套语义漂移的旧命名
 - `app-server-test-client` 的 README 流式说明现在也已继续补齐同一口径：`thread/started` 相关段落不再只写 `resume/start commands`，而会直接写成 `start/resume/reconnect commands`，让通知面文档和 resident reconnect 主线保持一致
 - `app-server-test-client` 的流式通知面现在也已补到 `thread/status/changed`：客户端会缓存先前从响应面或 `thread/started` 拿到的线程摘要，因此后续 status 变更在已知 thread 上也能继续打印 compact `mode + status + action` summary；同时这层边界也已补上负向回归，确保未知 thread id 仍保持 status-only，而不会凭空猜 mode / reconnect 语义
+- `app-server-test-client` 的未知线程状态恢复路径现在也已继续向 remote-bridge 清单靠拢：如果流式观察时先收到本地尚未缓存摘要的 `thread/status/changed`，客户端仍会先保持 status-only 输出，不猜 resident reconnect 语义；但随后会立即补一次 `thread/read`，把该线程的权威 `mode + status + action` 摘要拉回本地缓存，避免观察模式长期停留在“只知道 status、不知道角色”的半恢复状态
 - `app-server-test-client` 的这层通知消费现在也已抽成共享路径：不只是 turn 内的 `stream_turn(...)`，连 `thread-resume` / `watch` 这类持续观察入口也会复用同一套 resident-aware `thread/started` / `thread/status/changed` 摘要，避免“发起 turn 时有 compact summary，但纯观察模式又退回只剩原始 JSON”这类体验分叉
 - `app-server-test-client` 的 clap 顶层 `--help` 现在也已补上 resident-aware 回归：`resume-message-v2` 与 `thread-resume` 这两个恢复入口的子命令说明会稳定体现 `resume or reconnect`，不再只让 README 或联调输出承担这层语义
 - `app-server-test-client` 的这层 resident-aware 帮助回归现在也已明确是根帮助级别：`Cli::command().render_long_help()` 会直接锁住 `resume-message-v2` 与 `thread-resume` 在最外层命令总览里的 `resume or reconnect` 摘要，避免只覆盖子命令 help 后，顶层列表简介重新漂移
@@ -1107,11 +1163,15 @@ SQLite 在这里不是起点，而是收敛点。
 - `debug-client` 的 `:refresh-loaded` 请求侧闭环现在也已补上 cursor 文案回归：当用户传入续页 cursor 时，客户端请求日志会稳定写成 `requested loaded thread list (..., cursor=...)`，避免 loaded probe 只有响应侧能看见分页连续性，而请求侧调试日志继续退回不带 cursor 的泛化列表请求
 - `debug-client` 的 reader 状态缓存现在也已跟上这条输出升级：`thread/list` 响应不再只写回 `thread_mode`，而会把 `thread_status` 一起落进 `known_threads` 并透传到 `ReaderEvent::ThreadList`，避免 `:refresh-thread` 的 mode/status/action 渲染只是显示层局部改动，却没有把 status 连续性锁进 reader/state 边界
 - `debug-client` 的通知侧状态缓存现在也已补成闭环：除了 `thread/list` / `thread/start` / `thread/resume` 响应外，`thread/started` 与 `thread/status/changed` 也会继续刷新本地 `known_threads`；同时这层边界也已补上负向回归，确保 status-only 通知不会为未知 thread id 凭空推断 `mode`
+- `debug-client` 的未知线程状态恢复路径现在也已补成最小自愈闭环：如果先收到一个本地尚未缓存摘要的 `thread/status/changed`，客户端仍会先保持 status-only 输出，不凭空猜 resident reconnect 语义；但 reader 会立刻补发一次 `thread/loaded/read`，让后续本地摘要能自动回收该线程的 `mode + status + action`，而不必再完全依赖手工 `:refresh-thread`
+- `debug-client` 的这条 unknown-thread 自愈链路现在也已进一步锁到本地状态回收层：reader 测试不再只验证“会补发一次 `thread/loaded/read`”，还会在 loaded summary 返回后确认 resident `mode + status + name` 已重新写回 `known_threads`，避免消费侧长期停留在“只会触发 refresh、但缓存不一定真的修好”的半闭环状态
 - `debug-client` 的 client 状态读取面现在也已补上对称回归：`use_thread(...)` 在本地已知线程场景下不再只返回 `ThreadMode`，而会直接返回包含 `thread_mode + thread_status` 的完整缓存线程，避免 `:use` 提示虽然已经展示当前状态，但这层依赖仍只靠上层字符串测试间接覆盖
 - `codex-tui` 的 `AppServerSession` 现在也已把 `thread/loaded/list` 纳入 typed 会话层边界：新增直接的 `thread_loaded_list(...)` 包装，并锁住 loaded ids 与 `next_cursor` 的续页连续性，避免 TUI 只覆盖 `thread/loaded/read` 这条带 mode 的恢复面，却让同层 id-only probe 在重构里静默漂移
 - `codex-tui` 的 subagent backfill 边界现在也已在源码侧写清并补上纯函数回归：`backfill_loaded_subagent_threads` / `loaded_threads.rs` 明确说明这里仍必须继续消费 `thread/loaded/read`，因为 spawn tree、status badge 和 agent metadata 都不在 `thread/loaded/list` 的 id-only probe 里；相应测试也锁住“看起来像 loaded thread 但没有 spawn metadata 的条目不会被误认成子线程”
 - `codex-tui` 的 latest-session lookup / resume picker 现在也已把 `include_non_interactive` 的 source filter 语义修正并锁住：由于 app-server 上 `source_kinds: None` 实际表示“interactive only”而不是“all sources”，TUI 现在会在 `resume --last` 和 picker 里显式传完整 `ThreadSourceKind` 列表；对应回归同时锁住默认过滤仍会忽略较新的 `Exec` 等非交互线程，而显式开启 include-non-interactive 后会正确选中更新更晚的 resident non-interactive thread 并保留 `ResidentAssistant`
 - `codex-app-server-client` 的 in-process typed 回归现在也已把 resident `thread/unsubscribe` 的后续读取面锁住：最后一个订阅者断开后，`thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会稳定保留 `ResidentAssistant + Idle`，避免共享客户端在“已断开但仍常驻”的路径上把 reconnect 目标重新降回普通 interactive 线程
+- `codex-app-server-client` 的 stored-summary repair typed 回归现在也已把 `thread/resume` 补齐到与 `thread/read` / `thread/list` / `thread/metadata/update` / `thread/unarchive` 同一层：SQLite 行已存在但 rollout-derived preview 缺失时，resume 返回面本身也会继续直接暴露修补后的 resident summary，而不是把 reconnect 之后的补读责任重新推回调用方
+- `codex-app-server-client` 的 remote facade 现在也已补上同层最小透传回归：websocket 远端直接返回 resident repaired `thread/resume` 摘要时，typed remote client 也会继续原样保留 `thread.mode + preview + status + name`，避免“直接信服务端返回的 Thread”这条契约只在 in-process 路径上成立
 - `thread/rollback` 的 resident 路径现在也已补上真实 typed 回归，并顺手修掉了实现层的模式回退缺口：rollback 完成后 app-server 不再只按 rollout summary 重建一个默认 interactive `Thread`，而会像其他读取面一样合并持久化 metadata，所以 resident assistant 在 `thread/rollback` 响应里也会继续稳定保留 `ResidentAssistant`
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
 - `app-server/README.md` 的 API Overview 方法行现在也已继续补齐到同一口径：`thread/resume` 不再只写成“reopen an existing thread”，而会直接写成 `resume or reconnect`，避免最常读的接口摘要再次落回旧的纯 resume 心智

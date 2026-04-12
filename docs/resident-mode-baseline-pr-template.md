@@ -43,6 +43,7 @@ This PR preserves the following contracts:
 - `thread/loaded/list` does not become a full summary surface
 - `thread/loaded/read` remains the loaded `mode + status` summary surface
 - resident `thread/resume` remains productized as reconnect
+- metadata-only / restore paths keep returned `Thread` authoritative instead of requiring an extra `thread/read`
 - source-kinds omit/`[]` still means interactive-only
 
 ## Files / Areas
@@ -78,6 +79,7 @@ Updated as needed:
 - app-server README
 - app-server-client README
 - user-facing help/summary wording
+- any touched metadata-only / restore docs continue to say clients can trust the returned `Thread`
 - only the directly-adjacent design/protocol docs needed to stay accurate
 
 ## Why This PR First

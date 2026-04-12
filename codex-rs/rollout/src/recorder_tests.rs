@@ -438,6 +438,75 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
 }
 
 #[tokio::test]
+async fn list_threads_db_enabled_reconciles_missing_rollout_summary_fields() -> std::io::Result<()>
+{
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+
+    let uuid = Uuid::from_u128(9012);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+    let real_path = write_session_file(home.path(), "2025-01-03T13-00-00", uuid)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+    let created_at = chrono::Utc
+        .with_ymd_and_hms(2025, 1, 3, 13, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        real_path.clone(),
+        created_at,
+        SessionSource::Cli,
+    );
+    builder.model_provider = Some(config.model_provider_id.clone());
+    builder.cwd = home.path().to_path_buf();
+    runtime
+        .upsert_thread(&builder.build(config.model_provider_id.as_str()))
+        .await
+        .expect("state db upsert should succeed");
+
+    let default_provider = config.model_provider_id.clone();
+    let page = RolloutRecorder::list_threads(
+        &config,
+        /*page_size*/ 1,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        &[],
+        /*model_providers*/ None,
+        default_provider.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].path, real_path);
+    assert_eq!(
+        page.items[0].first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+
+    let persisted = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(
+        persisted.first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let stale_cwd = home.path().join("stale");

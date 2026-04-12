@@ -32,6 +32,9 @@
 - `thread/start`、`thread/fork`、`turn/start` 已经开始在 rollout 物化后修补或持久化线程模式，同时避免给未物化线程提前创建垃圾行
 - `thread/unarchive`、archived `thread/read` / `thread/list`、以及 `thread/metadata/update` 的 stored / loaded-repair / archived 路径，都已经补上 resident mode 连续性回归
 - `codex-state` 也已有边界测试保证：metadata patch 不会顺手覆盖 resident thread 的 `threads.mode`
+- `rollout` / SQLite 的摘要 repair 边界也已继续补齐：当 SQLite 已经有 thread 行、但 rollout-derived `first_user_message` 这类 stored summary 字段仍缺失时，read-repair 不会再停在只修 `rollout_path` 的半修复状态，而会继续 reconcile rollout，把 DB-backed `thread/list` 需要的摘要字段补完整
+- `thread/rollback` 现在也已继续对齐这条 stored-summary repair 约束：如果 rollback 前 SQLite row 已存在、但 rollout-derived preview 仍缺失，rollback 返回面、后续 `thread/read` / `thread/list`，以及 SQLite row 都会一起恢复同一份 summary，而不是只保 resident mode、继续留下空 preview
+- `app-server` / `app-server-client` README 也已开始把这条契约写实：`thread/list`、`thread/resume`、`thread/read`、`thread/metadata/update`、`thread/unarchive` 这些读取/恢复面返回的 `Thread` 本身应被直接视为权威 repaired summary，而不是“先拿 mode，再额外补一次 `thread/read`”的半恢复响应
 
 这意味着当前讨论的不是“要不要上 SQLite”，而是：
 
@@ -267,6 +270,56 @@ app-server 当前已经在读写 SQLite-backed thread metadata。
 - SQLite 保存的是其中值得长期持有的稳定底座
 
 不要让 app-server 的每个临时状态都自动等于数据库字段。
+
+这里还值得把当前更贴近真实实现的“读取面先信谁”顺序直接写短一点，
+避免后续 repair / restore 改动重新把 fallback 逻辑打散。
+
+### 当前更贴近实现的优先级
+
+- `thread/read`
+  先组出可读的 stored summary；优先是 state-db summary，其次才回退到 rollout summary，再不行才回退到 loaded snapshot
+- `thread/read`
+  基础摘要组好后，再补 SQLite 持久化的 resident metadata（尤其是 `threads.mode`），最后附着 runtime metadata 与 loaded status
+- `thread/list`
+  先以 stored summaries 为主，再叠加当前 loaded status；resident live set 命中时优先保留 runtime resident 语义，否则再回退到 SQLite 持久化 mode
+- `thread/list`
+  这里的 “stored summaries” 不能被理解成“SQLite 行存在即可”；如果 SQLite 线程行只具备 identity / `mode`，但还缺 rollout-derived `first_user_message` / preview 这类列表面必需字段，那么 read-repair 仍应继续回到 rollout reconcile，把摘要补完整后再让 DB-backed listing 成为权威来源
+- `thread/loaded/read`
+  先从当前 loaded runtime thread 组运行态摘要，再附着持久化 resident metadata，最后叠加 live status；不要把它反过来理解成“从 SQLite 读一行再顺手补 loaded 标记”
+- `thread/resume`
+  如果线程当前仍在运行，优先信 live runtime thread；如果需要从历史恢复，则先按 rollout/history 回建，再补持久化 resident metadata，最后附着 runtime metadata
+- `thread/unarchive` / `thread/metadata/update`
+  这类 metadata-first 恢复路径应直接信更新后的持久化 thread metadata 返回值，而不是要求消费侧再补一次 `thread/read` 去恢复 resident 语义
+- `thread/resume`
+  这条路径的返回值本身也应继续被消费侧当成权威 repaired summary；如果 persisted row 仍缺 rollout-derived preview，服务端应先 reconcile rollout，而不是让客户端在 reconnect 后再自行补读
+
+换句话说，当前更接近真实实现的心智不是“SQLite、rollout、runtime 三选一”，而是：
+
+- stored summary 提供基础线程骨架
+- SQLite metadata 提供稳定 resident identity
+- runtime metadata 提供当前 loaded / observer 状态
+
+这里还需要再加一条更贴近实现的约束：
+
+- “stored summary” 不是抽象占位，而是一组会直接影响读取面/列表面的具体字段
+- 如果 SQLite 已经有 thread 行，但这组 rollout-derived 摘要字段仍残缺，那么 `thread/read` 与 `thread/list` 很容易重新分叉：前者还能从 rollout fallback 看见线程，后者却可能因为 DB 过滤条件把同一线程直接漏掉
+- 因此更合理的 read-repair 心智不是“先把路径修到 SQLite 就算完成”，而是“只要摘要字段还不完整，就继续 reconcile rollout，直到 SQLite 能独立支撑 stored summary”
+
+如果后续还要继续压缩成 review 问句，最值得先问的是：
+
+- 这个路径的基础摘要先来自哪里
+- resident identity 是不是仍由 SQLite metadata 兜底
+- loaded / observer 状态是不是仍只由 runtime metadata 附着
+- 返回值是否已经足够让消费侧直接信 `thread.mode`，而不是再补一次读取或自己脑补
+
+如果需要把它进一步压成提交前的最短检查，可以直接用下面这五句：
+
+1. 这个路径的基础摘要先信哪里
+2. resident identity 还是不是 SQLite metadata 兜底
+3. loaded / observer 状态有没有被错误持久化
+4. SQLite 行残缺时会不会继续 reconcile rollout
+5. 消费侧是否还能直接信返回的 `thread.mode`
+6. README / typed client 契约是否仍把这些返回面写成权威 repaired summary，而不是重新暗示“再补一次 `thread/read`”
 
 ## 11. 渐进实施建议
 

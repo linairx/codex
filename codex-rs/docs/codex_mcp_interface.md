@@ -60,6 +60,10 @@ Two related boundaries matter for MCP consumers:
 - `thread/loaded/list` is intentionally only an id probe for currently loaded threads. If the client also needs reconnect semantics, the current thread role, or the current runtime status, it should follow up with `thread/loaded/read` and consume `thread.mode` plus `thread.status` there.
 - `thread/status/changed` is a status-only increment. It does not repeat `thread.mode`, so reconnect-aware clients should retain the last `mode` they observed from `thread/started`, `thread/read`, `thread/list`, or `thread/loaded/read`.
 
+One more boundary now matters for persisted-summary consumers too:
+
+- `thread/read`, `thread/list`, `thread/resume`, `thread/metadata/update`, and `thread/unarchive` should be treated as already-reconciled thread summary surfaces. If SQLite already has a thread row but rollout-derived summary fields such as preview / first-user-message are still missing, the server repairs that stored summary before returning the thread instead of expecting MCP clients to patch over rollout-vs-SQLite drift themselves with an extra read.
+
 `getConversationSummary` remains as a compatibility helper for clients that still need a summary lookup by `conversationId` or `rolloutPath`.
 
 For complete request and response shapes, see the app-server README and the protocol definitions in `app-server-protocol/src/protocol/v2.rs`.

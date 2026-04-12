@@ -428,12 +428,15 @@ pub async fn read_repair_rollout_path(
     };
 
     // Fast path: update an existing metadata row in place, but avoid writes when
-    // read-repair computes no effective change.
+    // read-repair computes no effective change. If rollout-derived summary
+    // fields are missing, fall through to full reconcile so DB-backed listing
+    // keeps matching rollout-backed reads.
     let mut saw_existing_metadata = false;
     if let Some(thread_id) = thread_id
         && let Ok(Some(metadata)) = ctx.get_thread(thread_id).await
     {
         saw_existing_metadata = true;
+        let needs_rollout_reconcile = metadata.first_user_message.is_none();
         let mut repaired = metadata.clone();
         repaired.rollout_path = rollout_path.to_path_buf();
         repaired.cwd = normalize_cwd_for_state_db(&repaired.cwd);
@@ -446,22 +449,31 @@ pub async fn read_repair_rollout_path(
             }
             Some(true) | None => {}
         }
-        if repaired == metadata {
+        if repaired == metadata && !needs_rollout_reconcile {
             return;
         }
-        warn!("state db discrepancy during read_repair_rollout_path: upsert_needed (fast path)");
-        if let Err(err) = ctx.upsert_thread(&repaired).await {
+        if needs_rollout_reconcile {
             warn!(
-                "state db read-repair upsert failed for {}: {err}",
-                rollout_path.display()
+                "state db discrepancy during read_repair_rollout_path: rollout_summary_refresh_needed"
             );
         } else {
-            return;
+            warn!(
+                "state db discrepancy during read_repair_rollout_path: upsert_needed (fast path)"
+            );
+            if let Err(err) = ctx.upsert_thread(&repaired).await {
+                warn!(
+                    "state db read-repair upsert failed for {}: {err}",
+                    rollout_path.display()
+                );
+            } else {
+                return;
+            }
         }
     }
 
-    // Slow path: when the row is missing/unreadable (or direct upsert failed),
-    // rebuild metadata from rollout contents and reconcile it into SQLite.
+    // Slow path: when the row is missing/unreadable, rollout-derived summary
+    // fields are incomplete, or direct upsert failed, rebuild metadata from
+    // rollout contents and reconcile it into SQLite.
     if !saw_existing_metadata {
         warn!("state db discrepancy during read_repair_rollout_path: upsert_needed (slow path)");
     }

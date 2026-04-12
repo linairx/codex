@@ -29,6 +29,7 @@
 4. `docs/remote-bridge-minimal-consumption-checklist.md`
 5. `docs/observer-event-source-checklist.md`
 6. `docs/sqlite-state-convergence-checklist.md`
+7. `docs/sqlite-state-convergence-file-todo.md`
 
 这个顺序对应的逻辑是：
 
@@ -38,6 +39,7 @@
 - 再证明现有 thread API 已经足够支撑最小远端消费者
 - 再把 observer 从状态标记推进成正式状态来源
 - 最后再收敛 SQLite 的状态分层与权威来源
+- 并把 SQLite 这一包继续压成可直接开工的文件级待办
 
 ## 3. 每份清单各自负责什么
 
@@ -127,6 +129,20 @@
 
 这份清单的重点不是“把所有状态都入库”，而是分层收敛。
 
+### 7. SQLite State Convergence File TODO
+
+文件：
+
+- `docs/sqlite-state-convergence-file-todo.md`
+
+负责：
+
+- 把 SQLite 收敛阶段继续压成文件级待办
+- 指明 `rollout/state_db`、`app-server`、测试面、typed client、README 该先查什么
+- 给这条线当前的实现收尾提供更直接的开工入口
+
+这份 TODO 不定义新设计边界，只负责把 SQLite checklist 继续落成执行顺序。
+
 ## 4. 怎么判断该用哪份清单
 
 可以用下面的简单规则：
@@ -144,13 +160,27 @@
 
 - `docs/persistent-runtime-checklists-index.md`
 
-进入索引页后，默认再从下面这份清单开始：
+按当前工作树与几份 checklist 已补的阶段快照看，更适合把默认下一站分成两层理解：
+
+- 如果目标还是收 resident / mode 语义基线，仍先从 `docs/resident-mode-baseline-pr-checklist.md` 进入
+- 如果本地改动已经覆盖 baseline、remote bridge 最小消费和 observer 读取面收口，那么默认更适合直接切到 `docs/sqlite-state-convergence-checklist.md`
+- 如果已经确定当前就在补 SQLite 这一包，且需要按文件直接开工，那么下一站更适合是 `docs/sqlite-state-convergence-file-todo.md`
+
+原因也已经和最初不同了：
+
+- baseline 仍是整条线的地板，但当前这包在本地工作树里已经明显进入收尾阶段
+- remote bridge 最小消费闭环和 observer 读取面边界也都已有本地回归与阶段快照
+- 当前更值得继续收口的主问题，已经更接近 “repair / archive / reconnect 到底先信谁” 这条 SQLite 权威来源问题
+
+如果需要一个最简默认规则，可以直接按下面执行：
+
+1. 先用索引页判断自己是在补哪一包
+2. 如果不是在补新的 baseline 漏口，优先进入 `docs/sqlite-state-convergence-checklist.md`
+3. 如果已经确认是在补 SQLite 收敛实现，直接切到 `docs/sqlite-state-convergence-file-todo.md`
+
+如果当前工作还停留在首个基线 PR 的整理阶段，再从下面这份清单开始：
 
 - `docs/resident-mode-baseline-pr-checklist.md`
-
-原因很简单：
-
-- 这条基线不稳，后面的 bridge、observer、SQLite 收敛都会建立在松动前提上
 
 ## 6. 这份索引页的维护原则
 

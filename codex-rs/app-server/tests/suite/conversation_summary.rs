@@ -3,6 +3,7 @@ use app_test_support::McpProcess;
 use app_test_support::create_fake_rollout;
 use app_test_support::rollout_path;
 use app_test_support::to_response;
+use chrono::Utc;
 use codex_app_server_protocol::ConversationSummary;
 use codex_app_server_protocol::GetConversationSummaryParams;
 use codex_app_server_protocol::GetConversationSummaryResponse;
@@ -10,6 +11,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use codex_state::StateRuntime;
+use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -109,5 +112,76 @@ async fn get_conversation_summary_by_relative_rollout_path_resolves_from_codex_h
     let received: GetConversationSummaryResponse = to_response(response)?;
 
     assert_eq!(received.summary, expected);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_conversation_summary_by_thread_id_repairs_missing_summary_for_existing_sqlite_row()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        FILENAME_TS,
+        META_RFC3339,
+        PREVIEW,
+        Some(MODEL_PROVIDER),
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let rollout_path = rollout_path(codex_home.path(), FILENAME_TS, &conversation_id);
+
+    let state_runtime = StateRuntime::init(codex_home.path().to_path_buf(), MODEL_PROVIDER.into())
+        .await
+        .map_err(std::io::Error::other)?;
+    state_runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    let created_at = Utc::now();
+    let mut builder = ThreadMetadataBuilder::new(
+        thread_id,
+        rollout_path.clone(),
+        created_at,
+        SessionSource::Cli,
+    );
+    builder.cwd = PathBuf::from("/");
+    builder.model_provider = Some(MODEL_PROVIDER.to_string());
+    builder.cli_version = Some("0.0.0".to_string());
+    let inserted = state_runtime
+        .insert_thread_if_absent(&builder.build(MODEL_PROVIDER))
+        .await
+        .map_err(std::io::Error::other)?;
+    assert!(
+        inserted,
+        "test setup should insert an incomplete sqlite row"
+    );
+
+    let expected = expected_summary(thread_id, std::fs::canonicalize(&rollout_path)?);
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_get_conversation_summary_request(GetConversationSummaryParams::ThreadId {
+            conversation_id: thread_id,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let received: GetConversationSummaryResponse = to_response(response)?;
+
+    assert_eq!(received.summary, expected);
+
+    let persisted = state_runtime
+        .get_thread(thread_id)
+        .await
+        .map_err(std::io::Error::other)?
+        .expect("thread metadata should exist after repair");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(PREVIEW));
+
     Ok(())
 }

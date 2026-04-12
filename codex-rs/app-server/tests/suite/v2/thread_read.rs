@@ -2,7 +2,9 @@ use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::rollout_path;
 use app_test_support::to_response;
+use chrono::Utc;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
@@ -30,11 +32,17 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_core::ARCHIVED_SESSIONS_SUBDIR;
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_state::StateRuntime;
+use codex_state::ThreadMetadataBuilder;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -93,6 +101,229 @@ async fn thread_read_returns_summary_without_turns() -> Result<()> {
     assert_eq!(thread.git_info, None);
     assert_eq!(thread.turns.len(), 0);
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stored_rollout_thread_read_and_list_preserve_rollout_summary_and_sqlite_mode() -> Result<()>
+{
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Stored resident summary";
+    let filename_ts = "2025-01-05T12-00-00";
+    let timestamp_rfc3339 = "2025-01-05T12:00:00Z";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        timestamp_rfc3339,
+        preview,
+        vec![],
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let rollout_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let mut metadata = ThreadMetadataBuilder::new(
+        thread_id,
+        rollout_path.clone(),
+        Utc::now(),
+        ProtocolSessionSource::Cli,
+    );
+    metadata.model_provider = Some("mock_provider".to_string());
+    metadata.cwd = PathBuf::from("/");
+    metadata.cli_version = Some("0.0.0".to_string());
+    let inserted = state_db
+        .insert_thread_if_absent(&metadata.build("mock_provider"))
+        .await?;
+    let updated = state_db
+        .set_thread_mode(metadata.id, "residentAssistant")
+        .await?;
+    assert!(
+        inserted || updated,
+        "thread metadata setup should insert or update the stored rollout row"
+    );
+    state_db
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert_eq!(read_thread.id, conversation_id);
+    assert_eq!(read_thread.preview, preview);
+    assert_eq!(read_thread.path, Some(rollout_path.clone()));
+    assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .iter()
+        .find(|listed_thread| listed_thread.id == conversation_id)
+        .expect("thread/list should include the stored resident rollout thread");
+    assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn archived_thread_read_and_list_reconcile_missing_summary_for_existing_sqlite_row()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Archived resident summary";
+    let filename_ts = "2025-01-05T12-00-00";
+    let timestamp_rfc3339 = "2025-01-05T12:00:00Z";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        timestamp_rfc3339,
+        preview,
+        vec![],
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir_all(&archived_dir)?;
+    let rollout_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    let archived_path = archived_dir.join(
+        rollout_path
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    fs::rename(&rollout_path, &archived_path)?;
+
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let mut metadata = ThreadMetadataBuilder::new(
+        thread_id,
+        archived_path.clone(),
+        Utc::now(),
+        ProtocolSessionSource::Cli,
+    );
+    metadata.model_provider = Some("mock_provider".to_string());
+    metadata.cwd = PathBuf::from("/");
+    metadata.cli_version = Some("0.0.0".to_string());
+    let inserted = state_db
+        .insert_thread_if_absent(&metadata.build("mock_provider"))
+        .await?;
+    assert!(
+        inserted,
+        "test setup should insert an incomplete archived sqlite row"
+    );
+    let updated_mode = state_db
+        .set_thread_mode(thread_id, "residentAssistant")
+        .await?;
+    assert!(
+        updated_mode,
+        "test setup should preserve resident mode in sqlite"
+    );
+    state_db
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert_eq!(read_thread.id, conversation_id);
+    assert_eq!(read_thread.preview, preview);
+    assert_eq!(read_thread.path, Some(archived_path.clone()));
+    assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: Some(true),
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == conversation_id)
+        .expect("thread/list archived=true should include repaired resident thread");
+    assert_eq!(listed_thread.preview, preview);
+    assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+    let persisted = state_db
+        .get_thread(thread_id)
+        .await?
+        .expect("thread metadata should exist after archived read repair");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
+    assert!(persisted.archived_at.is_some());
 
     Ok(())
 }
@@ -413,7 +644,7 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()> {
+async fn resident_thread_name_is_reflected_across_loaded_only_read_surfaces() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -424,6 +655,7 @@ async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            resident: true,
             ..Default::default()
         })
         .await?;
@@ -433,8 +665,9 @@ async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
-    let new_name = "Loaded only thread";
+    let new_name = "Loaded only resident thread";
     let set_id = mcp
         .send_thread_set_name_request(ThreadSetNameParams {
             thread_id: thread.id.clone(),
@@ -456,6 +689,44 @@ async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()
         serde_json::from_value(notification.params.expect("thread/name/updated params"))?;
     assert_eq!(notification.thread_id, thread.id);
     assert_eq!(notification.thread_name.as_deref(), Some(new_name));
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert_eq!(read_thread.name.as_deref(), Some(new_name));
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(read_thread.status, ThreadStatus::Idle);
+
+    let loaded_read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+        .await?;
+    let loaded_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_read_id)),
+    )
+    .await??;
+    let ThreadLoadedReadResponse { data, .. } =
+        to_response::<ThreadLoadedReadResponse>(loaded_read_resp)?;
+    let loaded_thread = data
+        .iter()
+        .find(|loaded_thread| loaded_thread.id == thread.id)
+        .expect("thread/loaded/read should include the loaded-only resident thread");
+    assert_eq!(loaded_thread.name.as_deref(), Some(new_name));
+    assert!(loaded_thread.resident);
+    assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(loaded_thread.status, ThreadStatus::Idle);
 
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
@@ -479,8 +750,11 @@ async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()
     let listed = data
         .iter()
         .find(|listed_thread| listed_thread.id == thread.id)
-        .expect("thread/list should include the loaded-only thread");
+        .expect("thread/list should include the loaded-only resident thread");
     assert_eq!(listed.name.as_deref(), Some(new_name));
+    assert!(listed.resident);
+    assert_eq!(listed.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(listed.status, ThreadStatus::Idle);
     let listed_json = list_result
         .get("data")
         .and_then(Value::as_array)
@@ -488,11 +762,16 @@ async fn thread_name_set_is_reflected_in_loaded_only_list_entries() -> Result<()
         .iter()
         .find(|entry| entry.get("id").and_then(Value::as_str) == Some(&thread.id))
         .and_then(Value::as_object)
-        .expect("thread/list should include the loaded-only thread as an object");
+        .expect("thread/list should include the loaded-only resident thread as an object");
     assert_eq!(
         listed_json.get("name").and_then(Value::as_str),
         Some(new_name),
-        "thread/list must serialize `thread.name` for loaded-only thread entries"
+        "thread/list must serialize `thread.name` for loaded-only resident thread entries"
+    );
+    assert_eq!(
+        listed_json.get("mode").and_then(Value::as_str),
+        Some("residentAssistant"),
+        "thread/list must serialize `thread.mode` for loaded-only resident thread entries"
     );
 
     Ok(())

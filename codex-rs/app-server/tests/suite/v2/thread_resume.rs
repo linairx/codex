@@ -71,11 +71,13 @@ use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::GuardianRiskLevel as CoreGuardianRiskLevel;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::SessionSource as RolloutSessionSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_state::StateRuntime;
+use codex_state::ThreadMetadataBuilder;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -512,6 +514,75 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         }
         other => panic!("expected user message item, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_reconciles_missing_summary_for_existing_sqlite_row() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let rollout_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    state_db
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+    let mut metadata = ThreadMetadataBuilder::new(
+        thread_id,
+        rollout_path,
+        Utc::now(),
+        ProtocolSessionSource::Cli,
+    );
+    metadata.model_provider = Some("mock_provider".to_string());
+    metadata.cwd = PathBuf::from("/");
+    metadata.cli_version = Some("0.0.0".to_string());
+    let inserted = state_db
+        .insert_thread_if_absent(&metadata.build("mock_provider"))
+        .await?;
+    assert!(
+        inserted,
+        "test setup should insert an incomplete sqlite row"
+    );
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(thread.id, conversation_id);
+    assert_eq!(thread.preview, preview);
+
+    let persisted = state_db
+        .get_thread(thread_id)
+        .await?
+        .expect("thread metadata should exist after resume");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
 
     Ok(())
 }

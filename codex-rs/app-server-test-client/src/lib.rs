@@ -1796,9 +1796,14 @@ fn thread_name_updated_notification_lines(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::thread;
 
     use super::Cli;
+    use super::ClientTransport;
+    use super::CodexClient;
     use super::KnownThreadSummary;
     use super::all_thread_source_kinds;
     use super::thread_collection_summary_lines_with_cursor;
@@ -1814,12 +1819,21 @@ mod tests {
     use super::thread_status_label;
     use super::thread_summary_fields;
     use clap::CommandFactory;
+    use codex_app_server_protocol::JSONRPCMessage;
+    use codex_app_server_protocol::JSONRPCRequest;
+    use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::ThreadStatusChangedNotification;
     use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
+    use tungstenite::accept;
+    use tungstenite::connect;
+    use tungstenite::protocol::Message;
 
     fn make_thread(
         id: &str,
@@ -2347,6 +2361,22 @@ mod tests {
     }
 
     #[test]
+    fn thread_status_changed_refresh_summary_line_mentions_resident_reconnect_action() {
+        let resident_thread = make_thread(
+            "thread-1",
+            Some("atlas"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::SystemError,
+        );
+
+        assert_eq!(
+            thread_response_summary_line("thread/status/changed refresh", &resident_thread),
+            "< thread/status/changed refresh summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=SystemError, action=reconnect"
+        );
+    }
+
+    #[test]
     fn thread_status_changed_summary_line_stays_status_only_for_unknown_threads() {
         assert_eq!(
             thread_status_changed_summary_line("thread-unknown", &ThreadStatus::SystemError, None),
@@ -2471,6 +2501,105 @@ mod tests {
                 "< thread/name/updated summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
             )]
         );
+    }
+
+    #[test]
+    fn unknown_thread_status_change_refresh_round_trip_restores_known_thread_summary() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("server should accept");
+            let mut websocket = accept(stream).expect("websocket handshake should succeed");
+
+            let request_message = websocket.read().expect("thread/read request should arrive");
+            let Message::Text(payload) = request_message else {
+                panic!("expected text websocket frame");
+            };
+            let JSONRPCMessage::Request(JSONRPCRequest {
+                id, method, params, ..
+            }) = serde_json::from_str(&payload).expect("request should decode")
+            else {
+                panic!("expected JSON-RPC request");
+            };
+            assert_eq!(method, "thread/read");
+            assert_eq!(
+                params,
+                Some(serde_json::json!({
+                    "threadId": "thread-unknown",
+                    "includeTurns": false
+                }))
+            );
+
+            let response = JSONRPCMessage::Response(JSONRPCResponse {
+                id,
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: make_thread(
+                        "thread-unknown",
+                        Some("atlas"),
+                        ThreadMode::ResidentAssistant,
+                        true,
+                        ThreadStatus::SystemError,
+                    ),
+                })
+                .expect("thread/read response should serialize"),
+            });
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&response)
+                        .expect("response should encode")
+                        .into(),
+                ))
+                .expect("websocket response should send");
+        });
+
+        let (socket, _response) =
+            connect(format!("ws://{addr}")).expect("websocket client should connect");
+        let mut client = CodexClient {
+            transport: ClientTransport::WebSocket {
+                url: format!("ws://{addr}"),
+                socket: Box::new(socket),
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: Default::default(),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+                thread_id: "thread-unknown".to_string(),
+                status: ThreadStatus::SystemError,
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "status notification should not terminate streaming"
+        );
+        assert_eq!(
+            client.known_threads.get("thread-unknown"),
+            Some(&KnownThreadSummary {
+                name: Some("atlas".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::SystemError,
+            })
+        );
+
+        server.join().expect("websocket server should exit cleanly");
     }
 }
 
@@ -2915,6 +3044,9 @@ impl CodexClient {
                         println!("{line}");
                     }
                 }
+                if known_thread.is_none() {
+                    self.refresh_unknown_thread_summary(&payload.thread_id);
+                }
                 false
             }
             ServerNotification::ThreadNameUpdated(payload) => {
@@ -3175,6 +3307,23 @@ impl CodexClient {
         let response: ThreadReadResponse = self.send_request(request, request_id, "thread/read")?;
         self.remember_thread(&response.thread);
         Ok(response)
+    }
+
+    fn refresh_unknown_thread_summary(&mut self, thread_id: &str) {
+        match self.thread_read(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: false,
+        }) {
+            Ok(response) => println!(
+                "{}",
+                thread_response_summary_line("thread/status/changed refresh", &response.thread)
+            ),
+            Err(err) => {
+                println!(
+                    "< thread/status/changed refresh failed: thread_id={thread_id}, error={err:#}"
+                );
+            }
+        }
     }
 
     fn thread_loaded_read(

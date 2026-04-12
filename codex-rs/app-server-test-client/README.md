@@ -104,12 +104,14 @@ notifications now reuse the locally cached thread summary as well: when the
 client already knows that thread's `mode`, the status change line keeps the
 same compact `mode + status + action` shape; when the thread id is still
 unknown, it deliberately stays status-only instead of guessing reconnect
-semantics. `thread/name/updated` now follows the same rule: known threads reuse
-cached mode/status/action context while unknown thread ids stay identity-only.
-That shared notification handling now covers both turn streaming and
-long-running observation modes such as `thread-resume` / `watch`, so the
-resident-aware summaries stay consistent even when you keep the client attached
-just to watch later runtime state changes.
+semantics, then immediately follows up with a `thread/read` refresh so later
+notifications and summaries can recover the authoritative `mode + status +
+action` snapshot. `thread/name/updated` now follows the same rule: known
+threads reuse cached mode/status/action context while unknown thread ids stay
+identity-only. That shared notification handling now covers both turn
+streaming and long-running observation modes such as `thread-resume` /
+`watch`, so the resident-aware summaries stay consistent even when you keep the
+client attached just to watch later runtime state changes.
 
 ### 2) Resume or reconnect while a turn is in progress (two terminals)
 

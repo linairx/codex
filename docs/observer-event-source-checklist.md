@@ -8,6 +8,54 @@
 
 目标不是再解释 observer 为什么有价值，而是把“把 observer 从状态标记推进成正式事件源”收成一份可直接执行的清单。
 
+## 0. 当前本地进度快照（2026-04-12）
+
+按当前工作树与刚通过的服务端集成测试看，这一阶段也已经不再是纯设计稿状态，而是已有一批 observer 相关边界被真实钉在 `app-server` 上。
+
+当前已落在本地改动与回归里的主要入口是：
+
+- `codex-rs/app-server/tests/suite/v2/thread_status.rs`
+- `codex-rs/app-server/src/thread_status.rs`
+- `codex-rs/app-server/src/codex_message_processor.rs`
+
+当前已经可以明确视为本阶段已落地的点包括：
+
+- `thread/status/changed` 仍保持 status-only 增量，不会为 observer 强化重新把 `mode` 塞回通知
+- resident thread 的 `workspaceChanged` 会继续在 `thread/read`、`thread/list`、`thread/loaded/read` 等读取面上保持一致
+- non-resident loaded thread 不会错误继承 observer 语义；即使工作区发生变化，也不会被错误标成 `workspaceChanged`
+- loaded resident thread 在 metadata repair 后不会丢掉 `workspaceChanged`，而 resident unsubscribe / 后续 resume 也会继续保留同一条 observer 脏标记，而不是把这层状态清空或误当成 thread close
+- resident watcher 在 `cwd` 迁移后也不会继续消费旧工作区变化：切到新 `cwd` 后，旧 workspace 的文件变化不会再把线程重新标成 `workspaceChanged`
+
+当前已完成并通过的本地验证包括：
+
+- `cargo test -p codex-app-server --test all thread_status`
+- `cargo test -p codex-app-server --test all thread_metadata_update_repairs_loaded_resident_thread_without_losing_workspace_changed`
+- `cargo test -p codex-app-server --test all thread_unsubscribe_keeps_resident_thread_loaded`
+- `cargo test -p codex-app-server --test all resident_thread_preserves_workspace_changed_across_unsubscribe_and_resume`
+- `cargo test -p codex-app-server moving_resident_watch_to_new_cwd_ignores_old_workspace_changes`
+- `cargo test -p codex-tui workspace_changed_status_is_consistent_across_read_list_and_loaded_read`
+
+这意味着这份清单当前更适合继续承担：
+
+- 检查 watcher 生命周期和 observer 读取面是否还有未统一的边缘恢复路径
+- 确认后续消费侧强化不会重新把 status-only 通知当成完整摘要面
+
+### 当前阶段判断
+
+按第 7 节的完成定义看，这一包也已经接近阶段完成，剩余工作更多像零星补扫，而不是还缺主干闭环。
+
+当前可以这样判断，主要是因为：
+
+- watcher 注册、移除、`cwd` 迁移、resident unsubscribe、shutdown 这些高风险边界都已经有回归落点
+- `workspaceChanged` 已在 app-server、typed client、TUI 三层读取面上验证过连续性
+- `thread/status/changed` 的 status-only 边界在这一轮 observer 强化里没有被重新打穿
+
+因此这份清单后续更适合作为：
+
+- observer 相关改动的边界回归索引
+
+而不是当前主线里最优先的新开工包。
+
 ## 1. 这一阶段要解决什么
 
 这一阶段的唯一主问题应该是：

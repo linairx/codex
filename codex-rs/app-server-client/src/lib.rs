@@ -851,14 +851,18 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use codex_app_server_protocol::AccountUpdatedNotification;
+    use codex_app_server_protocol::ApprovalsReviewer;
+    use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::GetAccountResponse;
     use codex_app_server_protocol::GitInfo;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::SandboxPolicy;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadListResponse;
@@ -886,6 +890,7 @@ mod tests {
     use codex_app_server_protocol::TurnStatus;
     use codex_app_server_protocol::UserInput;
     use codex_core::config::ConfigBuilder;
+    use codex_core::find_archived_thread_path_by_id_str;
     use codex_core::state_db_bridge::open_if_present;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::SessionMeta;
@@ -897,6 +902,7 @@ mod tests {
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
     use tokio::net::TcpListener;
@@ -969,9 +975,34 @@ supports_websockets = false
         session_source: SessionSource,
         channel_capacity: usize,
     ) -> InProcessAppServerClient {
+        start_test_client_with_config_and_capacity(
+            session_source,
+            Arc::new(build_test_config().await),
+            channel_capacity,
+        )
+        .await
+    }
+
+    async fn start_test_client_with_config(
+        session_source: SessionSource,
+        config: Arc<Config>,
+    ) -> InProcessAppServerClient {
+        start_test_client_with_config_and_capacity(
+            session_source,
+            config,
+            DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        )
+        .await
+    }
+
+    async fn start_test_client_with_config_and_capacity(
+        session_source: SessionSource,
+        config: Arc<Config>,
+        channel_capacity: usize,
+    ) -> InProcessAppServerClient {
         InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            config: Arc::new(build_test_config().await),
+            config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
             cloud_requirements: CloudRequirementsLoader::default(),
@@ -1789,6 +1820,334 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn read_and_list_reconcile_missing_summary_for_existing_sqlite_row_through_typed_requests()
+     {
+        let server = responses::start_mock_server().await;
+        let _response_mock = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(401),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let turn_start: codex_app_server_protocol::TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(402),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "sqlite summary repair".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..TurnStartParams::default()
+                },
+            })
+            .await
+            .expect("turn/start should materialize the rollout");
+        assert!(!turn_start.turn.id.is_empty());
+        client.shutdown().await.expect("shutdown should complete");
+
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let mut metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            ProtocolSessionSource::Cli,
+        );
+        metadata.mode = "residentAssistant".to_string();
+        metadata.model_provider = Some(started.thread.model_provider.clone());
+        metadata.cwd = started.thread.cwd.clone();
+        metadata.cli_version = Some(started.thread.cli_version.clone());
+        state_db
+            .upsert_thread(&metadata.build(config.model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should clear rollout-derived summary");
+        mark_state_backfill_complete(&config).await;
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(403),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read should reconcile missing summary");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(read.thread.resident);
+        assert_eq!(read.thread.preview, "sqlite summary repair");
+
+        let listed: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(404),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: Some(vec![started.thread.model_provider.clone()]),
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: Some("sqlite summary repair".to_string()),
+                },
+            })
+            .await
+            .expect("thread/list should reconcile missing summary");
+        let listed_thread = listed
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/list should include the reconciled resident thread");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert!(listed_thread.resident);
+        assert_eq!(listed_thread.preview, "sqlite summary repair");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn metadata_update_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests()
+     {
+        let server = responses::start_mock_server().await;
+        let _response_mock = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(405),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let turn_start: codex_app_server_protocol::TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(406),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "sqlite metadata repair".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..TurnStartParams::default()
+                },
+            })
+            .await
+            .expect("turn/start should materialize the rollout");
+        assert!(!turn_start.turn.id.is_empty());
+        client.shutdown().await.expect("shutdown should complete");
+
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let mut metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            ProtocolSessionSource::Cli,
+        );
+        metadata.mode = "residentAssistant".to_string();
+        metadata.model_provider = Some(started.thread.model_provider.clone());
+        metadata.cwd = started.thread.cwd.clone();
+        metadata.cli_version = Some(started.thread.cli_version.clone());
+        state_db
+            .upsert_thread(&metadata.build(config.model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should clear rollout-derived summary");
+        mark_state_backfill_complete(&config).await;
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let updated: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(407),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("repair123".to_string())),
+                        branch: Some(Some("sqlite-repair".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should reconcile missing summary");
+        assert_eq!(updated.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(updated.thread.resident);
+        assert_eq!(updated.thread.preview, "sqlite metadata repair");
+        let updated_git_info = updated
+            .thread
+            .git_info
+            .expect("metadata update should return git info");
+        assert_eq!(updated_git_info.sha.as_deref(), Some("repair123"));
+        assert_eq!(updated_git_info.branch.as_deref(), Some("sqlite-repair"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[test]
+    fn resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests() {
+        const TEST_STACK_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
+        let handle = std::thread::Builder::new()
+            .name(
+                "resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests"
+                    .to_string(),
+            )
+            .stack_size(TEST_STACK_SIZE_BYTES)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime should build");
+                runtime.block_on(async {
+                    resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests_impl()
+                        .await;
+                });
+            })
+            .expect("test thread should spawn");
+
+        handle
+            .join()
+            .expect("resume stored-summary repair test thread should not panic");
+    }
+
+    async fn resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests_impl()
+    {
+        let server = responses::start_mock_server().await;
+        let _response_mock = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(408),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let turn_start: codex_app_server_protocol::TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(409),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "sqlite resume repair".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..TurnStartParams::default()
+                },
+            })
+            .await
+            .expect("turn/start should materialize the rollout");
+        assert!(!turn_start.turn.id.is_empty());
+        client.shutdown().await.expect("shutdown should complete");
+
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let mut metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            ProtocolSessionSource::Cli,
+        );
+        metadata.mode = "residentAssistant".to_string();
+        metadata.model_provider = Some(started.thread.model_provider.clone());
+        metadata.cwd = started.thread.cwd.clone();
+        metadata.cli_version = Some(started.thread.cli_version.clone());
+        state_db
+            .upsert_thread(&metadata.build(config.model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should clear rollout-derived summary");
+        mark_state_backfill_complete(&config).await;
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(410),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("thread/resume should reconcile missing summary");
+        assert_eq!(resumed.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(resumed.thread.resident);
+        assert_eq!(resumed.thread.preview, "sqlite resume repair");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn list_preserves_next_cursor_and_resident_mode_across_pages() {
         let client = start_test_client(SessionSource::Cli).await;
 
@@ -2044,6 +2403,113 @@ supports_websockets = false
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
         assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
         assert!(listed_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn unarchive_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(408),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(409),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "sqlite unarchive repair".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(410),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+        client.shutdown().await.expect("shutdown should complete");
+
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let archived_path =
+            find_archived_thread_path_by_id_str(&config.codex_home, &started.thread.id)
+                .await
+                .expect("archived thread lookup should succeed")
+                .expect("thread/archive should move the rollout into the archive");
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let deleted = state_db
+            .delete_thread(thread_id)
+            .await
+            .expect("delete_thread should succeed");
+        assert_eq!(deleted, 1, "archive should have persisted one thread row");
+        let mut metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            archived_path,
+            Utc::now(),
+            ProtocolSessionSource::Cli,
+        );
+        metadata.mode = "residentAssistant".to_string();
+        metadata.model_provider = Some(started.thread.model_provider.clone());
+        metadata.cwd = started.thread.cwd.clone();
+        metadata.cli_version = Some(started.thread.cli_version.clone());
+        state_db
+            .upsert_thread(&metadata.build(config.model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should clear archived rollout-derived summary");
+        mark_state_backfill_complete(&config).await;
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let unarchived: codex_app_server_protocol::ThreadUnarchiveResponse = client
+            .request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(411),
+                params: codex_app_server_protocol::ThreadUnarchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unarchive should reconcile missing summary");
+
+        assert_eq!(unarchived.thread.id, started.thread.id);
+        assert_eq!(unarchived.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(unarchived.thread.status, ThreadStatus::NotLoaded);
+        assert!(unarchived.thread.resident);
+        assert_eq!(unarchived.thread.preview, "sqlite unarchive repair");
 
         client.shutdown().await.expect("shutdown should complete");
     }
@@ -3026,6 +3492,133 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn rollback_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(411),
+                params: ThreadStartParams {
+                    resident: true,
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(412),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "typed rollback repair".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let mut metadata = ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            ProtocolSessionSource::Cli,
+        );
+        metadata.mode = "residentAssistant".to_string();
+        metadata.model_provider = Some(started.thread.model_provider.clone());
+        metadata.cwd = started.thread.cwd.clone();
+        metadata.cli_version = Some(started.thread.cli_version.clone());
+        state_db
+            .upsert_thread(&metadata.build(config.model_provider_id.as_str()))
+            .await
+            .expect("state db upsert should clear rollout-derived summary");
+        mark_state_backfill_complete(&config).await;
+
+        let rollback: ThreadRollbackResponse = client
+            .request_typed(ClientRequest::ThreadRollback {
+                request_id: RequestId::Integer(413),
+                params: codex_app_server_protocol::ThreadRollbackParams {
+                    thread_id: started.thread.id.clone(),
+                    num_turns: 1,
+                },
+            })
+            .await
+            .expect("thread/rollback should reconcile missing summary");
+        assert_eq!(rollback.thread.id, started.thread.id);
+        assert_eq!(rollback.thread.preview, "typed rollback repair");
+        assert_eq!(rollback.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(rollback.thread.status, ThreadStatus::Idle);
+        assert!(rollback.thread.resident);
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(414),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read after rollback should succeed");
+        assert_eq!(read.thread.preview, "typed rollback repair");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(read.thread.resident);
+
+        let listed: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(415),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: Some(vec![started.thread.model_provider.clone()]),
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: Some("typed rollback repair".to_string()),
+                },
+            })
+            .await
+            .expect("thread/list after rollback should succeed");
+        let listed_thread = listed
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/list should include repaired resident rollback thread");
+        assert_eq!(listed_thread.preview, "typed rollback repair");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert!(listed_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn named_resident_thread_preserves_name_through_loaded_read_rollback_and_resume() {
         let server = responses::start_mock_server().await;
         let _response = responses::mount_sse_once(
@@ -3330,6 +3923,87 @@ supports_websockets = false
             .await
             .expect("typed request should succeed");
         assert_eq!(response.account, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_resume_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/resume request");
+            };
+            assert_eq!(request.method, "thread/resume");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadResumeResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "sqlite resume repair".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                        model: "mock-model".to_string(),
+                        model_provider: "mock_provider".to_string(),
+                        service_tier: None,
+                        cwd: PathBuf::from("/workspace"),
+                        approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
+                        sandbox: SandboxPolicy::ReadOnly {
+                            access: Default::default(),
+                            network_access: false,
+                        },
+                        reasoning_effort: None,
+                    })
+                    .expect("thread/resume response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(2),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: "thread-resident".to_string(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("remote typed thread/resume should succeed");
+
+        assert_eq!(response.thread.id, "thread-resident");
+        assert_eq!(response.thread.preview, "sqlite resume repair");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(response.thread.resident);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
+        assert_eq!(response.thread.name.as_deref(), Some("Atlas"));
+        assert_eq!(response.model_provider, "mock_provider");
+        assert_eq!(response.cwd, PathBuf::from("/workspace"));
 
         client.shutdown().await.expect("shutdown should complete");
     }

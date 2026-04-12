@@ -77,9 +77,11 @@ with live thread status instead of only updating after the next manual
 
 Those lifecycle notifications now also emit compact stderr summaries. Known
 threads reuse the cached `mode` and action label, while unknown
-`thread/status/changed` notifications intentionally stay status-only and tell
-you to refresh the thread summary instead of guessing resident reconnect
-semantics.
+`thread/status/changed` notifications intentionally stay status-only instead of
+guessing resident reconnect semantics. When that happens, the reader also
+queues a background `thread/loaded/read` refresh so later local summaries can
+recover the missing `mode/status/action` snapshot without waiting for a manual
+`:refresh-thread`.
 
 The prompt shows the active thread id. Client messages (help, errors, approvals)
 print to stderr; raw server JSON prints to stdout so you can pipe/record it

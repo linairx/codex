@@ -2,6 +2,7 @@ use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
+use chrono::Utc;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadArchiveParams;
@@ -11,6 +12,8 @@ use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadSetNameParams;
+use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -22,11 +25,17 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_core::find_archived_thread_path_by_id_str;
 use codex_core::find_thread_path_by_id_str;
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
+use codex_state::StateRuntime;
+use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use tempfile::TempDir;
@@ -292,6 +301,297 @@ async fn resident_thread_unarchive_preserves_resident_mode() -> Result<()> {
     assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn named_resident_thread_unarchive_preserves_name_and_mode() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+    let thread_name = "Named resident unarchive thread";
+    let set_name_id = mcp
+        .send_thread_set_name_request(ThreadSetNameParams {
+            thread_id: thread.id.clone(),
+            name: thread_name.to_string(),
+        })
+        .await?;
+    let set_name_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(set_name_id)),
+    )
+    .await??;
+    let _: ThreadSetNameResponse = to_response::<ThreadSetNameResponse>(set_name_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "materialize named resident thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let archive_id = mcp
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let archive_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(archive_id)),
+    )
+    .await??;
+    let _: ThreadArchiveResponse = to_response::<ThreadArchiveResponse>(archive_resp)?;
+
+    let unarchive_id = mcp
+        .send_thread_unarchive_request(ThreadUnarchiveParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let unarchive_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unarchive_id)),
+    )
+    .await??;
+    let ThreadUnarchiveResponse {
+        thread: unarchived_thread,
+    } = to_response::<ThreadUnarchiveResponse>(unarchive_resp)?;
+    assert!(unarchived_thread.resident);
+    assert_eq!(unarchived_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(unarchived_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(unarchived_thread.name.as_deref(), Some(thread_name));
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(read_thread.name.as_deref(), Some(thread_name));
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: Some(false),
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include unarchived named resident thread");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resident_thread_unarchive_reconciles_missing_summary_for_existing_sqlite_row() -> Result<()>
+{
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+    let preview = "materialize resident thread";
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: preview.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let archive_id = mcp
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let archive_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(archive_id)),
+    )
+    .await??;
+    let _: ThreadArchiveResponse = to_response::<ThreadArchiveResponse>(archive_resp)?;
+
+    let thread_uuid = ThreadId::from_string(&thread.id)?;
+    let archived_path = find_archived_thread_path_by_id_str(codex_home.path(), &thread.id)
+        .await?
+        .expect("archived rollout should exist");
+    assert_eq!(state_db.delete_thread(thread_uuid).await?, 1);
+    let mut metadata = ThreadMetadataBuilder::new(
+        thread_uuid,
+        archived_path.clone(),
+        Utc::now(),
+        ProtocolSessionSource::Cli,
+    );
+    metadata.model_provider = Some("mock_provider".to_string());
+    metadata.cwd = PathBuf::from("/");
+    metadata.cli_version = Some("0.0.0".to_string());
+    let inserted = state_db
+        .insert_thread_if_absent(&metadata.build("mock_provider"))
+        .await?;
+    assert!(
+        inserted,
+        "test setup should insert an incomplete sqlite row"
+    );
+    let updated_mode = state_db
+        .set_thread_mode(thread_uuid, "residentAssistant")
+        .await?;
+    assert!(
+        updated_mode,
+        "test setup should preserve resident mode in sqlite"
+    );
+
+    let unarchive_id = mcp
+        .send_thread_unarchive_request(ThreadUnarchiveParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let unarchive_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unarchive_id)),
+    )
+    .await??;
+    let ThreadUnarchiveResponse {
+        thread: unarchived_thread,
+    } = to_response::<ThreadUnarchiveResponse>(unarchive_resp)?;
+    assert!(unarchived_thread.resident);
+    assert_eq!(unarchived_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(unarchived_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(unarchived_thread.preview, preview);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: Some(false),
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include unarchived resident thread");
+    assert_eq!(listed_thread.preview, preview);
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+
+    let persisted = state_db
+        .get_thread(thread_uuid)
+        .await?
+        .expect("thread metadata should exist after unarchive");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
+    assert!(persisted.archived_at.is_none());
+
+    Ok(())
+}
+
+async fn init_state_db(codex_home: &Path) -> Result<Arc<StateRuntime>> {
+    let state_db = StateRuntime::init(codex_home.to_path_buf(), "mock_provider".into()).await?;
+    state_db
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+    Ok(state_db)
 }
 
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {

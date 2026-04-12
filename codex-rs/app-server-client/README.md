@@ -97,6 +97,24 @@ The same resident continuity is now locked down for `thread/rollback`: after a
 resident assistant completes a turn, the rollback response must preserve
 `thread.mode = residentAssistant` instead of reconstructing the rollout as an
 ordinary interactive resume target summary.
+That same rollback boundary now also covers stored-summary repair: if a
+resident thread already has a persisted SQLite row but rollout-derived preview
+data is missing, typed `thread/rollback` should still return the reconciled
+thread snapshot directly instead of preserving only `thread.mode` and forcing a
+follow-up `thread/read` just to recover preview.
+The same typed boundary now also covers stored-summary repair: if a thread
+already has a persisted SQLite row but rollout-derived summary fields such as
+preview / first-user-message are still missing, follow-up `thread/read`,
+`thread/list`, `thread/resume`, `thread/metadata/update`, and `thread/unarchive`
+responses should continue to come back already reconciled. Typed callers should
+therefore treat the returned thread snapshot as authoritative instead of
+assuming they need an extra `thread/read` round-trip to repair missing preview
+data after restore / metadata / reconnect flows.
+The same contract now applies to the websocket-backed remote facade too: when
+the remote app-server already returns a repaired thread summary, the typed
+remote client should preserve `thread.mode`, preview, status, and name exactly
+as returned instead of reintroducing a client-side “resume, then re-read”
+repair step.
 The event stream is now locked down at the same boundary too: in-process
 `next_event()` consumers can rely on `thread/started` as the resident-aware
 snapshot that still carries `thread.mode`, while later

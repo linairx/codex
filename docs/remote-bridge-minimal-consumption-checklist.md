@@ -8,6 +8,65 @@
 
 目标不是设计完整 bridge 产品，而是给“最小线程消费闭环”提供一份可直接执行的清单。
 
+## 0. 当前本地进度快照（2026-04-12）
+
+按当前工作树与已通过的本地测试看，这一阶段已经不再停留在“远端消费者理论上应该怎么做”，而是已有一条最小自愈闭环落地到现有调试/联调入口。
+
+当前已落在本地改动与回归里的主要入口是：
+
+- `codex-rs/debug-client/`
+- `codex-rs/app-server-test-client/`
+- `codex-rs/app-server/tests/suite/v2/thread_status.rs`
+- `codex-rs/app-server-client/`
+- `docs/`
+
+当前已经可以明确视为本阶段已落地的点包括：
+
+- `debug-client` 在收到未知 thread 的 `thread/status/changed` 时，仍会先保持 status-only 输出，不猜 `mode`；但随后会自动补发一次 `thread/loaded/read`，把后续本地摘要恢复到权威 `mode + status + action`
+- `debug-client` 的这条补读链路现在也已补成真正的本地状态回收闭环：`thread/loaded/read` 回来后，resident `mode + status + name` 会重新落回 `known_threads`，而不只是打印一次刷新日志
+- `app-server-test-client` 在同类 unknown-thread 状态通知路径上，也会先保持 status-only，再立即补一次 `thread/read`，避免长时间停留在“只知道 status、不知道动作语义”的半恢复状态
+- `app-server-test-client` 的这条补读链路现在也已有单测锁住：未知 thread 的 `thread/status/changed` 触发后，会发出一次真实 `thread/read`，并把 resident `mode + status + name` 回收到本地 `known_threads`
+- `app-server-client` 的 typed 请求/README 现在也已与这条消费契约对齐：调用方应直接信任 `thread/start` / `thread/resume` / `thread/metadata/update` / `thread/unarchive` / `thread/rollback` 返回里的 `thread.mode`，并继续把 `thread/status/changed` 当成 status-only 增量，而不是二次脑补 resident reconnect 语义
+- `app-server-client` 这层 typed 契约现在也已继续补到两条先前更薄的边界：一是 in-process `thread/resume` 的 stored-summary repair 回归，二是 remote websocket facade 对 resident repaired `thread/resume` 摘要的 typed 透传回归
+- 这两条路径都已补上本地回归，并通过最小消费者层的单测锁住 unknown-thread 不猜 resident reconnect、但随后会回到读取面补 summary 这条契约
+
+当前已完成并通过的本地验证包括：
+
+- `cargo test -p codex-debug-client`
+- `cargo test -p codex-app-server-test-client`
+- `cargo test -p codex-app-server-test-client unknown_thread_status_change_refresh_round_trip_restores_known_thread_summary`
+- `cargo test -p codex-app-server --test all thread_status`
+- `cargo test -p codex-app-server-client --lib loaded_read_preserves_resident_thread_mode_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib resident_workspace_changed_preserves_status_across_typed_reads_list_and_resume`
+- `cargo test -p codex-app-server-client --lib resident_unsubscribe_preserves_mode_on_followup_reads_and_resume`
+- `cargo test -p codex-app-server-client --lib archived_metadata_update_preserves_resident_thread_mode_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib archived_read_preserves_resident_thread_mode_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib unarchive_preserves_resident_thread_mode_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib rollback_preserves_resident_thread_mode_through_typed_response_and_follow_up_reads`
+- `cargo test -p codex-app-server-client --lib resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_resume_preserves_repaired_thread_summary`
+
+这意味着这份清单当前更适合继续承担：
+
+- 检查剩余远端消费者是否仍沿同一条“status-only 增量 + 读取面恢复摘要”主线
+- 确认后续 bridge 壳层不再重新发明另一套 unknown-thread 恢复逻辑
+
+### 当前阶段判断
+
+按第 8 节的完成定义看，这一包现在已经基本满足“阶段完成”条件。
+
+当前已经可以相对明确地下这个判断，是因为：
+
+- 最小远端消费者不再只停留在一个入口，而是已经覆盖 `debug-client`、`app-server-test-client`、`app-server-client`
+- `thread/list` / `thread/loaded/read` / `thread/status/changed` / `thread/resume` 这四条主消费路径都已有本地验证落点
+- resident reconnect 的动作语义已经在 README、调试输出和 typed 返回面上保持一致
+
+因此这份清单后续更适合作为：
+
+- 后续 bridge 壳层开发时的回归对照表
+
+而不是继续作为需要优先扩写的新任务包。
+
 ## 1. 这一阶段要解决什么
 
 这一阶段的唯一主问题应该是：
