@@ -114,6 +114,40 @@ async fn slash_rename_confirmation_mentions_resident_reconnect() {
 }
 
 #[tokio::test]
+async fn slash_rename_confirmation_mentions_resume_for_interactive_threads() {
+    let rendered = lines_to_single_string(
+        &ChatWidget::rename_confirmation_cell(
+            "atlas",
+            Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
+            Some(codex_app_server_protocol::ThreadMode::Interactive),
+        )
+        .display_lines(/*width*/ 120),
+    );
+
+    assert_eq!(
+        rendered.trim_end(),
+        "• Thread renamed to atlas to resume this thread run codex resume atlas"
+    );
+}
+
+#[tokio::test]
+async fn slash_rename_confirmation_defaults_to_resume_when_thread_mode_is_unknown() {
+    let rendered = lines_to_single_string(
+        &ChatWidget::rename_confirmation_cell(
+            "atlas",
+            Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
+            /*thread_mode*/ None,
+        )
+        .display_lines(/*width*/ 120),
+    );
+
+    assert_eq!(
+        rendered.trim_end(),
+        "• Thread renamed to atlas to resume this thread run codex resume atlas"
+    );
+}
+
+#[tokio::test]
 async fn slash_quit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

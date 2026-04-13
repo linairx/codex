@@ -9,6 +9,8 @@ use codex_app_server_protocol::GetConversationSummaryParams;
 use codex_app_server_protocol::GetConversationSummaryResponse;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_state::StateRuntime;
@@ -184,4 +186,194 @@ async fn get_conversation_summary_by_thread_id_repairs_missing_summary_for_exist
     assert_eq!(persisted.first_user_message.as_deref(), Some(PREVIEW));
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_conversation_summary_by_thread_id_uses_loaded_external_rollout_path() -> Result<()> {
+    const EXTERNAL_MODEL_PROVIDER: &str = "mock_provider";
+
+    let codex_home = TempDir::new()?;
+    let config_toml = codex_home.path().join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "{EXTERNAL_MODEL_PROVIDER}"
+
+[model_providers.{EXTERNAL_MODEL_PROVIDER}]
+name = "Mock provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )?;
+
+    let external_home = TempDir::new()?;
+    let conversation_id = create_fake_rollout(
+        external_home.path(),
+        FILENAME_TS,
+        META_RFC3339,
+        PREVIEW,
+        Some(EXTERNAL_MODEL_PROVIDER),
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let external_rollout = std::fs::canonicalize(rollout_path(
+        external_home.path(),
+        FILENAME_TS,
+        &conversation_id,
+    ))?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            path: Some(external_rollout.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_request_id)),
+    )
+    .await??;
+    let _: ThreadResumeResponse = to_response(resume_response)?;
+
+    let request_id = mcp
+        .send_get_conversation_summary_request(GetConversationSummaryParams::ThreadId {
+            conversation_id: thread_id,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let received: GetConversationSummaryResponse = to_response(response)?;
+
+    assert_eq!(
+        received.summary,
+        ConversationSummary {
+            conversation_id: thread_id,
+            path: external_rollout,
+            preview: PREVIEW.to_string(),
+            timestamp: Some(META_RFC3339.to_string()),
+            updated_at: Some(META_RFC3339.to_string()),
+            model_provider: EXTERNAL_MODEL_PROVIDER.to_string(),
+            cwd: PathBuf::from("/"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli,
+            git_info: None,
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_conversation_summary_by_thread_id_uses_loaded_provider_override_for_external_rollout()
+-> Result<()> {
+    const OVERRIDE_PROVIDER: &str = "mock_provider";
+
+    let codex_home = TempDir::new()?;
+    create_multi_provider_config_toml(codex_home.path())?;
+
+    let external_home = TempDir::new()?;
+    let conversation_id = create_fake_rollout(
+        external_home.path(),
+        FILENAME_TS,
+        META_RFC3339,
+        PREVIEW,
+        /*model_provider*/ None,
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let external_rollout = std::fs::canonicalize(rollout_path(
+        external_home.path(),
+        FILENAME_TS,
+        &conversation_id,
+    ))?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            path: Some(external_rollout.clone()),
+            model_provider: Some(OVERRIDE_PROVIDER.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_request_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response(resume_response)?;
+    assert_eq!(thread.model_provider, OVERRIDE_PROVIDER);
+
+    let request_id = mcp
+        .send_get_conversation_summary_request(GetConversationSummaryParams::ThreadId {
+            conversation_id: thread_id,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let received: GetConversationSummaryResponse = to_response(response)?;
+
+    assert_eq!(
+        received.summary,
+        ConversationSummary {
+            conversation_id: thread_id,
+            path: external_rollout,
+            preview: PREVIEW.to_string(),
+            timestamp: Some(META_RFC3339.to_string()),
+            updated_at: Some(META_RFC3339.to_string()),
+            model_provider: OVERRIDE_PROVIDER.to_string(),
+            cwd: PathBuf::from("/"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli,
+            git_info: None,
+        }
+    );
+
+    Ok(())
+}
+
+fn create_multi_provider_config_toml(codex_home: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "target_provider"
+
+[model_providers.target_provider]
+name = "Target fallback provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+
+[model_providers.mock_provider]
+name = "Mock override provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+    )
 }

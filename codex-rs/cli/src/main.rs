@@ -1631,6 +1631,7 @@ mod tests {
             .render_long_help()
             .to_string();
 
+        assert!(help.contains("SESSION_ID_OR_NAME"));
         assert!(help.contains("Resume or reconnect to the most recent recorded session"));
         assert!(help.contains("--include-non-interactive"));
         assert!(help.contains("Include non-interactive sessions in the resume/reconnect picker"));
@@ -1673,6 +1674,7 @@ mod tests {
             .to_string();
 
         assert!(help.contains("Resume or reconnect to a previous session by id or name"));
+        assert!(help.contains("SESSION_ID_OR_NAME"));
         assert!(help.contains("Resume or reconnect to the most recent recorded session"));
         assert!(help.contains("--last"));
     }
@@ -1819,6 +1821,23 @@ mod tests {
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
                 "To reconnect to this resident assistant, run codex resume atlas".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_exit_messages_uses_continue_hint_for_interactive_threads() {
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            Some("atlas"),
+            Some(ThreadMode::Interactive),
+        );
+        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage: total=2 input=0 output=2".to_string(),
+                "To continue this session, run codex resume atlas".to_string(),
             ]
         );
     }

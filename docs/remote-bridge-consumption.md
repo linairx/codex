@@ -36,6 +36,7 @@
 
 - `Thread.mode` 已进入主要 `Thread` 返回面
 - `thread/read`、`thread/list` 以及后续 `thread/resume` 已能在服务重启后回补 SQLite 中持久化的 resident 模式
+- websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 也已开始原样保留 `thread.mode + preview + status + path + name`，不再只在 in-process 路径上成立
 - `workspaceChanged` 已开始具备更稳定的保留与清理语义
 - resident thread 的 watcher 生命周期已开始与 shutdown / reconnect 语义对齐
 
@@ -138,7 +139,7 @@
 当前可依赖事实：
 
 - 远端已经可以把 `thread/list` 视为“长期线程与普通线程总览”的主入口
-- 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的 `mode + status` 摘要面，并且这条读取面本身会继续返回 `thread.mode`
+- 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的 `mode + status` 摘要面，并且这条读取面本身就应继续被消费侧当成权威当前线程摘要，而不是退回成还需要额外补一次 `thread/read` 的半恢复接口
 - 对于服务重启后的未加载 resident thread，`thread/list` 不再只能看到普通历史线程语义，而是可以读到持久化回补后的 resident 模式
 - 即使 SQLite 中已经有线程行，远端也不应把“有 row”直接等同于“stored summary 已完整”；当前更可靠的契约是继续直接信 `thread/list` / `thread/read` / `thread/resume` / `thread/unarchive` / `thread/metadata/update` 返回的线程摘要，因为服务端会先 reconcile rollout，再把修补后的 summary 暴露出来
 

@@ -507,6 +507,307 @@ async fn list_threads_db_enabled_reconciles_missing_rollout_summary_fields() -> 
 }
 
 #[tokio::test]
+async fn read_repair_rollout_path_reconciles_missing_summary_for_existing_sqlite_row()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+
+    let uuid = Uuid::from_u128(9013);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+    let real_path = write_session_file(home.path(), "2025-01-03T14-00-00", uuid)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+
+    let created_at = chrono::Utc
+        .with_ymd_and_hms(2025, 1, 3, 14, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        real_path.clone(),
+        created_at,
+        SessionSource::Cli,
+    );
+    builder.model_provider = Some(config.model_provider_id.clone());
+    builder.cwd = home.path().to_path_buf();
+    runtime
+        .upsert_thread(&builder.build(config.model_provider_id.as_str()))
+        .await
+        .expect("state db upsert should succeed");
+
+    let persisted_before = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(persisted_before.first_user_message, None);
+
+    crate::state_db::read_repair_rollout_path(
+        Some(&runtime),
+        Some(thread_id),
+        Some(false),
+        &real_path,
+    )
+    .await;
+
+    let persisted_after = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(
+        persisted_after.first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+    assert_eq!(persisted_after.rollout_path, real_path);
+    assert_eq!(persisted_after.archived_at, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_repair_rollout_path_preserves_archived_semantics_while_reconciling_missing_summary()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+
+    let uuid = Uuid::from_u128(9014);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+    let real_path = write_session_file(home.path(), "2025-01-03T15-00-00", uuid)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+
+    let created_at = chrono::Utc
+        .with_ymd_and_hms(2025, 1, 3, 15, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        real_path.clone(),
+        created_at,
+        SessionSource::Cli,
+    );
+    builder.model_provider = Some(config.model_provider_id.clone());
+    builder.cwd = home.path().to_path_buf();
+    runtime
+        .upsert_thread(&builder.build(config.model_provider_id.as_str()))
+        .await
+        .expect("state db upsert should succeed");
+
+    crate::state_db::read_repair_rollout_path(
+        Some(&runtime),
+        Some(thread_id),
+        Some(true),
+        &real_path,
+    )
+    .await;
+
+    let persisted_after = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(
+        persisted_after.first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+    assert_eq!(persisted_after.rollout_path, real_path);
+    assert_eq!(
+        persisted_after.archived_at,
+        Some(persisted_after.updated_at)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_repair_rollout_path_clears_archived_semantics_while_reconciling_missing_summary()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+
+    let uuid = Uuid::from_u128(9015);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+    let real_path = write_session_file(home.path(), "2025-01-03T16-00-00", uuid)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+
+    let created_at = chrono::Utc
+        .with_ymd_and_hms(2025, 1, 3, 16, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        real_path.clone(),
+        created_at,
+        SessionSource::Cli,
+    );
+    builder.model_provider = Some(config.model_provider_id.clone());
+    builder.cwd = home.path().to_path_buf();
+    builder.archived_at = Some(created_at);
+    runtime
+        .upsert_thread(&builder.build(config.model_provider_id.as_str()))
+        .await
+        .expect("state db upsert should succeed");
+
+    crate::state_db::read_repair_rollout_path(
+        Some(&runtime),
+        Some(thread_id),
+        Some(false),
+        &real_path,
+    )
+    .await;
+
+    let persisted_after = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(
+        persisted_after.first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+    assert_eq!(persisted_after.rollout_path, real_path);
+    assert_eq!(persisted_after.archived_at, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_repair_rollout_path_recreates_archived_row_from_rollout_when_sqlite_row_is_missing()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+
+    let uuid = Uuid::from_u128(9016);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+    let real_path = write_session_file(home.path(), "2025-01-03T17-00-00", uuid)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+
+    assert_eq!(
+        runtime
+            .get_thread(thread_id)
+            .await
+            .expect("state db lookup should succeed"),
+        None
+    );
+
+    crate::state_db::read_repair_rollout_path(
+        Some(&runtime),
+        Some(thread_id),
+        Some(true),
+        &real_path,
+    )
+    .await;
+
+    let persisted_after = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(
+        persisted_after.first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+    assert_eq!(persisted_after.rollout_path, real_path);
+    assert_eq!(
+        persisted_after.archived_at,
+        Some(persisted_after.updated_at)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_repair_rollout_path_recreates_unarchived_row_from_rollout_when_sqlite_row_is_missing()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+
+    let uuid = Uuid::from_u128(9017);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+    let real_path = write_session_file(home.path(), "2025-01-03T18-00-00", uuid)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+
+    assert_eq!(
+        runtime
+            .get_thread(thread_id)
+            .await
+            .expect("state db lookup should succeed"),
+        None
+    );
+
+    crate::state_db::read_repair_rollout_path(
+        Some(&runtime),
+        Some(thread_id),
+        Some(false),
+        &real_path,
+    )
+    .await;
+
+    let persisted_after = runtime
+        .get_thread(thread_id)
+        .await
+        .expect("state db lookup should succeed")
+        .expect("thread metadata should exist");
+    assert_eq!(
+        persisted_after.first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+    assert_eq!(persisted_after.rollout_path, real_path);
+    assert_eq!(persisted_after.archived_at, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let stale_cwd = home.path().join("stale");

@@ -63,6 +63,7 @@ Two related boundaries matter for MCP consumers:
 One more boundary now matters for persisted-summary consumers too:
 
 - `thread/read`, `thread/list`, `thread/resume`, `thread/metadata/update`, and `thread/unarchive` should be treated as already-reconciled thread summary surfaces. If SQLite already has a thread row but rollout-derived summary fields such as preview / first-user-message are still missing, the server repairs that stored summary before returning the thread instead of expecting MCP clients to patch over rollout-vs-SQLite drift themselves with an extra read.
+- `thread/loaded/read` should likewise be treated as the authoritative current loaded-thread summary surface. If the loaded thread already carries repaired rollout metadata, a provider override, or an external rollout path, MCP clients should continue to consume that returned `Thread` directly instead of treating loaded polling as an id/status probe that still needs a follow-up `thread/read`.
 
 `getConversationSummary` remains as a compatibility helper for clients that still need a summary lookup by `conversationId` or `rolloutPath`.
 

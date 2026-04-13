@@ -2424,6 +2424,61 @@ mod tests {
     }
 
     #[test]
+    fn resume_picker_hint_mentions_resume_for_interactive_threads() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Investigate interactive resume path"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Interactive thread")),
+            mode: ThreadMode::Interactive,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/interactive")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+
+        let rendered = picker_hint_line(&state).to_string();
+        assert!(
+            rendered.contains("enter to resume"),
+            "interactive picker hint should keep resume wording: {rendered}"
+        );
+    }
+
+    #[test]
+    fn resume_picker_hint_defaults_to_resume_without_selected_thread_mode() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+
+        let rendered = picker_hint_line(&state).to_string();
+        assert!(
+            rendered.contains("enter to resume"),
+            "picker hint should default to resume wording without a selected thread: {rendered}"
+        );
+    }
+
+    #[test]
     fn resume_picker_hint_mentions_session_kind_toggle_when_supported() {
         use crate::custom_terminal::Terminal;
         use crate::test_backend::VT100Backend;

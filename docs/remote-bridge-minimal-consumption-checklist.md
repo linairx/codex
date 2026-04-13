@@ -5,6 +5,7 @@
 - `docs/codex-rs-source-analysis.md`
 - `docs/remote-bridge-consumption.md`
 - `docs/resident-mode-baseline-pr-checklist.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 目标不是设计完整 bridge 产品，而是给“最小线程消费闭环”提供一份可直接执行的清单。
 
@@ -27,7 +28,7 @@
 - `app-server-test-client` 在同类 unknown-thread 状态通知路径上，也会先保持 status-only，再立即补一次 `thread/read`，避免长时间停留在“只知道 status、不知道动作语义”的半恢复状态
 - `app-server-test-client` 的这条补读链路现在也已有单测锁住：未知 thread 的 `thread/status/changed` 触发后，会发出一次真实 `thread/read`，并把 resident `mode + status + name` 回收到本地 `known_threads`
 - `app-server-client` 的 typed 请求/README 现在也已与这条消费契约对齐：调用方应直接信任 `thread/start` / `thread/resume` / `thread/metadata/update` / `thread/unarchive` / `thread/rollback` 返回里的 `thread.mode`，并继续把 `thread/status/changed` 当成 status-only 增量，而不是二次脑补 resident reconnect 语义
-- `app-server-client` 这层 typed 契约现在也已继续补到两条先前更薄的边界：一是 in-process `thread/resume` 的 stored-summary repair 回归，二是 remote websocket facade 对 resident repaired `thread/resume` 摘要的 typed 透传回归
+- `app-server-client` 这层 typed 契约现在也已继续补到两条先前更薄的边界：一是 in-process `thread/resume` 的 stored-summary repair 回归，二是 remote websocket facade 对 resident repaired `thread/resume`、`thread/read`、`thread/list` 与 `thread/loaded/read` 摘要的 typed 透传回归
 - 这两条路径都已补上本地回归，并通过最小消费者层的单测锁住 unknown-thread 不猜 resident reconnect、但随后会回到读取面补 summary 这条契约
 
 当前已完成并通过的本地验证包括：
@@ -45,6 +46,9 @@
 - `cargo test -p codex-app-server-client --lib rollback_preserves_resident_thread_mode_through_typed_response_and_follow_up_reads`
 - `cargo test -p codex-app-server-client --lib resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_resume_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_read_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_list_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_read_preserves_repaired_thread_summary`
 
 这意味着这份清单当前更适合继续承担：
 
@@ -58,7 +62,7 @@
 当前已经可以相对明确地下这个判断，是因为：
 
 - 最小远端消费者不再只停留在一个入口，而是已经覆盖 `debug-client`、`app-server-test-client`、`app-server-client`
-- `thread/list` / `thread/loaded/read` / `thread/status/changed` / `thread/resume` 这四条主消费路径都已有本地验证落点
+- `thread/list` / `thread/read` / `thread/loaded/read` / `thread/status/changed` / `thread/resume` 这五条主消费路径都已有本地验证落点
 - resident reconnect 的动作语义已经在 README、调试输出和 typed 返回面上保持一致
 
 因此这份清单后续更适合作为：
@@ -66,6 +70,11 @@
 - 后续 bridge 壳层开发时的回归对照表
 
 而不是继续作为需要优先扩写的新任务包。
+
+如果当前要做的已经不是“继续补最小消费闭环”，而是“把这包整理成单独 PR，或判断它是否已经和 observer / SQLite 混包”，更适合继续看：
+
+- `docs/remote-bridge-minimal-consumption-pr-template.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 ## 1. 这一阶段要解决什么
 
@@ -76,6 +85,7 @@
 它适合覆盖的能力包括：
 
 - 用 `thread/list` 渲染线程摘要
+- unknown-thread 或缺摘要时，回到 `thread/read` 补权威当前摘要
 - 用 `thread/loaded/read` 刷新 loaded thread 的 `mode + status`
 - 用 `thread/status/changed` 消费 status-only 增量
 - 用 `thread/resume` 进入 resident reconnect

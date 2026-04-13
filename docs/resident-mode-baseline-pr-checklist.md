@@ -4,10 +4,11 @@
 
 - `docs/codex-rs-source-analysis.md`
 - `docs/persistent-runtime-implementation-plan.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 目标不是再解释 resident / mode 主线为什么重要，而是给首个“语义基线 PR”提供一份可直接执行、review 和提交的清单。
 
-## 0. 当前本地进度快照（2026-04-11）
+## 0. 当前本地进度快照（2026-04-14）
 
 按当前工作树看，这个 baseline PR 已经明显进入“收尾而不是起步”阶段。
 
@@ -18,25 +19,33 @@
 - `codex-rs/app-server-test-client/`
 - `codex-rs/debug-client/`
 - `codex-rs/tui/src/app_server_session.rs`
+- `codex-rs/tui/src/resume_picker.rs`
+- `codex-rs/tui/src/chatwidget.rs`
+- `codex-rs/cli/src/`
+- `codex-rs/exec/`
 - `docs/`
 
 当前尚未进入本地改动集、但仍值得作为收尾检查项的入口是：
 
-- `codex-rs/cli/src/`
-- `codex-rs/exec/`
-- `codex-rs/tui/src/resume_picker.rs`
-- `codex-rs/tui/src/chatwidget.rs`
+- `codex-rs/README.md`
+- 根 `README.md`
 
 这意味着这份清单当前更适合被用作：
 
 - 检查已经落地的语义是否真正闭环
-- 快速识别还有哪些用户入口尚未完成同口径收尾
+- 确认剩余顶层 README / 提交边界是否已跟上当前实现
 
 补充说明：
 
-- 这些未进入当前改动集的入口不应自动视为“尚未支持 resident-aware 语义”
-- 按当前仓库内容看，其中不少入口已经具备 `resume or reconnect`、resident reconnect 或 `session mode/action` 相关口径
-- 因此更合理的做法是先验证这些入口是否仍与当前实现一致，再决定是否真的需要补改
+- 当前这包 baseline 改动已不再只停留在服务端、typed client 和 TUI 会话层；`resume_picker`、`chatwidget`、`exec` 与顶层 `codex` 包装层也都已经有 resident-aware 回归进入本地改动集
+- 因此这份清单当前更不适合继续把这些入口当成“待确认是否需要补改”的开放项，而应把重点切到：
+  - 这些入口是否真的说同一套话
+  - 剩余 README / 提交边界是否已跟上
+
+如果当前要做的已经不是“继续查 resident baseline 还缺什么”，而是“把这包整理成单独 PR，或判断它是否已经和 SQLite / 文档流程整理混包”，更适合继续看：
+
+- `docs/resident-mode-baseline-pr-template.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 ## 1. 本 PR 要解决什么
 
@@ -93,6 +102,7 @@
 - `thread/loaded/read` 仍承担 loaded `mode + status` 恢复面
 - `thread/loaded/list` 仍只是 id-only probe
 - `thread/resume` 在 resident thread 上继续表达 reconnect 语义
+- websocket remote facade 在 `thread/resume`、`thread/read`、`thread/list`、`thread/loaded/read` 上继续原样保留服务端返回的 `Thread`
 
 ### 通知面
 
@@ -136,12 +146,19 @@
 
 优先跑这几个 crate：
 
-- `cargo test -p codex-app-server`
+- `cargo test -p codex-app-server --test all thread_`
+- `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_uses_loaded_external_rollout_path`
 - `cargo test -p codex-app-server-client`
 - `cargo test -p codex-tui`
 - `cargo test -p codex-exec`
+- `cargo test -p codex-cli`
 
-如果只改了局部路径，可以先跑更聚焦子集；但这四个 crate 是最容易暴露语义漂移的地方。
+如果只改了局部路径，可以先跑更聚焦子集；但这几组命令是最容易暴露语义漂移的地方。
+
+补充说明：
+
+- 对 baseline 这包，`codex-app-server` 更适合优先跑 thread / loaded-read / resume / status / summary 这条主线，而不是默认整份 `--test all`
+- 整份 `cargo test -p codex-app-server --test all` 仍值得在更大范围提交前跑一次，但它可能被与 resident/thread baseline 无关的表面波动打断，例如 `app/list` force-refetch 之类的路径
 
 ## 6. Review 时该怎么问
 
@@ -166,6 +183,7 @@
 - `thread/loaded/list` 仍严格保持 id-only probe
 - `thread/loaded/read` 仍承担 loaded `mode + status` 恢复面
 - `thread/resume` 在 resident thread 上仍明确表示 reconnect
+- remote facade 不会把服务端已返回的 repaired `Thread` 重新降级成客户端补读职责
 - `app-server-client`、`tui`、`cli` / `exec`、调试入口没有继续残留旧语义
 - 相关 crate 的测试已覆盖
 - 主要 README / help 已同步

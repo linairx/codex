@@ -2531,7 +2531,8 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: ThreadArchiveParams,
     ) {
-        // TODO(jif) mostly rewrite this using sqlite after phase 1
+        // Archival still starts with moving the rollout on disk, but persisted
+        // metadata remains the authority for restored summaries and mode continuity.
         let thread_id = match ThreadId::from_string(&params.thread_id) {
             Ok(id) => id,
             Err(err) => {
@@ -3061,7 +3062,8 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: ThreadUnarchiveParams,
     ) {
-        // TODO(jif) mostly rewrite this using sqlite after phase 1
+        // Unarchive still moves the rollout back into sessions/, then reconciles
+        // persisted metadata so repaired summaries stay aligned with SQLite.
         let thread_id = match ThreadId::from_string(&params.thread_id) {
             Ok(id) => id,
             Err(err) => {
@@ -3550,7 +3552,7 @@ impl CodexMessageProcessor {
                 let Ok(loaded_thread) = self.thread_manager.get_thread(thread_id).await else {
                     continue;
                 };
-                let Some(rollout_path) = loaded_thread.rollout_path() else {
+                let Some(_) = loaded_thread.rollout_path() else {
                     continue;
                 };
 
@@ -3575,8 +3577,9 @@ impl CodexMessageProcessor {
                     continue;
                 }
 
-                let mut thread =
-                    build_thread_from_snapshot(thread_id, &config_snapshot, Some(rollout_path));
+                let mut thread = self
+                    .load_thread_summary_for_loaded_thread(thread_id, &loaded_thread)
+                    .await;
                 self.attach_runtime_thread_metadata(thread_id, &mut thread)
                     .await;
                 let loaded_status = self
@@ -3680,28 +3683,9 @@ impl CodexMessageProcessor {
                 continue;
             };
 
-            let config_snapshot = loaded_thread.config_snapshot().await;
-            let loaded_rollout_path = loaded_thread.rollout_path();
-            let mut thread = if let Some(rollout_path) = loaded_rollout_path.as_ref() {
-                match load_thread_summary_for_rollout(
-                    &self.config,
-                    thread_uuid,
-                    rollout_path,
-                    self.config.model_provider_id.as_str(),
-                    /*persisted_metadata*/ None,
-                )
-                .await
-                {
-                    Ok(thread) => thread,
-                    Err(_) => build_thread_from_snapshot(
-                        thread_uuid,
-                        &config_snapshot,
-                        loaded_rollout_path.clone(),
-                    ),
-                }
-            } else {
-                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
-            };
+            let mut thread = self
+                .load_thread_summary_for_loaded_thread(thread_uuid, &loaded_thread)
+                .await;
             self.attach_runtime_thread_metadata(thread_uuid, &mut thread)
                 .await;
 
@@ -3795,6 +3779,44 @@ impl CodexMessageProcessor {
         Some((page, next_cursor))
     }
 
+    async fn load_thread_summary_for_loaded_thread(
+        &self,
+        thread_id: ThreadId,
+        loaded_thread: &Arc<CodexThread>,
+    ) -> Thread {
+        let config_snapshot = loaded_thread.config_snapshot().await;
+        let loaded_rollout_path = loaded_thread.rollout_path();
+        if let Some(rollout_path) = loaded_rollout_path.as_ref() {
+            match load_thread_summary_for_rollout(
+                &self.config,
+                thread_id,
+                rollout_path,
+                config_snapshot.model_provider_id.as_str(),
+                /*persisted_metadata*/ None,
+            )
+            .await
+            {
+                Ok(thread) => thread,
+                Err(_) => build_thread_from_snapshot(
+                    thread_id,
+                    &config_snapshot,
+                    Some(rollout_path.to_path_buf()),
+                ),
+            }
+        } else {
+            build_thread_from_snapshot(thread_id, &config_snapshot, loaded_rollout_path)
+        }
+    }
+
+    async fn preferred_state_db_handle(
+        &self,
+        loaded_thread: Option<&Arc<CodexThread>>,
+    ) -> Option<StateDbHandle> {
+        loaded_thread
+            .and_then(|thread| thread.state_db())
+            .or(get_state_db(&self.config).await)
+    }
+
     async fn thread_read(&mut self, request_id: ConnectionRequestId, params: ThreadReadParams) {
         let ThreadReadParams {
             thread_id,
@@ -3811,17 +3833,9 @@ impl CodexMessageProcessor {
         };
 
         let loaded_thread = self.thread_manager.get_thread(thread_uuid).await.ok();
-        let loaded_thread_state_db = loaded_thread.as_ref().and_then(|thread| thread.state_db());
-        let persisted_metadata = if let Some(state_db_ctx) = loaded_thread_state_db.as_ref() {
-            load_persisted_thread_metadata_with_summary_repair(
-                state_db_ctx,
-                thread_uuid,
-                self.config.model_provider_id.as_str(),
-            )
-            .await
-            .ok()
-            .flatten()
-        } else if let Some(state_db_ctx) = get_state_db(&self.config).await {
+        let persisted_metadata = if let Some(state_db_ctx) =
+            self.preferred_state_db_handle(loaded_thread.as_ref()).await
+        {
             load_persisted_thread_metadata_with_summary_repair(
                 &state_db_ctx,
                 thread_uuid,
@@ -3873,12 +3887,16 @@ impl CodexMessageProcessor {
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
         } else if let Some(rollout_path) = rollout_path.as_ref() {
-            let fallback_provider = self.config.model_provider_id.as_str();
+            let fallback_provider = if let Some(thread) = loaded_thread.as_ref() {
+                thread.config_snapshot().await.model_provider_id
+            } else {
+                self.config.model_provider_id.clone()
+            };
             match load_thread_summary_for_rollout(
                 &self.config,
                 thread_uuid,
                 rollout_path,
-                fallback_provider,
+                fallback_provider.as_str(),
                 /*persisted_metadata*/ None,
             )
             .await
@@ -3911,7 +3929,12 @@ impl CodexMessageProcessor {
             if include_turns {
                 rollout_path = loaded_rollout_path.clone();
             }
-            build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
+            if loaded_rollout_path.is_some() {
+                self.load_thread_summary_for_loaded_thread(thread_uuid, thread)
+                    .await
+            } else {
+                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
+            }
         };
         if thread.forked_from_id.is_none()
             && let Some(rollout_path) = rollout_path.as_ref()
@@ -4949,6 +4972,7 @@ impl CodexMessageProcessor {
             return;
         }
 
+        let mut fallback_provider = self.config.model_provider_id.clone();
         let path = match params {
             GetConversationSummaryParams::RolloutPath { rollout_path } => {
                 if rollout_path.is_relative() {
@@ -4965,23 +4989,42 @@ impl CodexMessageProcessor {
                 .await
                 {
                     Ok(Some(p)) => p,
-                    _ => {
-                        let error = JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!(
-                                "no rollout found for conversation id {conversation_id}"
-                            ),
-                            data: None,
-                        };
-                        self.outgoing.send_error(request_id, error).await;
-                        return;
-                    }
+                    _ => match self.thread_manager.get_thread(conversation_id).await {
+                        Ok(thread) => match thread.rollout_path() {
+                            Some(path) => {
+                                fallback_provider =
+                                    thread.config_snapshot().await.model_provider_id;
+                                path
+                            }
+                            None => {
+                                let error = JSONRPCErrorError {
+                                    code: INVALID_REQUEST_ERROR_CODE,
+                                    message: format!(
+                                        "no rollout found for conversation id {conversation_id}"
+                                    ),
+                                    data: None,
+                                };
+                                self.outgoing.send_error(request_id, error).await;
+                                return;
+                            }
+                        },
+                        Err(_) => {
+                            let error = JSONRPCErrorError {
+                                code: INVALID_REQUEST_ERROR_CODE,
+                                message: format!(
+                                    "no rollout found for conversation id {conversation_id}"
+                                ),
+                                data: None,
+                            };
+                            self.outgoing.send_error(request_id, error).await;
+                            return;
+                        }
+                    },
                 }
             }
         };
 
-        let fallback_provider = self.config.model_provider_id.as_str();
-        match read_summary_from_rollout(&path, fallback_provider).await {
+        match read_summary_from_rollout(&path, fallback_provider.as_str()).await {
             Ok(summary) => {
                 let response = GetConversationSummaryResponse { summary };
                 self.outgoing.send_response(request_id, response).await;

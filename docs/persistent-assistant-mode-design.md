@@ -170,6 +170,7 @@
 
 - `thread/read`、`thread/resume`，以及后续的 metadata-only / restore 路径返回的 `thread`
   都应逐步成为“客户端可直接信”的线程摘要
+- 这条“直接信返回的 `Thread`”心智也应继续覆盖远端 typed facade：如果 websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要，消费侧也不应重新退回“再补一次 `thread/read` 才算恢复完成”
 - 如果服务端后面需要在 rollout 与 SQLite 之间做 stored-summary repair，这层修补也应尽量停留在服务端返回面，而不是重新推回客户端做额外 `thread/read` 或本地脑补
 
 换句话说，第一阶段虽然不把 SQLite 重构混进同一个 PR，但也不应给客户端留下“以后还得自己修 resident summary 漂移”的心智空档。

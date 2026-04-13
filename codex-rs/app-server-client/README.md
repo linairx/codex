@@ -112,9 +112,18 @@ assuming they need an extra `thread/read` round-trip to repair missing preview
 data after restore / metadata / reconnect flows.
 The same contract now applies to the websocket-backed remote facade too: when
 the remote app-server already returns a repaired thread summary, the typed
-remote client should preserve `thread.mode`, preview, status, and name exactly
-as returned instead of reintroducing a client-side “resume, then re-read”
-repair step.
+remote client should preserve `thread.mode`, preview, status, path, and name
+exactly as returned instead of reintroducing a client-side “resume, then
+re-read” repair step. That boundary is now locked down directly for both
+`thread/resume`, `thread/read`, `thread/list`, and `thread/loaded/read`, so
+remote callers can continue to treat each of those responses as the
+authoritative repaired snapshot when reconnect, stored lookup, history
+listing, or loaded-thread polling returns an already repaired `Thread`.
+The same remote typed layer now also locks down `thread/loaded/list` as the
+id-only loaded probe: websocket callers should preserve loaded ids plus
+`next_cursor` exactly as returned, and should continue with
+`thread/loaded/read` whenever reconnect semantics or current loaded-thread
+status are needed.
 The event stream is now locked down at the same boundary too: in-process
 `next_event()` consumers can rely on `thread/started` as the resident-aware
 snapshot that still carries `thread.mode`, while later

@@ -518,6 +518,11 @@ Rust 版已经有比 `claude` 更好的基础：
 1. `docs/sqlite-state-convergence-checklist.md`
 2. `docs/sqlite-state-convergence-file-todo.md`
 
+如果当前已经不是在问“SQLite 这包先从哪里开工”，而是在问“怎么把当前这批改动整理成单独 PR，或判断它是不是已经和别的主线混包”，更适合继续看：
+
+1. `docs/persistent-runtime-current-worktree-pr-split.md`
+2. `docs/persistent-runtime-pr-workflow.md`
+
 ## 21. 补充执行状态（2026-04-13）
 
 沿着上面的推荐阅读与实现链继续往下看，当前这包工作已经不再只是“方向判断”，而是有一批 SQLite summary repair / resident metadata 收口已经落到代码并能被回归锁住。
@@ -547,7 +552,7 @@ Rust 版已经有比 `claude` 更好的基础：
 
 1. 继续检查 `docs/sqlite-state-convergence-file-todo.md` 里是否还有未收口的文件级 repair/helper 分叉
 2. 只在出现新的消费侧分叉或新的恢复路径遗漏时，再补对应服务端 / typed client / README 回归
-3. 如果这批边界已经都稳定，则把下一段工作切到真正消费这层稳定摘要的更高层功能，而不是继续扩写总览文档
+3. 如果这批边界已经都稳定，则把下一段工作切到真正消费这层稳定摘要的更高层入口；更具体地说，先回第 50 到 55 节挑 `tui` / `exec` / bridge 的最小切片，或按 `docs/persistent-runtime-pr-workflow.md` / `docs/persistent-runtime-current-worktree-pr-split.md` 继续整理提交，而不是继续扩写总览文档
 
 ### 先判断结论
 
@@ -1034,7 +1039,7 @@ SQLite 在这里不是起点，而是收敛点。
 它应只处理：
 
 - 远端控制面如何消费 `Thread.mode`
-- 远端如何使用 `thread/list`、`thread/loaded/read`、`thread/status/changed`
+- 远端如何使用 `thread/list`、`thread/read`、`thread/loaded/read`、`thread/status/changed`、`thread/resume`
 - observer 摘要和 SQLite 元数据对远端摘要的意义
 - 为什么远端首页不应依赖全量 item 流重建
 
@@ -1057,6 +1062,7 @@ SQLite 在这里不是起点，而是收敛点。
 - `thread_status.rs` 已开始收敛 watcher 生命周期，shutdown 会主动清理 resident thread 的工作区 watch
 - `workspaceChanged` 的保留与清理语义已开始稳定：shutdown 后不会被陈旧 watcher 事件重新激活，下一次 turn 完成后会清掉该标记
 - resident thread 在最后一个订阅者断开后也已补上负向与读取面回归：保持 loaded 的同时不会错误发出 `thread/closed`；后续 `thread/read` 仍会稳定返回 `ResidentAssistant`，`thread/loaded/read` 也会继续把该线程暴露为 `ResidentAssistant + Idle`
+- `app-server` 的 loaded-thread 读取面现在也已开始共用同一条 loaded summary helper：`thread/list`、`thread/loaded/read` 和 loaded `thread/read` fallback 不再各自重复一份 rollout summary 拼装逻辑，而会统一从当前 loaded thread 恢复 provider override、外部 rollout path 和 resident-aware 摘要，再叠加 live status
 - observer 的读取面和列表面现在也已继续收口到同一状态入口：resident thread 命中工作区变化后，`thread/read`、`thread/list`、`thread/loaded/read` 与 reconnect 用的 `thread/resume` 响应都会继续保留同一个 `workspaceChanged` 状态，不再只在 `thread/status/changed` 通知里短暂可见
 - `thread/status/changed` 的 status-only 边界现在也已被进一步钉实：observer 相关回归会直接检查通知 payload 仍只包含 `threadId + status`，避免后续有人把 resident reconnect 语义重新塞回增量通知，而不是继续从读取面上的 `Thread.mode` 恢复
 - `thread/rollback` 的 resident continuity 也已补到真实恢复路径：rollback 完成后 app-server 不再只按 rollout summary 回建默认 interactive 线程，而会重新合并当前 runtime metadata，因此 resident assistant 在 rollback 响应以及后续 `thread/read` / `thread/list` 里都会稳定保留 `ResidentAssistant`
@@ -1171,7 +1177,8 @@ SQLite 在这里不是起点，而是收敛点。
 - `codex-tui` 的 latest-session lookup / resume picker 现在也已把 `include_non_interactive` 的 source filter 语义修正并锁住：由于 app-server 上 `source_kinds: None` 实际表示“interactive only”而不是“all sources”，TUI 现在会在 `resume --last` 和 picker 里显式传完整 `ThreadSourceKind` 列表；对应回归同时锁住默认过滤仍会忽略较新的 `Exec` 等非交互线程，而显式开启 include-non-interactive 后会正确选中更新更晚的 resident non-interactive thread 并保留 `ResidentAssistant`
 - `codex-app-server-client` 的 in-process typed 回归现在也已把 resident `thread/unsubscribe` 的后续读取面锁住：最后一个订阅者断开后，`thread/loaded/read`、`thread/read` 与 `thread/resume` 仍会稳定保留 `ResidentAssistant + Idle`，避免共享客户端在“已断开但仍常驻”的路径上把 reconnect 目标重新降回普通 interactive 线程
 - `codex-app-server-client` 的 stored-summary repair typed 回归现在也已把 `thread/resume` 补齐到与 `thread/read` / `thread/list` / `thread/metadata/update` / `thread/unarchive` 同一层：SQLite 行已存在但 rollout-derived preview 缺失时，resume 返回面本身也会继续直接暴露修补后的 resident summary，而不是把 reconnect 之后的补读责任重新推回调用方
-- `codex-app-server-client` 的 remote facade 现在也已补上同层最小透传回归：websocket 远端直接返回 resident repaired `thread/resume` 摘要时，typed remote client 也会继续原样保留 `thread.mode + preview + status + name`，避免“直接信服务端返回的 Thread”这条契约只在 in-process 路径上成立
+- `codex-app-server-client` 的 remote facade 现在也已补上同层更完整的透传回归：websocket 远端直接返回 resident repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 也会继续原样保留 `thread.mode + preview + status + path + name`，避免“直接信服务端返回的 Thread”这条契约只在 in-process 路径上成立
+- `codex-app-server-client` 的 remote typed 回归现在也已把 `thread/loaded/list` 这条 id-only probe 补到同一层：websocket facade 会继续原样保留 loaded ids 与 `next_cursor`，而不会把这条 probe 漂成带 `mode` / `status` 的摘要接口；如果远端调用方需要 reconnect 语义或当前 loaded runtime 状态，仍应继续读 `thread/loaded/read`
 - `thread/rollback` 的 resident 路径现在也已补上真实 typed 回归，并顺手修掉了实现层的模式回退缺口：rollback 完成后 app-server 不再只按 rollout summary 重建一个默认 interactive `Thread`，而会像其他读取面一样合并持久化 metadata，所以 resident assistant 在 `thread/rollback` 响应里也会继续稳定保留 `ResidentAssistant`
 - `app-server/README.md` 的主接口说明也已继续收口：`thread/start`、`thread/resume`、`thread/fork`、`thread/list` 和 `thread/read` 都已明确把 `Thread.mode` 写成区分 resident reconnect 的主信号，而不是只讲 `resident: true`
 - `app-server/README.md` 的 API Overview 方法行现在也已继续补齐到同一口径：`thread/resume` 不再只写成“reopen an existing thread”，而会直接写成 `resume or reconnect`，避免最常读的接口摘要再次落回旧的纯 resume 心智
@@ -1243,8 +1250,8 @@ SQLite 在这里不是起点，而是收敛点。
 - `docs/remote-bridge-consumption.md` 现在也已继续对齐到同一口径：远端控制面应把 `thread/loaded/read` 视为带 `mode + status` 的 loaded 恢复面，而把 `thread/status/changed` 视为不重复 `mode` 的 status-only 增量通知
 - `docs/sqlite-state-convergence.md` 现在也已把这层边界补进状态分层：`thread/loaded/read` 属于当前线程摘要读取面，而 `thread/status/changed` 仍只是后续 status 增量，不应被当成需要落 SQLite 的完整线程恢复来源
 - `docs/sqlite-state-convergence.md` 也已从纯前瞻草案补成“当前状态 + 渐进收敛”视角，明确把 `threads.mode`、archive / unarchive、metadata update resident 连续性这些已落地边界写进 SQLite 文档，不再只停留在泛化设计层
-- `codex-rs/docs/codex_mcp_interface.md` 这份外围接口文档现在也已补齐同一消费约束：MCP 概览除了 `thread/start` / `thread/resume` / `thread/read` / `thread/list` 外，也已把 `thread/loaded/list`、`thread/loaded/read` 和 `thread/status/changed` 纳入主说明，并明确写出 `thread/loaded/list` 只是 id-only probe、`thread/loaded/read` 才是 loaded `mode + status` 摘要，而 `thread/status/changed` 继续只做 status-only 增量
-- 到这一步，这条“`thread/loaded/list` 只是 id-only probe、`thread/loaded/read` 才是 loaded `mode + status` 恢复面”的文档链已经基本收口：debug-client / app-server-test-client 的 help 与 README、app-server / MCP / app-server-client 的外围说明、以及几份设计稿和跟踪文档都已统一到同一消费边界；后续更合适的动作应是整理提交或切回新的代码闭环，而不是继续在同层文档里做低收益扩写
+- `codex-rs/docs/codex_mcp_interface.md` 这份外围接口文档现在也已补齐同一消费约束：MCP 概览除了 `thread/start` / `thread/resume` / `thread/read` / `thread/list` 外，也已把 `thread/loaded/list`、`thread/loaded/read` 和 `thread/status/changed` 纳入主说明，并明确写出 `thread/loaded/list` 只是 id-only probe、`thread/loaded/read` 才是 loaded `mode + status` 摘要，而且这条 loaded polling 返回面本身也应被直接当成权威当前线程摘要消费，而不是再补一次 `thread/read`
+- 到这一步，这条“`thread/loaded/list` 只是 id-only probe、`thread/loaded/read` 才是 loaded `mode + status` 恢复面”的文档链已经基本收口：debug-client / app-server-test-client 的 help 与 README、app-server / MCP / app-server-client 的外围说明、以及几份设计稿和跟踪文档都已统一到同一消费边界；后续更合适的动作应是按 `docs/persistent-runtime-current-worktree-pr-split.md` / `docs/persistent-runtime-pr-workflow.md` 整理提交，或切回新的代码闭环，而不是继续在同层文档里做低收益扩写
 - `debug-client` 的默认列表过滤现在也已补上 source-kinds 显式化：由于 app-server 上缺省 `source_kinds` 仍表示 interactive-only，`:refresh-thread` 与 `:refresh-loaded` 现在都会主动传完整 `ThreadSourceKind` 列表，并通过 README / 单测把“调试客户端默认看全量 interactive + non-interactive 线程来源”这层语义锁住，避免联调时把较新的 `Exec` 或其他非交互 resident 线程静默漏掉
 - `debug-client` 的内置 `:help` 现在也已继续跟上同一边界：`:refresh-thread` 会明确提示它跨 interactive + non-interactive 来源列出带 mode/status/action 的线程摘要，而 `:refresh-loaded` 会明确提示它只是跨这两类来源的 loaded thread id-only probe，避免 README 已经收口后，交互内置帮助仍把这两条命令写成泛化列表入口
 - `app-server-test-client` 的默认分页列表过滤现在也已补上同类修正：`thread-list`、`thread-loaded-read` 与 `thread-loaded-list` 不再依赖 app-server 的缺省 interactive-only `source_kinds` 语义，而会显式传完整 `ThreadSourceKind` 列表，并通过 README / 单测把“联调客户端默认看全量 interactive + non-interactive 线程来源”这层行为写死，避免手工验证 resident non-interactive 线程时被默认过滤误导
@@ -1327,6 +1334,7 @@ SQLite 在这里不是起点，而是收敛点。
 更合理的最小目标是：
 
 - 有一个远端消费者可以稳定列出线程
+- 在 unknown-thread 或本地缺摘要时，能回到 `thread/read` 补权威当前摘要
 - 能区分 `interactive` 和 `residentAssistant`
 - 能对 resident thread 执行 reconnect
 - 能消费 status-only 的增量通知
@@ -1408,6 +1416,7 @@ SQLite 在这里不是起点，而是收敛点。
 这个 PR 不该一上来做成完整产品，而应聚焦：
 
 - 列表
+- unknown-thread 或缺摘要时回到 `thread/read` 补权威当前摘要
 - reconnect
 - status 增量
 - 断连后重拉 summary
@@ -1656,6 +1665,7 @@ SQLite 在这里不是起点，而是收敛点。
 最值得先锁住的能力是：
 
 - 列表摘要来自 `thread/list`
+- unknown-thread 或缺摘要时回到 `thread/read`
 - loaded 运行态刷新来自 `thread/loaded/read`
 - 增量刷新只来自 `thread/status/changed`
 - reconnect 入口来自 `thread/resume`
@@ -1748,7 +1758,7 @@ SQLite 在这里不是起点，而是收敛点。
 - resident mode 文案与 typed 消费统一
 - observer 的 cwd 迁移与清理
 - SQLite 在 metadata repair 路径上的权威来源收敛
-- remote bridge 最小列表/重连闭环
+- remote bridge 最小列表 / read 补读 / 重连闭环
 
 不要在同一个 PR 同时解决两个主问题。
 
@@ -1960,6 +1970,10 @@ SQLite 在这里不是起点，而是收敛点。
 
 如果这些路径里有任意一个开始“说另一套话”，那就是高优先级 review 问题。
 
+此外还应继续检查：
+
+- websocket remote facade 是否继续在 `thread/resume`、`thread/read`、`thread/list`、`thread/loaded/read` 上原样保留服务端返回的 `Thread`
+
 ### 3. 再看通知面有没有破坏分层
 
 这条主线里最容易被顺手破坏的通知就是：
@@ -2085,6 +2099,7 @@ review 时最值得问的不是：
 - `thread/loaded/list` 仍严格保持 id-only probe
 - `thread/loaded/read` 仍承担 loaded `mode + status` 恢复面
 - `thread/resume` 在 resident thread 上的产品语义仍明确是 reconnect
+- remote facade 不会把服务端已返回的 repaired `Thread` 重新降级成客户端补读职责
 
 如果这些条件里还有任何一条需要靠“读代码猜一下”，那这个 PR 还不应算完成。
 
@@ -2376,6 +2391,18 @@ review 时最值得问的不是：
 - 文档同步入口
 - 完成定义
 
+如果当前已经不是在问“该进哪一包”，而是在问“怎么把对应 checklist / file todo / PR template 串成真正的提交流程”，更适合继续看：
+
+- `docs/persistent-runtime-pr-workflow.md`
+
+如果当前已经准备直接起草某一包的 PR，更适合继续看：
+
+- `docs/persistent-runtime-pr-drafts.md`
+
+如果当前面对的不是单一任务包，而是“这次本地工作树该先拆成哪几包”，更适合继续看：
+
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+
 而这份 `codex-rs-source-analysis.md` 更适合保留为：
 
 - 架构分析
@@ -2387,6 +2414,583 @@ review 时最值得问的不是：
 - 某个新阶段已经真实落地，需要补一段阶段总结
 
 而不是继续把执行细节堆回来。
+
+## 48. 当前阶段快照（2026-04-13，继续收口后）
+
+如果按 2026-04-13 当前这轮本地改动继续往前看，这份总分析文档更适合只额外记住一个新的阶段判断：
+
+- SQLite 这包当前最关键的 helper 分叉已经更接近“收尾”而不是“继续扩点”
+- remote bridge 最小消费闭环也已经更接近“回归基线”而不是“待设计能力”
+
+更具体地说，当前已经有两条新事实可以直接作为后续默认前提：
+
+- `app-server` 的 loaded-thread 读取面已经开始共用同一条 loaded summary helper：`thread/list`、`thread/read` 的 loaded fallback，以及 `thread/loaded/read` 不再各自重复一份 rollout summary 拼装逻辑，而会统一保留当前 loaded thread 持有的 provider override、外部 rollout path 与 repaired summary
+- `codex-app-server-client` 的 remote typed facade 现在也已把这条契约补成读取面对称回归：当 websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list`、`thread/loaded/read` 时，typed client 会继续原样保留 `thread.mode + preview + status + path + name`；而 `thread/loaded/list` 仍继续保持 id-only probe，不会被漂成完整摘要接口
+
+如果把这轮本地改动继续往更高层消费者看，还可以再记住一个新的阶段事实：
+
+- `codex-tui` 这条最终消费链也已进一步补成更完整的 resident-aware 回归：`app_server_session.rs` 的 loaded/read 外部 rollout repaired summary、`app.rs` 的 authoritative `thread/read` fallback、`resume_picker.rs` 的 resident / interactive / unknown action hint，以及 `chatwidget.rs` 的 resident label / rename follow-up hint，现在都已有直接断言锁住，不再只是在会话层保 resident mode、却让最终 UI 文案继续停留在泛化 resume 心智
+- `codex-exec` 与顶层 `codex` 包装层的 bootstrap / help / exit-summary 语义现在也已继续补齐对照项：`thread.started`、human-readable `session mode/session action`、`exec resume` 帮助里的 `SESSION_ID_OR_NAME`、以及顶层 CLI 的 `resume or reconnect` 帮助和 interactive / resident exit hint 都已有直接回归，避免只在底层事件或单一二进制里锁住 resident reconnect，而把主入口包装层继续留在旧语义
+
+按这轮本地验证结果看，至少下面这些回归已经能直接支撑这个判断：
+
+- `cargo test -p codex-app-server-client remote_typed_thread_`
+- `cargo test -p codex-app-server --test all thread_`
+- `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_uses_loaded_external_rollout_path`
+- `cargo test -p codex-tui`
+- `cargo test -p codex-exec`
+- `cargo test -p codex-cli`
+
+这意味着如果现在继续问“沿着本文应该做什么后续任务”，更合理的默认答案已经不是：
+
+- 再给 `rollout/state_db` 补一个类似 helper 个案
+- 再给 remote bridge 同层文档扩一轮同义描述
+
+而应该是：
+
+- 把这批 SQLite / loaded summary / remote facade 的已落地边界整理成提交级收口
+- 只在发现新的上层消费者仍然重写 unknown-thread 恢复逻辑或重新把 loaded polling 当成半恢复接口时，再补对应代码闭环
+- 如果这些消费者都已经站稳，就把下一段工作切到更高层的 observer / TUI / bridge 壳层消费，而不是继续回到同层总文档扩写
+
+换句话说，到这个阶段，这份文档更适合继续扮演的角色已经很明确：
+
+- 记录阶段结论
+- 指向下一份 checklist / file todo
+- 帮助判断“当前是不是该离开总文档、回到具体代码闭环了”
+
+而不是再承载新的实现级待办本体。
+
+## 49. 三条主线的默认优先级也已经变化
+
+如果继续沿这份文档问“接下来默认先做哪一包”，按当前本地状态，更贴近现实的排序已经不再是最初写下主线时的样子。
+
+现在更合理的判断是：
+
+- remote bridge 最小消费闭环已经基本站稳
+- observer 事件源收口也已经更接近边界回归索引
+- SQLite / loaded summary / repaired summary 这条线则处在“最后一轮提交级收口”的阶段
+
+这三个判断叠在一起，意味着当前默认下一站更适合是：
+
+- 按 `docs/persistent-runtime-current-worktree-pr-split.md` / `docs/persistent-runtime-pr-workflow.md` 继续整理提交边界
+- 或切到真正消费这层稳定线程摘要的更高层入口
+
+而不是重新开启另一轮同层协议或状态基础设施扩写。
+
+如果需要一个更短的执行规则，可以直接按下面记：
+
+1. 先看是不是还有新的消费者重新猜 `mode`、重写 unknown-thread 恢复逻辑，或把 `thread/loaded/read` 当成半恢复接口
+2. 如果没有，就不要继续在这层文档链上扩写，而应切到更高层消费者实现
+3. 只有当新阶段真的已经落地，才回到这份总文档补一小段阶段总结
+
+到这里，这份源码分析文档的后续任务定义也已经更清楚了：
+
+- 它负责宣布“哪一条主线现在已不再是默认开工点”
+- 不负责继续承载那条主线的具体 file todo
+
+## 50. 如果继续开工，默认更该切到哪些高层消费者
+
+当 remote bridge 最小消费、observer 边界和 SQLite repair 这三层都已经基本站稳后，“继续沿本文后续任务”就不该再默认理解成：
+
+- 回去补一个新的最小消费者
+- 再给 `rollout/state_db` 增加一个同类 repair helper
+- 再把同一条契约换个说法补进另一份文档
+
+更合理的默认下一站应该直接是这几个更高层消费者：
+
+1. `codex-rs/tui/`
+2. `codex-rs/exec/`
+3. 未来真正的 remote bridge / 控制面壳层
+
+原因也已经比较清楚：
+
+- `tui` 是当前最靠近真实产品体验的本地消费者，最容易暴露“读取面虽然已稳定，但最终展示或恢复入口仍各说各话”的问题
+- `exec` 是当前最靠近脚本化与自动化消费的入口，最容易暴露 bootstrap summary、JSON 首事件与 human-readable 提示之间是否仍存在双轨语义
+- 真正的 remote bridge 壳层已经不需要再发明线程语义；它更应该直接建立在 `thread/list` / `thread/read` / `thread/loaded/read` / `thread/status/changed` / `thread/resume` 这组已收口接口之上
+
+因此，如果当前没有新的基础层回归失败，更适合的最短执行规则已经变成：
+
+1. 先检查 `tui` / `exec` / bridge 壳层里是否还有地方没有直接信返回的 `Thread`
+2. 再检查这些高层消费者是否还在自己脑补 reconnect、unknown-thread 恢复或 loaded polling 语义
+3. 只有发现新的基础层分叉时，才回到 remote bridge / observer / SQLite 清单继续补低层
+
+这也意味着：
+
+- `docs/persistent-runtime-checklists-index.md` 仍然是阶段判断入口
+- 但真正继续开工时，更不该默认停在 checklist 本身
+- 更合理的动作是带着这些 checklist 结论，直接进入具体消费者代码闭环
+
+## 51. 更高层消费者的默认文件入口
+
+如果继续沿本文往下开工，最有价值的不是再问“该看哪份 checklist”，而是直接问：
+
+- 在 `tui` 里先看哪几个文件
+- 在 `exec` 里先看哪几个文件
+
+按当前代码形态，更合理的默认入口可以直接记成下面这样。
+
+### 1. `codex-rs/tui/`
+
+默认先看：
+
+1. `codex-rs/tui/src/app_server_session.rs`
+2. `codex-rs/tui/src/app.rs`
+3. `codex-rs/tui/src/resume_picker.rs`
+4. `codex-rs/tui/src/chatwidget.rs`
+
+原因是：
+
+- `app_server_session.rs` 是 TUI typed 消费 app-server 线程摘要的第一层边界，最适合检查它是否仍直接信 `thread/read` / `thread/list` / `thread/loaded/read` / `thread/resume` 返回的 `Thread`
+- `app.rs` 是 live attach、inactive thread fallback、store/widget 注入这些更高层恢复路径真正汇总的地方，最容易暴露某条路径是否又重新脑补 reconnect、unknown-thread 恢复或 loaded polling 语义
+- `resume_picker.rs` 是最直接的列表消费与动作映射入口，最容易检查 `interactive -> resume`、`residentAssistant -> reconnect` 是否在最终 UI 上继续一致
+- `chatwidget.rs` 是最终展示和 follow-up hint 收口面，最容易暴露“底层状态对了，但最终用户文案又退回泛化 session 心智”的问题
+
+如果当前没有新的低层回归失败，那么 TUI 里更值得优先补的通常不是再加字段，而是继续检查：
+
+- live attach 失败后的 fallback 是否仍直接信 `thread/read`
+- inactive thread / archived thread / rollback replay 这些高层入口是否仍保留 `thread_mode`
+- 最终 UI label、hint、status 卡片是否仍和读取面语义完全一致
+
+### 2. `codex-rs/exec/`
+
+默认先看：
+
+1. `codex-rs/exec/src/lib.rs`
+2. `codex-rs/exec/src/event_processor_with_human_output.rs`
+3. `codex-rs/exec/src/event_processor_with_jsonl_output.rs`
+4. `codex-rs/exec/src/exec_events.rs`
+
+原因是：
+
+- `lib.rs` 里已经承载了 bootstrap、首个 `thread.started` 事件以及 `turn/completed` 后的 `thread/read` backfill，这里最适合检查 exec 是否还在某条收尾路径上重新发明摘要恢复逻辑
+- `event_processor_with_human_output.rs` 是 human-readable `session mode/session action` 的最终出口，最适合检查普通 interactive resume 与 resident reconnect 是否继续保持一套稳定映射
+- `event_processor_with_jsonl_output.rs` 与 `exec_events.rs` 是脚本消费面的首要边界，最适合检查 `thread.started` JSON 首事件是否仍是权威 bootstrap summary，而不是又要求调用方补一次额外读取
+
+如果当前没有新的基础层分叉，exec 里更值得优先补的通常是：
+
+- human-readable 摘要与 JSON 首事件是否仍表达同一套 bootstrap 语义
+- `thread/read` backfill 是否仍只服务 turn item 恢复，而不是把 bootstrap 语义重新变成二次补读职责
+- 文档、公开 event 注释和真实输出是否仍保持一致
+
+### 3. 未来 remote bridge 壳层
+
+如果后续真的开始写新的 bridge 壳层，默认最该直接继承的契约已经很清楚：
+
+- 列表摘要来自 `thread/list`
+- unknown-thread 或缺摘要时回到 `thread/read`
+- loaded 当前摘要来自 `thread/loaded/read`
+- 增量只来自 `thread/status/changed`
+- reconnect 统一来自 `thread/resume`
+
+也就是说，下一层真正该做的不是重新解释线程语义，而是直接把这组已收口的读取面与增量面组装成产品壳层。
+
+## 52. 这些高层入口里最值得先看的具体问题
+
+仅仅知道“先看哪些文件”还不够；如果继续沿本文真的去开工，更有价值的是先带着问题进入这些文件。
+
+### 1. TUI 侧默认先问什么
+
+对 `codex-rs/tui/`，最值得优先确认的通常是这三类问题：
+
+- `thread/started`、`thread/read`、`thread/loaded/read` 与 `thread/resume` 进来的线程摘要，是否都还在同一层被直接映射成 `ThreadSessionState`
+- live attach 失败或 inactive thread fallback 时，TUI 是否仍直接信 `thread/read` 返回的权威摘要，而不是在上层自己重建 resident / reconnect 语义
+- subagent backfill、agent picker、resume picker、chat widget、status card 这些最终消费面，是否仍继续共享同一套 `thread_mode` / `status` 心智，而不是局部又退回旧文案
+
+按当前代码形态，这几个位置尤其值得带着这些问题去读：
+
+- `app_server_session.rs`
+  这里最值得看的是 typed response 到 `ThreadSessionState` 的映射边界，以及 `next_event()` 对 `thread/started` / `thread/status/changed` 的消费是否仍保持“started 带完整摘要、status 只带增量”
+- `app.rs`
+  这里最值得看的是 inactive thread 通知注入、live attach 失败后的 `thread/read` fallback、以及 `backfill_loaded_subagent_threads(...)` 是否仍坚持用 `thread/loaded/read` 而不是误把 `thread/loaded/list` 当摘要接口
+- `resume_picker.rs` / `chatwidget.rs`
+  这里最值得看的是最终 mode label、action hint、reconnect 文案和错误态徽标是否仍直接建立在 `Thread.mode` 上，而不是从局部 UI 状态再猜一次
+
+换句话说，TUI 这层更像是在检查：
+
+- “权威摘要有没有被继续直接消费”
+- 而不是再检查底层接口本身有没有字段
+
+### 2. exec 侧默认先问什么
+
+对 `codex-rs/exec/`，最值得优先确认的通常是这三类问题：
+
+- bootstrap 语义是否仍在首个 `thread.started` 事件和 human-readable `session mode/session action` 摘要之间保持一致
+- `thread/read` 在 exec 里是否仍只承担 turn completion 后的 item backfill，而没有重新退回成 bootstrap/reconnect 语义必须依赖的额外补读
+- 公开 JSON event 注释、README 和真实 stdout/stderr 输出是否仍在说同一套话
+
+按当前代码形态，这几个位置尤其值得带着这些问题去读：
+
+- `lib.rs`
+  这里最值得看的是 bootstrap、`thread.started` 发射，以及 `turn/completed` 后的 `maybe_backfill_turn_completed_items(...)`；这段逻辑最容易在后续改动里把“收尾补 item”误扩成“补线程语义”
+- `event_processor_with_human_output.rs`
+  这里最值得看的是 `config_summary_entries(...)`、`summarize_thread_mode(...)` 与 `summarize_thread_action(...)` 是否仍让 interactive/resident 两条路径稳定映射成 `resume/reconnect`
+- `event_processor_with_jsonl_output.rs` / `exec_events.rs`
+  这里最值得看的是 `thread_started_event(...)` 与公开 JSON 字段注释，确认脚本消费面是否仍把首个 `thread.started` 视为权威 bootstrap summary
+
+换句话说，exec 这层更像是在检查：
+
+- “第一跳 bootstrap 摘要是否仍然单一且可信”
+- 而不是继续给后续 CLI 输出补零散提示
+
+### 3. bridge 壳层默认先问什么
+
+如果后续真的去做新的 remote bridge 壳层，最值得先问的则不是“底层还缺什么字段”，而是：
+
+- 首页列表是不是直接消费 `thread/list`
+- unknown-thread / 缺摘要是不是直接回到 `thread/read`
+- loaded 当前态是不是直接消费 `thread/loaded/read`
+- 增量是不是只来自 `thread/status/changed`
+- reconnect 是不是只来自 `thread/resume`
+
+只要这五个问题仍然答成同一套接口分工，就说明新的壳层还是建立在这轮已收口的主干之上，而不是又在高层重新发明一套线程恢复协议。
+
+## 53. 继续开工时更合适的最小切片
+
+如果沿本文继续往下，不想再停留在“读哪里、问什么”，那么更适合的下一步就是把高层消费者继续压成最小可提交切片。
+
+### 1. TUI 的最小切片
+
+更合理的第一刀通常不是“把所有 TUI resident-aware 入口再梳一遍”，而是只收一条清晰主线，例如：
+
+- `ThreadSessionState` 映射
+- live attach fallback
+- 最终一个展示面
+
+也就是优先让下面这条链完全说同一套话：
+
+- `app_server_session.rs` 负责直接信 app-server 返回的 `Thread`
+- `app.rs` 负责在 attach 失败或 inactive thread 路径上继续直接信 `thread/read`
+- `resume_picker.rs` 或 `chatwidget.rs` 负责把这份模式/动作语义最终稳定显示出来
+
+如果一个 TUI PR 同时开始碰：
+
+- picker
+- chat widget
+- status card
+- subagent backfill
+- slash command 文案
+
+那通常就已经太散了。
+
+### 2. exec 的最小切片
+
+更合理的第一刀通常也不是“把 exec 的所有输出面都一起改”，而是只收一条 bootstrap 语义主线，例如：
+
+- `thread.started` JSON 首事件
+- human-readable `session mode/session action`
+- `thread/read` backfill 仍只服务 turn completion item 恢复
+
+也就是优先让下面这条链完全说同一套话：
+
+- `lib.rs` 负责发出 bootstrap 事件和必要的收尾 backfill
+- `event_processor_with_jsonl_output.rs` 负责 JSON 首事件契约
+- `event_processor_with_human_output.rs` 负责 human-readable bootstrap 契约
+
+如果一个 exec PR 同时开始碰：
+
+- bootstrap 事件
+- final message 输出
+- unrelated stderr 格式
+- help 文案
+- 非 bootstrap 的 item 渲染
+
+那也通常已经超出“最小闭环”了。
+
+### 3. bridge 壳层的最小切片
+
+如果后续真的开始写新的 remote bridge 壳层，更合理的第一刀也不该一上来做完整产品，而应只做：
+
+- 一份线程列表
+- 一份当前 loaded 摘要
+- 一条 status-only 增量
+- 一个 reconnect 动作
+
+也就是优先只收下面这条闭环：
+
+- `thread/list`
+- unknown-thread 时的 `thread/read`
+- `thread/loaded/read`
+- `thread/status/changed`
+- `thread/resume`
+
+只要这五条已经在壳层里形成稳定闭环，就已经足够证明高层产品不需要重新发明线程语义。
+
+### 一个更短的提交规则
+
+如果需要一个最短规则，可以直接按下面执行：
+
+1. 一个 PR 只收一条高层消费者主线
+2. 这条主线必须同时包含一个真实消费入口、一个负向边界和一组对应测试
+3. 如果开始把“帮助文案、多个 UI 面、多个恢复路径”一起混进来，就应该重新切 PR
+
+## 54. 这些最小切片最值得先跑哪些测试
+
+如果继续沿本文真的去开工，更高效的做法已经不是先跑整 crate，而是先抓住最贴近这条主线的测试入口。
+
+### 1. TUI 切片
+
+如果当前收的是：
+
+- `ThreadSessionState` 映射
+- live attach fallback
+- inactive thread 通知恢复
+- 最终 widget / store 的 resident continuity
+
+那么更值得先看的测试入口通常是：
+
+- `codex-rs/tui/src/app_server_session.rs`
+  - `resume_thread_preserves_resident_thread_mode`
+  - `next_event_preserves_resident_thread_mode_boundary`
+- `codex-rs/tui/src/app.rs`
+  - `session_state_for_thread_read_preserves_resident_thread_mode`
+  - `inactive_thread_started_notification_preserves_resident_thread_mode`
+  - `inactive_thread_status_notification_preserves_resident_thread_mode`
+  - `thread_rollback_response_preserves_resident_thread_mode_for_store_and_widget`
+- `codex-rs/tui/src/status/tests.rs`
+  - `status_snapshot_includes_resident_thread_mode`
+
+如果改动已经触到最终 UI 文案或 picker 展示，再扩大到：
+
+- `codex-rs/tui/src/resume_picker.rs` 的 resident label / row 映射测试
+- `codex-rs/tui/src/chatwidget/tests/`
+- 对应 snapshot 测试
+
+### 2. exec 切片
+
+如果当前收的是：
+
+- bootstrap `thread.started`
+- human-readable `session mode/session action`
+- `thread/read` backfill 的职责边界
+
+那么更值得先看的测试入口通常是：
+
+- `codex-rs/exec/src/event_processor_with_human_output_tests.rs`
+  - resident/interactive `session mode`
+  - resident/interactive `session action`
+  - unknown mode 不输出 `session mode/session action`
+- `codex-rs/exec/src/event_processor_with_jsonl_output_tests.rs`
+  - `thread_started_event_serializes_resident_thread_mode`
+  - `thread_started_event_omits_thread_mode_when_unknown`
+- `codex-rs/exec/tests/event_processor_with_json_output.rs`
+  - `thread.started` 的公开 JSON 形状回归
+- `codex-rs/exec/tests/suite/resume.rs`
+  - human-readable stderr 的 resident/interactive `session mode/session action`
+  - `--json` 下 `thread.started` 的 `thread_mode`
+  - `--json` 不泄露 human-readable session summary
+
+如果改动已经触到 `maybe_backfill_turn_completed_items(...)` 这一层，再补：
+
+- `codex-rs/exec/src/lib_tests.rs`
+
+### 3. bridge 壳层切片
+
+如果后续真的开始写新的 remote bridge 壳层，最值得先跑的依然应该是当前这条已收口主干上的现有回归，而不是壳层自己先发明新测试面：
+
+- `codex-app-server` 上的 `thread/list` / `thread/read` / `thread/loaded/read` / `thread_status` / `thread_resume`
+- `codex-app-server-client` 上的 remote typed facade 回归
+- `codex-debug-client` 与 `codex-app-server-test-client` 上的最小消费者回归
+
+一个更短的规则可以直接记成：
+
+1. 先跑离当前切片最近的单测/集成测试
+2. 再扩大到对应 crate
+3. 只有当这条最小闭环已经稳定，才值得继续往更大的 UI 或壳层范围扩
+
+## 55. 这些最小切片更合适的完成定义
+
+如果继续沿本文往下推进，到这里最值得补的已经不是新的入口，而是每种最小切片到底什么时候算“可以停手”。
+
+### 1. TUI 切片什么时候算完成
+
+至少应满足：
+
+- 一个真实入口已经直接消费了 app-server 返回的权威 `Thread`
+- 一个 fallback 或 inactive-thread 路径已经证明不会重新脑补 resident / reconnect 语义
+- 一个最终展示面已经把 `Thread.mode` 稳定映射成正确的 UI label / action hint
+- 对应 resident continuity 测试已经覆盖到 session 层和最终展示层
+
+review 时最值得先问：
+
+1. 这包改动是不是只收了一条 TUI 恢复主线
+2. `ThreadSessionState` 是否仍是唯一线程模式中间态，而不是又在别处复制一份
+3. attach 失败或 replay fallback 时，是不是仍直接信 `thread/read`
+4. 最终 UI 文案是不是仍直接来自 `Thread.mode`，而不是局部猜测
+
+### 2. exec 切片什么时候算完成
+
+至少应满足：
+
+- `thread.started` 首事件和 human-readable `session mode/session action` 继续表达同一套 bootstrap 语义
+- `thread/read` 仍只承担 turn completion item backfill，而不是重新变成 bootstrap 语义补读
+- JSON 输出、stderr 输出、README / event 注释之间没有再次分叉
+- resident / interactive / unknown-mode 三类分支都已有对应断言
+
+review 时最值得先问：
+
+1. 这包改动是不是只收了一条 bootstrap 语义主线
+2. `thread.started` 是否仍然是脚本消费面的第一权威摘要
+3. human-readable `session mode/session action` 是否仍和 JSON 首事件一一对应
+4. `thread/read` backfill 有没有被误扩成线程语义恢复逻辑
+
+### 3. bridge 壳层切片什么时候算完成
+
+至少应满足：
+
+- 首页列表已经稳定建立在 `thread/list`
+- unknown-thread 或缺摘要时已经稳定回到 `thread/read`
+- loaded 当前态已经稳定建立在 `thread/loaded/read`
+- 增量已经稳定建立在 `thread/status/changed`
+- reconnect 动作已经稳定建立在 `thread/resume`
+
+review 时最值得先问：
+
+1. 这包改动是不是只收了这五段最小闭环
+2. 壳层有没有重新发明另一套 unknown-thread 恢复逻辑
+3. `thread/loaded/list` 有没有被错误抬升成完整摘要接口
+4. `thread/status/changed` 有没有被错误当成完整恢复来源
+5. reconnect 动作是不是仍只来自 `Thread.mode + thread/resume`
+
+一个更短的停手规则可以直接记成：
+
+1. 真实入口已通
+2. 负向边界已锁
+3. 最终展示或最终动作已跟上
+4. 没有顺手把第二条主线一起做掉
+
+## 56. 按角色分流的 handoff 入口
+
+如果后续不是你自己继续做，而是要把这条线交给别人接手，那么到这里最有价值的补充已经不是更多设计说明，而是把不同角色该从哪里进写清楚。
+
+### 1. 实现者
+
+如果接手人是直接写代码的实现者，更合理的默认入口是：
+
+1. 先看本文件第 50 到 55 节，确认当前默认主线、最小切片、测试入口和完成定义
+2. 再去 `docs/persistent-runtime-implementation-plan.md` 看同一条主线在实现计划里的对应位置
+3. 如果当前要先判断自己该进哪一包，先去 `docs/persistent-runtime-checklists-index.md`
+4. 如果当前 worktree 已经明显混了两条主线，先去 `docs/persistent-runtime-current-worktree-pr-split.md`
+5. 最后才进入对应代码目录：
+   - `tui`
+   - `exec`
+   - 或新的 bridge 壳层
+
+实现者最不应该做的事是：
+
+- 重新从 resident / observer / SQLite 总设计开始发散
+- 在没选定最小切片前同时改多个高层入口
+
+### 2. reviewer
+
+如果接手人是 review 这条线的改动，更合理的默认入口是：
+
+1. 先看本文件第 55 节的完成定义
+2. 再看对应 checklist / file todo 里那条主线的负向边界
+3. 如果当前 diff 已经明显混包，先去 `docs/persistent-runtime-current-worktree-pr-split.md`
+4. 最后再回到 diff 判断这包 PR 是否把第二条主线一起带进来了
+
+reviewer 最该优先拦下的情况通常是：
+
+- 明明是高层消费者 PR，却顺手改了新的基础层协议语义
+- 明明只该收 bootstrap / fallback / final display 其中一条，却把多个恢复面和帮助文案一起混进来
+- 没有负向边界测试，却试图声称这一包已经收口
+
+### 3. 集成方 / 壳层实现者
+
+如果接手人是未来要写 remote bridge、控制面或其他外部壳层的集成方，更合理的默认入口是：
+
+1. 先看本文件第 50、52、53、54、55 节
+2. 再看 `docs/remote-bridge-consumption.md`
+3. 如果当前已经进入提交流程，再看 `docs/persistent-runtime-pr-workflow.md`
+4. 然后直接按那五段最小闭环消费现有接口：
+   - `thread/list`
+   - `thread/read`
+   - `thread/loaded/read`
+   - `thread/status/changed`
+   - `thread/resume`
+
+集成方最不应该做的事是：
+
+- 自己重定义 unknown-thread 恢复协议
+- 把 `thread/loaded/list` 抬成完整摘要接口
+- 从通知面重新猜 resident reconnect 语义
+
+### 一个更短的 handoff 规则
+
+如果需要一个最短版本，可以直接按下面交接：
+
+1. 先选角色：实现、review、还是集成
+2. 再选最小切片：TUI、exec、还是 bridge
+3. 最后按对应测试入口和完成定义收口
+
+做到这里，这份总文档对后续 handoff 的作用就已经基本完整了：
+
+- 它不负责替实现者写 file todo
+- 但它已经足够告诉下一个人“你该从哪一层开始，而不是回到最上游重做一次分诊”
+
+## 57. 最短默认行动顺序
+
+如果后续还要继续沿这份文档推进，但又不想在第 50 到 56 节之间来回跳，那么更适合直接按下面这组最短顺序执行：
+
+1. 先判断自己当前角色：
+   - 实现
+   - review
+   - 集成
+2. 再判断自己当前切片：
+   - `tui`
+   - `exec`
+   - bridge
+3. 只选一个最小闭环：
+   - 一个真实入口
+   - 一个负向边界
+   - 一个最终展示或最终动作
+4. 先跑离这条闭环最近的测试，而不是先跑整 crate
+5. 用第 55 节的完成定义判断这包是否已经可以停手
+6. 如果发现自己开始同时修改第二条主线，就不要继续往同一包里堆；先去 `docs/persistent-runtime-current-worktree-pr-split.md` 拆包，再按 `docs/persistent-runtime-pr-workflow.md` 整理提交
+
+如果需要再压成一句话，可以直接记成：
+
+- 先选角色
+- 再选切片
+- 再选最小闭环
+- 然后只用测试、完成定义和 worktree split 来约束停手点
+
+到这里，这份总文档已经不该再继续承担新的实现级拆解任务；它更合适的用途已经固定为：
+
+- 给下一步工作做分诊
+- 给最小切片做边界约束
+- 给 handoff 和 review 提供统一入口
+
+## 58. 什么时候不该再改这份文档
+
+如果后续有人还想继续往这份总文档里加内容，更合理的第一问已经不是“还能补什么”，而是：
+
+- 这段内容是不是其实应该进 checklist
+- 这段内容是不是其实应该进 file todo
+- 这段内容是不是其实应该直接落到代码和测试里
+
+一般来说，下面这些情况都不该继续改这份文档：
+
+- 只是发现了一个新的文件级待办
+- 只是想补一条新的测试入口
+- 只是想把某个 PR 的 scope 再拆细
+- 只是想把同一条契约换个说法再写一遍
+
+更适合继续修改本文件的触发条件应该只剩两类：
+
+1. 某个阶段已经真实落地，需要补一小段阶段总结
+2. 默认开工顺序、默认主线优先级或 handoff 入口发生了变化
+
+如果不满足这两个条件，更合理的动作通常是：
+
+- 去改实现计划
+- 去改 checklist / file todo
+- 去补代码和测试
+
+到这里，这份 `codex-rs-source-analysis.md` 的角色已经基本固定：
+
+- 它是总入口
+- 它不是活的任务堆栈
 
 ## 附：本分析的依据
 

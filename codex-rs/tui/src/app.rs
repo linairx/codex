@@ -8040,6 +8040,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_state_for_thread_read_prefers_authoritative_thread_summary_over_stale_primary()
+    {
+        let mut app = make_test_app().await;
+        let stale_thread_id = ThreadId::new();
+        app.primary_session_configured = Some(ThreadSessionState {
+            thread_name: Some("stale interactive thread".to_string()),
+            thread_mode: Some(ThreadMode::Interactive),
+            model: "stale-model".to_string(),
+            model_provider_id: "stale-provider".to_string(),
+            rollout_path: Some(PathBuf::from("/tmp/stale-rollout.jsonl")),
+            ..test_thread_session(stale_thread_id, PathBuf::from("/tmp/stale-cwd"))
+        });
+
+        let temp_dir = tempdir().expect("tempdir");
+        let rollout_path = temp_dir.path().join("resident-thread.jsonl");
+        std::fs::write(&rollout_path, "").expect("rollout should be writable");
+
+        let thread_id = ThreadId::new();
+        let thread = Thread {
+            id: thread_id.to_string(),
+            forked_from_id: None,
+            preview: "resident fallback thread".to_string(),
+            ephemeral: false,
+            model_provider: "mock_provider".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::Idle,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: Some(rollout_path.clone()),
+            cwd: PathBuf::from("/tmp/external"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli.into(),
+            agent_nickname: Some("Atlas".to_string()),
+            agent_role: Some("worker".to_string()),
+            git_info: None,
+            name: Some("resident fallback thread".to_string()),
+            turns: Vec::new(),
+        };
+
+        let session = app.session_state_for_thread_read(thread_id, &thread).await;
+
+        assert_eq!(session.thread_id, thread_id);
+        assert_eq!(
+            session.thread_name.as_deref(),
+            Some("resident fallback thread")
+        );
+        assert_eq!(session.thread_mode, Some(ThreadMode::ResidentAssistant));
+        assert_eq!(session.model_provider_id, "mock_provider".to_string());
+        assert_eq!(session.cwd, PathBuf::from("/tmp/external"));
+        assert_eq!(session.rollout_path, Some(rollout_path));
+        assert_eq!(session.model, String::new());
+    }
+
+    #[tokio::test]
     async fn refresh_agent_picker_thread_liveness_prunes_closed_metadata_only_threads() -> Result<()>
     {
         let mut app = make_test_app().await;

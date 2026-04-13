@@ -5,10 +5,11 @@
 - `docs/codex-rs-source-analysis.md`
 - `docs/observer-event-flow-design.md`
 - `docs/remote-bridge-minimal-consumption-checklist.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 目标不是再解释 observer 为什么有价值，而是把“把 observer 从状态标记推进成正式事件源”收成一份可直接执行的清单。
 
-## 0. 当前本地进度快照（2026-04-12）
+## 0. 当前本地进度快照（2026-04-13）
 
 按当前工作树与刚通过的服务端集成测试看，这一阶段也已经不再是纯设计稿状态，而是已有一批 observer 相关边界被真实钉在 `app-server` 上。
 
@@ -35,6 +36,11 @@
 - `cargo test -p codex-app-server moving_resident_watch_to_new_cwd_ignores_old_workspace_changes`
 - `cargo test -p codex-tui workspace_changed_status_is_consistent_across_read_list_and_loaded_read`
 
+按当前 2026-04-13 这轮本地改动继续往前看，这份清单更适合额外记住一个现实判断：
+
+- observer 这包当前已经更接近“边界回归索引”而不是“等待主干实现”
+- 后续更值得补的通常不会是再发明一套 watcher 语义，而是检查新的上层消费者或恢复路径有没有重新打破现有 status-only / 读取面分层
+
 这意味着这份清单当前更适合继续承担：
 
 - 检查 watcher 生命周期和 observer 读取面是否还有未统一的边缘恢复路径
@@ -55,6 +61,11 @@
 - observer 相关改动的边界回归索引
 
 而不是当前主线里最优先的新开工包。
+
+如果当前要做的已经不是“继续补 observer 主干边界”，而是“把这包整理成单独 PR，或判断它是否已经和 baseline / SQLite 混包”，更适合继续看：
+
+- `docs/observer-event-source-pr-template.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 ## 1. 这一阶段要解决什么
 

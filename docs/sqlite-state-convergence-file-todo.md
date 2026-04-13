@@ -4,6 +4,7 @@
 
 - `docs/sqlite-state-convergence-checklist.md`
 - `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 目标不是再补一层 SQLite 总设计，而是把当前这包“状态来源收敛”继续压成文件级待办，方便直接开工、review 和拆 PR。
 
@@ -14,6 +15,7 @@
 当前已经明显命中本地改动的主要文件或目录：
 
 - `codex-rs/rollout/src/state_db.rs`
+- `codex-rs/state/`
 - `codex-rs/app-server/src/codex_message_processor.rs`
 - `codex-rs/app-server/tests/suite/v2/thread_read.rs`
 - `codex-rs/app-server/tests/suite/v2/thread_resume.rs`
@@ -37,6 +39,9 @@
 
 - 这份 TODO 默认假设 resident continuity 基线、remote bridge 最小消费和 observer 读取面都已经基本站稳
 - 因此这里的主问题不再是“加更多 mode 字段”，而是“继续消灭半修复状态和分叉的权威来源”
+- 按当前本地改动集看，`rollout/state_db` 这层 helper 已经明显进入收尾阶段：`read_repair_rollout_path()` 的 existing-row / missing-row、archived / unarchived 几组关键分叉都已补上直接回归
+- `codex-state` 这层当前也已通过整 crate 本地验证，说明 resident mode 持久化与 rollout-derived summary 提取的底层地板没有再暴露新的明显缺口
+- 因此这份 TODO 当前更合理的默认下一步，也已经从“继续给 helper 叠更多个案”切到“转回 `app-server` 读取面 helper 与提交边界整理”
 
 ## 1. 这个 TODO 要服务哪个阶段
 
@@ -71,6 +76,17 @@
 
 - state-db repair helper 已经明确区分“只修路径”与“必须重新 reconcile rollout”
 
+按 2026-04-13 当前本地改动状态，这一小层已经基本接近完成：
+
+- `read_repair_rollout_path()` 的快路径 summary repair 已有直接回归
+- archived / unarchived 对称面已有直接回归
+- SQLite row 缺失时的 archived / unarchived slow path 也已有直接回归
+
+因此这里更适合作为 review 的重点已经不是“还要不要再补一个类似 helper 个案”，而是：
+
+- 这些 helper 级边界有没有在 `app-server` 读取面上继续被统一消费
+- 是否已经可以把 `rollout/state_db` 这层视为本包里相对稳定的地板
+
 ## 3. app-server 读取面与恢复面
 
 ### `codex-rs/app-server/src/codex_message_processor.rs`
@@ -87,6 +103,8 @@
 
 - `thread/rollback` 返回面已经继续走 `load_thread_summary_for_rollout(...)` 这条合并 persisted metadata 的路径，而不是单独重建另一套 rollback-only summary
 - rollback 前如果 SQLite row 已存在、但 rollout-derived preview 仍缺失，服务端与 typed client 回归都已经锁住：rollback 响应、后续 `thread/read` / `thread/list`，以及 SQLite row 会一起恢复同一份 preview，而不是只保 resident mode
+- `thread/read` 与 metadata repair 入口现在也已开始共用同一条 state-db 选择 helper：优先使用 loaded thread 自己挂着的 state-db，其次才回退到全局 state-db，避免同一类 persisted-summary repair 入口继续各自复制一份“先取哪个 SQLite 句柄”的分叉
+- `thread/archive` / `thread/unarchive` 里的旧 phase-1 TODO 注释现在也已收口到实现现状：这两条路径仍从文件系统移动 rollout 起步，但 SQLite reconcile 已经是 restored summary 与 resident continuity 的权威补齐层，不再适合继续留着“未来再改成 sqlite”这类过时提示
 
 最值得补的负向边界：
 
@@ -128,13 +146,13 @@
 待检查：
 
 - in-process typed 请求是否继续直接信服务端返回的修补后 `Thread`
-- remote facade 是否继续原样透传 repaired summary，而不是自己再补一次读取
+- remote facade 是否继续在 `thread/resume`、`thread/read`、`thread/list`、`thread/loaded/read` 上原样透传 repaired summary，而不是自己再补一次读取
 - archived / repaired / resumed 路径是否继续对称覆盖
 
 最值得补的负向边界：
 
 - typed client 不会只在 `thread/read` 看见 repaired preview，却在 `thread/resume` / `thread/unarchive` / `thread/rollback` 上退回半修复摘要
-- remote facade 不会把“服务端已经修补好 stored summary”重新降级成客户端二次补读职责
+- remote facade 不会把“服务端已经修补好 stored summary”在任一读取/恢复面上重新降级成客户端二次补读职责
 
 完成标志：
 
@@ -174,7 +192,7 @@
 
 - in-process typed client README 已明确把 `thread/resume` 返回值写成 `resume or reconnect` 的启动摘要
 - README 也已明确把 `thread/read` / `thread/list` / `thread/resume` / `thread/metadata/update` / `thread/unarchive` 这些 repaired 返回面写成可直接信任的权威摘要
-- remote facade 也已补上同层口径：websocket 远端直接返回 repaired `Thread` 时，typed remote client 应继续原样保留该摘要，而不是重新引入客户端补读
+- remote facade 也已补上同层口径：websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 应继续原样保留 `thread.mode + preview + status + path + name`，而不是重新引入客户端补读
 
 ### `docs/sqlite-state-convergence.md` 与 `docs/sqlite-state-convergence-checklist.md`
 
@@ -202,6 +220,10 @@
 4. 最后补 README / checklist / 设计稿里的阶段结论
 
 如果某个改动只是补文档，而没有顺手确认对应 helper 和测试，这一包通常还不能算真正收口。
+
+如果走到这一步时发现当前 diff 已经明显混入 resident baseline 或纯文档流程整理，更合理的动作不是继续硬收成单一 SQLite PR，而是先回：
+
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 ## 8. 这份 TODO 收完后做什么
 

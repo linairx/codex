@@ -34,7 +34,9 @@
 - `codex-state` 也已有边界测试保证：metadata patch 不会顺手覆盖 resident thread 的 `threads.mode`
 - `rollout` / SQLite 的摘要 repair 边界也已继续补齐：当 SQLite 已经有 thread 行、但 rollout-derived `first_user_message` 这类 stored summary 字段仍缺失时，read-repair 不会再停在只修 `rollout_path` 的半修复状态，而会继续 reconcile rollout，把 DB-backed `thread/list` 需要的摘要字段补完整
 - `thread/rollback` 现在也已继续对齐这条 stored-summary repair 约束：如果 rollback 前 SQLite row 已存在、但 rollout-derived preview 仍缺失，rollback 返回面、后续 `thread/read` / `thread/list`，以及 SQLite row 都会一起恢复同一份 summary，而不是只保 resident mode、继续留下空 preview
+- `app-server` 的 loaded-thread 读取面现在也已开始共用同一条 helper：`thread/list`、`thread/loaded/read` 和 `thread/read` 的 loaded fallback 不再各自重复一份 rollout summary 拼装逻辑，而是共同走 resident-aware 的 loaded summary helper；因此 loaded thread 的 provider override 也不会在 rollout metadata 缺失时悄悄退回默认 provider
 - `app-server` / `app-server-client` README 也已开始把这条契约写实：`thread/list`、`thread/resume`、`thread/read`、`thread/metadata/update`、`thread/unarchive` 这些读取/恢复面返回的 `Thread` 本身应被直接视为权威 repaired summary，而不是“先拿 mode，再额外补一次 `thread/read`”的半恢复响应
+- `codex-app-server-client` 的 remote facade 也已继续补到同一层：websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 现在都会继续原样保留 `thread.mode + preview + status + path + name`，而不是把 reconnect / stored lookup / list polling / loaded polling 的摘要修补职责重新推回客户端
 
 这意味着当前讨论的不是“要不要上 SQLite”，而是：
 
@@ -286,6 +288,8 @@ app-server 当前已经在读写 SQLite-backed thread metadata。
   这里的 “stored summaries” 不能被理解成“SQLite 行存在即可”；如果 SQLite 线程行只具备 identity / `mode`，但还缺 rollout-derived `first_user_message` / preview 这类列表面必需字段，那么 read-repair 仍应继续回到 rollout reconcile，把摘要补完整后再让 DB-backed listing 成为权威来源
 - `thread/loaded/read`
   先从当前 loaded runtime thread 组运行态摘要，再附着持久化 resident metadata，最后叠加 live status；不要把它反过来理解成“从 SQLite 读一行再顺手补 loaded 标记”
+- `thread/loaded/read`
+  这条路径现在也应继续和 loaded `thread/read` / `thread/list` 共享同一条 loaded-summary helper：如果 rollout metadata 缺失但当前 loaded thread 仍持有 provider override 或外部 rollout path，loaded polling 返回面本身就应继续保留这组摘要，而不是只在某一条读取面里单独正确
 - `thread/resume`
   如果线程当前仍在运行，优先信 live runtime thread；如果需要从历史恢复，则先按 rollout/history 回建，再补持久化 resident metadata，最后附着 runtime metadata
 - `thread/unarchive` / `thread/metadata/update`

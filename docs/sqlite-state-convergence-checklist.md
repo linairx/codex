@@ -6,6 +6,7 @@
 - `docs/sqlite-state-convergence.md`
 - `docs/observer-event-source-checklist.md`
 - `docs/sqlite-state-convergence-file-todo.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 目标不是再讨论 SQLite 为什么重要，而是把“哪些线程状态应该收敛进 SQLite、哪些不该进”收成一份可直接执行的清单。
 
@@ -20,20 +21,38 @@
 - `metadata update` / repair 的边界已经补上 resident mode 连续性保护：缺失或修补 SQLite 行时，不会把 resident thread 静默降回 interactive
 - `app-server-client` README 和 typed 回归也已开始把这条边界写实：metadata-only update、unarchive、post-unsubscribe reconnect、rollback 这些路径都应直接信任返回的 `thread.mode`，而不是要求消费侧再补一次 `thread/read` 去恢复 resident 语义
 - rollout/SQLite 的摘要收敛现在也已补上一个更细的 repair 边界：如果 SQLite 里已经有 thread 行，但 rollout-derived summary 字段还残缺，`read_repair_rollout_path()` 不会再只修路径而保留空摘要；它会继续回到 rollout reconcile，把 `first_user_message` 这类 stored summary 字段补齐，避免 `thread/read` 能从 rollout 看见线程、但 `thread/list` 因 DB fallback 过滤条件而把同一线程静默丢掉
+- `codex-rollout` 现在也已把这条 helper 级快路径边界单独锁住：当 SQLite row 已存在、路径本身也已经正确、但 rollout-derived summary 仍缺失时，`read_repair_rollout_path()` 仍会继续走 rollout reconcile，把 `first_user_message` 补回，而不是把半修复状态留给 `thread/read` / `thread/list`
+- `codex-rollout` 现在也已把同一 helper 的 archived 对称面锁住：即使 `read_repair_rollout_path()` 在 `archived_only = true` 下遇到的是“已有 SQLite row + 缺 summary”的半修复状态，它也会继续 reconcile rollout，并同时把 archived 语义正确写回，而不是只补摘要或把 archived 标记写散
+- `codex-rollout` 现在也已把同一 helper 的 unarchive 对称面锁住：如果已有 SQLite row 仍带着旧的 archived 标记、但又需要靠 rollout reconcile 补回 summary，`read_repair_rollout_path()` 在 `archived_only = false` 下也会一起清掉 `archived_at`，避免修完摘要后仍把线程留在错误的 archived 状态
+- `codex-rollout` 现在也已把同一 helper 的 slow-path archived 入口锁住：当 SQLite row 已缺失、只能靠 rollout 重建 metadata 时，`read_repair_rollout_path()` 在 `archived_only = true` 下也会直接重建带 archived 语义的完整线程行，而不是只补 path/summary 却把 archived 状态漏掉
+- `codex-rollout` 现在也已把同一 helper 的 slow-path unarchive 入口锁住：当 SQLite row 已缺失、只能靠 rollout 重建 metadata 时，`read_repair_rollout_path()` 在 `archived_only = false` 下也会直接重建未归档的完整线程行，而不是把 archived 语义留成不确定状态
 - `thread/metadata/update` 的 repair 入口现在也已继续对齐同一条摘要完整度约束：如果 SQLite row 已存在、但 `first_user_message` 这类 stored summary 字段仍缺失，服务端不会再直接拿残缺 row 组 update 响应，而会先 reconcile rollout，再返回更新后的线程摘要，避免 metadata patch 响应继续比 `thread/read` / `thread/list` 少一层 preview
 - `thread/unarchive` 现在也已补上同样的对称修复：服务端不会再只调用 `mark_unarchived()` 去移动路径与 archived 标记，而会先对恢复后的 rollout 做一次 reconcile，再读取持久化 metadata；这样 unarchive 响应、后续 `thread/list`，以及 SQLite 里的 stored summary 会一起恢复，而不是只让响应面从 rollout 临时看见 preview、DB-backed list 仍保留空摘要
 - `thread/resume` 的 persisted-metadata 入口现在也已继续对齐：如果 resume 前 SQLite row 已存在、但 rollout-derived summary 字段仍缺失，服务端不会再直接拿这条残缺 row 做 overrides merge 并继续返回响应，而会先 reconcile rollout，再读取修补后的 persisted metadata；这样 resume 响应与 resume 后的 SQLite row 都会一起恢复 preview，不再只让响应面看起来正确
 - `thread/rollback` 现在也已补到同一条 stored-summary repair 边界：如果 rollback 前 SQLite row 已存在、但 rollout-derived preview 仍缺失，响应面不会再只保 resident mode 而继续返回空摘要；rollback 返回值、后续 `thread/read` / `thread/list`，以及 SQLite row 都会一起恢复同一份 preview
+- `app-server` 的 loaded-thread 读取面现在也已开始共用同一条 helper：`thread/list`、`thread/loaded/read` 和 `thread/read` 的 loaded fallback 不再各自重复一份 rollout-summary 拼装逻辑，而是共同走 resident-aware 的 loaded summary helper；对应 provider-override 回归也已分别锁住这三条路径不会在 rollout metadata 缺失时退回默认 provider
+- `app-server` 的 persisted-summary repair 入口现在也已继续朝同一条 state-db 选择边界收口：`thread/read` 与 metadata repair 入口会优先复用 loaded thread 自己持有的 state-db，再回退到全局 state-db，避免同一类 stored-summary repair 逻辑继续各自复制一份 SQLite 句柄选择分叉
 - `app-server-client` 的 typed 读取面现在也已把这条缺摘要 repair 路径补成对称回归：当 SQLite row 仍在、但 rollout-derived summary 字段被清空后，typed `thread/read` 与 `thread/list` 都会继续命中同一条 reconcile 路径，恢复 resident thread 的 preview，而不是只在服务端集成测试里证明这层 stored-summary 修复
 - `app-server-client` 的 typed repair 现在也已把 `thread/resume` 补齐到同一层：如果 SQLite row 已存在、但 rollout-derived preview 缺失，in-process `thread/resume` 也会继续直接返回修补后的 resident summary，而不是把 reconnect 之后的补读责任重新推回调用方
 - `app-server-client` 的 typed rollback 现在也已补到同一层：如果 resident thread 在 rollback 前已存在残缺 SQLite row，typed `thread/rollback` 也会继续直接返回修补后的 summary，而不是只在 follow-up `thread/read` / `thread/list` 上才补回 preview
-- `app-server-client` 的 remote facade 现在也已补上这条契约的最小透传回归：当 websocket 远端直接返回 resident repaired `thread/resume` 摘要时，typed remote client 会继续原样保留 `thread.mode + preview + status + name`，避免“直接信服务端返回的 Thread”只在 in-process 路径上成立
+- `app-server-client` 的 remote facade 现在也已补上这条契约的读取面对称回归：当 websocket 远端直接返回 resident repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 都会继续原样保留 `thread.mode + preview + status + path + name`，避免“直接信服务端返回的 Thread”只在 in-process 路径上成立；同一层 remote typed 回归现在也已把 `thread/loaded/list` 锁成 id-only probe，确保远端 facade 不会把 loaded ids 漂成完整摘要读取面
 - `app-server/README.md` 与 `app-server-client/README.md` 现在也已继续收口到同一口径：`thread/list`、`thread/resume` 等返回面已被明确写成权威 repaired summary，remote facade 也被明确要求原样保留服务端返回的 repaired `Thread`，而不是重新引入“resume 后再补一次 `thread/read`”的旧心智
 - `debug-client` 的 unknown-thread 自愈链路现在也已继续补到本地缓存层：reader 不再只验证“会补发一次 `thread/loaded/read`”，而会在 loaded summary 返回后确认 resident `mode + status + name` 已重新写回 `known_threads`，让这条“status-only 增量之后回到读取面恢复权威摘要”的消费契约真正形成闭环
 
+按当前本地改动集看，`rollout/state_db` 这层最关键的 helper 分叉现在已经基本被直接锁住：
+
+- `read_repair_rollout_path()` 在 existing-row / missing-row 两类入口上都已覆盖
+- archived / unarchived 两类语义也都已覆盖
+- “缺 summary 时不能停在半修复状态” 这条约束已经不再只靠 `app-server` 间接证明
+
+因此，这份 checklist 当前更合理的默认下一步已经不是继续给 `read_repair_rollout_path()` 叠更多同类个案，而是：
+
+- 把后续注意力转到 `app-server` 读取面 helper 是否也已经完全共用同一条 repaired-summary 边界
+- 开始整理这一包 SQLite 收敛改动的提交边界，而不是继续扩写同层总文档
+
 当前更适合作为下一步继续核对的点是：
 
-- 哪些恢复路径已经真正以 SQLite 稳定元数据为主干来源，哪些仍在 fallback 到 rollout 或 runtime overlay
+- 哪些 `app-server` 恢复路径已经真正以 SQLite 稳定元数据为主干来源，哪些仍在 fallback 到 rollout 或 runtime overlay
 - typed client 与 app-server README 是否已经把这些“直接信返回的 `thread.mode` 与 repaired summary，不要再二次脑补”语义完全写实
 
 当前已明确通过、可直接支撑这条判断的 typed client 验证包括：
@@ -49,6 +68,10 @@
 - `cargo test -p codex-app-server-client --lib unarchive_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests`
 - `cargo test -p codex-app-server-client --lib resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_resume_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_read_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_list_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_list_preserves_id_only_probe`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_read_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib rollback_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests -- --nocapture`
 
 当前已明确通过、可直接支撑这条判断的服务端验证包括：
@@ -62,6 +85,14 @@
 - `cargo test -p codex-app-server --test all thread_resume_reconciles_missing_summary_for_existing_sqlite_row`
 - `cargo test -p codex-app-server --test all resident_thread_rollback_reconciles_missing_summary_for_existing_sqlite_row`
 - `cargo test -p codex-rollout list_threads_db_enabled_reconciles_missing_rollout_summary_fields`
+- `cargo test -p codex-rollout read_repair_rollout_path_reconciles_missing_summary_for_existing_sqlite_row`
+- `cargo test -p codex-rollout read_repair_rollout_path_preserves_archived_semantics_while_reconciling_missing_summary`
+- `cargo test -p codex-rollout read_repair_rollout_path_clears_archived_semantics_while_reconciling_missing_summary`
+- `cargo test -p codex-rollout read_repair_rollout_path_recreates_archived_row_from_rollout_when_sqlite_row_is_missing`
+- `cargo test -p codex-rollout read_repair_rollout_path_recreates_unarchived_row_from_rollout_when_sqlite_row_is_missing`
+- `cargo test -p codex-state`
+- `cargo test -p codex-app-server --test all thread_loaded_read_uses_loaded_thread_model_provider_override_when_rollout_metadata_is_missing`
+- `cargo test -p codex-app-server --test all thread_list_uses_loaded_thread_model_provider_override_when_rollout_metadata_is_missing`
 - `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_repairs_missing_summary_for_existing_sqlite_row`
 
 ### 当前阶段判断
@@ -72,6 +103,8 @@
 
 - resident continuity 的关键恢复面虽然已经补得很全，但“各读取面先信谁”的优先级说明还更像散落在测试和设计稿里的事实，而不是收成一段更明确的阶段结论
 - SQLite / rollout / runtime overlay 的职责分工虽然已经越来越清楚，但仍值得再补一次面向实现者的简洁总结，避免后续改动重新把 fallback 逻辑写散
+- `codex-state` 这层虽然现在也已通过整 crate 本地验证，但这更像是在说明底层稳定元数据地板已基本站稳；当前真正还值得继续收口的仍是 `app-server` / typed client 这一层对“先信谁”的表达与提交边界整理
+- `app-server` 里虽然已经继续清掉了一部分旧 phase-1 TODO 与 state-db 选择分叉，但这也反过来说明当前主问题更接近“把剩余旧心智清干净”，而不是继续发散到新的状态模型或存储面
 
 因此这份清单当前更适合作为：
 
@@ -83,6 +116,11 @@
 如果已经确定当前就在补这条 SQLite 收敛实现，而不是继续判断阶段边界，更适合直接转到：
 
 - `docs/sqlite-state-convergence-file-todo.md`
+
+如果当前要做的已经不是“继续判断 SQLite 这包还缺哪些主干边界”，而是“把这包整理成单独 PR，或判断它是否已经和 baseline / 文档流程整理混包”，更适合继续看：
+
+- `docs/sqlite-state-convergence-pr-template.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
 
 ### 当前权威来源优先级快照
 

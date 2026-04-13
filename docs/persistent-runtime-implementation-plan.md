@@ -14,6 +14,12 @@
 
 - `docs/persistent-runtime-checklists-index.md`
 
+如果当前已经不是在问“按什么顺序实现”，而是在问“怎么把当前 worktree 整理成 PR”，再继续看：
+
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+
 它回答的问题不是：
 
 - “为什么值得做”
@@ -23,6 +29,12 @@
 - “按什么顺序做”
 - “每个阶段的输出是什么”
 - “哪些内容必须一起落，哪些不应该混在一个 PR”
+
+而上面三份文档更适合回答：
+
+- 当前 worktree 应该先拆哪几包
+- 每一包的 PR 草稿从哪里起
+- checklist / file todo / template 之间该怎么切换
 
 ## 1. 总体原则
 
@@ -41,7 +53,7 @@
 
 ## 2. 推荐阶段划分
 
-### 当前进度（2026-04-12）
+### 当前进度（2026-04-14）
 
 这条线已经不再是纯设计状态，阶段 1 到阶段 4 都已有第一批代码落地：
 
@@ -62,17 +74,60 @@
 - `app-server` / `app-server-client` / MCP / remote-bridge 相关文档现在也已开始对齐同一条 stored-summary 契约：`thread/read`、`thread/resume`、`thread/metadata/update`、`thread/unarchive` 等返回面应被直接视为权威线程摘要；如果 SQLite row 已存在但 rollout-derived preview 仍残缺，服务端会先 reconcile rollout，再把修补后的 `Thread` 暴露出来，而不是把额外补读责任推回客户端
 - `debug-client` 与 `app-server-test-client` 这两个最小远端消费者现在也已补成自愈闭环：unknown thread 的 `thread/status/changed` 仍先保持 status-only，但随后会主动回到读取面补权威 summary，不再各自脑补 resident reconnect 语义
 - `codex-app-server-client` 的 typed repair 回归现在也已把 `thread/resume` 补齐到与 `thread/read` / `thread/list` / `thread/metadata/update` / `thread/unarchive` 同一条契约上：SQLite 行已存在但 rollout-derived preview 缺失时，resume 返回面本身也会继续直接暴露修补后的 resident summary，而不是要求消费侧在 reconnect 之后再补一次 `thread/read`
-- `codex-app-server-client` 的 remote facade 现在也已补上最小透传回归：当 websocket 远端直接返回 resident repaired `thread/resume` 摘要时，typed remote client 会继续原样保留 `thread.mode + preview + status + name`，避免这条“直接信服务端返回的 Thread”契约只在 in-process 路径上成立
+- `codex-app-server-client` 的 remote facade 现在也已补上更完整的透传回归：当 websocket 远端直接返回 resident repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 都会继续原样保留 `thread.mode + preview + status + path + name`，避免这条“直接信服务端返回的 Thread”契约只在 in-process 路径上成立
 - `debug-client` 的 unknown-thread 自愈链路现在也已补成完整回收闭环：reader 不再只是验证“会补发一次 thread/loaded/read”，还会在 loaded summary 回来后把 resident `mode + status + name` 写回本地 `known_threads`，让后续 `:use` / 摘要输出真正恢复到权威 resident thread 视图
 - `observer` 相关高风险边界现在也已补到 watcher 生命周期级别：resident thread 的 `cwd` 迁移后旧工作区变化不会再重新置位 `workspaceChanged`，resident unsubscribe / reconnect 之后同一 observer 脏标记也会继续保留
 - SQLite 收敛也已继续补到“SQLite 行存在但 stored summary 仍残缺”的 repair 边界：`thread/read`、`thread/list`、`thread/resume`、`thread/metadata/update` 与 `thread/unarchive` 都开始先 reconcile rollout，再返回修补后的摘要，而不是把半修复状态暴露给消费侧
+- `app-server` 的 loaded-thread 读取面现在也已开始共用同一条 loaded summary helper：`thread/list`、`thread/loaded/read` 与 loaded `thread/read` fallback 不再各自重复一份 rollout-summary 拼装逻辑，而是统一从当前 loaded thread 恢复 provider override、外部 rollout path 和 resident-aware 摘要，再叠加 live status
+- `codex-tui` 这条高层消费链现在也已继续补到最终展示面：`app_server_session.rs` 的 loaded/read repaired summary、`app.rs` 的 authoritative `thread/read` fallback、`resume_picker.rs` 的 resident / interactive / unknown action hint，以及 `chatwidget.rs` 的 resident label 与 rename follow-up hint 都已有直接回归，避免 resident mode 只在会话层存在、最终 UI 文案又退回泛化 resume 心智
+- `codex-exec` 与顶层 `codex` 包装层现在也已继续补齐 bootstrap / help / exit-summary 对照项：`thread.started`、human-readable `session mode/session action`、`exec resume` 帮助里的 `SESSION_ID_OR_NAME`，以及顶层 CLI 的 `resume or reconnect` 帮助和 interactive / resident exit hint 都已有直接回归，不再只在单一二进制或底层事件层锁住 resident reconnect
 
 这意味着接下来的工作重点不再是“从零开始补字段”，而是把已经形成闭环的协议、observer 和 SQLite 最小改动收敛成可 review 的 PR，并继续检查消费侧是否还存在遗漏。
 
-按当前进度，下一段更适合切入的新代码闭环不是继续扫 help/README 文案，而是：
+按当前进度，下一段更适合切入的新动作已经不再是继续扫 help/README 文案，而是：
 
-- 优先沿 PR 5 收敛 SQLite 稳定元数据与 repair 路径
+- 把已经落地的 baseline 高层消费者改动整理成提交级 scope，而不是继续把 `tui` / `exec` / `cli` 的同义回归散落在多个局部说明里
 - 仅在 observer 或 remote bridge 又出现新的实现分叉时，再回到对应 checklist 做补扫
+- 如果这些分叉都没有再出现，则默认下一站更适合切到 SQLite 收口或新的 bridge 壳层最小闭环，而不是继续在 baseline 同层文案上低收益扩写
+
+如果需要把这条“切到高层消费者”再压成最短开工入口，可以直接按下面记：
+
+1. `tui` 先看 `src/app_server_session.rs`、`src/app.rs`、`src/resume_picker.rs`、`src/chatwidget.rs`
+2. `exec` 先看 `src/lib.rs`、`src/event_processor_with_human_output.rs`、`src/event_processor_with_jsonl_output.rs`、`src/exec_events.rs`
+3. 新的 bridge 壳层默认直接建立在 `thread/list` / `thread/read` / `thread/loaded/read` / `thread/status/changed` / `thread/resume` 这组接口之上，而不是重新定义线程语义
+
+进一步说，这些高层入口最值得先问的不是“还缺什么字段”，而是：
+
+- `tui` 是否仍把 `thread/started` / `thread/read` / `thread/loaded/read` / `thread/resume` 统一映射成同一套 `ThreadSessionState`
+- `exec` 是否仍把 `thread.started` 首事件和 human-readable `session mode/session action` 当成唯一 bootstrap 语义，而把 `thread/read` 只留给 turn-completion item backfill
+- bridge 壳层是否仍把 `thread/list` / `thread/read` / `thread/loaded/read` / `thread/status/changed` / `thread/resume` 维持成单一的列表、补读、loaded 摘要、增量、reconnect 分工
+
+如果要把这条“切到高层消费者”再压成最小可提交边界，更合理的第一刀通常是：
+
+- `tui`
+  只收 `ThreadSessionState` 映射、live attach fallback、以及一个最终展示面，让同一条 `Thread` 语义真正贯通到 UI
+- `exec`
+  只收 `thread.started` JSON 首事件、human-readable `session mode/session action` 与 `thread/read` backfill 的职责边界，让 bootstrap 语义保持单一
+- bridge 壳层
+  只收 `thread/list` + unknown-thread `thread/read` + `thread/loaded/read` + `thread/status/changed` + `thread/resume` 这五段最小闭环，不要一开始就做完整产品壳
+
+对应的优先测试入口也应尽量跟着这条最小切片走：
+
+- `tui`
+  先看 `app_server_session.rs`、`app.rs` 和 `status/tests.rs` 里已有的 resident mode continuity 回归；只有真的碰到最终 UI 文案或 picker 展示时，再扩大到 snapshot
+- `exec`
+  先看 `event_processor_with_human_output_tests.rs`、`event_processor_with_jsonl_output_tests.rs`、`tests/event_processor_with_json_output.rs` 与 `tests/suite/resume.rs`
+- bridge 壳层
+  先复用 `codex-app-server`、`codex-app-server-client`、`codex-debug-client`、`codex-app-server-test-client` 现有的主干回归，而不是先为壳层再发明一套并行线程语义测试面
+
+对应的完成定义也应保持同样收敛：
+
+- `tui`
+  至少做到一个真实恢复入口、一个 fallback/负向边界、一个最终展示面三者说同一套 `Thread.mode` 语义
+- `exec`
+  至少做到 `thread.started` 首事件、human-readable `session mode/session action`、以及 `thread/read` backfill 职责边界三者说同一套 bootstrap 语义
+- bridge 壳层
+  至少做到 `thread/list`、unknown-thread `thread/read`、`thread/loaded/read`、`thread/status/changed`、`thread/resume` 这五段闭环稳定成立，而不重新发明线程恢复协议
 
 优先建议：
 

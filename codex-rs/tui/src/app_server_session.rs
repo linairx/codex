@@ -1190,6 +1190,8 @@ mod tests {
     use codex_app_server_protocol::ThreadMetadataUpdateParams;
     use codex_app_server_protocol::ThreadMetadataUpdateResponse;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadResumeParams;
+    use codex_app_server_protocol::ThreadResumeResponse;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ThreadStatus;
@@ -1260,7 +1262,12 @@ mod tests {
         )
     }
 
-    fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
+    fn write_rollout_with_preview(
+        path: &Path,
+        thread_id: &str,
+        preview: &str,
+        model_provider: Option<&str>,
+    ) {
         let conversation_id = ThreadId::from_string(thread_id).expect("valid thread id");
         let timestamp = "2025-01-05T12:00:00Z";
         let meta = SessionMeta {
@@ -1274,7 +1281,7 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
-            model_provider: Some(model_provider.to_string()),
+            model_provider: model_provider.map(ToOwned::to_owned),
             base_instructions: None,
             dynamic_tools: None,
             memory_mode: None,
@@ -1294,7 +1301,7 @@ mod tests {
                 "payload": {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "resident resume"}]
+                    "content": [{"type": "input_text", "text": preview}]
                 }
             })
             .to_string(),
@@ -1303,7 +1310,7 @@ mod tests {
                 "type": "event_msg",
                 "payload": {
                     "type": "user_message",
-                    "message": "resident resume",
+                    "message": preview,
                     "kind": "plain"
                 }
             })
@@ -1313,6 +1320,39 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("rollout path should have parent"))
             .expect("rollout directory should exist");
         std::fs::write(path, lines.join("\n") + "\n").expect("rollout should be writable");
+    }
+
+    fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
+        write_rollout_with_preview(path, thread_id, "resident resume", Some(model_provider));
+    }
+
+    async fn build_multi_provider_config(temp_dir: &TempDir) -> Config {
+        std::fs::write(
+            temp_dir.path().join("config.toml"),
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "target_provider"
+
+[model_providers.target_provider]
+name = "Target fallback provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+
+[model_providers.mock_provider]
+name = "Mock override provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+        )
+        .expect("config.toml should be writable");
+        build_config(temp_dir).await
     }
 
     #[tokio::test]
@@ -1991,6 +2031,100 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown should succeed");
+    }
+
+    #[test]
+    fn loaded_read_and_thread_read_preserve_repaired_summary_for_external_rollout() {
+        std::thread::Builder::new()
+            .name("loaded-read-external-rollout".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut runtime = tokio::runtime::Builder::new_current_thread();
+                runtime.enable_all();
+                runtime
+                    .build()
+                    .expect("runtime should build")
+                    .block_on(async {
+                        let temp_dir = tempfile::tempdir().expect("tempdir");
+                        let config = build_multi_provider_config(&temp_dir).await;
+                        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+                            .await
+                            .expect("embedded app server should start");
+
+                        let external_home = tempfile::tempdir().expect("external tempdir");
+                        let thread_id = ThreadId::new();
+                        let preview = "external loaded preview";
+                        let external_rollout = external_home
+                            .path()
+                            .join("sessions")
+                            .join("2025")
+                            .join(format!("{thread_id}.jsonl"));
+                        write_rollout_with_preview(
+                            external_rollout.as_path(),
+                            &thread_id.to_string(),
+                            preview,
+                            /*model_provider*/ None,
+                        );
+
+                        let request_id = app_server.next_request_id();
+                        let response: ThreadResumeResponse = app_server
+                            .client
+                            .request_typed(ClientRequest::ThreadResume {
+                                request_id,
+                                params: ThreadResumeParams {
+                                    thread_id: thread_id.to_string(),
+                                    path: Some(external_rollout.clone()),
+                                    model_provider: Some("mock_provider".to_string()),
+                                    ..Default::default()
+                                },
+                            })
+                            .await
+                            .expect("thread/resume should succeed");
+                        assert_eq!(response.thread.preview, preview);
+                        assert_eq!(response.thread.model_provider, "mock_provider");
+                        assert_eq!(response.thread.path.as_ref(), Some(&external_rollout));
+
+                        let resumed = started_thread_from_resume_response(response, &config)
+                            .await
+                            .expect("resume response should map");
+                        assert_eq!(resumed.session.model_provider_id, "mock_provider");
+
+                        let read = app_server
+                            .thread_read(thread_id, /*include_turns*/ false)
+                            .await
+                            .expect("thread/read should succeed");
+                        assert_eq!(read.preview, preview);
+                        assert_eq!(read.model_provider, "mock_provider");
+                        assert_eq!(read.path.as_ref(), Some(&external_rollout));
+
+                        let loaded = app_server
+                            .thread_loaded_read(ThreadLoadedReadParams {
+                                cursor: None,
+                                limit: Some(20),
+                                model_providers: None,
+                                source_kinds: None,
+                                cwd: None,
+                            })
+                            .await
+                            .expect("thread/loaded/read should succeed");
+                        let loaded_thread = loaded
+                            .data
+                            .into_iter()
+                            .find(|thread| thread.id == thread_id.to_string())
+                            .expect("thread/loaded/read should include external loaded thread");
+                        assert_eq!(loaded_thread.preview, preview);
+                        assert_eq!(loaded_thread.model_provider, "mock_provider");
+                        assert_eq!(loaded_thread.path.as_ref(), Some(&external_rollout));
+
+                        app_server
+                            .shutdown()
+                            .await
+                            .expect("shutdown should succeed");
+                    });
+            })
+            .expect("test thread should spawn")
+            .join()
+            .expect("test thread should finish");
     }
 
     #[tokio::test]

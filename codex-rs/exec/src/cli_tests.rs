@@ -71,6 +71,7 @@ fn resume_subcommand_help_mentions_reconnect_and_last() {
         .to_string();
 
     assert!(help.contains("Resume or reconnect to a previous session by id or name"));
+    assert!(help.contains("SESSION_ID_OR_NAME"));
     assert!(help.contains("Resume or reconnect to the most recent recorded session"));
     assert!(help.contains("--last"));
 }

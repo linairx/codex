@@ -15,6 +15,8 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
@@ -352,6 +354,123 @@ async fn thread_list_reports_workspace_changed_for_resident_threads() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn thread_list_preserves_preview_for_loaded_thread_resumed_from_external_rollout()
+-> Result<()> {
+    let server = create_mock_responses_server_sequence(vec![]).await;
+
+    let codex_home = TempDir::new()?;
+    create_runtime_config(codex_home.path(), &server.uri())?;
+
+    let external_home = TempDir::new()?;
+    let preview = "external loaded preview";
+    let conversation_id = create_fake_rollout(
+        external_home.path(),
+        "2025-01-02T10-00-00",
+        "2025-01-02T10:00:00Z",
+        preview,
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let external_rollout_path = rollout_path(
+        external_home.path(),
+        "2025-01-02T10-00-00",
+        &conversation_id,
+    );
+
+    let mut mcp = init_mcp(codex_home.path()).await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            path: Some(external_rollout_path.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(thread.preview, preview);
+
+    let ThreadListResponse { data, next_cursor } = list_threads(
+        &mut mcp,
+        /*cursor*/ None,
+        Some(10),
+        Some(vec!["mock_provider".to_string()]),
+        Some(interactive_thread_source_kinds()),
+        /*archived*/ None,
+    )
+    .await?;
+
+    assert_eq!(next_cursor, None);
+    let listed = data
+        .iter()
+        .find(|candidate| candidate.id == conversation_id)
+        .expect("thread/list should include loaded thread resumed from external rollout");
+    assert_eq!(listed.preview, preview);
+    assert_eq!(listed.path.as_ref(), Some(&external_rollout_path));
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_list_uses_loaded_thread_model_provider_override_when_rollout_metadata_is_missing()
+-> Result<()> {
+    let server = create_mock_responses_server_sequence(vec![]).await;
+
+    let codex_home = TempDir::new()?;
+    create_multi_provider_config(codex_home.path(), &server.uri())?;
+
+    let preview = "provider override preview";
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-06T08-00-00",
+        "2025-01-06T08:00:00Z",
+        preview,
+        /*model_provider*/ None,
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = init_mcp(codex_home.path()).await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            model_provider: Some("mock_provider".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(thread.model_provider, "mock_provider");
+    assert_eq!(thread.preview, preview);
+
+    let ThreadListResponse { data, next_cursor } = list_threads(
+        &mut mcp,
+        /*cursor*/ None,
+        Some(10),
+        Some(vec!["mock_provider".to_string()]),
+        Some(interactive_thread_source_kinds()),
+        /*archived*/ None,
+    )
+    .await?;
+
+    assert_eq!(next_cursor, None);
+    let listed = data
+        .iter()
+        .find(|candidate| candidate.id == conversation_id)
+        .expect("thread/list should include loaded thread");
+    assert_eq!(listed.preview, preview);
+    assert_eq!(listed.model_provider, "mock_provider");
+    Ok(())
+}
+
 // Minimal config.toml for listing.
 fn create_minimal_config(codex_home: &std::path::Path) -> std::io::Result<()> {
     let config_toml = codex_home.join("config.toml");
@@ -378,6 +497,39 @@ model_provider = "mock_provider"
 
 [model_providers.mock_provider]
 name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_multi_provider_config(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "target_provider"
+
+[model_providers.target_provider]
+name = "Target fallback provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+
+[model_providers.mock_provider]
+name = "Mock override provider for test"
 base_url = "{server_uri}/v1"
 wire_api = "responses"
 request_max_retries = 0

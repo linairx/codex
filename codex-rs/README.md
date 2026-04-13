@@ -64,7 +64,10 @@ emit `residentAssistant`. When the mode is unknown, the field is omitted.
 Downstream consumers can use `thread_mode` to distinguish an ordinary
 interactive resume target from a resident assistant reconnect target. In
 `--json` mode this bootstrap metadata is carried by JSON events, not by the
-human-readable stderr session summary.
+human-readable stderr session summary. Treat that first `thread.started`
+payload as the authoritative bootstrap summary for the run rather than as a
+hint that still requires an extra follow-up read to recover reconnect
+semantics.
 
 ### Resume and fork saved sessions
 

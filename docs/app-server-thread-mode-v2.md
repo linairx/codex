@@ -238,6 +238,7 @@ runtime status，应该继续读取 `thread/loaded/read`，而不是期待 id-on
 
 - 如果某条线程已经有持久化元数据，但 rollout-derived summary 仍残缺，服务端应优先在这些返回面上把摘要修补好
 - 客户端应继续把 `thread/read`、`thread/resume`、`thread/metadata/update`、`thread/list`、`thread/loaded/read`，以及后续 restore 路径返回的 `Thread` 当作权威摘要，而不是把 rollout-vs-SQLite 的 reconcile 责任重新推回消费侧
+- 这条契约现在也已开始直接延伸到 websocket remote facade：当远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 也应继续原样保留 `thread.mode + preview + status + path + name`，而不是重新引入“远端 reconnect / lookup / list / loaded polling 之后再补一次 `thread/read`”的旧心智
 
 这条约束虽然更完整地属于后续 SQLite 收敛文档，但这里值得先写清，因为它直接决定 `Thread.mode` 一旦进入返回面后，客户端是否还能继续相信“返回的 `Thread` 就是当前权威摘要”。
 

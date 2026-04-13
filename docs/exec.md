@@ -68,4 +68,6 @@ available also includes `thread_mode`.
 - When the mode is unknown, the field is omitted instead of guessed.
 
 In `--json` mode, this bootstrap metadata is emitted via JSON events, not via
-the human-readable stderr summary.
+the human-readable stderr summary. Treat that first `thread.started` event as
+the authoritative bootstrap summary for the run rather than as a hint that
+still requires an extra read to recover reconnect semantics.

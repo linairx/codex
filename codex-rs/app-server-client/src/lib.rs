@@ -1075,7 +1075,12 @@ supports_websockets = false
         );
     }
 
-    fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
+    fn write_rollout_with_preview(
+        path: &Path,
+        thread_id: &str,
+        preview: &str,
+        model_provider: Option<&str>,
+    ) {
         let conversation_id = ThreadId::from_string(thread_id).expect("valid thread id");
         let timestamp = "2025-01-05T12:00:00Z";
         let meta = SessionMeta {
@@ -1089,7 +1094,7 @@ supports_websockets = false
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
-            model_provider: Some(model_provider.to_string()),
+            model_provider: model_provider.map(ToOwned::to_owned),
             base_instructions: None,
             dynamic_tools: None,
             memory_mode: None,
@@ -1109,7 +1114,7 @@ supports_websockets = false
                 "payload": {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "resident metadata update"}]
+                    "content": [{"type": "input_text", "text": preview}]
                 }
             })
             .to_string(),
@@ -1118,7 +1123,7 @@ supports_websockets = false
                 "type": "event_msg",
                 "payload": {
                     "type": "user_message",
-                    "message": "resident metadata update",
+                    "message": preview,
                     "kind": "plain"
                 }
             })
@@ -1128,6 +1133,15 @@ supports_websockets = false
         std::fs::create_dir_all(path.parent().expect("rollout path should have parent"))
             .expect("rollout directory should exist");
         std::fs::write(path, lines.join("\n") + "\n").expect("rollout should be writable");
+    }
+
+    fn write_minimal_rollout(path: &Path, thread_id: &str, model_provider: &str) {
+        write_rollout_with_preview(
+            path,
+            thread_id,
+            "resident metadata update",
+            Some(model_provider),
+        );
     }
 
     async fn start_test_remote_server<F, Fut>(handler: F) -> String
@@ -4004,6 +4018,280 @@ supports_websockets = false
         assert_eq!(response.thread.name.as_deref(), Some("Atlas"));
         assert_eq!(response.model_provider, "mock_provider");
         assert_eq!(response.cwd, PathBuf::from("/workspace"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_read_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/read request");
+            };
+            assert_eq!(request.method, "thread/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadReadResponse {
+                        thread: Thread {
+                            id: "thread-external".to_string(),
+                            forked_from_id: None,
+                            preview: "external loaded preview".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from(
+                                "/tmp/external-rollouts/2025/thread-external.jsonl",
+                            )),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(80),
+                params: ThreadReadParams {
+                    thread_id: "thread-external".to_string(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("typed thread/read should succeed");
+        assert_eq!(response.thread.preview, "external loaded preview");
+        assert_eq!(
+            response.thread.path.as_ref(),
+            Some(&PathBuf::from(
+                "/tmp/external-rollouts/2025/thread-external.jsonl"
+            ))
+        );
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
+        assert!(response.thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_loaded_read_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/loaded/read request");
+            };
+            assert_eq!(request.method, "thread/loaded/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadLoadedReadResponse {
+                        data: vec![Thread {
+                            id: "thread-external".to_string(),
+                            forked_from_id: None,
+                            preview: "external loaded preview".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from(
+                                "/tmp/external-rollouts/2025/thread-external.jsonl",
+                            )),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        }],
+                        next_cursor: None,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(81),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("typed thread/loaded/read should succeed");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].preview, "external loaded preview");
+        assert_eq!(
+            response.data[0].path.as_ref(),
+            Some(&PathBuf::from(
+                "/tmp/external-rollouts/2025/thread-external.jsonl"
+            ))
+        );
+        assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.data[0].status, ThreadStatus::Idle);
+        assert!(response.data[0].resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_list_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/list request");
+            };
+            assert_eq!(request.method, "thread/list");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadListResponse {
+                        data: vec![Thread {
+                            id: "thread-external".to_string(),
+                            forked_from_id: None,
+                            preview: "external loaded preview".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from(
+                                "/tmp/external-rollouts/2025/thread-external.jsonl",
+                            )),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        }],
+                        next_cursor: None,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadListResponse = client
+            .request_typed(ClientRequest::ThreadList {
+                request_id: RequestId::Integer(82),
+                params: ThreadListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    sort_key: None,
+                    model_providers: Some(vec!["mock_provider".to_string()]),
+                    source_kinds: None,
+                    archived: None,
+                    cwd: None,
+                    search_term: None,
+                },
+            })
+            .await
+            .expect("typed thread/list should succeed");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].preview, "external loaded preview");
+        assert_eq!(
+            response.data[0].path.as_ref(),
+            Some(&PathBuf::from(
+                "/tmp/external-rollouts/2025/thread-external.jsonl"
+            ))
+        );
+        assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.data[0].status, ThreadStatus::Idle);
+        assert!(response.data[0].resident);
+        assert_eq!(response.next_cursor, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_loaded_list_preserves_id_only_probe() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/loaded/list request");
+            };
+            assert_eq!(request.method, "thread/loaded/list");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadLoadedListResponse {
+                        data: vec!["thread-external".to_string()],
+                        next_cursor: Some("cursor:next".to_string()),
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadLoadedListResponse = client
+            .request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(83),
+                params: ThreadLoadedListParams {
+                    cursor: None,
+                    limit: Some(10),
+                    model_providers: Some(vec!["mock_provider".to_string()]),
+                    source_kinds: None,
+                    cwd: None,
+                },
+            })
+            .await
+            .expect("typed thread/loaded/list should succeed");
+        assert_eq!(response.data, vec!["thread-external".to_string()]);
+        assert_eq!(response.next_cursor.as_deref(), Some("cursor:next"));
 
         client.shutdown().await.expect("shutdown should complete");
     }
