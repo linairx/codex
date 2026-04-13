@@ -351,6 +351,96 @@ async fn get_conversation_summary_by_thread_id_uses_loaded_provider_override_for
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_conversation_summary_by_thread_id_repairs_missing_summary_with_loaded_provider_override()
+-> Result<()> {
+    const OVERRIDE_PROVIDER: &str = "mock_provider";
+
+    let codex_home = TempDir::new()?;
+    create_multi_provider_config_toml(codex_home.path())?;
+
+    let external_home = TempDir::new()?;
+    let conversation_id = create_fake_rollout(
+        external_home.path(),
+        FILENAME_TS,
+        META_RFC3339,
+        PREVIEW,
+        /*model_provider*/ None,
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(&conversation_id)?;
+    let external_rollout = std::fs::canonicalize(rollout_path(
+        external_home.path(),
+        FILENAME_TS,
+        &conversation_id,
+    ))?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_request_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            path: Some(external_rollout.clone()),
+            model_provider: Some(OVERRIDE_PROVIDER.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_request_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response(resume_response)?;
+    assert_eq!(thread.model_provider, OVERRIDE_PROVIDER);
+
+    let state_runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "target_provider".into()).await?;
+    let mut metadata = state_runtime
+        .get_thread(thread_id)
+        .await?
+        .expect("resume should persist thread metadata");
+    metadata.first_user_message = None;
+    state_runtime.upsert_thread(&metadata).await?;
+
+    let request_id = mcp
+        .send_get_conversation_summary_request(GetConversationSummaryParams::ThreadId {
+            conversation_id: thread_id,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let received: GetConversationSummaryResponse = to_response(response)?;
+
+    assert_eq!(
+        received.summary,
+        ConversationSummary {
+            conversation_id: thread_id,
+            path: external_rollout.clone(),
+            preview: PREVIEW.to_string(),
+            timestamp: Some(META_RFC3339.to_string()),
+            updated_at: Some(META_RFC3339.to_string()),
+            model_provider: OVERRIDE_PROVIDER.to_string(),
+            cwd: PathBuf::from("/"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli,
+            git_info: None,
+        }
+    );
+
+    let persisted = state_runtime
+        .get_thread(thread_id)
+        .await?
+        .expect("thread metadata should exist after repair");
+    assert_eq!(persisted.first_user_message.as_deref(), Some(PREVIEW));
+    assert_eq!(persisted.model_provider, OVERRIDE_PROVIDER);
+
+    Ok(())
+}
+
 fn create_multi_provider_config_toml(codex_home: &std::path::Path) -> std::io::Result<()> {
     std::fs::write(
         codex_home.join("config.toml"),

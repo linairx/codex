@@ -854,7 +854,10 @@ mod tests {
     use codex_app_server_protocol::ApprovalsReviewer;
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
+    use codex_app_server_protocol::ConversationSummary;
     use codex_app_server_protocol::GetAccountResponse;
+    use codex_app_server_protocol::GetConversationSummaryParams;
+    use codex_app_server_protocol::GetConversationSummaryResponse;
     use codex_app_server_protocol::GitInfo;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCRequest;
@@ -969,6 +972,51 @@ supports_websockets = false
             .build()
             .await
             .expect("mock test config should load")
+    }
+
+    async fn build_multi_provider_test_config() -> Config {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let codex_home_path = std::env::temp_dir().join(format!(
+            "codex-app-server-client-multi-provider-test-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&codex_home_path).expect("temp codex home should exist");
+        std::fs::write(
+            codex_home_path.join("config.toml"),
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "target_provider"
+
+[model_providers.target_provider]
+name = "Target fallback provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+
+[model_providers.mock_provider]
+name = "Mock override provider for test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+"#,
+        )
+        .expect("multi-provider config.toml should be writable");
+
+        ConfigBuilder::default()
+            .codex_home(codex_home_path)
+            .build()
+            .await
+            .expect("multi-provider test config should load")
     }
 
     async fn start_test_client_with_capacity(
@@ -2157,6 +2205,116 @@ supports_websockets = false
         assert_eq!(resumed.thread.mode, ThreadMode::ResidentAssistant);
         assert!(resumed.thread.resident);
         assert_eq!(resumed.thread.preview, "sqlite resume repair");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[test]
+    fn get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests()
+     {
+        const TEST_STACK_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
+        let handle = std::thread::Builder::new()
+            .name(
+                "get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests"
+                    .to_string(),
+            )
+            .stack_size(TEST_STACK_SIZE_BYTES)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime should build");
+                runtime.block_on(async {
+                    get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests_impl()
+                        .await;
+                });
+            })
+            .expect("test thread should spawn");
+
+        handle
+            .join()
+            .expect("conversation summary repair test thread should not panic");
+    }
+
+    async fn get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests_impl()
+     {
+        const OVERRIDE_PROVIDER: &str = "mock_provider";
+        const PREVIEW: &str = "typed conversation summary repair";
+
+        let config = Arc::new(build_multi_provider_test_config().await);
+        let thread_id = ThreadId::new();
+        let rollout_path = config
+            .codex_home
+            .join(format!("external/2025-01-02T12-00-00-{thread_id}.jsonl"));
+        write_rollout_with_preview(
+            rollout_path.as_path(),
+            &thread_id.to_string(),
+            PREVIEW,
+            /*model_provider*/ None,
+        );
+
+        let client = start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(411),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: thread_id.to_string(),
+                    path: Some(rollout_path.clone()),
+                    model_provider: Some(OVERRIDE_PROVIDER.to_string()),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("thread/resume should load the external rollout");
+        assert_eq!(resumed.thread.model_provider, OVERRIDE_PROVIDER);
+
+        let state_db = open_if_present(&config.codex_home, OVERRIDE_PROVIDER)
+            .await
+            .expect("state db should exist for the override provider");
+        let mut metadata = state_db
+            .get_thread(thread_id)
+            .await
+            .expect("state db lookup should succeed")
+            .expect("thread metadata should exist before repair");
+        metadata.first_user_message = None;
+        state_db
+            .upsert_thread(&metadata)
+            .await
+            .expect("state db upsert should clear the stored summary");
+
+        let response: GetConversationSummaryResponse = client
+            .request_typed(ClientRequest::GetConversationSummary {
+                request_id: RequestId::Integer(412),
+                params: GetConversationSummaryParams::ThreadId {
+                    conversation_id: thread_id,
+                },
+            })
+            .await
+            .expect("getConversationSummary should reconcile missing summary");
+
+        let expected_summary = ConversationSummary {
+            conversation_id: thread_id,
+            path: rollout_path,
+            preview: PREVIEW.to_string(),
+            timestamp: Some("2025-01-05T12:00:00Z".to_string()),
+            updated_at: response.summary.updated_at.clone(),
+            model_provider: OVERRIDE_PROVIDER.to_string(),
+            cwd: std::env::temp_dir(),
+            cli_version: "0.0.0-test".to_string(),
+            source: ProtocolSessionSource::Cli,
+            git_info: None,
+        };
+        assert_eq!(response.summary, expected_summary);
+
+        let repaired = state_db
+            .get_thread(thread_id)
+            .await
+            .expect("state db lookup should succeed after repair")
+            .expect("thread metadata should exist after repair");
+        assert_eq!(repaired.first_user_message.as_deref(), Some(PREVIEW));
+        assert_eq!(repaired.model_provider, OVERRIDE_PROVIDER);
 
         client.shutdown().await.expect("shutdown should complete");
     }
@@ -4292,6 +4450,70 @@ supports_websockets = false
             .expect("typed thread/loaded/list should succeed");
         assert_eq!(response.data, vec!["thread-external".to_string()]);
         assert_eq!(response.next_cursor.as_deref(), Some("cursor:next"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_get_conversation_summary_preserves_repaired_summary() {
+        let thread_id = ThreadId::new();
+        let response_thread_id = thread_id;
+        let websocket_url = start_test_remote_server(move |mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected getConversationSummary request");
+            };
+            assert_eq!(request.method, "getConversationSummary");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(GetConversationSummaryResponse {
+                        summary: ConversationSummary {
+                            conversation_id: response_thread_id,
+                            path: PathBuf::from(
+                                "/tmp/external-rollouts/2025/thread-external.jsonl",
+                            ),
+                            preview: "external loaded preview".to_string(),
+                            timestamp: Some("2025-01-02T12:00:00Z".to_string()),
+                            updated_at: Some("2025-01-02T12:00:00Z".to_string()),
+                            model_provider: "mock_provider".to_string(),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ProtocolSessionSource::Cli,
+                            git_info: None,
+                        },
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: GetConversationSummaryResponse = client
+            .request_typed(ClientRequest::GetConversationSummary {
+                request_id: RequestId::Integer(84),
+                params: GetConversationSummaryParams::ThreadId {
+                    conversation_id: thread_id,
+                },
+            })
+            .await
+            .expect("typed getConversationSummary should succeed");
+        assert_eq!(response.summary.conversation_id, thread_id);
+        assert_eq!(response.summary.preview, "external loaded preview");
+        assert_eq!(
+            response.summary.path,
+            PathBuf::from("/tmp/external-rollouts/2025/thread-external.jsonl")
+        );
+        assert_eq!(response.summary.model_provider, "mock_provider");
+        assert_eq!(response.summary.cwd, PathBuf::from("/workspace"));
+        assert_eq!(response.summary.source, ProtocolSessionSource::Cli);
 
         client.shutdown().await.expect("shutdown should complete");
     }
