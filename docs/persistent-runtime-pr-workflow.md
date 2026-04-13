@@ -200,6 +200,11 @@ review 时最该优先拦下的通常是：
 
 只要某份文档开始承担下一层的职责，就应该停手并切换到下一份文档。
 
+按当前这轮 SQLite / repaired-summary 收口的实际状态，还可以再补一句更落地的规则：
+
+- 如果 `sqlite-state-convergence-pr-template.md` 已经能自然装下当前 diff，且对应测试列表已经能直接列出，就不该继续扩写同层 checklist / workflow / 总分析文档；默认动作应改成直接起草 PR 2
+- 如果 `persistent-runtime-pr-drafts.md` 里的 `Runtime Docs Workflow` 最小草稿已经能自然装下当前 docs diff，也不该继续回到 split / workflow 文档补同层说明；默认动作应改成直接起草 PR 3
+
 ## 7. 这份流程完成后该做什么
 
 做到这里，这条文档链的默认下一步已经很明确：
