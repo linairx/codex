@@ -105,6 +105,8 @@
 - rollback 前如果 SQLite row 已存在、但 rollout-derived preview 仍缺失，服务端与 typed client 回归都已经锁住：rollback 响应、后续 `thread/read` / `thread/list`，以及 SQLite row 会一起恢复同一份 preview，而不是只保 resident mode
 - `thread/read` 与 metadata repair 入口现在也已开始共用同一条 state-db 选择 helper：优先使用 loaded thread 自己挂着的 state-db，其次才回退到全局 state-db，避免同一类 persisted-summary repair 入口继续各自复制一份“先取哪个 SQLite 句柄”的分叉
 - `getConversationSummary` 现在也已继续收口到同一条 helper 语义：按 thread id 读取摘要时，会优先复用 loaded thread 自己挂着的 state-db 与 provider override，因此外部 rollout 的缺摘要 repair 不会再单独退回默认 provider 或绕开 loaded state-db
+- `thread/read`、`thread/resume`、`thread/unarchive`、`thread/rollback` 现在也都继续围绕 `load_thread_summary_for_rollout(...)` 组织 repaired summary，不再明显残留“某一条恢复面自己拼一份 summary”的 helper 分叉
+- `thread/loaded/read` 与 loaded-only `thread/list` fallback 继续共用 `load_thread_summary_for_loaded_thread(...)`，说明 loaded 线程读取面没有重新长出另一套 repaired-summary 语义
 - `thread/archive` / `thread/unarchive` 里的旧 phase-1 TODO 注释现在也已收口到实现现状：这两条路径仍从文件系统移动 rollout 起步，但 SQLite reconcile 已经是 restored summary 与 resident continuity 的权威补齐层，不再适合继续留着“未来再改成 sqlite”这类过时提示
 
 最值得补的负向边界：
@@ -116,6 +118,12 @@
 完成标志：
 
 - app-server 内部不再残留多套“缺摘要 repair”或“resident continuity overlay”实现
+
+按当前这轮 helper 级审计，这一节的默认后续动作也应收短为：
+
+1. 不再继续给 `codex_message_processor.rs` 扩写同层 TODO
+2. 直接按 `docs/sqlite-state-convergence-pr-template.md` 整理 `PR 2` 描述
+3. 再按 `docs/persistent-runtime-current-worktree-pr-split.md` 把 runtime docs workflow 留给 `PR 3`
 
 ## 4. 服务端测试面
 

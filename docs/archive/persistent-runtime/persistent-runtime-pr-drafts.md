@@ -326,6 +326,8 @@ submitted without adding new implementation scope.
 ### PR 2 已提交草稿
 
 ```md
+Title: Align getConversationSummary with repaired summary flow
+
 ## Summary
 
 This PR aligns `getConversationSummary` with the repaired-summary flow already
@@ -377,6 +379,8 @@ Ran:
 ### PR 3 已提交草稿
 
 ```md
+Title: Tighten persistent-runtime PR split and drafting flow
+
 ## Summary
 
 This PR tightens the persistent-runtime docs workflow so the current worktree
@@ -416,6 +420,135 @@ Out of scope:
 - the drafts doc contains directly-usable minimal PR text for the current
   SQLite and docs-workflow splits
 ```
+
+## 5.2 GitHub PR shortcuts
+
+如果现在已经到了 GitHub 开 PR 这一步，更适合直接用下面这组最短入口：
+
+- `PR 2`
+  - branch: `pr/sqlite-state-convergence-get-summary`
+  - compare URL: `https://github.com/linairx/codex/pull/new/pr/sqlite-state-convergence-get-summary`
+  - title: `Align getConversationSummary with repaired summary flow`
+- `PR 3`
+  - branch: `pr/runtime-docs-workflow`
+  - compare URL: `https://github.com/linairx/codex/pull/new/pr/runtime-docs-workflow`
+  - title: `Tighten persistent-runtime PR split and drafting flow`
+
+## 5.3 可直接贴到 GitHub 的最终正文
+
+如果当前目标已经不是“继续整理草稿”，而是“把 PR 页面一次填完”，更适合直接从下面两段正文起步。
+
+### PR 2 final body
+
+```md
+## Summary
+
+This PR aligns `getConversationSummary` with the repaired-summary flow already
+used by the main thread read surfaces.
+
+It reuses the loaded thread's state-db handle and provider override when
+looking up a conversation summary by thread id, repairs missing stored summary
+fields instead of drifting back to default-provider fallback behavior, and adds
+typed app-server-client coverage so both in-process and remote facades preserve
+the repaired `ConversationSummary` directly.
+
+## Scope
+
+This PR is intentionally limited to:
+
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/tests/suite/conversation_summary.rs`
+- `codex-rs/app-server-client/src/lib.rs`
+- `docs/sqlite-state-convergence-checklist.md`
+- `docs/sqlite-state-convergence-file-todo.md`
+- `docs/sqlite-state-convergence-pr-template.md`
+
+Out of scope:
+
+- new bridge transport
+- observer lifecycle changes
+- TUI / exec / CLI wording work
+- broader SQLite helper refactors beyond this compatibility-summary path
+
+## Contract Checks
+
+- `getConversationSummary` reuses the loaded thread's state-db and provider
+  override when reading by thread id
+- existing SQLite rows with missing stored summary are reconciled instead of
+  falling back to default-provider behavior
+- in-process typed clients receive the repaired `ConversationSummary` directly
+  without a follow-up read
+- remote typed facades preserve server-returned repaired `ConversationSummary`
+  values directly
+
+## Tests
+
+Ran:
+
+- `cargo test -p codex-app-server conversation_summary`
+- `cargo test -p codex-app-server-client get_conversation_summary`
+```
+
+### PR 3 final body
+
+```md
+## Summary
+
+This PR tightens the persistent-runtime docs workflow so the current worktree
+can be split into implementation PRs without reusing the source-analysis doc as
+an implementation todo list.
+
+It turns the current docs chain into a clearer handoff path from analysis, to
+package selection, to worktree split, to PR drafting, and closes the loop for
+the current SQLite convergence work by routing it into a directly-usable PR 2
+draft while keeping docs-workflow changes in a separate PR 3 draft.
+
+## Scope
+
+This PR is intentionally limited to:
+
+- `docs/codex-rs-source-analysis.md`
+- `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+
+Out of scope:
+
+- new code changes
+- new runtime protocol semantics
+- new test-only boundaries
+- changes that belong in SQLite / baseline / observer implementation PRs
+
+## Contract Checks
+
+- the source-analysis doc stops at routing and handoff instead of growing new
+  implementation-level todo lists
+- the current worktree split keeps repaired-summary code/docs in PR 2 and
+  keeps workflow / drafts / routing docs in PR 3
+- the workflow doc points directly at the PR-template layer as the stop point
+  once a package is ready
+- the drafts doc contains directly-usable minimal PR text for the current
+  SQLite and docs-workflow splits
+```
+
+## 5.4 到这一步后的默认动作
+
+如果你已经同时具备下面四项：
+
+- commit subject
+- branch 名称
+- compare URL
+- 可直接粘贴的 PR body
+
+那默认动作就不该再回到 `source-analysis` / checklist / workflow 文档继续扩写同层说明，而应该直接：
+
+1. 打开对应 compare URL
+2. 粘贴这里的 title 和 body
+3. 只按实际 diff 微调 files / tests / docs 列表
+4. 提交 PR
+
+换句话说，到了这一层，这份 drafts 文档本身就应该是当前这条链的终点，而不是再回跳上一层重新组织文本。
 
 ## 6. 和其他文档的分工
 

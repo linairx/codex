@@ -205,6 +205,14 @@ review 时最该优先拦下的通常是：
 - 如果 `sqlite-state-convergence-pr-template.md` 已经能自然装下当前 diff，且对应测试列表已经能直接列出，就不该继续扩写同层 checklist / workflow / 总分析文档；默认动作应改成直接起草 PR 2
 - 如果 `persistent-runtime-pr-drafts.md` 里的 `Runtime Docs Workflow` 最小草稿已经能自然装下当前 docs diff，也不该继续回到 split / workflow 文档补同层说明；默认动作应改成直接起草 PR 3
 
+把这条规则换成当前这轮更容易执行的判断，也可以直接记成：
+
+1. `docs/codex-rs-source-analysis.md` 只负责把你送到 `sqlite-state-convergence-*` 或 worktree split
+2. `docs/sqlite-state-convergence-checklist.md` / `file-todo.md` 只负责确认 repaired-summary 边界是否已经站稳
+3. 一旦确认 `codex_message_processor.rs` 主要读取面与 `getConversationSummary` 已站到同一条 repaired-summary / provider-override 语义上，就应直接切到 `docs/sqlite-state-convergence-pr-template.md`
+4. 如果剩余 diff 主要都在 `docs/persistent-runtime-*` 和 `docs/codex-rs-source-analysis.md`，就应直接切到 `docs/persistent-runtime-pr-drafts.md` 起草 `PR 3`
+5. 如果 `persistent-runtime-pr-drafts.md` 已经给出了 commit、branch、compare URL 和 final body，就不该再回 template / workflow / split 文档补同层说明；默认动作应改成直接开 PR
+
 ## 7. 这份流程完成后该做什么
 
 做到这里，这条文档链的默认下一步已经很明确：
@@ -212,6 +220,7 @@ review 时最该优先拦下的通常是：
 - 不再新增同层模板
 - 直接选择一个任务包
 - 用对应 PR template 整理成最终提交文本
+- 或在 drafts 已具备最终正文时，直接去 GitHub 开 PR
 
 如果后续还要继续扩文档，更合理的触发条件通常只剩两类：
 

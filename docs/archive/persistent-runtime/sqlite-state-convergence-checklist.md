@@ -55,6 +55,17 @@
 - 哪些 `app-server` 恢复路径已经真正以 SQLite 稳定元数据为主干来源，哪些仍在 fallback 到 rollout 或 runtime overlay
 - typed client 与 app-server README 是否已经把这些“直接信返回的 `thread.mode` 与 repaired summary，不要再二次脑补”语义完全写实
 
+按当前 `codex_message_processor.rs` 的读取面 helper 进一步核对，这条线也已经比前一版更接近收尾：
+
+- `thread/read`、`thread/resume`、`thread/unarchive`、`thread/rollback` 继续共用 `load_thread_summary_for_rollout(...)` 这条 repaired-summary 入口，而不是各自复制一套 rollout/read repair 拼装
+- `thread/loaded/read` 与 loaded-only fallback 继续共用 `load_thread_summary_for_loaded_thread(...)`，不会再为 loaded 线程额外引入一套不同的 repaired-summary 语义
+- `getConversationSummary` 的 thread-id 读取面现在也继续走 `preferred_state_db_handle(...)` + `read_summary_from_state_db_context_by_thread_id(...)`，因此 loaded thread 的 provider override 与缺摘要 repair 也没有重新游离成兼容接口专属分叉
+
+因此，这份 checklist 当前更合理的默认下一步已经进一步明确成：
+
+- 不再继续给同层 helper 叠更多个案
+- 直接按 `docs/sqlite-state-convergence-pr-template.md` 和 `docs/persistent-runtime-current-worktree-pr-split.md` 整理 `PR 2: SQLite State Convergence`
+
 当前已明确通过、可直接支撑这条判断的 typed client 验证包括：
 
 - `cargo test -p codex-app-server-client --lib archived_metadata_update_preserves_resident_thread_mode_through_typed_requests`

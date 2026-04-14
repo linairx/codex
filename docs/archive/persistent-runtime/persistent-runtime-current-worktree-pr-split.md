@@ -174,6 +174,7 @@
 
 - 当前已修改文件实际上主要落在 `PR 2 + PR 3`
 - `PR 1` 在这轮 worktree 里更像背景边界，而不是当前需要先拆出来的一包
+- 如果当前新增改动已经主要落在 `docs/codex-rs-source-analysis.md`、`docs/sqlite-state-convergence-checklist.md`、`docs/sqlite-state-convergence-file-todo.md` 这类路由与阶段结论文档，而不是新的 `codex-rs/**` helper / test diff，那么更应把它们视为“把 PR 2 / PR 3 的交接写清”，而不是再判断一次 SQLite 主问题本身
 
 如果只按当前已改文件直接拆，最短顺序更适合是：
 
@@ -217,6 +218,7 @@
 这一步的目标是：
 
 - 先把 repaired-summary / provider-override / typed facade 透传这条代码主线从当前 worktree 里拿出来
+- 如果这一步已经只剩 `docs/sqlite-state-convergence-*` 的补充结论，而没有新的代码或测试 diff，说明 `PR 2` 更适合直接基于现有模板起稿，而不是继续扩写 split 文档
 
 ### 再拆 PR 3
 
@@ -231,6 +233,7 @@
 这一步的目标是：
 
 - 再把分诊 / 选包 / 拆包 / 起稿这条 docs workflow 链单独整理出来
+- 如果这一步的 docs diff 已经主要是在强调“source-analysis 只负责路由，checklist/file todo 只负责边界，template/drafts 才是最终起稿入口”，说明 `PR 3` 已经可以直接从最小草稿起稿，而不是再回到 workflow 文档扩写同层说明
 
 如果需要更短的执行规则，可以直接记成：
 
