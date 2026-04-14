@@ -77,6 +77,7 @@
 - `codex-rs/rollout/src/recorder_tests.rs`
 - `codex-rs/app-server-client/src/lib.rs`
   仅保留 repaired summary / remote facade / typed repaired-thread 透传相关改动
+  - 包括 `getConversationSummary` 的 loaded provider override repair 与 typed facade 透传回归
 - `codex-rs/app-server-client/README.md`
 - `codex-rs/docs/codex_mcp_interface.md`
 - `docs/sqlite-state-convergence.md`
@@ -96,6 +97,7 @@
 - repaired summary authority-first
 - SQLite / rollout / runtime overlay 的优先级
 - remote facade 不重新降级服务端已修补的 `Thread`
+- compatibility summary 读取面也继续直接信任服务端已修补的 `ConversationSummary`
 
 不应混入：
 
@@ -125,6 +127,9 @@
 
 不应混入：
 
+- `docs/sqlite-state-convergence-checklist.md`
+- `docs/sqlite-state-convergence-file-todo.md`
+- `docs/sqlite-state-convergence-pr-template.md`
 - 新代码语义
 - 新测试
 - 新实现级边界
@@ -146,6 +151,11 @@
 - 只要某段改动主要在讲 repaired summary / preview / authority ordering / remote facade direct trust， 更偏 PR 2
 - 只要某段改动主要在讲“该看哪份文档、怎么起草 PR”，更偏 PR 3
 
+如果当前是按文件直接拆分，更适合再多记一条：
+
+- `docs/sqlite-state-convergence-*` 留在 PR 2
+- `docs/persistent-runtime-*` 和 `docs/codex-rs-source-analysis.md` 留在 PR 3
+
 ## 4. 建议提交顺序
 
 更合理的顺序通常是：
@@ -160,15 +170,27 @@
 - SQLite 收口依赖 baseline 已经稳定，但又比纯文档 workflow 更贴近当前代码主改动
 - docs workflow 最适合最后单独整理，避免在前两包 review 时引入额外阅读噪声
 
+按当前这轮本地 `git status`，还可以再记住一个更贴近现实的结论：
+
+- 当前已修改文件实际上主要落在 `PR 2 + PR 3`
+- `PR 1` 在这轮 worktree 里更像背景边界，而不是当前需要先拆出来的一包
+
+如果只按当前已改文件直接拆，最短顺序更适合是：
+
+1. 先整理 `PR 2: SQLite State Convergence`
+2. 再整理 `PR 3: Runtime Docs Workflow`
+
 ## 5. 每包起草时最短入口
 
 如果现在就要开始起草：
 
 - PR 1 从 `docs/resident-mode-baseline-pr-template.md` 开始
 - PR 2 从 `docs/sqlite-state-convergence-pr-template.md` 开始
-- PR 3 暂时不需要新的专用模板
+- PR 3 当前可以直接从 `docs/persistent-runtime-pr-drafts.md` 里的
+  `Runtime Docs Workflow` 最小草稿起稿
 
-PR 3 更适合直接按下面结构起草：
+如果后续不想重新手写结构，PR 3 现在更适合直接复用那份最小草稿；只在 scope
+明显变化时，再回到下面这组结构重新展开：
 
 1. Summary:
    把 persistent runtime 文档链从总分析收成分诊 / 选包 / worktree 拆包 / 流程 / drafts 体系
@@ -176,6 +198,171 @@ PR 3 更适合直接按下面结构起草：
    只包含 docs 下的索引、template、workflow、drafts 与当前 worktree 拆包收口
 3. Out of scope:
    不新增代码、不新增实现级边界、不修改运行时契约
+
+## 5.1 当前 worktree 的最短拆分顺序
+
+如果当前只是想把这轮已改文件直接拆成可提交的两包，更适合按下面顺序操作：
+
+### 先拆 PR 2
+
+先只收下面这些文件：
+
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/tests/suite/conversation_summary.rs`
+- `codex-rs/app-server-client/src/lib.rs`
+- `docs/sqlite-state-convergence-checklist.md`
+- `docs/sqlite-state-convergence-file-todo.md`
+- `docs/sqlite-state-convergence-pr-template.md`
+
+这一步的目标是：
+
+- 先把 repaired-summary / provider-override / typed facade 透传这条代码主线从当前 worktree 里拿出来
+
+### 再拆 PR 3
+
+剩下这批文档更适合留给 `PR 3`：
+
+- `docs/codex-rs-source-analysis.md`
+- `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+
+这一步的目标是：
+
+- 再把分诊 / 选包 / 拆包 / 起稿这条 docs workflow 链单独整理出来
+
+如果需要更短的执行规则，可以直接记成：
+
+1. 先把 `codex-rs/**` 代码改动和 `docs/sqlite-state-convergence-*` 一起归到 PR 2
+2. 再把 `docs/persistent-runtime-*` 和 `docs/codex-rs-source-analysis.md` 归到 PR 3
+
+## 5.2 当前 worktree 的最短暂存顺序
+
+如果当前已经准备直接在本地拆 commit，更适合按下面顺序暂存：
+
+### 先暂存 PR 2
+
+```bash
+git add \
+  codex-rs/app-server/src/codex_message_processor.rs \
+  codex-rs/app-server/tests/suite/conversation_summary.rs \
+  codex-rs/app-server-client/src/lib.rs \
+  docs/sqlite-state-convergence-checklist.md \
+  docs/sqlite-state-convergence-file-todo.md \
+  docs/sqlite-state-convergence-pr-template.md
+```
+
+然后先检查一次：
+
+```bash
+git diff --cached --stat
+```
+
+如果缓存区里还混入了 `docs/persistent-runtime-*` 或 `docs/codex-rs-source-analysis.md`，
+说明这一步还没有切干净，应先把 docs-workflow 那包拿出去。
+
+### 再暂存 PR 3
+
+在 PR 2 提交或导出 patch 之后，再暂存：
+
+```bash
+git add \
+  docs/codex-rs-source-analysis.md \
+  docs/persistent-runtime-checklists-index.md \
+  docs/persistent-runtime-current-worktree-pr-split.md \
+  docs/persistent-runtime-pr-workflow.md \
+  docs/persistent-runtime-pr-drafts.md
+```
+
+同样再检查一次：
+
+```bash
+git diff --cached --stat
+```
+
+如果缓存区里又出现 `codex-rs/app-server/**`、`codex-rs/app-server-client/src/lib.rs` 或
+`docs/sqlite-state-convergence-*`，说明 repaired-summary 那包重新混回来了。
+
+如果需要最短版，可以直接记成：
+
+1. 先 `git add` 代码文件 + `docs/sqlite-state-convergence-*`
+2. 看一次 `git diff --cached --stat`
+3. 再 `git add` `docs/persistent-runtime-*` + `docs/codex-rs-source-analysis.md`
+4. 再看一次 `git diff --cached --stat`
+
+## 5.3 当前 worktree 的最短提交顺序
+
+如果当前已经按上面的顺序把缓存区切开，更适合继续按下面顺序提交：
+
+### 先提交 PR 2
+
+更合适的提交说明可以直接写成：
+
+```bash
+git commit -m "Align getConversationSummary with repaired summary flow"
+```
+
+提交前最后再看一眼：
+
+```bash
+git diff --cached --stat
+git diff --cached
+```
+
+这一步最该确认的是：
+
+- 只包含 `codex-rs/app-server/**`、`codex-rs/app-server-client/src/lib.rs` 和
+  `docs/sqlite-state-convergence-*`
+- 没有把 `docs/persistent-runtime-*` 或 `docs/codex-rs-source-analysis.md` 混进去
+
+### 再提交 PR 3
+
+更合适的提交说明可以直接写成：
+
+```bash
+git commit -m "Tighten persistent-runtime PR split and drafting flow"
+```
+
+提交前同样再看一眼：
+
+```bash
+git diff --cached --stat
+git diff --cached
+```
+
+这一步最该确认的是：
+
+- 只包含 `docs/codex-rs-source-analysis.md` 和 `docs/persistent-runtime-*`
+- 没有把 `codex-rs/app-server/**`、`codex-rs/app-server-client/src/lib.rs` 或
+  `docs/sqlite-state-convergence-*` 带回来
+
+如果需要最短版，可以直接记成：
+
+1. 先提交 repaired-summary 代码包
+2. 再提交 docs workflow 包
+3. 每次提交前都同时看 `git diff --cached --stat` 和 `git diff --cached`
+
+## 5.4 提交后的最短 handoff
+
+如果这两包已经分别提交完成，下一步更适合直接按下面衔接：
+
+### PR 2 提交后
+
+- 直接回 `docs/sqlite-state-convergence-pr-template.md`
+- 使用其中“当前工作树可直接使用的草稿”
+- 只保留这次实际提交里包含的文件、契约和已跑测试
+
+### PR 3 提交后
+
+- 直接回 `docs/persistent-runtime-pr-drafts.md`
+- 使用其中 `Runtime Docs Workflow` 的最小草稿
+- 只保留这次 docs-workflow 提交里实际包含的文档范围
+
+如果需要最短版，可以直接记成：
+
+1. 提交完 PR 2，就用 SQLite template 起 PR 文本
+2. 提交完 PR 3，就用 Runtime Docs Workflow 草稿起 PR 文本
 
 ## 6. 这份拆包草案的作用边界
 

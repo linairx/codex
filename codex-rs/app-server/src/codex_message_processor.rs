@@ -4963,16 +4963,31 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: GetConversationSummaryParams,
     ) {
+        let loaded_thread = match &params {
+            GetConversationSummaryParams::ThreadId { conversation_id } => {
+                self.thread_manager.get_thread(*conversation_id).await.ok()
+            }
+            GetConversationSummaryParams::RolloutPath { .. } => None,
+        };
+        let mut fallback_provider = self.config.model_provider_id.clone();
+        if let Some(thread) = loaded_thread.as_ref() {
+            fallback_provider = thread.config_snapshot().await.model_provider_id;
+        }
         if let GetConversationSummaryParams::ThreadId { conversation_id } = &params
-            && let Some(summary) =
-                read_summary_from_state_db_by_thread_id(&self.config, *conversation_id).await
+            && let Some(summary) = read_summary_from_state_db_context_by_thread_id(
+                self.preferred_state_db_handle(loaded_thread.as_ref())
+                    .await
+                    .as_ref(),
+                *conversation_id,
+                fallback_provider.as_str(),
+            )
+            .await
         {
             let response = GetConversationSummaryResponse { summary };
             self.outgoing.send_response(request_id, response).await;
             return;
         }
 
-        let mut fallback_provider = self.config.model_provider_id.clone();
         let path = match params {
             GetConversationSummaryParams::RolloutPath { rollout_path } => {
                 if rollout_path.is_relative() {
@@ -4989,13 +5004,9 @@ impl CodexMessageProcessor {
                 .await
                 {
                     Ok(Some(p)) => p,
-                    _ => match self.thread_manager.get_thread(conversation_id).await {
-                        Ok(thread) => match thread.rollout_path() {
-                            Some(path) => {
-                                fallback_provider =
-                                    thread.config_snapshot().await.model_provider_id;
-                                path
-                            }
+                    _ => match loaded_thread {
+                        Some(thread) => match thread.rollout_path() {
+                            Some(path) => path,
                             None => {
                                 let error = JSONRPCErrorError {
                                     code: INVALID_REQUEST_ERROR_CODE,
@@ -5008,7 +5019,7 @@ impl CodexMessageProcessor {
                                 return;
                             }
                         },
-                        Err(_) => {
+                        None => {
                             let error = JSONRPCErrorError {
                                 code: INVALID_REQUEST_ERROR_CODE,
                                 message: format!(
@@ -9014,22 +9025,6 @@ async fn read_history_cwd_from_state_db(
             None
         }
     }
-}
-
-async fn read_summary_from_state_db_by_thread_id(
-    config: &Config,
-    thread_id: ThreadId,
-) -> Option<ConversationSummary> {
-    let state_db_ctx = get_state_db(config).await?;
-    let metadata = load_persisted_thread_metadata_with_summary_repair(
-        &state_db_ctx,
-        thread_id,
-        config.model_provider_id.as_str(),
-    )
-    .await
-    .ok()
-    .flatten()?;
-    Some(summary_from_thread_metadata(&metadata))
 }
 
 async fn read_summary_from_state_db_context_by_thread_id(

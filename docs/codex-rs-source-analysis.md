@@ -2425,6 +2425,7 @@ review 时最值得问的不是：
 更具体地说，当前已经有两条新事实可以直接作为后续默认前提：
 
 - `app-server` 的 loaded-thread 读取面已经开始共用同一条 loaded summary helper：`thread/list`、`thread/read` 的 loaded fallback，以及 `thread/loaded/read` 不再各自重复一份 rollout summary 拼装逻辑，而会统一保留当前 loaded thread 持有的 provider override、外部 rollout path 与 repaired summary
+- `getConversationSummary` 现在也已对齐到同一条 loaded summary repair 边界：按 thread id 读取摘要时，会优先复用当前 loaded thread 持有的 state-db 与 provider override；因此即使外部 rollout 的 SQLite row 已存在但 preview 仍缺失，这条摘要读取面也会继续 reconcile rollout，并保留 loaded provider，而不是退回默认 provider 或把 repair 责任重新推回调用方
 - `codex-app-server-client` 的 remote typed facade 现在也已把这条契约补成读取面对称回归：当 websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list`、`thread/loaded/read` 时，typed client 会继续原样保留 `thread.mode + preview + status + path + name`；而 `thread/loaded/list` 仍继续保持 id-only probe，不会被漂成完整摘要接口
 
 如果把这轮本地改动继续往更高层消费者看，还可以再记住一个新的阶段事实：
@@ -2437,6 +2438,7 @@ review 时最值得问的不是：
 - `cargo test -p codex-app-server-client remote_typed_thread_`
 - `cargo test -p codex-app-server --test all thread_`
 - `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_uses_loaded_external_rollout_path`
+- `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_repairs_missing_summary_with_loaded_provider_override`
 - `cargo test -p codex-tui`
 - `cargo test -p codex-exec`
 - `cargo test -p codex-cli`
@@ -2482,6 +2484,12 @@ review 时最值得问的不是：
 1. 先看是不是还有新的消费者重新猜 `mode`、重写 unknown-thread 恢复逻辑，或把 `thread/loaded/read` 当成半恢复接口
 2. 如果没有，就不要继续在这层文档链上扩写，而应切到更高层消费者实现
 3. 只有当新阶段真的已经落地，才回到这份总文档补一小段阶段总结
+
+按当前这轮本地改动再往前一步看，这里还可以再记住一个更具体的停手点：
+
+- SQLite 这包现在已经不只停在 checklist / file todo 可执行，而是连 PR 2 的模板草稿也已经能直接承接当前 diff
+- 这意味着如果当前 worktree 仍主要集中在 `codex_message_processor.rs`、`conversation_summary.rs`、`app-server-client/src/lib.rs` 和 SQLite convergence 文档上，更合理的默认动作已经是直接按 `docs/sqlite-state-convergence-pr-template.md` 起草提交文本
+- 只有当后续 diff 又重新混入新的高层消费者闭环，或再次跨回 baseline / observer / docs workflow 主问题时，才需要回到 `worktree split` 继续拆包
 
 到这里，这份源码分析文档的后续任务定义也已经更清楚了：
 
@@ -2975,6 +2983,27 @@ reviewer 最该优先拦下的情况通常是：
 - 只是想补一条新的测试入口
 - 只是想把某个 PR 的 scope 再拆细
 - 只是想把同一条契约换个说法再写一遍
+
+按当前这轮本地改动，更合适的默认下一步已经可以直接写成一句话：
+
+- 停在这里，不再继续扩这份总文档；直接去 `docs/persistent-runtime-pr-drafts.md`，进入 `SQLite State Convergence`，复制 `docs/sqlite-state-convergence-pr-template.md` 里的“当前工作树可直接使用的草稿”，再按当前实际已跑测试删减成最终 PR 2 文本
+
+如果当前要整理的已经不是 `PR 2`，而是把同一轮 worktree 里的流程 / 分诊 / drafts 文档单独拆成 `PR 3`，更合适的默认动作也已经很明确：
+
+- 同样停在这里，不再继续扩这份总文档；直接去 `docs/persistent-runtime-pr-drafts.md` 里的 `Runtime Docs Workflow` 最小草稿起稿
+
+到这里，这条文档链对当前 worktree 的作用其实已经完成了：
+
+- `codex-rs-source-analysis.md` 负责分诊和停手点
+- `persistent-runtime-checklists-index.md` 负责选包
+- `persistent-runtime-current-worktree-pr-split.md` 负责切包、暂存顺序和提交顺序
+- `persistent-runtime-pr-workflow.md` 负责把“什么时候停在模板层”说清楚
+- `sqlite-state-convergence-pr-template.md` 和 `persistent-runtime-pr-drafts.md` 负责直接起草 PR 文本
+
+所以如果后续没有出现新的主线、没有新的混包形态、也没有新的高层消费者切片，这份总分析文档当前更合理的默认状态应该是：
+
+- 暂时停止继续扩写
+- 直接执行现有拆包 / 提交 / 起稿流程
 
 更适合继续修改本文件的触发条件应该只剩两类：
 

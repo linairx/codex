@@ -35,6 +35,13 @@
 4. 打开对应 PR template
 5. 从这份汇总里的“当前工作树建议”判断是否已经可以起草 PR
 
+按当前这轮本地 worktree，如果你只是想知道“现在立刻该做什么”，更短的答案已经可以固定成：
+
+1. 选 `4. SQLite State Convergence`
+2. 打开 `docs/sqlite-state-convergence-pr-template.md`
+3. 复制“当前工作树可直接使用的草稿”
+4. 只保留这轮 diff 实际覆盖的文件、契约和已跑测试
+
 如果你还没完成分诊，先回：
 
 - `docs/codex-rs-source-analysis.md`
@@ -94,6 +101,92 @@
 
 - 如果你现在的 diff 主要在 watcher 注册/迁移/清理与 `workspaceChanged` 读取面一致性上，这包可以直接起草
 
+### 3.1 Runtime Docs Workflow
+
+适合在下面这些情况优先起草：
+
+- 当前改动不再新增运行时契约，而是在收 `codex-rs-source-analysis.md` 到 checklist /
+  file todo / PR template / worktree split / workflow / drafts 这一整条文档链
+- 当前目标是把“怎么分诊、怎么拆包、怎么起草 PR”写成可执行流程，而不是继续补实现级边界
+- 当前 worktree 已经需要把 `PR 2` 和 `PR 3` 的 docs 范围切开
+
+推荐进入顺序：
+
+1. `docs/persistent-runtime-current-worktree-pr-split.md`
+2. `docs/persistent-runtime-pr-workflow.md`
+3. `docs/persistent-runtime-pr-drafts.md`
+
+当前工作树建议：
+
+- 如果你现在的 diff 主要在 `docs/codex-rs-source-analysis.md`、`docs/persistent-runtime-checklists-index.md`、`docs/persistent-runtime-current-worktree-pr-split.md`、`docs/persistent-runtime-pr-workflow.md` 和 `docs/persistent-runtime-pr-drafts.md` 上，这包可以直接起草
+- 按当前这轮本地改动看，这包也已经可以直接按下面这份最小草稿起稿，而不需要再回去补新的模板
+- 如果当前 diff 还带着 `docs/sqlite-state-convergence-checklist.md`、`docs/sqlite-state-convergence-file-todo.md` 或 `docs/sqlite-state-convergence-pr-template.md`，应先把这些留回 PR 2，再起这份 docs workflow 草稿
+
+当前这轮 worktree 可直接使用的最小 PR 草稿可以先写成：
+
+```md
+## Summary
+
+This PR tightens the persistent-runtime docs workflow so the current worktree
+ can be split into implementation PRs without reusing the source-analysis doc as
+ an implementation todo list.
+
+It turns the current docs chain into a clearer handoff path from analysis, to
+ package selection, to worktree split, to PR drafting, and makes the current
+ SQLite convergence work stop at a directly-usable PR 2 draft instead of
+ continuing to expand same-level docs.
+
+## Scope
+
+This PR is intentionally limited to:
+
+- `docs/codex-rs-source-analysis.md`
+- `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+
+Out of scope:
+
+- new code changes
+- new runtime protocol semantics
+- new test-only boundaries
+- changes that belong in SQLite / baseline / observer implementation PRs
+
+## Contract Checks
+
+- the source-analysis doc stops at routing and handoff instead of growing new
+  implementation-level todo lists
+- the current worktree split keeps repaired-summary code/docs in PR 2 and
+  keeps workflow / drafts / routing docs in PR 3
+- the workflow doc now points directly at the PR template layer as the stop
+  point once a package is ready
+- the drafts doc contains directly-usable minimal PR text for the current
+  SQLite and docs-workflow splits
+
+## Docs
+
+Updated:
+
+- `docs/codex-rs-source-analysis.md`
+- `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+
+Left to PR 2 instead of this docs-workflow PR:
+
+- `docs/sqlite-state-convergence-checklist.md`
+- `docs/sqlite-state-convergence-file-todo.md`
+- `docs/sqlite-state-convergence-pr-template.md`
+
+## Why This PR Now
+
+This keeps the current persistent-runtime doc chain from drifting back into a
+ second implementation planning layer and makes the current mixed worktree
+ directly splittable into SQLite convergence and docs workflow PRs.
+```
+
 ### 4. SQLite State Convergence
 
 适合在下面这些情况优先起草：
@@ -111,6 +204,86 @@
 当前工作树建议：
 
 - 如果你现在的 diff 主要在 `rollout/state_db`、`codex_message_processor.rs`、相关服务端测试、typed repaired-summary 回归和 README 契约上，这包可以直接起草
+- 如果这批改动还顺带补了 `getConversationSummary` 的 loaded provider override repair、以及 `app-server-client` 对 repaired `ConversationSummary` 的 typed 透传回归，也仍应留在这包，而不是拆去 baseline 或纯文档 PR
+- 按当前这轮本地改动看，这包已经可以直接从 `docs/sqlite-state-convergence-pr-template.md` 的“当前工作树可直接使用的草稿”起草，再按实际已跑测试删减为最小提交文本
+
+当前这轮 worktree 可直接使用的最小 PR 草稿可以先写成：
+
+```md
+## Summary
+
+This PR tightens the repaired-summary boundary for compatibility summary reads so
+`getConversationSummary` stays aligned with the same SQLite / rollout /
+loaded-thread authority ordering already used by the main thread read surfaces.
+
+It keeps loaded provider overrides and repaired stored summaries intact when a
+conversation summary is looked up by thread id, and extends the typed
+app-server-client coverage so both in-process and remote facades continue to
+preserve the repaired `ConversationSummary` directly.
+
+## Scope
+
+This PR is intentionally limited to:
+
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/tests/suite/conversation_summary.rs`
+- `codex-rs/app-server-client/src/lib.rs`
+- directly-adjacent SQLite convergence docs that describe this repaired-summary
+  boundary and PR scope
+
+Out of scope:
+
+- new bridge transport
+- observer lifecycle changes
+- TUI / exec / CLI wording work
+- broader SQLite helper refactors beyond this compatibility-summary path
+
+## Contract Checks
+
+- `getConversationSummary` continues to reuse the loaded thread's state-db and
+  provider override when reading by thread id
+- existing SQLite rows with missing stored summary are reconciled instead of
+  falling back to default-provider behavior
+- in-process typed clients continue to receive the repaired
+  `ConversationSummary` directly without a follow-up read
+- remote typed facades continue to preserve server-returned repaired
+  `ConversationSummary` values directly
+
+## Tests
+
+Ran:
+
+- `cargo test -p codex-app-server conversation_summary`
+- `cargo test -p codex-app-server-client get_conversation_summary`
+
+## Docs
+
+Updated as needed:
+
+- `docs/sqlite-state-convergence-checklist.md`
+- `docs/sqlite-state-convergence-file-todo.md`
+- `docs/sqlite-state-convergence-pr-template.md`
+
+## Why This PR Now
+
+This keeps the compatibility summary path from drifting away from the repaired
+summary contract that the main thread read/list/resume surfaces already follow,
+and leaves the current worktree in a state where PR 2 can be split and
+submitted without adding new implementation scope.
+```
+
+如果当前 worktree 还同时带着下面这些文档改动：
+
+- `docs/codex-rs-source-analysis.md`
+- `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+
+更合理的默认动作不是把它们继续塞进这份最小 PR 2 草稿，而是：
+
+1. 保持上面这份 SQLite 草稿只覆盖代码 + SQLite convergence 文档
+2. 把这些流程 / 分诊 / 草稿入口文档留给 `PR 3: Runtime Docs Workflow`
 
 ## 4. 什么时候不要起草新的包
 
@@ -136,6 +309,113 @@
 3. 用 checklist / file todo 把 scope、contracts、tests、docs sync 填实
 4. 删除草稿里和当前 diff 无关的句子
 5. 只保留当前这包真正完成的边界，不替下一包预写承诺
+
+## 5.1 当前已提交的两包
+
+按当前本地提交状态，这两包已经不只是“可起草”，而是已经各自落成单独 commit：
+
+- `PR 2 / SQLite State Convergence`
+  - commit: `b979890e3`
+  - subject: `Align getConversationSummary with repaired summary flow`
+- `PR 3 / Runtime Docs Workflow`
+  - commit: `ad3d8d89d`
+  - subject: `Tighten persistent-runtime PR split and drafting flow`
+
+如果现在的目标已经不是继续拆包，而是直接贴出 PR 文本，更适合从下面这两段现成草稿开始，而不是再回上一层模板重新删改。
+
+### PR 2 已提交草稿
+
+```md
+## Summary
+
+This PR aligns `getConversationSummary` with the repaired-summary flow already
+used by the main thread read surfaces.
+
+It reuses the loaded thread's state-db handle and provider override when
+looking up a conversation summary by thread id, repairs missing stored summary
+fields instead of drifting back to default-provider fallback behavior, and adds
+typed app-server-client coverage so both in-process and remote facades preserve
+the repaired `ConversationSummary` directly.
+
+## Scope
+
+This PR is intentionally limited to:
+
+- `codex-rs/app-server/src/codex_message_processor.rs`
+- `codex-rs/app-server/tests/suite/conversation_summary.rs`
+- `codex-rs/app-server-client/src/lib.rs`
+- `docs/sqlite-state-convergence-checklist.md`
+- `docs/sqlite-state-convergence-file-todo.md`
+- `docs/sqlite-state-convergence-pr-template.md`
+
+Out of scope:
+
+- new bridge transport
+- observer lifecycle changes
+- TUI / exec / CLI wording work
+- broader SQLite helper refactors beyond this compatibility-summary path
+
+## Contract Checks
+
+- `getConversationSummary` reuses the loaded thread's state-db and provider
+  override when reading by thread id
+- existing SQLite rows with missing stored summary are reconciled instead of
+  falling back to default-provider behavior
+- in-process typed clients receive the repaired `ConversationSummary` directly
+  without a follow-up read
+- remote typed facades preserve server-returned repaired `ConversationSummary`
+  values directly
+
+## Tests
+
+Ran:
+
+- `cargo test -p codex-app-server conversation_summary`
+- `cargo test -p codex-app-server-client get_conversation_summary`
+```
+
+### PR 3 已提交草稿
+
+```md
+## Summary
+
+This PR tightens the persistent-runtime docs workflow so the current worktree
+can be split into implementation PRs without reusing the source-analysis doc as
+an implementation todo list.
+
+It turns the current docs chain into a clearer handoff path from analysis, to
+package selection, to worktree split, to PR drafting, and closes the loop for
+the current SQLite convergence work by routing it into a directly-usable PR 2
+draft while keeping docs-workflow changes in a separate PR 3 draft.
+
+## Scope
+
+This PR is intentionally limited to:
+
+- `docs/codex-rs-source-analysis.md`
+- `docs/persistent-runtime-checklists-index.md`
+- `docs/persistent-runtime-current-worktree-pr-split.md`
+- `docs/persistent-runtime-pr-workflow.md`
+- `docs/persistent-runtime-pr-drafts.md`
+
+Out of scope:
+
+- new code changes
+- new runtime protocol semantics
+- new test-only boundaries
+- changes that belong in SQLite / baseline / observer implementation PRs
+
+## Contract Checks
+
+- the source-analysis doc stops at routing and handoff instead of growing new
+  implementation-level todo lists
+- the current worktree split keeps repaired-summary code/docs in PR 2 and
+  keeps workflow / drafts / routing docs in PR 3
+- the workflow doc points directly at the PR-template layer as the stop point
+  once a package is ready
+- the drafts doc contains directly-usable minimal PR text for the current
+  SQLite and docs-workflow splits
+```
 
 ## 6. 和其他文档的分工
 

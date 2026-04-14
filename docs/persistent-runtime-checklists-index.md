@@ -15,6 +15,13 @@
 
 - `docs/persistent-runtime-pr-drafts.md`
 
+按当前这轮本地 worktree，更贴近现实的最短起稿入口已经是：
+
+- `PR 2: SQLite State Convergence`
+  直接从 `docs/sqlite-state-convergence-pr-template.md` 的“当前工作树可直接使用的草稿”起稿
+- `PR 3: Runtime Docs Workflow`
+  直接从 `docs/persistent-runtime-pr-drafts.md` 里的最小草稿起稿
+
 如果你当前面对的不是“挑哪一包”，而是“这次本地工作树该先拆成哪几包”，再配合：
 
 - `docs/persistent-runtime-current-worktree-pr-split.md`
@@ -187,6 +194,7 @@
 
 - 把 SQLite 收敛阶段继续压成文件级待办
 - 指明 `rollout/state_db`、`app-server`、测试面、typed client、README 该先查什么
+- 明确像 `getConversationSummary` 这类兼容摘要读取面，也应继续按 repaired-summary / provider-override 收口，而不是单独游离在主读取面之外
 - 给这条线当前的实现收尾提供更直接的开工入口
 
 这份 TODO 不定义新设计边界，只负责把 SQLite checklist 继续落成执行顺序。
@@ -218,6 +226,7 @@
 - 如果问题是“observer 这包已经准备提交，但想快速写对 PR 描述”，先看 observer PR template
 - 如果问题是“repair / archive / reconnect 到底该信 rollout 还是 SQLite”，先看 SQLite
 - 如果问题是“SQLite 这包已经准备提交，但想快速写对 PR 描述”，先看 SQLite PR template
+- 如果问题是“当前 worktree 已经分出 SQLite PR 和 docs workflow PR，但想直接复制最小草稿起稿”，先看 `docs/persistent-runtime-pr-drafts.md`
 
 ## 5. 当前最推荐的起点
 

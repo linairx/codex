@@ -27,6 +27,8 @@ This PR is intentionally limited to:
 
 - stored-summary repair / reconcile behavior in `rollout/state_db`
 - app-server read/list/resume/unarchive/metadata-update/rollback authority ordering
+- compatibility summary reads such as `getConversationSummary` staying on the same repaired-summary /
+  loaded-provider-override path
 - typed client continuity for repaired summary surfaces
 - authority-first README / checklist wording for repaired thread summaries
 
@@ -49,7 +51,12 @@ This PR preserves the following contracts:
 - `thread/read`, `thread/list`, `thread/resume`, `thread/unarchive`,
   `thread/metadata/update`, and `thread/rollback` return repaired summaries directly rather than
   requiring a follow-up `thread/read`
+- compatibility summary reads such as `getConversationSummary` continue to preserve loaded-thread
+  provider overrides and repaired stored summaries instead of drifting back to default-provider
+  fallback behavior
 - remote typed facades continue to preserve repaired server-returned `Thread` values directly
+- remote/in-process typed facades continue to preserve repaired `ConversationSummary` values
+  directly on compatibility summary reads
 
 ## Files / Areas
 
@@ -85,6 +92,8 @@ Ran:
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_list_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_read_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_list_preserves_id_only_probe`
+- `cargo test -p codex-app-server-client --lib get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib remote_typed_get_conversation_summary_preserves_repaired_summary`
 
 Key negative-boundary coverage:
 
@@ -138,7 +147,7 @@ rollout/state-db helpers, app-server read/restore paths, and typed client consum
 It keeps stored summaries reconciled before they are treated as authoritative, keeps resident
 identity anchored in persisted metadata, and keeps repaired responses directly trustworthy on
 `thread/read`, `thread/list`, `thread/resume`, `thread/unarchive`, `thread/metadata/update`, and
-`thread/rollback`.
+`thread/rollback`, while keeping `getConversationSummary` on the same repaired-summary path.
 
 ## Scope
 
@@ -146,6 +155,7 @@ This PR is intentionally limited to:
 
 - `read_repair_rollout_path()` and related reconcile behavior in `rollout/state_db`
 - app-server authority ordering for read/list/resume/unarchive/metadata-update/rollback
+- compatibility summary reads such as `getConversationSummary`
 - typed client continuity for repaired summary surfaces
 - authority-first README / checklist wording
 
@@ -164,6 +174,8 @@ Out of scope:
 - runtime-only observer/loaded status stays runtime-attached
 - repaired responses are directly trustworthy and do not require a follow-up `thread/read`
 - remote typed facades preserve repaired `Thread` values directly
+- compatibility summary reads preserve loaded provider overrides and repaired
+  `ConversationSummary` values directly
 
 ## Tests
 
@@ -190,6 +202,8 @@ Ran:
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_list_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_read_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_list_preserves_id_only_probe`
+- `cargo test -p codex-app-server-client --lib get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib remote_typed_get_conversation_summary_preserves_repaired_summary`
 
 ## Docs
 

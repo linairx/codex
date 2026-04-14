@@ -104,6 +104,7 @@
 - `thread/rollback` 返回面已经继续走 `load_thread_summary_for_rollout(...)` 这条合并 persisted metadata 的路径，而不是单独重建另一套 rollback-only summary
 - rollback 前如果 SQLite row 已存在、但 rollout-derived preview 仍缺失，服务端与 typed client 回归都已经锁住：rollback 响应、后续 `thread/read` / `thread/list`，以及 SQLite row 会一起恢复同一份 preview，而不是只保 resident mode
 - `thread/read` 与 metadata repair 入口现在也已开始共用同一条 state-db 选择 helper：优先使用 loaded thread 自己挂着的 state-db，其次才回退到全局 state-db，避免同一类 persisted-summary repair 入口继续各自复制一份“先取哪个 SQLite 句柄”的分叉
+- `getConversationSummary` 现在也已继续收口到同一条 helper 语义：按 thread id 读取摘要时，会优先复用 loaded thread 自己挂着的 state-db 与 provider override，因此外部 rollout 的缺摘要 repair 不会再单独退回默认 provider 或绕开 loaded state-db
 - `thread/archive` / `thread/unarchive` 里的旧 phase-1 TODO 注释现在也已收口到实现现状：这两条路径仍从文件系统移动 rollout 起步，但 SQLite reconcile 已经是 restored summary 与 resident continuity 的权威补齐层，不再适合继续留着“未来再改成 sqlite”这类过时提示
 
 最值得补的负向边界：
@@ -152,6 +153,7 @@
 最值得补的负向边界：
 
 - typed client 不会只在 `thread/read` 看见 repaired preview，却在 `thread/resume` / `thread/unarchive` / `thread/rollback` 上退回半修复摘要
+- typed client 也不会在 `getConversationSummary` 这条兼容摘要读取面上重新退回默认 provider，或把 loaded-thread repair 责任重新推回调用方
 - remote facade 不会把“服务端已经修补好 stored summary”在任一读取/恢复面上重新降级成客户端二次补读职责
 
 完成标志：

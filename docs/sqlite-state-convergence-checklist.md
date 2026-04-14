@@ -72,6 +72,8 @@
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_list_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_list_preserves_id_only_probe`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_read_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib get_conversation_summary_reconciles_missing_summary_with_loaded_provider_override_through_typed_requests`
+- `cargo test -p codex-app-server-client --lib remote_typed_get_conversation_summary_preserves_repaired_summary`
 - `cargo test -p codex-app-server-client --lib rollback_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests -- --nocapture`
 
 当前已明确通过、可直接支撑这条判断的服务端验证包括：
@@ -94,6 +96,7 @@
 - `cargo test -p codex-app-server --test all thread_loaded_read_uses_loaded_thread_model_provider_override_when_rollout_metadata_is_missing`
 - `cargo test -p codex-app-server --test all thread_list_uses_loaded_thread_model_provider_override_when_rollout_metadata_is_missing`
 - `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_repairs_missing_summary_for_existing_sqlite_row`
+- `cargo test -p codex-app-server --test all get_conversation_summary_by_thread_id_repairs_missing_summary_with_loaded_provider_override`
 
 ### 当前阶段判断
 
