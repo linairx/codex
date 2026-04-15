@@ -3,6 +3,7 @@ use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
 use pretty_assertions::assert_eq;
+use tokio::sync::mpsc::error::TryRecvError;
 
 #[tokio::test]
 async fn handle_thread_session_preserves_resident_thread_mode() {
@@ -649,7 +650,7 @@ async fn live_app_server_invalid_thread_name_update_is_ignored() {
 }
 
 #[tokio::test]
-async fn live_app_server_thread_closed_requests_immediate_exit() {
+async fn live_app_server_thread_closed_does_not_request_immediate_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.handle_server_notification(
@@ -659,5 +660,5 @@ async fn live_app_server_thread_closed_requests_immediate_exit() {
         /*replay_kind*/ None,
     );
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Immediate)));
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
 }

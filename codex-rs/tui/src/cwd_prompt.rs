@@ -27,14 +27,26 @@ use tokio_stream::StreamExt;
 pub(crate) enum CwdPromptAction {
     Resume,
     Reconnect,
+    ReconnectClosed,
     Fork,
 }
 
 impl CwdPromptAction {
+    fn title_phrase(self) -> &'static str {
+        match self {
+            CwdPromptAction::Resume => "resume this session",
+            CwdPromptAction::Reconnect => "reconnect to this session",
+            CwdPromptAction::ReconnectClosed => "reconnect to this closed session",
+            CwdPromptAction::Fork => "fork this session",
+        }
+    }
+
+    #[cfg(test)]
     fn verb(self) -> &'static str {
         match self {
             CwdPromptAction::Resume => "resume",
             CwdPromptAction::Reconnect => "reconnect to",
+            CwdPromptAction::ReconnectClosed => "reconnect to closed",
             CwdPromptAction::Fork => "fork",
         }
     }
@@ -43,6 +55,7 @@ impl CwdPromptAction {
         match self {
             CwdPromptAction::Resume => "resumed",
             CwdPromptAction::Reconnect => "resident assistant",
+            CwdPromptAction::ReconnectClosed => "closed resident assistant",
             CwdPromptAction::Fork => "forked",
         }
     }
@@ -198,7 +211,7 @@ impl WidgetRef for &CwdPromptScreen {
         Clear.render(area, buf);
         let mut column = ColumnRenderable::new();
 
-        let action_verb = self.action.verb();
+        let action_title_phrase = self.action.title_phrase();
         let action_past = self.action.past_participle();
         let current_cwd = self.current_cwd.as_str();
         let session_cwd = self.session_cwd.as_str();
@@ -206,8 +219,7 @@ impl WidgetRef for &CwdPromptScreen {
         column.push("");
         column.push(Line::from(vec![
             "Choose working directory to ".into(),
-            action_verb.bold(),
-            " this session".into(),
+            action_title_phrase.bold(),
         ]));
         column.push("");
         column.push(
@@ -312,11 +324,35 @@ mod tests {
     }
 
     #[test]
+    fn cwd_prompt_reconnect_closed_snapshot() {
+        let screen = CwdPromptScreen::new(
+            FrameRequester::test_dummy(),
+            CwdPromptAction::ReconnectClosed,
+            "/Users/example/current".to_string(),
+            "/Users/example/session".to_string(),
+        );
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 80, /*height*/ 14)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
+            .expect("render cwd prompt");
+        insta::assert_snapshot!("cwd_prompt_reconnect_closed_modal", terminal.backend());
+    }
+
+    #[test]
     fn reconnect_action_uses_resident_assistant_wording() {
         assert_eq!(CwdPromptAction::Reconnect.verb(), "reconnect to");
         assert_eq!(
             CwdPromptAction::Reconnect.past_participle(),
             "resident assistant"
+        );
+        assert_eq!(
+            CwdPromptAction::ReconnectClosed.verb(),
+            "reconnect to closed"
+        );
+        assert_eq!(
+            CwdPromptAction::ReconnectClosed.past_participle(),
+            "closed resident assistant"
         );
     }
 

@@ -108,6 +108,9 @@ pub(crate) enum AppEvent {
     /// Fork the current session into a new thread.
     ForkCurrentSession,
 
+    /// Close the current session runtime and immediately start a fresh session.
+    CloseCurrentSession,
+
     /// Request to exit the application.
     ///
     /// Use `ShutdownFirst` for user-initiated quits so core cleanup runs and the
@@ -582,6 +585,7 @@ pub(crate) enum ExitMode {
     ///
     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and
     /// cleanup that normally runs before `ShutdownComplete` can be missed.
+    #[cfg(test)]
     Immediate,
 }
 

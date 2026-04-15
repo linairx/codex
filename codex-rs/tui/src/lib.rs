@@ -20,6 +20,7 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
+use codex_app_server_protocol::ThreadStatus;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
@@ -461,6 +462,7 @@ fn session_target_from_app_server_thread(
             path: thread.path,
             thread_id,
             mode: Some(thread.mode),
+            is_closed: matches!(thread.status, ThreadStatus::NotLoaded),
         }),
         Err(err) => {
             warn!(
@@ -1799,6 +1801,7 @@ mod tests {
             path: None,
             thread_id,
             mode: None,
+            is_closed: false,
         };
 
         assert_eq!(target.display_label(), format!("thread {thread_id}"));

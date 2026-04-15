@@ -142,6 +142,7 @@ Example with notification opt-out:
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`. The response preserves stored thread identity metadata such as `mode` and `name`, so reconnect-aware clients do not need to re-read the thread just to recover resident assistant semantics or user-visible naming after a metadata-only update.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). This notification is status-only and does not repeat `thread.mode`; clients that need reconnect semantics should retain `mode` from the corresponding thread snapshot. `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
+- `thread/close` — explicitly shut down and unload a loaded thread, even if it is resident or still has subscribers. The response status reports `closing` when teardown has been accepted and `notLoaded` when no loaded runtime exists. Completion still arrives through `thread/status/changed` (`notLoaded`) plus `thread/closed`. Closing a resident thread only ends the loaded runtime; later `thread/read`, `thread/list`, and `thread/resume` calls still preserve the thread’s stored `mode`.
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, unless the thread is `resident: true`; non-resident unloads emit `thread/closed`, while resident threads stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success, preserving its existing `mode`, and emits `thread/unarchived`.
@@ -365,11 +366,40 @@ When `nextCursor` is `null`, you’ve reached the final page.
 
 If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Threads started/resumed/forked with `resident: true` stay loaded instead, so `thread/unsubscribe` only detaches the connection.
 
+The same lifecycle rule applies when the last transport connection goes away
+without an explicit `thread/unsubscribe`. In other words, a websocket client
+that disconnects after owning the last subscription drives the same thread
+teardown or resident keep-alive behavior as an explicit unsubscribe:
+
+- non-resident threads transition to `notLoaded` and emit `thread/closed`
+- resident threads stay loaded and continue surfacing their existing `mode`
+  plus runtime `status` on later `thread/loaded/read`, `thread/read`, and
+  `thread/resume` calls
+- notification ordering between `thread/status/changed` and `thread/closed` is
+  not guaranteed; consumers should treat both as part of the same unload
+  transition rather than depending on a fixed sequence
+
 For resident threads, that means `thread/unsubscribe` does not downgrade the
 thread back to an ordinary stored session: subsequent `thread/loaded/read`,
 `thread/read`, and `thread/resume` calls continue to surface the resident
 thread’s existing `mode` and loaded/runtime state instead of requiring clients
 to reconstruct reconnect semantics themselves.
+
+### Example: Explicitly close a loaded thread
+
+`thread/close` force-closes the loaded runtime for a thread. This applies to
+both ordinary interactive threads and resident assistant threads. The response
+status is one of:
+
+- `closing` when the shutdown/unload request has been accepted.
+- `notLoaded` when no loaded thread runtime exists for that id.
+
+As with `thread/unsubscribe`, completion is observed through
+`thread/status/changed` plus `thread/closed`; the response only confirms that
+shutdown has been queued. For resident threads, closing the runtime does not
+erase the thread's stored resident identity, so later `thread/read`,
+`thread/list`, and `thread/resume` continue to preserve `thread.mode =
+residentAssistant`.
 
 ```json
 { "method": "thread/unsubscribe", "id": 22, "params": { "threadId": "thr_123" } }

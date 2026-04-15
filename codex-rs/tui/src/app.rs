@@ -79,6 +79,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadActiveFlag;
+use codex_app_server_protocol::ThreadCloseStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadMode;
@@ -1087,6 +1088,12 @@ enum AppServerThreadAttachKind {
     Forked,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentThreadTransition {
+    Unsubscribe,
+    Close,
+}
+
 #[derive(Default)]
 struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
@@ -1162,7 +1169,13 @@ fn cwd_prompt_action_for_session_selection(
     target_session: &crate::resume_picker::SessionTarget,
 ) -> CwdPromptAction {
     match target_session.mode {
-        Some(ThreadMode::ResidentAssistant) => CwdPromptAction::Reconnect,
+        Some(ThreadMode::ResidentAssistant) => {
+            if target_session.is_closed {
+                CwdPromptAction::ReconnectClosed
+            } else {
+                CwdPromptAction::Reconnect
+            }
+        }
         Some(ThreadMode::Interactive) | None => CwdPromptAction::Resume,
     }
 }
@@ -1202,7 +1215,12 @@ fn session_restore_failure_message(
 ) -> String {
     let base = match target_session.mode {
         Some(ThreadMode::ResidentAssistant) => {
-            format!("Failed to reconnect to resident assistant from {target_label}")
+            let assistant_state = if target_session.is_closed {
+                "closed resident assistant"
+            } else {
+                "resident assistant"
+            };
+            format!("Failed to reconnect to {assistant_state} from {target_label}")
         }
         Some(ThreadMode::Interactive) | None => {
             format!("Failed to resume session from {target_label}")
@@ -1721,6 +1739,24 @@ impl App {
             }
             self.abort_thread_event_listener(thread_id);
         }
+    }
+
+    async fn close_current_thread(&mut self, app_server: &mut AppServerSession) -> Result<()> {
+        let Some(thread_id) = self.current_displayed_thread_id() else {
+            return Ok(());
+        };
+
+        self.backtrack.pending_rollback = None;
+        let status = app_server
+            .thread_close(thread_id)
+            .await
+            .wrap_err_with(|| format!("failed to close thread {thread_id}"))?;
+        match status {
+            ThreadCloseStatus::Closing | ThreadCloseStatus::NotLoaded => {}
+        }
+        self.abort_thread_event_listener(thread_id);
+        self.clear_active_thread().await;
+        Ok(())
     }
 
     fn abort_thread_event_listener(&mut self, thread_id: ThreadId) {
@@ -3505,22 +3541,66 @@ impl App {
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
     ) {
+        self.transition_to_fresh_session_with_summary_hint(
+            tui,
+            app_server,
+            CurrentThreadTransition::Unsubscribe,
+        )
+        .await;
+    }
+
+    async fn close_current_session_with_summary_hint(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+    ) {
+        self.transition_to_fresh_session_with_summary_hint(
+            tui,
+            app_server,
+            CurrentThreadTransition::Close,
+        )
+        .await;
+    }
+
+    async fn transition_to_fresh_session_with_summary_hint(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        current_thread_transition: CurrentThreadTransition,
+    ) {
         // Start a fresh in-memory session while preserving resumability via persisted rollout
         // history.
         self.refresh_in_memory_config_from_disk_best_effort("starting a new thread")
             .await;
         let model = self.chat_widget.current_model().to_string();
         let config = self.fresh_session_config();
+        let current_thread_id = self.current_displayed_thread_id();
         let summary = session_summary(
             self.chat_widget.token_usage(),
             self.chat_widget.thread_id(),
             self.chat_widget.thread_name(),
             self.chat_widget.thread_mode(),
         );
-        self.shutdown_current_thread(app_server).await;
+        match current_thread_transition {
+            CurrentThreadTransition::Unsubscribe => {
+                self.shutdown_current_thread(app_server).await;
+            }
+            CurrentThreadTransition::Close => {
+                if let Err(err) = self.close_current_thread(app_server).await {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to close the current session through the app server: {err}"
+                    ));
+                    tui.frame_requester().schedule_frame();
+                    return;
+                }
+            }
+        }
         let tracked_thread_ids: Vec<ThreadId> =
             self.thread_event_channels.keys().copied().collect();
         for thread_id in tracked_thread_ids {
+            if Some(thread_id) == current_thread_id {
+                continue;
+            }
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
             }
@@ -4258,6 +4338,15 @@ impl App {
                 self.reset_app_ui_state_after_clear();
 
                 self.start_fresh_session_with_summary_hint(tui, app_server)
+                    .await;
+            }
+            AppEvent::CloseCurrentSession => {
+                if self.current_displayed_thread_id().is_none() {
+                    self.chat_widget
+                        .add_error_message("No active thread is available.".to_string());
+                    return Ok(AppRunControl::Continue);
+                }
+                self.close_current_session_with_summary_hint(tui, app_server)
                     .await;
             }
             AppEvent::OpenResumePicker => {
@@ -5797,6 +5886,7 @@ impl App {
                 self.pending_shutdown_exit_thread_id = None;
                 AppRunControl::Exit(ExitReason::UserRequested)
             }
+            #[cfg(test)]
             ExitMode::Immediate => {
                 self.pending_shutdown_exit_thread_id = None;
                 AppRunControl::Exit(ExitReason::UserRequested)
@@ -6722,6 +6812,7 @@ mod tests {
                     path: Some(PathBuf::from("/tmp/restore")),
                     thread_id: ThreadId::new(),
                     mode: None,
+                    is_closed: false,
                 }
             )),
             false
@@ -6732,6 +6823,7 @@ mod tests {
                     path: Some(PathBuf::from("/tmp/fork")),
                     thread_id: ThreadId::new(),
                     mode: None,
+                    is_closed: false,
                 }
             )),
             false
@@ -6782,6 +6874,7 @@ mod tests {
                 path: Some(PathBuf::from("/tmp/restore")),
                 thread_id: ThreadId::new(),
                 mode: None,
+                is_closed: false,
             },
         ));
         assert_eq!(
@@ -6796,6 +6889,7 @@ mod tests {
                 path: Some(PathBuf::from("/tmp/fork")),
                 thread_id: ThreadId::new(),
                 mode: None,
+                is_closed: false,
             },
         ));
         assert_eq!(
@@ -10390,16 +10484,28 @@ guardian_approval = true
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: false,
+        };
+        let closed_resident_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: true,
         };
         let interactive_target = crate::resume_picker::SessionTarget {
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::Interactive),
+            is_closed: false,
         };
 
         assert_eq!(
             cwd_prompt_action_for_session_selection(&resident_target),
             CwdPromptAction::Reconnect
+        );
+        assert_eq!(
+            cwd_prompt_action_for_session_selection(&closed_resident_target),
+            CwdPromptAction::ReconnectClosed
         );
         assert_eq!(
             cwd_prompt_action_for_session_selection(&interactive_target),
@@ -10413,11 +10519,13 @@ guardian_approval = true
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: false,
         };
         let interactive_target = crate::resume_picker::SessionTarget {
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::Interactive),
+            is_closed: false,
         };
 
         assert_eq!(
@@ -10436,11 +10544,13 @@ guardian_approval = true
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: false,
         };
         let interactive_target = crate::resume_picker::SessionTarget {
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::Interactive),
+            is_closed: false,
         };
 
         assert_eq!(
@@ -10459,11 +10569,19 @@ guardian_approval = true
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: false,
+        };
+        let closed_resident_target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: true,
         };
         let interactive_target = crate::resume_picker::SessionTarget {
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::Interactive),
+            is_closed: false,
         };
 
         assert_eq!(
@@ -10473,6 +10591,14 @@ guardian_approval = true
         assert_eq!(
             session_restore_failure_message(&resident_target, "/tmp/atlas", Some("boom")),
             "Failed to reconnect to resident assistant from /tmp/atlas: boom"
+        );
+        assert_eq!(
+            session_restore_failure_message(&closed_resident_target, "/tmp/atlas", None),
+            "Failed to reconnect to closed resident assistant from /tmp/atlas"
+        );
+        assert_eq!(
+            session_restore_failure_message(&closed_resident_target, "/tmp/atlas", Some("boom")),
+            "Failed to reconnect to closed resident assistant from /tmp/atlas: boom"
         );
         assert_eq!(
             session_restore_failure_message(&interactive_target, "/tmp/chat", None),
@@ -10486,10 +10612,26 @@ guardian_approval = true
             path: None,
             thread_id: ThreadId::new(),
             mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: false,
         };
 
         assert_snapshot!(
             "resident_session_restore_failure_message",
+            session_restore_failure_message(&target, "/tmp/atlas", Some("boom"))
+        );
+    }
+
+    #[test]
+    fn session_restore_failure_message_closed_resident_snapshot() {
+        let target = crate::resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::new(),
+            mode: Some(ThreadMode::ResidentAssistant),
+            is_closed: true,
+        };
+
+        assert_snapshot!(
+            "closed_resident_session_restore_failure_message",
             session_restore_failure_message(&target, "/tmp/atlas", Some("boom"))
         );
     }

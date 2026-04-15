@@ -157,6 +157,15 @@ async fn slash_quit_requests_exit() {
 }
 
 #[tokio::test]
+async fn slash_close_requests_close_current_session() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Close);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::CloseCurrentSession));
+}
+
+#[tokio::test]
 async fn slash_copy_state_tracks_turn_complete_final_reply() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

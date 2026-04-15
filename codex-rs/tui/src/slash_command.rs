@@ -27,6 +27,7 @@ pub enum SlashCommand {
     New,
     Resume,
     Fork,
+    Close,
     Init,
     Compact,
     Plan,
@@ -79,6 +80,7 @@ impl SlashCommand {
             SlashCommand::Resume => "resume chat or reconnect to resident assistant",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
+            SlashCommand::Close => "close the current chat and start a fresh one",
             // SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
@@ -142,6 +144,7 @@ impl SlashCommand {
             SlashCommand::New
             | SlashCommand::Resume
             | SlashCommand::Fork
+            | SlashCommand::Close
             | SlashCommand::Init
             | SlashCommand::Compact
             // | SlashCommand::Undo

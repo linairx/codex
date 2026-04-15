@@ -106,12 +106,35 @@ same compact `mode + status + action` shape; when the thread id is still
 unknown, it deliberately stays status-only instead of guessing reconnect
 semantics, then immediately follows up with a `thread/read` refresh so later
 notifications and summaries can recover the authoritative `mode + status +
-action` snapshot. `thread/name/updated` now follows the same rule: known
-threads reuse cached mode/status/action context while unknown thread ids stay
-identity-only. That shared notification handling now covers both turn
-streaming and long-running observation modes such as `thread-resume` /
+action` snapshot. The only exception is `thread/status/changed ->
+notLoaded` for an unknown thread id: that unload edge stays status-only so the
+client does not issue a noisy refresh read after a matching `thread/closed`
+transition. `thread/name/updated` now follows the same rule: known threads
+reuse cached mode/status/action context while unknown thread ids stay
+identity-only, and `thread/closed` evicts any cached summary after printing the
+final compact unload line. That shared notification handling now covers both
+turn streaming and long-running observation modes such as `thread-resume` /
 `watch`, so the resident-aware summaries stay consistent even when you keep the
 client attached just to watch later runtime state changes.
+
+When the test client receives server-side approval or elicitation requests, it
+now auto-responds across the full current app-server v2 set instead of only the
+legacy command/file subset:
+
+- command execution approvals: accept
+- file change approvals: accept
+- permission approvals: grant the requested profile with turn scope
+- request_user_input: answer each question with its first option when present,
+  otherwise an empty string
+- MCP elicitation requests: cancel
+
+That lifecycle model also applies if the underlying connection drops instead of
+issuing an explicit `thread-unsubscribe`: non-resident threads unload through
+the same `thread/status/changed -> notLoaded` plus `thread/closed` transition,
+while resident assistants remain available through later `thread-loaded/read`,
+`thread-read`, or `thread-resume` probes. When watching those unload
+notifications, do not assume `thread/status/changed` and `thread/closed` will
+arrive in a fixed order.
 
 ### 2) Resume or reconnect while a turn is in progress (two terminals)
 

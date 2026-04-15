@@ -3923,6 +3923,7 @@ impl ChatWidget {
             .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
     }
 
+    #[cfg(test)]
     fn on_shutdown_complete(&mut self) {
         self.request_immediate_exit();
     }
@@ -5031,6 +5032,9 @@ impl ChatWidget {
             }
             SlashCommand::Fork => {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
+            }
+            SlashCommand::Close => {
+                self.app_event_tx.send(AppEvent::CloseCurrentSession);
             }
             SlashCommand::Init => {
                 let init_target = match self.config.cwd.join(DEFAULT_PROJECT_DOC_FILENAME) {
@@ -6454,11 +6458,7 @@ impl ChatWidget {
                     notification.action,
                 );
             }
-            ServerNotification::ThreadClosed(_) => {
-                if !from_replay {
-                    self.on_shutdown_complete();
-                }
-            }
+            ServerNotification::ThreadClosed(_) => {}
             ServerNotification::ThreadRealtimeStarted(notification) => {
                 if !from_replay {
                     self.on_realtime_conversation_started(
@@ -7182,6 +7182,7 @@ impl ChatWidget {
     ///
     /// Prefer [`Self::request_quit_without_confirmation`] for user-initiated exits;
     /// this is mainly a fallback for shutdown completion or emergency exits.
+    #[cfg(test)]
     fn request_immediate_exit(&self) {
         self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
     }

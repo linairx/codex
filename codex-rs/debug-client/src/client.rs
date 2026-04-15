@@ -25,6 +25,10 @@ use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::McpServerElicitationRequestResponse;
+use codex_app_server_protocol::PermissionGrantScope;
+use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadLoadedListParams;
@@ -35,6 +39,9 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ToolRequestUserInputAnswer;
+use codex_app_server_protocol::ToolRequestUserInputQuestion;
+use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::all_thread_source_kinds;
@@ -445,8 +452,66 @@ fn handle_server_request(
             };
             send_jsonrpc_response(stdin, request_id, response)
         }
+        codex_app_server_protocol::ServerRequest::PermissionsRequestApproval {
+            request_id,
+            params,
+        } => {
+            let response = PermissionsRequestApprovalResponse {
+                permissions: denied_permissions_response(&params.permissions),
+                scope: PermissionGrantScope::Turn,
+            };
+            send_jsonrpc_response(stdin, request_id, response)
+        }
+        codex_app_server_protocol::ServerRequest::ToolRequestUserInput { request_id, params } => {
+            let response = ToolRequestUserInputResponse {
+                answers: default_user_input_answers(&params.questions),
+            };
+            send_jsonrpc_response(stdin, request_id, response)
+        }
+        codex_app_server_protocol::ServerRequest::McpServerElicitationRequest {
+            request_id,
+            ..
+        } => {
+            let response = McpServerElicitationRequestResponse {
+                action: McpServerElicitationAction::Cancel,
+                content: None,
+                meta: None,
+            };
+            send_jsonrpc_response(stdin, request_id, response)
+        }
         _ => Ok(()),
     }
+}
+
+fn denied_permissions_response(
+    _request: &codex_app_server_protocol::RequestPermissionProfile,
+) -> codex_app_server_protocol::GrantedPermissionProfile {
+    codex_app_server_protocol::GrantedPermissionProfile {
+        network: None,
+        file_system: None,
+    }
+}
+
+fn default_user_input_answers(
+    questions: &[ToolRequestUserInputQuestion],
+) -> std::collections::HashMap<String, ToolRequestUserInputAnswer> {
+    questions
+        .iter()
+        .map(|question| {
+            let answer = question
+                .options
+                .as_ref()
+                .and_then(|options| options.first())
+                .map(|option| option.label.clone())
+                .unwrap_or_default();
+            (
+                question.id.clone(),
+                ToolRequestUserInputAnswer {
+                    answers: vec![answer],
+                },
+            )
+        })
+        .collect()
 }
 
 fn send_jsonrpc_response<T: Serialize>(
@@ -512,12 +577,17 @@ pub fn build_thread_resume_params(
 mod tests {
     use super::AppServerClient;
     use super::all_thread_source_kinds;
+    use super::default_user_input_answers;
+    use super::denied_permissions_response;
     use crate::output::Output;
     use crate::state::KnownThread;
     use crate::state::State;
     use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::ToolRequestUserInputOption;
+    use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
     use std::process::Command;
     use std::process::Stdio;
     use std::sync::Arc;
@@ -573,5 +643,65 @@ mod tests {
 
         assert_eq!(selected, Some(known_thread));
         client.shutdown();
+    }
+
+    #[test]
+    fn denied_permissions_response_returns_empty_grant() {
+        assert_eq!(
+            denied_permissions_response(&codex_app_server_protocol::RequestPermissionProfile {
+                network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                    enabled: Some(true),
+                }),
+                file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
+                    read: Some(vec![]),
+                    write: Some(vec![]),
+                }),
+            }),
+            codex_app_server_protocol::GrantedPermissionProfile {
+                network: None,
+                file_system: None,
+            }
+        );
+    }
+
+    #[test]
+    fn default_user_input_answers_prefers_first_option_and_empty_fallback() {
+        assert_eq!(
+            default_user_input_answers(&[
+                ToolRequestUserInputQuestion {
+                    id: "q1".to_string(),
+                    header: "Mode".to_string(),
+                    question: "Pick one".to_string(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![ToolRequestUserInputOption {
+                        label: "fast".to_string(),
+                        description: "short".to_string(),
+                    }]),
+                },
+                ToolRequestUserInputQuestion {
+                    id: "q2".to_string(),
+                    header: "Freeform".to_string(),
+                    question: "Type".to_string(),
+                    is_other: true,
+                    is_secret: false,
+                    options: None,
+                },
+            ]),
+            HashMap::from([
+                (
+                    "q1".to_string(),
+                    codex_app_server_protocol::ToolRequestUserInputAnswer {
+                        answers: vec!["fast".to_string()],
+                    },
+                ),
+                (
+                    "q2".to_string(),
+                    codex_app_server_protocol::ToolRequestUserInputAnswer {
+                        answers: vec![String::new()],
+                    },
+                ),
+            ])
+        );
     }
 }

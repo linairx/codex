@@ -55,6 +55,7 @@ pub struct SessionTarget {
     pub path: Option<PathBuf>,
     pub thread_id: ThreadId,
     pub mode: Option<ThreadMode>,
+    pub is_closed: bool,
 }
 
 impl SessionTarget {
@@ -103,11 +104,13 @@ impl SessionPickerAction {
         path: Option<PathBuf>,
         thread_id: ThreadId,
         mode: Option<ThreadMode>,
+        is_closed: bool,
     ) -> SessionSelection {
         let target_session = SessionTarget {
             path,
             thread_id,
             mode,
+            is_closed,
         };
         match self {
             SessionPickerAction::Resume => SessionSelection::Resume(target_session),
@@ -567,6 +570,7 @@ struct Row {
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     mode: ThreadMode,
+    is_closed: bool,
     active_flags: Vec<ThreadActiveFlag>,
     has_system_error: bool,
     created_at: Option<DateTime<Utc>>,
@@ -685,7 +689,12 @@ impl PickerState {
                         },
                     };
                     if let Some(thread_id) = thread_id {
-                        return Ok(Some(self.action.selection(path, thread_id, Some(row.mode))));
+                        return Ok(Some(self.action.selection(
+                            path,
+                            thread_id,
+                            Some(row.mode),
+                            row.is_closed,
+                        )));
                     }
                     self.inline_error = Some(match path {
                         Some(path) => {
@@ -1142,6 +1151,7 @@ fn head_to_row(item: &ThreadItem) -> Row {
         thread_id: item.thread_id,
         thread_name: None,
         mode: ThreadMode::Interactive,
+        is_closed: false,
         active_flags: Vec::new(),
         has_system_error: false,
         created_at,
@@ -1176,6 +1186,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => Vec::new(),
         ThreadStatus::Active { active_flags } => active_flags.clone(),
     };
+    let is_closed = matches!(status, ThreadStatus::NotLoaded);
     let has_system_error = matches!(status, ThreadStatus::SystemError);
     let preview = preview.trim();
     Some(Row {
@@ -1188,6 +1199,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         thread_id: Some(thread_id),
         thread_name: name,
         mode,
+        is_closed,
         active_flags,
         has_system_error,
         created_at: chrono::DateTime::from_timestamp(created_at, 0)
@@ -1217,6 +1229,10 @@ fn thread_mode_label(mode: ThreadMode) -> Option<&'static str> {
 
 fn system_error_label() -> &'static str {
     "[error]"
+}
+
+fn closed_label() -> &'static str {
+    "[closed]"
 }
 
 fn thread_list_params(
@@ -1460,6 +1476,10 @@ fn render_list(
             preview_width =
                 preview_width.saturating_sub(UnicodeWidthStr::width(system_error_label()) + 1);
         }
+        if row.is_closed {
+            preview_width =
+                preview_width.saturating_sub(UnicodeWidthStr::width(closed_label()) + 1);
+        }
         if let Some(mode_label) = thread_mode_label(row.mode) {
             preview_width = preview_width.saturating_sub(UnicodeWidthStr::width(mode_label) + 1);
         }
@@ -1490,6 +1510,10 @@ fn render_list(
         }
         if row.has_system_error {
             spans.push(system_error_label().red());
+            spans.push(" ".into());
+        }
+        if row.is_closed {
+            spans.push(closed_label().dim());
             spans.push(" ".into());
         }
         if let Some(mode_label) = thread_mode_label(row.mode) {
@@ -2066,6 +2090,7 @@ mod tests {
             thread_id: None,
             thread_name: Some(String::from("My session")),
             mode: ThreadMode::Interactive,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -2126,6 +2151,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: None,
             mode: ThreadMode::Interactive,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -2163,6 +2189,7 @@ mod tests {
                 thread_id: None,
                 thread_name: None,
                 mode: ThreadMode::Interactive,
+                is_closed: false,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: Some(now - Duration::minutes(16)),
@@ -2176,6 +2203,7 @@ mod tests {
                 thread_id: None,
                 thread_name: None,
                 mode: ThreadMode::Interactive,
+                is_closed: false,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: Some(now - Duration::hours(1)),
@@ -2189,6 +2217,7 @@ mod tests {
                 thread_id: None,
                 thread_name: None,
                 mode: ThreadMode::Interactive,
+                is_closed: false,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: Some(now - Duration::hours(2)),
@@ -2252,6 +2281,7 @@ mod tests {
                 thread_id: Some(ThreadId::new()),
                 thread_name: Some(String::from("Remote active thread")),
                 mode: ThreadMode::ResidentAssistant,
+                is_closed: false,
                 active_flags: vec![
                     ThreadActiveFlag::WorkspaceChanged,
                     ThreadActiveFlag::WaitingOnApproval,
@@ -2268,6 +2298,7 @@ mod tests {
                 thread_id: Some(ThreadId::new()),
                 thread_name: None,
                 mode: ThreadMode::Interactive,
+                is_closed: false,
                 active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
                 has_system_error: false,
                 created_at: Some(now - Duration::hours(2)),
@@ -2362,6 +2393,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Remote active thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: Some(Utc::now()),
@@ -2406,6 +2438,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Remote active thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: Some(Utc::now()),
@@ -2441,6 +2474,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Interactive thread")),
             mode: ThreadMode::Interactive,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: Some(Utc::now()),
@@ -2500,6 +2534,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Remote active thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: Some(Utc::now()),
@@ -2549,6 +2584,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Forkable resident thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: Some(Utc::now()),
@@ -2587,6 +2623,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Remote active thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: Some(Utc::now()),
@@ -2624,6 +2661,63 @@ mod tests {
     }
 
     #[test]
+    fn resume_picker_row_renders_closed_badge_for_not_loaded_resident_threads() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+        use ratatui::layout::Constraint;
+        use ratatui::layout::Layout;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.filtered_rows = vec![Row {
+            path: None,
+            preview: String::from("Reconnect to a closed resident assistant"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: Some(String::from("Closed resident thread")),
+            mode: ThreadMode::ResidentAssistant,
+            is_closed: true,
+            active_flags: Vec::new(),
+            has_system_error: false,
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            cwd: Some(PathBuf::from("/srv/project")),
+            git_branch: Some(String::from("feature/resident")),
+        }];
+        state.all_rows = state.filtered_rows.clone();
+        state.view_rows = Some(1);
+        state.selected = 0;
+        state.scroll_top = 0;
+
+        let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
+
+        let width: u16 = 110;
+        let height: u16 = 3;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            let segments =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
+            render_list(&mut frame, segments[1], &state, &metrics);
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("resume_picker_closed_resident_thread", snapshot);
+    }
+
+    #[test]
     fn resume_picker_row_renders_system_error_badge_for_resident_threads() {
         use crate::custom_terminal::Terminal;
         use crate::test_backend::VT100Backend;
@@ -2646,6 +2740,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Remote errored thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: true,
             created_at: Some(Utc::now()),
@@ -2702,6 +2797,7 @@ mod tests {
             thread_id: Some(ThreadId::new()),
             thread_name: Some(String::from("Remote errored thread")),
             mode: ThreadMode::ResidentAssistant,
+            is_closed: false,
             active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
             has_system_error: true,
             created_at: Some(Utc::now()),
@@ -2790,6 +2886,7 @@ mod tests {
                 thread_id: Some(id1),
                 thread_name: None,
                 mode: ThreadMode::Interactive,
+                is_closed: false,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: None,
@@ -2803,6 +2900,7 @@ mod tests {
                 thread_id: Some(id2),
                 thread_name: None,
                 mode: ThreadMode::Interactive,
+                is_closed: false,
                 active_flags: Vec::new(),
                 has_system_error: false,
                 created_at: None,
@@ -2875,6 +2973,7 @@ mod tests {
             thread_id: Some(thread_id),
             thread_name: Some(String::from("stale backend title")),
             mode: ThreadMode::Interactive,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -3215,6 +3314,7 @@ mod tests {
             thread_id: None,
             thread_name: None,
             mode: ThreadMode::Interactive,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -3258,6 +3358,7 @@ mod tests {
             thread_id: Some(thread_id),
             thread_name: None,
             mode: ThreadMode::Interactive,
+            is_closed: false,
             active_flags: Vec::new(),
             has_system_error: false,
             created_at: None,
@@ -3278,6 +3379,7 @@ mod tests {
                 path: None,
                 thread_id: selected_thread_id,
                 mode: Some(ThreadMode::Interactive),
+                is_closed: false,
             })) => assert_eq!(selected_thread_id, thread_id),
             other => panic!("unexpected selection: {other:?}"),
         }
@@ -3313,6 +3415,11 @@ mod tests {
     }
 
     #[test]
+    fn closed_label_marks_not_loaded_threads() {
+        assert_eq!(closed_label(), "[closed]");
+    }
+
+    #[test]
     fn app_server_row_keeps_pathless_threads() {
         let thread_id = ThreadId::new();
         let thread = Thread {
@@ -3342,6 +3449,7 @@ mod tests {
         assert_eq!(row.path, None);
         assert_eq!(row.thread_id, Some(thread_id));
         assert_eq!(row.thread_name, Some(String::from("Named thread")));
+        assert!(!row.is_closed);
         assert_eq!(row.active_flags, Vec::new());
         assert!(!row.has_system_error);
     }
@@ -3416,6 +3524,38 @@ mod tests {
         assert_eq!(row.mode, ThreadMode::ResidentAssistant);
         assert!(row.active_flags.is_empty());
         assert!(row.has_system_error);
+    }
+
+    #[test]
+    fn app_server_row_marks_not_loaded_status_closed() {
+        let thread = Thread {
+            id: ThreadId::new().to_string(),
+            forked_from_id: None,
+            preview: String::from("closed resident thread"),
+            ephemeral: false,
+            model_provider: String::from("openai"),
+            created_at: 1,
+            updated_at: 2,
+            status: ThreadStatus::NotLoaded,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: None,
+            cwd: PathBuf::from("/tmp"),
+            cli_version: String::from("0.0.0"),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: Some(String::from("Closed resident thread")),
+            turns: Vec::new(),
+        };
+
+        let row = row_from_app_server_thread(thread).expect("row should be preserved");
+
+        assert!(row.is_closed);
+        assert_eq!(row.mode, ThreadMode::ResidentAssistant);
+        assert!(row.active_flags.is_empty());
+        assert!(!row.has_system_error);
     }
 
     #[test]

@@ -117,6 +117,9 @@ use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadCloseParams;
+use codex_app_server_protocol::ThreadCloseResponse;
+use codex_app_server_protocol::ThreadCloseStatus;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
@@ -733,6 +736,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ThreadArchive { request_id, params } => {
                 self.thread_archive(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::ThreadClose { request_id, params } => {
+                self.thread_close(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::ThreadIncrementElicitation { request_id, params } => {
@@ -3466,6 +3473,7 @@ impl CodexMessageProcessor {
             .map(|value| value as usize)
             .unwrap_or(THREAD_LIST_DEFAULT_LIMIT)
             .clamp(1, THREAD_LIST_MAX_LIMIT);
+        let cursor_for_state_fallback = cursor.clone();
         let archived = archived.unwrap_or(false);
         let model_providers_filter = model_providers.clone();
         let source_kinds_filter = source_kinds.clone();
@@ -3541,6 +3549,64 @@ impl CodexMessageProcessor {
                 apply_persisted_thread_mode(&mut thread, &metadata);
             }
             data.push(thread);
+        }
+
+        if cursor_for_state_fallback.is_none()
+            && data.len() < requested_page_size
+            && let Some(state_db_ctx) = state_db_ctx.as_ref()
+        {
+            let model_provider_filter = model_providers_filter.as_ref().and_then(|providers| {
+                if providers.is_empty() {
+                    None
+                } else {
+                    Some(providers.as_slice())
+                }
+            });
+            let (allowed_sources, _) = compute_source_filters(source_kinds_filter.clone());
+            let allowed_sources = allowed_sources
+                .into_iter()
+                .filter_map(|source| serde_json::to_string(&source).ok())
+                .collect::<Vec<_>>();
+            let state_sort_key = match core_sort_key {
+                CoreThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
+                CoreThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
+            };
+
+            match state_db_ctx
+                .list_threads(
+                    requested_page_size,
+                    /*anchor*/ None,
+                    state_sort_key,
+                    &allowed_sources,
+                    model_provider_filter,
+                    archived,
+                    search_term_filter.as_deref(),
+                )
+                .await
+            {
+                Ok(page) => {
+                    for metadata in page.items {
+                        if thread_ids.contains(&metadata.id) {
+                            continue;
+                        }
+                        if cwd_filter
+                            .as_ref()
+                            .is_some_and(|expected_cwd| &metadata.cwd != expected_cwd)
+                        {
+                            continue;
+                        }
+
+                        let mut thread = summary_to_thread(summary_from_thread_metadata(&metadata));
+                        apply_persisted_thread_mode(&mut thread, &metadata);
+                        data.push(thread);
+                        thread_ids.insert(metadata.id);
+                        if data.len() == requested_page_size {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => warn!("failed to list persisted threads for list fallback: {err}"),
+            }
         }
 
         if !archived && search_term_filter.is_none() && data.len() < requested_page_size {
@@ -4010,9 +4076,13 @@ impl CodexMessageProcessor {
         self.command_exec_manager
             .connection_closed(connection_id)
             .await;
-        self.thread_state_manager
+        let thread_ids_without_subscribers = self
+            .thread_state_manager
             .remove_connection(connection_id)
             .await;
+        for thread_id in thread_ids_without_subscribers {
+            self.handle_thread_with_no_subscribers(thread_id).await;
+        }
     }
 
     pub(crate) fn subscribe_running_assistant_turn_count(&self) -> watch::Receiver<usize> {
@@ -5807,6 +5877,94 @@ impl CodexMessageProcessor {
             .await;
     }
 
+    async fn handle_thread_with_no_subscribers(&mut self, thread_id: ThreadId) {
+        if self.thread_state_manager.has_subscribers(thread_id).await {
+            return;
+        }
+
+        let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+            self.finalize_thread_teardown(thread_id).await;
+            return;
+        };
+
+        if self
+            .thread_state_manager
+            .is_thread_resident(thread_id)
+            .await
+        {
+            thread.ensure_rollout_materialized().await;
+            thread.flush_rollout().await;
+            if let Some(rollout_path) = thread.rollout_path() {
+                ensure_thread_mode_persisted_in_state_db(
+                    self.config.as_ref(),
+                    thread_id,
+                    rollout_path.as_path(),
+                    &thread.config_snapshot().await,
+                    /*resident*/ true,
+                )
+                .await;
+            }
+            return;
+        }
+
+        let should_start_unload = {
+            let mut pending_thread_unloads = self.pending_thread_unloads.lock().await;
+            pending_thread_unloads.insert(thread_id)
+        };
+        if !should_start_unload {
+            return;
+        }
+
+        info!("thread {thread_id} has no subscribers; shutting down");
+        // Any pending app-server -> client requests for this thread can no longer be
+        // answered; cancel their callbacks before shutdown/unload.
+        self.outgoing
+            .cancel_requests_for_thread(thread_id, /*error*/ None)
+            .await;
+        self.thread_state_manager
+            .remove_thread_state(thread_id)
+            .await;
+
+        let outgoing = self.outgoing.clone();
+        let pending_thread_unloads = self.pending_thread_unloads.clone();
+        let thread_manager = self.thread_manager.clone();
+        let thread_watch_manager = self.thread_watch_manager.clone();
+        tokio::spawn(async move {
+            match Self::wait_for_thread_shutdown(&thread).await {
+                ThreadShutdownResult::Complete => {
+                    if thread_manager.remove_thread(&thread_id).await.is_none() {
+                        info!(
+                            "thread {thread_id} was already removed before unsubscribe finalized"
+                        );
+                        thread_watch_manager
+                            .remove_thread(&thread_id.to_string())
+                            .await;
+                        pending_thread_unloads.lock().await.remove(&thread_id);
+                        return;
+                    }
+                    thread_watch_manager
+                        .remove_thread(&thread_id.to_string())
+                        .await;
+                    let notification = ThreadClosedNotification {
+                        thread_id: thread_id.to_string(),
+                    };
+                    outgoing
+                        .send_server_notification(ServerNotification::ThreadClosed(notification))
+                        .await;
+                    pending_thread_unloads.lock().await.remove(&thread_id);
+                }
+                ThreadShutdownResult::SubmitFailed => {
+                    pending_thread_unloads.lock().await.remove(&thread_id);
+                    warn!("failed to submit Shutdown to thread {thread_id}");
+                }
+                ThreadShutdownResult::TimedOut => {
+                    pending_thread_unloads.lock().await.remove(&thread_id);
+                    warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
+                }
+            }
+        });
+    }
+
     async fn thread_unsubscribe(
         &mut self,
         request_id: ConnectionRequestId,
@@ -5821,7 +5979,7 @@ impl CodexMessageProcessor {
             }
         };
 
-        let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+        if self.thread_manager.get_thread(thread_id).await.is_err() {
             // Reconcile stale app-server bookkeeping when the thread has already been
             // removed from the core manager. This keeps loaded-status/subscription state
             // consistent with the source of truth before reporting NotLoaded.
@@ -5835,7 +5993,7 @@ impl CodexMessageProcessor {
                 )
                 .await;
             return;
-        };
+        }
 
         let was_subscribed = self
             .thread_state_manager
@@ -5853,84 +6011,8 @@ impl CodexMessageProcessor {
             return;
         }
 
-        if !self.thread_state_manager.has_subscribers(thread_id).await
-            && self
-                .thread_state_manager
-                .is_thread_resident(thread_id)
-                .await
-        {
-            thread.ensure_rollout_materialized().await;
-            thread.flush_rollout().await;
-            if let Some(rollout_path) = thread.rollout_path() {
-                ensure_thread_mode_persisted_in_state_db(
-                    self.config.as_ref(),
-                    thread_id,
-                    rollout_path.as_path(),
-                    &thread.config_snapshot().await,
-                    /*resident*/ true,
-                )
-                .await;
-            }
-        }
-
-        if !self.thread_state_manager.has_subscribers(thread_id).await
-            && !self
-                .thread_state_manager
-                .is_thread_resident(thread_id)
-                .await
-        {
-            // This connection was the last subscriber. Only now do we unload the thread.
-            info!("thread {thread_id} has no subscribers; shutting down");
-            self.pending_thread_unloads.lock().await.insert(thread_id);
-            // Any pending app-server -> client requests for this thread can no longer be
-            // answered; cancel their callbacks before shutdown/unload.
-            self.outgoing
-                .cancel_requests_for_thread(thread_id, /*error*/ None)
-                .await;
-            self.thread_state_manager
-                .remove_thread_state(thread_id)
-                .await;
-
-            let outgoing = self.outgoing.clone();
-            let pending_thread_unloads = self.pending_thread_unloads.clone();
-            let thread_manager = self.thread_manager.clone();
-            let thread_watch_manager = self.thread_watch_manager.clone();
-            tokio::spawn(async move {
-                match Self::wait_for_thread_shutdown(&thread).await {
-                    ThreadShutdownResult::Complete => {
-                        if thread_manager.remove_thread(&thread_id).await.is_none() {
-                            info!(
-                                "thread {thread_id} was already removed before unsubscribe finalized"
-                            );
-                            thread_watch_manager
-                                .remove_thread(&thread_id.to_string())
-                                .await;
-                            pending_thread_unloads.lock().await.remove(&thread_id);
-                            return;
-                        }
-                        thread_watch_manager
-                            .remove_thread(&thread_id.to_string())
-                            .await;
-                        let notification = ThreadClosedNotification {
-                            thread_id: thread_id.to_string(),
-                        };
-                        outgoing
-                            .send_server_notification(ServerNotification::ThreadClosed(
-                                notification,
-                            ))
-                            .await;
-                        pending_thread_unloads.lock().await.remove(&thread_id);
-                    }
-                    ThreadShutdownResult::SubmitFailed => {
-                        pending_thread_unloads.lock().await.remove(&thread_id);
-                        warn!("failed to submit Shutdown to thread {thread_id}");
-                    }
-                    ThreadShutdownResult::TimedOut => {
-                        pending_thread_unloads.lock().await.remove(&thread_id);
-                        warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
-                    }
-                }
-            });
+        if !self.thread_state_manager.has_subscribers(thread_id).await {
+            self.handle_thread_with_no_subscribers(thread_id).await;
         }
 
         self.outgoing
@@ -5938,6 +6020,80 @@ impl CodexMessageProcessor {
                 request_id,
                 ThreadUnsubscribeResponse {
                     status: ThreadUnsubscribeStatus::Unsubscribed,
+                },
+            )
+            .await;
+    }
+
+    async fn thread_close(&mut self, request_id: ConnectionRequestId, params: ThreadCloseParams) {
+        let thread_id = match ThreadId::from_string(&params.thread_id) {
+            Ok(id) => id,
+            Err(err) => {
+                self.send_invalid_request_error(request_id, format!("invalid thread id: {err}"))
+                    .await;
+                return;
+            }
+        };
+
+        let loaded_thread = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(_) => {
+                self.finalize_thread_teardown(thread_id).await;
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        ThreadCloseResponse {
+                            status: ThreadCloseStatus::NotLoaded,
+                        },
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        if self
+            .pending_thread_unloads
+            .lock()
+            .await
+            .contains(&thread_id)
+        {
+            self.outgoing
+                .send_response(
+                    request_id,
+                    ThreadCloseResponse {
+                        status: ThreadCloseStatus::Closing,
+                    },
+                )
+                .await;
+            return;
+        }
+
+        loaded_thread.ensure_rollout_materialized().await;
+        loaded_thread.flush_rollout().await;
+        if let Some(rollout_path) = loaded_thread.rollout_path() {
+            ensure_thread_mode_persisted_in_state_db(
+                self.config.as_ref(),
+                thread_id,
+                rollout_path.as_path(),
+                &loaded_thread.config_snapshot().await,
+                /*resident*/ true,
+            )
+            .await;
+        }
+
+        self.thread_state_manager
+            .set_thread_resident(thread_id, /*resident*/ false)
+            .await;
+        self.thread_state_manager
+            .clear_thread_subscribers(thread_id)
+            .await;
+        self.handle_thread_with_no_subscribers(thread_id).await;
+
+        self.outgoing
+            .send_response(
+                request_id,
+                ThreadCloseResponse {
+                    status: ThreadCloseStatus::Closing,
                 },
             )
             .await;
@@ -10464,7 +10620,8 @@ mod tests {
             state.lock().await.cancel_tx = Some(cancel_tx);
         }
 
-        manager.remove_connection(connection_a).await;
+        let thread_ids_without_subscribers = manager.remove_connection(connection_a).await;
+        assert_eq!(thread_ids_without_subscribers, Vec::<ThreadId>::new());
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut cancel_rx)
                 .await
@@ -10485,7 +10642,8 @@ mod tests {
         let connection = ConnectionId(1);
 
         manager.connection_initialized(connection).await;
-        manager.remove_connection(connection).await;
+        let thread_ids_without_subscribers = manager.remove_connection(connection).await;
+        assert_eq!(thread_ids_without_subscribers, Vec::<ThreadId>::new());
 
         assert!(
             manager
@@ -10495,6 +10653,26 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert!(!manager.has_subscribers(thread_id).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_last_connection_reports_thread_without_subscribers() -> Result<()> {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
+        let connection = ConnectionId(1);
+
+        manager.connection_initialized(connection).await;
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id, connection, /*experimental_raw_events*/ false,
+            )
+            .await
+            .expect("connection should be live");
+
+        let thread_ids_without_subscribers = manager.remove_connection(connection).await;
+        assert_eq!(thread_ids_without_subscribers, vec![thread_id]);
         assert!(!manager.has_subscribers(thread_id).await);
         Ok(())
     }

@@ -29,11 +29,11 @@ pub(super) struct UnsupportedAppServerRequest {
 
 #[derive(Debug, Default)]
 pub(super) struct PendingAppServerRequests {
-    exec_approvals: HashMap<String, AppServerRequestId>,
-    file_change_approvals: HashMap<String, AppServerRequestId>,
-    permissions_approvals: HashMap<String, AppServerRequestId>,
-    user_inputs: HashMap<String, AppServerRequestId>,
-    mcp_requests: HashMap<McpLegacyRequestKey, AppServerRequestId>,
+    exec_approvals: HashMap<String, PendingThreadRequest>,
+    file_change_approvals: HashMap<String, PendingThreadRequest>,
+    permissions_approvals: HashMap<String, PendingThreadRequest>,
+    user_inputs: HashMap<String, PendingThreadRequest>,
+    mcp_requests: HashMap<McpLegacyRequestKey, PendingThreadRequest>,
 }
 
 impl PendingAppServerRequests {
@@ -55,22 +55,31 @@ impl PendingAppServerRequests {
                     .approval_id
                     .clone()
                     .unwrap_or_else(|| params.item_id.clone());
-                self.exec_approvals.insert(approval_id, request_id.clone());
+                self.exec_approvals.insert(
+                    approval_id,
+                    PendingThreadRequest::new(request_id.clone(), params.thread_id.clone()),
+                );
                 None
             }
             ServerRequest::FileChangeRequestApproval { request_id, params } => {
-                self.file_change_approvals
-                    .insert(params.item_id.clone(), request_id.clone());
+                self.file_change_approvals.insert(
+                    params.item_id.clone(),
+                    PendingThreadRequest::new(request_id.clone(), params.thread_id.clone()),
+                );
                 None
             }
             ServerRequest::PermissionsRequestApproval { request_id, params } => {
-                self.permissions_approvals
-                    .insert(params.item_id.clone(), request_id.clone());
+                self.permissions_approvals.insert(
+                    params.item_id.clone(),
+                    PendingThreadRequest::new(request_id.clone(), params.thread_id.clone()),
+                );
                 None
             }
             ServerRequest::ToolRequestUserInput { request_id, params } => {
-                self.user_inputs
-                    .insert(params.turn_id.clone(), request_id.clone());
+                self.user_inputs.insert(
+                    params.turn_id.clone(),
+                    PendingThreadRequest::new(request_id.clone(), params.thread_id.clone()),
+                );
                 None
             }
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
@@ -79,7 +88,7 @@ impl PendingAppServerRequests {
                         server_name: params.server_name.clone(),
                         request_id: app_server_request_id_to_mcp_request_id(request_id),
                     },
-                    request_id.clone(),
+                    PendingThreadRequest::new(request_id.clone(), params.thread_id.clone()),
                 );
                 None
             }
@@ -119,9 +128,9 @@ impl PendingAppServerRequests {
             AppCommandView::ExecApproval { id, decision, .. } => self
                 .exec_approvals
                 .remove(id)
-                .map(|request_id| {
+                .map(|request| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
-                        request_id,
+                        request_id: request.request_id,
                         result: serde_json::to_value(CommandExecutionRequestApprovalResponse {
                             decision: decision.clone().into(),
                         })
@@ -134,9 +143,9 @@ impl PendingAppServerRequests {
             AppCommandView::PatchApproval { id, decision } => self
                 .file_change_approvals
                 .remove(id)
-                .map(|request_id| {
+                .map(|request| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
-                        request_id,
+                        request_id: request.request_id,
                         result: serde_json::to_value(FileChangeRequestApprovalResponse {
                             decision: file_change_decision(decision)?,
                         })
@@ -149,9 +158,9 @@ impl PendingAppServerRequests {
             AppCommandView::RequestPermissionsResponse { id, response } => self
                 .permissions_approvals
                 .remove(id)
-                .map(|request_id| {
+                .map(|request| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
-                        request_id,
+                        request_id: request.request_id,
                         result: serde_json::to_value(PermissionsRequestApprovalResponse {
                             permissions: granted_permission_profile_from_request(
                                 response.permissions.clone(),
@@ -167,9 +176,9 @@ impl PendingAppServerRequests {
             AppCommandView::UserInputAnswer { id, response } => self
                 .user_inputs
                 .remove(id)
-                .map(|request_id| {
+                .map(|request| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
-                        request_id,
+                        request_id: request.request_id,
                         result: serde_json::to_value(
                             serde_json::from_value::<ToolRequestUserInputResponse>(
                                 serde_json::to_value(response).map_err(|err| {
@@ -200,9 +209,9 @@ impl PendingAppServerRequests {
                     server_name: server_name.to_string(),
                     request_id: request_id.clone(),
                 })
-                .map(|request_id| {
+                .map(|request| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
-                        request_id,
+                        request_id: request.request_id,
                         result: serde_json::to_value(McpServerElicitationRequestResponse {
                             action: match decision {
                                 codex_protocol::approvals::ElicitationAction::Accept => {
@@ -230,13 +239,44 @@ impl PendingAppServerRequests {
     }
 
     pub(super) fn resolve_notification(&mut self, request_id: &AppServerRequestId) {
-        self.exec_approvals.retain(|_, value| value != request_id);
+        self.exec_approvals
+            .retain(|_, value| &value.request_id != request_id);
         self.file_change_approvals
-            .retain(|_, value| value != request_id);
+            .retain(|_, value| &value.request_id != request_id);
         self.permissions_approvals
-            .retain(|_, value| value != request_id);
-        self.user_inputs.retain(|_, value| value != request_id);
-        self.mcp_requests.retain(|_, value| value != request_id);
+            .retain(|_, value| &value.request_id != request_id);
+        self.user_inputs
+            .retain(|_, value| &value.request_id != request_id);
+        self.mcp_requests
+            .retain(|_, value| &value.request_id != request_id);
+    }
+
+    pub(super) fn resolve_thread_closed(&mut self, thread_id: &str) {
+        self.exec_approvals
+            .retain(|_, value| value.thread_id != thread_id);
+        self.file_change_approvals
+            .retain(|_, value| value.thread_id != thread_id);
+        self.permissions_approvals
+            .retain(|_, value| value.thread_id != thread_id);
+        self.user_inputs
+            .retain(|_, value| value.thread_id != thread_id);
+        self.mcp_requests
+            .retain(|_, value| value.thread_id != thread_id);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingThreadRequest {
+    request_id: AppServerRequestId,
+    thread_id: String,
+}
+
+impl PendingThreadRequest {
+    fn new(request_id: AppServerRequestId, thread_id: String) -> Self {
+        Self {
+            request_id,
+            thread_id,
+        }
     }
 }
 
@@ -571,5 +611,65 @@ mod tests {
             error,
             "execpolicy amendment is not a valid file change approval decision"
         );
+    }
+
+    #[test]
+    fn thread_closed_clears_pending_requests_for_that_thread_only() {
+        let mut pending = PendingAppServerRequests::default();
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::CommandExecutionRequestApproval {
+                request_id: AppServerRequestId::Integer(21),
+                params: CommandExecutionRequestApprovalParams {
+                    thread_id: "thread-closed".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "call-1".to_string(),
+                    approval_id: None,
+                    reason: None,
+                    network_approval_context: None,
+                    command: Some("ls".to_string()),
+                    cwd: None,
+                    command_actions: None,
+                    additional_permissions: None,
+                    proposed_execpolicy_amendment: None,
+                    proposed_network_policy_amendments: None,
+                    available_decisions: None,
+                },
+            }),
+            None
+        );
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::FileChangeRequestApproval {
+                request_id: AppServerRequestId::Integer(22),
+                params: FileChangeRequestApprovalParams {
+                    thread_id: "thread-open".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    item_id: "patch-2".to_string(),
+                    reason: None,
+                    grant_root: None,
+                },
+            }),
+            None
+        );
+
+        pending.resolve_thread_closed("thread-closed");
+
+        let closed_resolution = pending
+            .take_resolution(&Op::ExecApproval {
+                id: "call-1".to_string(),
+                turn_id: None,
+                decision: ReviewDecision::Approved,
+            })
+            .expect("resolution should serialize");
+        assert_eq!(closed_resolution, None);
+
+        let open_resolution = pending
+            .take_resolution(&Op::PatchApproval {
+                id: "patch-2".to_string(),
+                decision: ReviewDecision::Approved,
+            })
+            .expect("resolution should serialize")
+            .expect("other thread request should remain pending");
+        assert_eq!(open_resolution.request_id, AppServerRequestId::Integer(22));
+        assert_eq!(open_resolution.result, json!({ "decision": "accept" }));
     }
 }

@@ -161,6 +161,10 @@ impl App {
                 self.pending_app_server_requests
                     .resolve_notification(&notification.request_id);
             }
+            ServerNotification::ThreadClosed(notification) => {
+                self.pending_app_server_requests
+                    .resolve_thread_closed(&notification.thread_id);
+            }
             ServerNotification::McpServerStatusUpdated(_) => {
                 self.refresh_mcp_startup_expected_servers_from_config();
             }

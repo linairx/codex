@@ -27,7 +27,8 @@ cargo run -p codex-debug-client -- --thread-id thr_123
 - `-c, --config key=value`: pass through `--config` overrides to `codex`.
 - `--thread-id <id>`: resume or reconnect to a thread instead of starting a new one.
 - `--approval-policy <policy>`: `untrusted`, `on-failure` (deprecated), `on-request`, `never`.
-- `--auto-approve`: auto-approve command/file-change approvals (default: decline).
+- `--auto-approve`: auto-approve command/file-change approvals and grant requested
+  permission profiles (default: decline command/file-change and deny extra permissions).
 - `--final-only`: only show completed assistant messages and tool items.
 - `--model <name>`: optional model override for thread start/resume or reconnect.
 - `--model-provider <name>`: optional provider override.
@@ -94,3 +95,9 @@ unless `--final-only` is set.
 - Approvals for `item/commandExecution/requestApproval` and
   `item/fileChange/requestApproval` are auto-responded to with decline unless
   `--auto-approve` is set.
+- `item/requestPermissions/requestApproval` is auto-responded to with an empty
+  grant by default, or the requested permission profile when `--auto-approve`
+  is set.
+- `item/tool/requestUserInput` is auto-responded to with the first option for
+  each question when available, otherwise an empty-string answer.
+- `mcp/server/elicitation` is auto-responded to with `cancel`.

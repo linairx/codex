@@ -47,8 +47,13 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
+use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::PermissionGrantScope;
+use codex_app_server_protocol::PermissionsRequestApprovalParams;
+use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::ReadOnlyAccess;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
@@ -56,6 +61,9 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadActiveFlag;
+use codex_app_server_protocol::ThreadCloseParams;
+use codex_app_server_protocol::ThreadCloseResponse;
+use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDecrementElicitationResponse;
 use codex_app_server_protocol::ThreadForkParams;
@@ -83,6 +91,10 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
+use codex_app_server_protocol::ToolRequestUserInputAnswer;
+use codex_app_server_protocol::ToolRequestUserInputParams;
+use codex_app_server_protocol::ToolRequestUserInputQuestion;
+use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
@@ -288,6 +300,12 @@ enum CliCommand {
         /// Include stored turns in the response.
         #[arg(long, default_value_t = false)]
         include_turns: bool,
+    },
+    /// Explicitly close a loaded thread runtime by id.
+    #[command(name = "thread-close")]
+    ThreadClose {
+        /// Existing thread id to close.
+        thread_id: String,
     },
     /// Fork a stored thread into a new thread.
     ///
@@ -532,6 +550,11 @@ pub async fn run() -> Result<()> {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-read")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
             thread_read(&endpoint, &config_overrides, thread_id, include_turns).await
+        }
+        CliCommand::ThreadClose { thread_id } => {
+            ensure_dynamic_tools_unused(&dynamic_tools, "thread-close")?;
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            thread_close(&endpoint, &config_overrides, thread_id).await
         }
         CliCommand::ThreadFork {
             thread_id,
@@ -1393,6 +1416,23 @@ async fn thread_read(
     .await
 }
 
+async fn thread_close(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    thread_id: String,
+) -> Result<()> {
+    with_client("thread-close", endpoint, config_overrides, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
+
+        let response = client.thread_close(ThreadCloseParams { thread_id })?;
+        println!("< thread/close response: {response:?}");
+
+        Ok(())
+    })
+    .await
+}
+
 async fn thread_fork(
     endpoint: &Endpoint,
     config_overrides: &[String],
@@ -1760,6 +1800,23 @@ fn thread_name_updated_summary_line(
     }
 }
 
+fn thread_closed_summary_line(
+    thread_id: &str,
+    known_thread: Option<&KnownThreadSummary>,
+) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, resident={}, status={}, action={}",
+            thread_name_label(thread.name.as_deref()),
+            thread_mode_label(thread.mode),
+            thread.resident,
+            thread_status_label(&thread.status),
+            thread_resume_action_label(thread.mode)
+        ),
+        None => format!("id={thread_id}"),
+    }
+}
+
 fn thread_started_notification_lines(
     thread: &AppServerThread,
     include_raw_debug: bool,
@@ -1794,18 +1851,35 @@ fn thread_name_updated_notification_lines(
     )]
 }
 
+fn thread_closed_notification_lines(
+    thread_id: &str,
+    known_thread: Option<&KnownThreadSummary>,
+) -> Vec<String> {
+    vec![format!(
+        "< thread/closed summary: {}",
+        thread_closed_summary_line(thread_id, known_thread)
+    )]
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::thread;
+    use std::time::Duration;
 
     use super::Cli;
     use super::ClientTransport;
     use super::CodexClient;
     use super::KnownThreadSummary;
     use super::all_thread_source_kinds;
+    use super::default_user_input_answers;
+    use super::granted_permission_profile_from_request;
+    use super::thread_closed_notification_lines;
+    use super::thread_closed_summary_line;
     use super::thread_collection_summary_lines_with_cursor;
     use super::thread_id_collection_summary_lines_with_cursor;
     use super::thread_mode_label;
@@ -1826,10 +1900,13 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
+    use codex_app_server_protocol::ThreadClosedNotification;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
+    use codex_app_server_protocol::ToolRequestUserInputOption;
+    use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
     use tungstenite::accept;
     use tungstenite::connect;
@@ -2487,6 +2564,29 @@ mod tests {
     }
 
     #[test]
+    fn thread_closed_summary_line_uses_known_thread_context_when_available() {
+        let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::NotLoaded,
+        };
+
+        assert_eq!(
+            thread_closed_summary_line("thread-1", Some(&known_thread)),
+            "id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_closed_summary_line_stays_identity_only_for_unknown_threads() {
+        assert_eq!(
+            thread_closed_summary_line("thread-unknown", None),
+            "id=thread-unknown"
+        );
+    }
+
+    #[test]
     fn thread_name_updated_notification_lines_wrap_summary_line() {
         let known_thread = KnownThreadSummary {
             name: Some("old-name".to_string()),
@@ -2500,6 +2600,90 @@ mod tests {
             vec![String::from(
                 "< thread/name/updated summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
             )]
+        );
+    }
+
+    #[test]
+    fn thread_closed_notification_lines_wrap_summary_line() {
+        let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::NotLoaded,
+        };
+
+        assert_eq!(
+            thread_closed_notification_lines("thread-1", Some(&known_thread)),
+            vec![String::from(
+                "< thread/closed summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
+            )]
+        );
+    }
+
+    #[test]
+    fn granted_permission_profile_from_request_keeps_requested_permissions() {
+        assert_eq!(
+            granted_permission_profile_from_request(
+                codex_app_server_protocol::RequestPermissionProfile {
+                    network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
+                        read: Some(vec![]),
+                        write: Some(vec![]),
+                    }),
+                }
+            ),
+            codex_app_server_protocol::GrantedPermissionProfile {
+                network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                    enabled: Some(true),
+                }),
+                file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
+                    read: Some(vec![]),
+                    write: Some(vec![]),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn default_user_input_answers_prefers_first_option_and_empty_fallback() {
+        assert_eq!(
+            default_user_input_answers(&[
+                ToolRequestUserInputQuestion {
+                    id: "q1".to_string(),
+                    header: "Mode".to_string(),
+                    question: "Pick one".to_string(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![ToolRequestUserInputOption {
+                        label: "fast".to_string(),
+                        description: "short".to_string(),
+                    }]),
+                },
+                ToolRequestUserInputQuestion {
+                    id: "q2".to_string(),
+                    header: "Freeform".to_string(),
+                    question: "Type".to_string(),
+                    is_other: true,
+                    is_secret: false,
+                    options: None,
+                },
+            ]),
+            HashMap::from([
+                (
+                    "q1".to_string(),
+                    codex_app_server_protocol::ToolRequestUserInputAnswer {
+                        answers: vec!["fast".to_string()],
+                    },
+                ),
+                (
+                    "q2".to_string(),
+                    codex_app_server_protocol::ToolRequestUserInputAnswer {
+                        answers: vec![String::new()],
+                    },
+                ),
+            ])
         );
     }
 
@@ -2600,6 +2784,120 @@ mod tests {
         );
 
         server.join().expect("websocket server should exit cleanly");
+    }
+
+    #[test]
+    fn unknown_thread_not_loaded_status_change_skips_refresh_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("server should accept");
+            let mut websocket = accept(stream).expect("websocket handshake should succeed");
+            std::thread::sleep(Duration::from_millis(50));
+            websocket
+                .close(None)
+                .expect("websocket should close cleanly");
+        });
+
+        let (socket, _response) =
+            connect(format!("ws://{addr}")).expect("websocket client should connect");
+        let mut client = CodexClient {
+            transport: ClientTransport::WebSocket {
+                url: format!("ws://{addr}"),
+                socket: Box::new(socket),
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: Default::default(),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+                thread_id: "thread-unknown".to_string(),
+                status: ThreadStatus::NotLoaded,
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "status notification should not terminate streaming"
+        );
+        assert!(
+            client.known_threads.is_empty(),
+            "notLoaded for an unknown thread should not trigger a refresh read"
+        );
+
+        server.join().expect("websocket server should exit cleanly");
+    }
+
+    #[test]
+    fn thread_closed_notification_removes_known_thread_summary() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("child should spawn");
+        let mut client = CodexClient {
+            transport: ClientTransport::Stdio {
+                stdin: child.stdin.take(),
+                stdout: std::io::BufReader::new(
+                    child.stdout.take().expect("child stdout should exist"),
+                ),
+                child,
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: BTreeMap::from([(
+                "thread-1".to_string(),
+                KnownThreadSummary {
+                    name: Some("atlas".to_string()),
+                    mode: ThreadMode::ResidentAssistant,
+                    resident: true,
+                    status: ThreadStatus::NotLoaded,
+                },
+            )]),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: "thread-1".to_string(),
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "thread/closed notification should not terminate streaming"
+        );
+        assert!(
+            !client.known_threads.contains_key("thread-1"),
+            "thread/closed should evict cached thread summary"
+        );
     }
 }
 
@@ -3044,8 +3342,23 @@ impl CodexClient {
                         println!("{line}");
                     }
                 }
-                if known_thread.is_none() {
+                if known_thread.is_none()
+                    && payload.status != codex_app_server_protocol::ThreadStatus::NotLoaded
+                {
                     self.refresh_unknown_thread_summary(&payload.thread_id);
+                }
+                false
+            }
+            ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: closed_thread_id,
+            }) => {
+                let known_thread = self.known_threads.remove(&closed_thread_id);
+                if thread_id.is_none_or(|id| closed_thread_id == id) {
+                    for line in
+                        thread_closed_notification_lines(&closed_thread_id, known_thread.as_ref())
+                    {
+                        println!("{line}");
+                    }
                 }
                 false
             }
@@ -3307,6 +3620,16 @@ impl CodexClient {
         let response: ThreadReadResponse = self.send_request(request, request_id, "thread/read")?;
         self.remember_thread(&response.thread);
         Ok(response)
+    }
+
+    fn thread_close(&mut self, params: ThreadCloseParams) -> Result<ThreadCloseResponse> {
+        let request_id = self.request_id();
+        let request = ClientRequest::ThreadClose {
+            request_id: request_id.clone(),
+            params,
+        };
+
+        self.send_request(request, request_id, "thread/close")
     }
 
     fn refresh_unknown_thread_summary(&mut self, thread_id: &str) {
@@ -3599,6 +3922,15 @@ impl CodexClient {
             ServerRequest::FileChangeRequestApproval { request_id, params } => {
                 self.approve_file_change_request(request_id, params)?;
             }
+            ServerRequest::PermissionsRequestApproval { request_id, params } => {
+                self.approve_permissions_request(request_id, params)?;
+            }
+            ServerRequest::ToolRequestUserInput { request_id, params } => {
+                self.answer_request_user_input(request_id, params)?;
+            }
+            ServerRequest::McpServerElicitationRequest { request_id, params } => {
+                self.resolve_mcp_elicitation_request(request_id, params)?;
+            }
             other => {
                 bail!("received unsupported server request: {other:?}");
             }
@@ -3713,6 +4045,87 @@ impl CodexClient {
         Ok(())
     }
 
+    fn approve_permissions_request(
+        &mut self,
+        request_id: RequestId,
+        params: PermissionsRequestApprovalParams,
+    ) -> Result<()> {
+        let PermissionsRequestApprovalParams {
+            thread_id,
+            turn_id,
+            item_id,
+            reason,
+            permissions,
+        } = params;
+
+        println!(
+            "\n< permissions approval requested for thread {thread_id}, turn {turn_id}, item {item_id}"
+        );
+        if let Some(reason) = reason.as_deref() {
+            println!("< reason: {reason}");
+        }
+        println!("< requested permissions: {permissions:?}");
+
+        let response = PermissionsRequestApprovalResponse {
+            permissions: granted_permission_profile_from_request(permissions),
+            scope: PermissionGrantScope::Turn,
+        };
+        self.send_server_request_response(request_id, &response)?;
+        println!("< granted permissions request for item {item_id}");
+        Ok(())
+    }
+
+    fn answer_request_user_input(
+        &mut self,
+        request_id: RequestId,
+        params: ToolRequestUserInputParams,
+    ) -> Result<()> {
+        let ToolRequestUserInputParams {
+            thread_id,
+            turn_id,
+            item_id,
+            questions,
+        } = params;
+
+        println!(
+            "\n< request_user_input requested for thread {thread_id}, turn {turn_id}, item {item_id}"
+        );
+        println!("< questions: {questions:?}");
+
+        let response = ToolRequestUserInputResponse {
+            answers: default_user_input_answers(&questions),
+        };
+        self.send_server_request_response(request_id, &response)?;
+        println!("< answered request_user_input for item {item_id}");
+        Ok(())
+    }
+
+    fn resolve_mcp_elicitation_request(
+        &mut self,
+        request_id: RequestId,
+        params: codex_app_server_protocol::McpServerElicitationRequestParams,
+    ) -> Result<()> {
+        let thread_id = params.thread_id;
+        let turn_id = params.turn_id;
+        let server_name = params.server_name;
+        let request = params.request;
+
+        println!(
+            "\n< MCP elicitation requested for thread {thread_id}, turn {}, server {server_name}",
+            turn_id.as_deref().unwrap_or("-")
+        );
+        println!("< elicitation request: {request:?}");
+
+        let response = McpServerElicitationRequestResponse {
+            action: McpServerElicitationAction::Cancel,
+            content: None,
+            meta: None,
+        };
+        self.send_server_request_response(request_id, &response)?;
+        println!("< cancelled MCP elicitation for server {server_name}");
+        Ok(())
+    }
+
     fn send_server_request_response<T>(&mut self, request_id: RequestId, response: &T) -> Result<()>
     where
         T: Serialize,
@@ -3779,6 +4192,46 @@ impl CodexClient {
             },
         }
     }
+}
+
+fn granted_permission_profile_from_request(
+    value: codex_app_server_protocol::RequestPermissionProfile,
+) -> codex_app_server_protocol::GrantedPermissionProfile {
+    codex_app_server_protocol::GrantedPermissionProfile {
+        network: value.network.map(|network| {
+            codex_app_server_protocol::AdditionalNetworkPermissions {
+                enabled: network.enabled,
+            }
+        }),
+        file_system: value.file_system.map(|file_system| {
+            codex_app_server_protocol::AdditionalFileSystemPermissions {
+                read: file_system.read,
+                write: file_system.write,
+            }
+        }),
+    }
+}
+
+fn default_user_input_answers(
+    questions: &[ToolRequestUserInputQuestion],
+) -> std::collections::HashMap<String, ToolRequestUserInputAnswer> {
+    questions
+        .iter()
+        .map(|question| {
+            let answer = question
+                .options
+                .as_ref()
+                .and_then(|options| options.first())
+                .map(|option| option.label.clone())
+                .unwrap_or_default();
+            (
+                question.id.clone(),
+                ToolRequestUserInputAnswer {
+                    answers: vec![answer],
+                },
+            )
+        })
+        .collect()
 }
 
 fn print_multiline_with_prefix(prefix: &str, payload: &str) {

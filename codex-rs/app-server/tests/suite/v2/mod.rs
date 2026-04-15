@@ -31,6 +31,8 @@ mod review;
 mod safety_check_downgrade;
 mod skills_list;
 mod thread_archive;
+mod thread_close;
+mod thread_disconnect_websocket;
 mod thread_fork;
 mod thread_list;
 mod thread_loaded_list;

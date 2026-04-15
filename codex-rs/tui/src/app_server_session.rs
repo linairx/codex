@@ -26,6 +26,9 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadCloseParams;
+use codex_app_server_protocol::ThreadCloseResponse;
+use codex_app_server_protocol::ThreadCloseStatus;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadForkParams;
@@ -544,6 +547,22 @@ impl AppServerSession {
             .await
             .wrap_err("thread/unsubscribe failed in TUI")?;
         Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn thread_close(&mut self, thread_id: ThreadId) -> Result<ThreadCloseStatus> {
+        let request_id = self.next_request_id();
+        let response: ThreadCloseResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadClose {
+                request_id,
+                params: ThreadCloseParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("thread/close failed in TUI")?;
+        Ok(response.status)
     }
 
     pub(crate) async fn thread_compact_start(&mut self, thread_id: ThreadId) -> Result<()> {
@@ -1183,6 +1202,7 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
+    use codex_app_server_protocol::ThreadCloseStatus;
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadLoadedListParams;
     use codex_app_server_protocol::ThreadLoadedReadParams;
@@ -2475,6 +2495,113 @@ stream_max_retries = 0
             .shutdown()
             .await
             .expect("shutdown should succeed");
+    }
+
+    #[test]
+    fn close_thread_preserves_resident_thread_mode_on_followup_reads_and_resume() {
+        std::thread::Builder::new()
+            .name("thread-close-resident-mode".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut runtime = tokio::runtime::Builder::new_current_thread();
+                runtime.enable_all();
+                runtime
+                    .build()
+                    .expect("runtime should build")
+                    .block_on(async {
+                        let temp_dir = tempfile::tempdir().expect("tempdir");
+                        let config = build_config(&temp_dir).await;
+                        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+                            .await
+                            .expect("embedded app server should start");
+                        let request_id = app_server.next_request_id();
+
+                        let response: ThreadStartResponse = app_server
+                            .client
+                            .request_typed(ClientRequest::ThreadStart {
+                                request_id,
+                                params: ThreadStartParams {
+                                    resident: true,
+                                    ..ThreadStartParams::default()
+                                },
+                            })
+                            .await
+                            .expect("resident thread/start should succeed");
+                        let thread_id = ThreadId::from_string(&response.thread.id)
+                            .expect("thread/start should return thread id");
+                        let rollout_path = response
+                            .thread
+                            .path
+                            .clone()
+                            .expect("resident thread/start should expose rollout path");
+                        write_minimal_rollout(
+                            rollout_path.as_path(),
+                            &response.thread.id,
+                            &response.thread.model_provider,
+                        );
+
+                        let close_status = app_server
+                            .thread_close(thread_id)
+                            .await
+                            .expect("thread/close should succeed");
+                        assert_eq!(close_status, ThreadCloseStatus::Closing);
+
+                        let closed_status = timeout(Duration::from_secs(5), async {
+                            loop {
+                                let thread = app_server
+                                    .thread_read(thread_id, /*include_turns*/ false)
+                                    .await
+                                    .expect("thread/read should succeed while polling");
+                                if thread.status == ThreadStatus::NotLoaded {
+                                    return thread;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        })
+                        .await
+                        .expect("thread should become notLoaded after close");
+                        assert_eq!(closed_status.mode, ThreadMode::ResidentAssistant);
+
+                        let listed = app_server
+                            .thread_list(ThreadListParams {
+                                cursor: None,
+                                limit: Some(20),
+                                sort_key: None,
+                                model_providers: None,
+                                source_kinds: None,
+                                archived: Some(false),
+                                cwd: None,
+                                search_term: None,
+                            })
+                            .await
+                            .expect("thread/list should succeed after close");
+                        let listed_thread = listed
+                            .data
+                            .into_iter()
+                            .find(|thread| thread.id == response.thread.id)
+                            .expect("thread/list should include closed resident thread");
+                        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+                        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+
+                        let resumed = app_server
+                            .resume_thread(config.clone(), thread_id)
+                            .await
+                            .expect("thread/resume should succeed after close");
+                        assert_eq!(resumed.session.thread_id, thread_id);
+                        assert_eq!(
+                            resumed.session.thread_mode,
+                            Some(ThreadMode::ResidentAssistant)
+                        );
+
+                        app_server
+                            .shutdown()
+                            .await
+                            .expect("shutdown should succeed");
+                    });
+            })
+            .expect("thread should spawn")
+            .join()
+            .expect("thread should complete");
     }
 
     #[tokio::test]

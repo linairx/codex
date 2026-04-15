@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ThreadCloseStatus": {
+      "enum": [
+        "notLoaded",
+        "closing"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "status": {
+      "$ref": "#/definitions/ThreadCloseStatus"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "title": "ThreadCloseResponse",
+  "type": "object"
+}

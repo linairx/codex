@@ -20,6 +20,10 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::McpServerElicitationRequestResponse;
+use codex_app_server_protocol::PermissionGrantScope;
+use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
@@ -32,6 +36,9 @@ use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ToolRequestUserInputAnswer;
+use codex_app_server_protocol::ToolRequestUserInputQuestion;
+use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_app_server_protocol::all_thread_source_kinds;
 use serde::Serialize;
 use std::io::Write;
@@ -159,8 +166,89 @@ fn handle_server_request(
             ))?;
             send_response(stdin, request_id, response)
         }
+        ServerRequest::PermissionsRequestApproval { request_id, params } => {
+            let response = PermissionsRequestApprovalResponse {
+                permissions: permissions_response_from_request(
+                    &params.permissions,
+                    *command_decision == CommandExecutionApprovalDecision::Accept,
+                ),
+                scope: PermissionGrantScope::Turn,
+            };
+            output.client_line(&format!(
+                "auto-response for permissions approval {request_id:?}: {response:?} ({params:?})"
+            ))?;
+            send_response(stdin, request_id, response)
+        }
+        ServerRequest::ToolRequestUserInput { request_id, params } => {
+            let response = ToolRequestUserInputResponse {
+                answers: user_input_answers_from_questions(&params.questions),
+            };
+            output.client_line(&format!(
+                "auto-response for request_user_input {request_id:?}: {response:?} ({params:?})"
+            ))?;
+            send_response(stdin, request_id, response)
+        }
+        ServerRequest::McpServerElicitationRequest { request_id, params } => {
+            let response = McpServerElicitationRequestResponse {
+                action: McpServerElicitationAction::Cancel,
+                content: None,
+                meta: None,
+            };
+            output.client_line(&format!(
+                "auto-response for MCP elicitation {request_id:?}: {response:?} ({params:?})"
+            ))?;
+            send_response(stdin, request_id, response)
+        }
         _ => Ok(()),
     }
+}
+
+fn permissions_response_from_request(
+    request: &codex_app_server_protocol::RequestPermissionProfile,
+    auto_approve: bool,
+) -> codex_app_server_protocol::GrantedPermissionProfile {
+    if !auto_approve {
+        return codex_app_server_protocol::GrantedPermissionProfile {
+            network: None,
+            file_system: None,
+        };
+    }
+
+    codex_app_server_protocol::GrantedPermissionProfile {
+        network: request.network.as_ref().map(|network| {
+            codex_app_server_protocol::AdditionalNetworkPermissions {
+                enabled: network.enabled,
+            }
+        }),
+        file_system: request.file_system.as_ref().map(|file_system| {
+            codex_app_server_protocol::AdditionalFileSystemPermissions {
+                read: file_system.read.clone(),
+                write: file_system.write.clone(),
+            }
+        }),
+    }
+}
+
+fn user_input_answers_from_questions(
+    questions: &[ToolRequestUserInputQuestion],
+) -> std::collections::HashMap<String, ToolRequestUserInputAnswer> {
+    questions
+        .iter()
+        .map(|question| {
+            let answer = question
+                .options
+                .as_ref()
+                .and_then(|options| options.first())
+                .map(|option| option.label.clone())
+                .unwrap_or_default();
+            (
+                question.id.clone(),
+                ToolRequestUserInputAnswer {
+                    answers: vec![answer],
+                },
+            )
+        })
+        .collect()
 }
 
 fn handle_response(
@@ -385,6 +473,7 @@ fn handle_notification(
                 None
             };
             let refresh_request_id = if known_thread.is_none()
+                && payload.status != ThreadStatus::NotLoaded
                 && !app_state
                     .pending
                     .values()
@@ -425,6 +514,19 @@ fn handle_notification(
                 let mut app_state = state.lock().expect("state lock poisoned");
                 app_state.pending.remove(&request_id);
                 return Err(err);
+            }
+            Ok(())
+        }
+        ServerNotification::ThreadClosed(payload) => {
+            let mut state = state.lock().expect("state lock poisoned");
+            let known_thread = state
+                .known_threads
+                .iter()
+                .position(|thread| thread.thread_id == payload.thread_id)
+                .map(|index| state.known_threads.remove(index));
+            drop(state);
+            for line in thread_closed_summary_lines(&payload.thread_id, known_thread.as_ref()) {
+                output.client_line(&line)?;
             }
             Ok(())
         }
@@ -483,6 +585,13 @@ fn thread_name_updated_summary_lines(
     )]
 }
 
+fn thread_closed_summary_lines(thread_id: &str, known_thread: Option<&KnownThread>) -> Vec<String> {
+    vec![format!(
+        "thread closed: {}",
+        thread_closed_summary_line(thread_id, known_thread)
+    )]
+}
+
 fn thread_summary_fields(thread: &KnownThread) -> String {
     format!(
         "id={}, name={}, mode={}, status={}, action={}",
@@ -507,10 +616,17 @@ fn thread_status_changed_summary_line(
             thread_status_label(status),
             thread_resume_action_label(thread.thread_mode)
         ),
-        None => format!(
-            "id={thread_id}, status={} (refresh thread summary to recover mode/action)",
-            thread_status_label(status)
-        ),
+        None => match status {
+            ThreadStatus::NotLoaded => {
+                format!("id={thread_id}, status={}", thread_status_label(status))
+            }
+            ThreadStatus::Idle | ThreadStatus::SystemError | ThreadStatus::Active { .. } => {
+                format!(
+                    "id={thread_id}, status={} (refresh thread summary to recover mode/action)",
+                    thread_status_label(status)
+                )
+            }
+        },
     }
 }
 
@@ -528,6 +644,19 @@ fn thread_name_updated_summary_line(
             thread_resume_action_label(thread.thread_mode)
         ),
         None => format!("id={thread_id}, name={}", thread_name_label(thread_name)),
+    }
+}
+
+fn thread_closed_summary_line(thread_id: &str, known_thread: Option<&KnownThread>) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, status={}, action={}",
+            thread_name_label(thread.thread_name.as_deref()),
+            thread_mode_label(thread.thread_mode),
+            thread_status_label(&thread.thread_status),
+            thread_resume_action_label(thread.thread_mode)
+        ),
+        None => format!("id={thread_id}"),
     }
 }
 
@@ -718,9 +847,12 @@ mod tests {
     use super::ReaderRequestSink;
     use super::handle_notification;
     use super::handle_response;
+    use super::permissions_response_from_request;
+    use super::thread_closed_summary_line;
     use super::thread_name_updated_summary_line;
     use super::thread_started_summary_lines;
     use super::thread_status_changed_summary_line;
+    use super::user_input_answers_from_questions;
     use crate::output::Output;
     use crate::state::KnownThread;
     use crate::state::PendingRequest;
@@ -733,6 +865,7 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
+    use codex_app_server_protocol::ThreadClosedNotification;
     use codex_app_server_protocol::ThreadLoadedListResponse;
     use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadLoadedReadResponse;
@@ -741,9 +874,12 @@ mod tests {
     use codex_app_server_protocol::ThreadStartedNotification;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
+    use codex_app_server_protocol::ToolRequestUserInputOption;
+    use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_app_server_protocol::all_thread_source_kinds;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::io::BufRead;
     use std::io::BufReader;
     use std::process::Command;
@@ -758,6 +894,88 @@ mod tests {
             method: method.to_string(),
             params: Some(serde_json::to_value(params).expect("notification params serialize")),
         }
+    }
+
+    #[test]
+    fn permissions_response_from_request_respects_auto_approve() {
+        let request = codex_app_server_protocol::RequestPermissionProfile {
+            network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
+                read: Some(vec![]),
+                write: Some(vec![]),
+            }),
+        };
+
+        assert_eq!(
+            permissions_response_from_request(&request, /*auto_approve*/ true),
+            codex_app_server_protocol::GrantedPermissionProfile {
+                network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                    enabled: Some(true),
+                }),
+                file_system: Some(codex_app_server_protocol::AdditionalFileSystemPermissions {
+                    read: Some(vec![]),
+                    write: Some(vec![]),
+                }),
+            }
+        );
+        assert_eq!(
+            permissions_response_from_request(&request, /*auto_approve*/ false),
+            codex_app_server_protocol::GrantedPermissionProfile {
+                network: None,
+                file_system: None,
+            }
+        );
+    }
+
+    #[test]
+    fn user_input_answers_from_questions_prefers_first_option_and_empty_fallback() {
+        let questions = vec![
+            ToolRequestUserInputQuestion {
+                id: "q1".to_string(),
+                header: "Mode".to_string(),
+                question: "Pick one".to_string(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![
+                    ToolRequestUserInputOption {
+                        label: "fast".to_string(),
+                        description: "short".to_string(),
+                    },
+                    ToolRequestUserInputOption {
+                        label: "slow".to_string(),
+                        description: "long".to_string(),
+                    },
+                ]),
+            },
+            ToolRequestUserInputQuestion {
+                id: "q2".to_string(),
+                header: "Freeform".to_string(),
+                question: "Type something".to_string(),
+                is_other: true,
+                is_secret: false,
+                options: None,
+            },
+        ];
+
+        assert_eq!(
+            user_input_answers_from_questions(&questions),
+            HashMap::from([
+                (
+                    "q1".to_string(),
+                    codex_app_server_protocol::ToolRequestUserInputAnswer {
+                        answers: vec!["fast".to_string()],
+                    },
+                ),
+                (
+                    "q2".to_string(),
+                    codex_app_server_protocol::ToolRequestUserInputAnswer {
+                        answers: vec![String::new()],
+                    },
+                ),
+            ])
+        );
     }
 
     #[test]
@@ -1195,6 +1413,43 @@ mod tests {
     }
 
     #[test]
+    fn unknown_thread_not_loaded_status_change_skips_loaded_read_refresh() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat should start");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+
+        handle_notification(
+            notification(
+                "thread/status/changed",
+                ThreadStatusChangedNotification {
+                    thread_id: "thread-unknown".to_string(),
+                    status: ThreadStatus::NotLoaded,
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::clone(&stdin),
+                next_request_id: Arc::new(AtomicI64::new(11)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("unknown notLoaded status change should not queue loaded/read refresh");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert!(state.known_threads.is_empty());
+        assert!(state.pending.is_empty());
+
+        drop(state);
+        drop(stdin);
+        child.wait().expect("cat should exit cleanly");
+    }
+
+    #[test]
     fn unknown_thread_status_change_refresh_round_trip_restores_resident_summary() {
         let state = Arc::new(Mutex::new(State::default()));
         let next_request_id = Arc::new(AtomicI64::new(11));
@@ -1312,6 +1567,14 @@ mod tests {
     }
 
     #[test]
+    fn unknown_not_loaded_status_change_stays_status_only_without_refresh_hint() {
+        assert_eq!(
+            thread_status_changed_summary_line("thread-unknown", &ThreadStatus::NotLoaded, None),
+            "id=thread-unknown, status=not loaded"
+        );
+    }
+
+    #[test]
     fn thread_name_updated_notification_refreshes_known_thread_name() {
         let state = Arc::new(Mutex::new(State::default()));
         {
@@ -1402,6 +1665,64 @@ mod tests {
         assert_eq!(
             thread_name_updated_summary_line("thread-unknown", Some("atlas"), None),
             "id=thread-unknown, name=atlas"
+        );
+    }
+
+    #[test]
+    fn thread_closed_notification_removes_known_thread() {
+        let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state.known_threads.push(KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::NotLoaded,
+            });
+        }
+
+        handle_notification(
+            notification(
+                "thread/closed",
+                ThreadClosedNotification {
+                    thread_id: "thread-known".to_string(),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread closed notification should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert!(state.known_threads.is_empty());
+    }
+
+    #[test]
+    fn thread_closed_summary_line_uses_known_thread_context_when_available() {
+        assert_eq!(
+            thread_closed_summary_line(
+                "thread-known",
+                Some(&KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::NotLoaded,
+                }),
+            ),
+            "id=thread-known, name=atlas, mode=resident assistant, status=not loaded, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_closed_summary_line_stays_identity_only_for_unknown_threads() {
+        assert_eq!(
+            thread_closed_summary_line("thread-unknown", None),
+            "id=thread-unknown"
         );
     }
 }

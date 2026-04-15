@@ -853,8 +853,14 @@ mod tests {
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ApprovalsReviewer;
     use codex_app_server_protocol::AskForApproval;
+    use codex_app_server_protocol::CommandExecutionApprovalDecision;
+    use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
+    use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::ConversationSummary;
+    use codex_app_server_protocol::FileChangeApprovalDecision;
+    use codex_app_server_protocol::FileChangeRequestApprovalParams;
+    use codex_app_server_protocol::FileChangeRequestApprovalResponse;
     use codex_app_server_protocol::GetAccountResponse;
     use codex_app_server_protocol::GetConversationSummaryParams;
     use codex_app_server_protocol::GetConversationSummaryResponse;
@@ -862,6 +868,14 @@ mod tests {
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::McpServerElicitationAction;
+    use codex_app_server_protocol::McpServerElicitationRequest;
+    use codex_app_server_protocol::McpServerElicitationRequestParams;
+    use codex_app_server_protocol::McpServerElicitationRequestResponse;
+    use codex_app_server_protocol::PermissionGrantScope;
+    use codex_app_server_protocol::PermissionsRequestApprovalParams;
+    use codex_app_server_protocol::PermissionsRequestApprovalResponse;
+    use codex_app_server_protocol::RequestPermissionProfile;
     use codex_app_server_protocol::SandboxPolicy;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
@@ -887,8 +901,10 @@ mod tests {
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadUnsubscribeStatus;
+    use codex_app_server_protocol::ToolRequestUserInputAnswer;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
+    use codex_app_server_protocol::ToolRequestUserInputResponse;
     use codex_app_server_protocol::TurnStartParams;
     use codex_app_server_protocol::TurnStatus;
     use codex_app_server_protocol::UserInput;
@@ -904,6 +920,7 @@ mod tests {
     use futures::SinkExt;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::SystemTime;
@@ -1368,7 +1385,10 @@ supports_websockets = false
             })
             .await
             .expect("typed request should succeed");
-        client.shutdown().await.expect("shutdown should complete");
+        let shutdown = client.shutdown().await;
+        if let Err(err) = shutdown {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
     }
 
     #[tokio::test]
@@ -1388,7 +1408,10 @@ supports_websockets = false
             err.to_string().starts_with("thread/read failed:"),
             "expected method-qualified JSON-RPC failure message"
         );
-        client.shutdown().await.expect("shutdown should complete");
+        let shutdown = client.shutdown().await;
+        if let Err(err) = shutdown {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
     }
 
     #[tokio::test]
@@ -1441,7 +1464,10 @@ supports_websockets = false
             .expect("thread/read should return the newly started thread");
         assert_eq!(read.thread.id, response.thread.id);
 
-        client.shutdown().await.expect("shutdown should complete");
+        let shutdown = client.shutdown().await;
+        if let Err(err) = shutdown {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
     }
 
     #[tokio::test]
@@ -4058,6 +4084,51 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn forward_in_process_event_rejects_server_request_when_queue_is_full() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        event_tx
+            .send(InProcessServerEvent::ServerNotification(
+                command_execution_output_delta_notification("stdout-1"),
+            ))
+            .await
+            .expect("initial event should enqueue");
+
+        let mut rejected_request_id = None;
+        let mut skipped_events = 0usize;
+        let result = forward_in_process_event(
+            &event_tx,
+            &mut skipped_events,
+            InProcessServerEvent::ServerRequest(ServerRequest::ToolRequestUserInput {
+                request_id: RequestId::String("srv-user-input".to_string()),
+                params: ToolRequestUserInputParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    questions: vec![ToolRequestUserInputQuestion {
+                        id: "mode".to_string(),
+                        header: "Mode".to_string(),
+                        question: "Pick one".to_string(),
+                        is_other: false,
+                        is_secret: false,
+                        options: Some(vec![]),
+                    }],
+                },
+            }),
+            |request| {
+                rejected_request_id = Some(request.id().clone());
+            },
+        )
+        .await;
+
+        assert_eq!(result, ForwardEventResult::Continue);
+        assert_eq!(skipped_events, 1);
+        assert_eq!(
+            rejected_request_id,
+            Some(RequestId::String("srv-user-input".to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn remote_typed_request_roundtrip_works() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
@@ -4695,6 +4766,79 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn remote_thread_closed_notification_arrives_over_websocket() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(ServerNotification::ThreadClosed(
+                            codex_app_server_protocol::ThreadClosedNotification {
+                                thread_id: "thread-closed".to_string(),
+                            },
+                        ))
+                        .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(notification))
+                if notification.thread_id == "thread-closed"
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_thread_not_loaded_status_notification_arrives_over_websocket() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(ServerNotification::ThreadStatusChanged(
+                            codex_app_server_protocol::ThreadStatusChangedNotification {
+                                thread_id: "thread-unloaded".to_string(),
+                                status: ThreadStatus::NotLoaded,
+                            },
+                        ))
+                        .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadStatusChanged(
+                notification
+            )) if notification.thread_id == "thread-unloaded"
+                && notification.status == ThreadStatus::NotLoaded
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn remote_backpressure_preserves_transcript_notifications() {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
@@ -4846,6 +4990,486 @@ supports_websockets = false
             .resolve_server_request(request.id().clone(), serde_json::json!({}))
             .await
             .expect("server request should resolve");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_backpressure_rejects_server_request_when_queue_is_full() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(command_execution_output_delta_notification(
+                            "stdout-1",
+                        ))
+                        .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+
+            let request_id = RequestId::String("srv-user-input-overflow".to_string());
+            let server_request: JSONRPCRequest = serde_json::from_value(
+                serde_json::to_value(ServerRequest::ToolRequestUserInput {
+                    request_id: request_id.clone(),
+                    params: ToolRequestUserInputParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "item-1".to_string(),
+                        questions: vec![ToolRequestUserInputQuestion {
+                            id: "mode".to_string(),
+                            header: "Mode".to_string(),
+                            question: "Pick one".to_string(),
+                            is_other: false,
+                            is_secret: false,
+                            options: Some(vec![]),
+                        }],
+                    },
+                })
+                .expect("server request should serialize"),
+            )
+            .expect("server request should convert to JSON-RPC");
+            write_websocket_message(&mut websocket, JSONRPCMessage::Request(server_request)).await;
+
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected JSON-RPC error rejecting overflowed server request");
+            };
+            assert_eq!(error.id, request_id);
+            assert_eq!(error.error.code, -32001);
+            assert_eq!(error.error.message, "remote app-server event queue is full");
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url,
+            auth_token: None,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 1,
+        })
+        .await
+        .expect("remote client should connect");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let first_event = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("first event should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            first_event,
+            AppServerEvent::ServerNotification(ServerNotification::CommandExecutionOutputDelta(
+                notification
+            )) if notification.delta == "stdout-1"
+        ));
+
+        if let Ok(Some(event)) = timeout(Duration::from_millis(250), client.next_event()).await {
+            assert!(
+                !matches!(event, AppServerEvent::ServerRequest(_)),
+                "overflowed server request should be rejected upstream rather than delivered locally"
+            );
+        }
+
+        let shutdown = client.shutdown().await;
+        if let Err(err) = shutdown {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_command_execution_approval_roundtrip_works() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let request_id = RequestId::String("srv-command-approval".to_string());
+            let server_request: JSONRPCRequest = serde_json::from_value(
+                serde_json::to_value(ServerRequest::CommandExecutionRequestApproval {
+                    request_id: request_id.clone(),
+                    params: CommandExecutionRequestApprovalParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "call-1".to_string(),
+                        approval_id: None,
+                        reason: Some("needs approval".to_string()),
+                        network_approval_context: None,
+                        command: Some("git status".to_string()),
+                        cwd: Some(PathBuf::from("/workspace")),
+                        command_actions: None,
+                        additional_permissions: None,
+                        proposed_execpolicy_amendment: None,
+                        proposed_network_policy_amendments: None,
+                        available_decisions: Some(vec![
+                            CommandExecutionApprovalDecision::Accept,
+                            CommandExecutionApprovalDecision::Decline,
+                        ]),
+                    },
+                })
+                .expect("server request should serialize"),
+            )
+            .expect("server request should convert to JSON-RPC");
+            write_websocket_message(&mut websocket, JSONRPCMessage::Request(server_request)).await;
+
+            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected command approval response");
+            };
+            assert_eq!(response.id, request_id);
+            assert_eq!(
+                response.result,
+                serde_json::to_value(CommandExecutionRequestApprovalResponse {
+                    decision: CommandExecutionApprovalDecision::Accept,
+                })
+                .expect("approval response should serialize")
+            );
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let AppServerEvent::ServerRequest(request) = client
+            .next_event()
+            .await
+            .expect("request event should arrive")
+        else {
+            panic!("expected server request event");
+        };
+        let ServerRequest::CommandExecutionRequestApproval { request_id, params } = request else {
+            panic!("expected command execution approval request");
+        };
+        assert_eq!(
+            request_id,
+            RequestId::String("srv-command-approval".to_string())
+        );
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.command.as_deref(), Some("git status"));
+        client
+            .resolve_server_request(
+                request_id,
+                serde_json::to_value(CommandExecutionRequestApprovalResponse {
+                    decision: CommandExecutionApprovalDecision::Accept,
+                })
+                .expect("approval response should serialize"),
+            )
+            .await
+            .expect("command approval request should resolve");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_file_change_approval_roundtrip_works() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let request_id = RequestId::String("srv-file-approval".to_string());
+            let server_request: JSONRPCRequest = serde_json::from_value(
+                serde_json::to_value(ServerRequest::FileChangeRequestApproval {
+                    request_id: request_id.clone(),
+                    params: FileChangeRequestApprovalParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "patch-1".to_string(),
+                        reason: Some("needs write access".to_string()),
+                        grant_root: Some(PathBuf::from("/workspace")),
+                    },
+                })
+                .expect("server request should serialize"),
+            )
+            .expect("server request should convert to JSON-RPC");
+            write_websocket_message(&mut websocket, JSONRPCMessage::Request(server_request)).await;
+
+            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected file approval response");
+            };
+            assert_eq!(response.id, request_id);
+            assert_eq!(
+                response.result,
+                serde_json::to_value(FileChangeRequestApprovalResponse {
+                    decision: FileChangeApprovalDecision::Accept,
+                })
+                .expect("approval response should serialize")
+            );
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let AppServerEvent::ServerRequest(request) = client
+            .next_event()
+            .await
+            .expect("request event should arrive")
+        else {
+            panic!("expected server request event");
+        };
+        let ServerRequest::FileChangeRequestApproval { request_id, params } = request else {
+            panic!("expected file change approval request");
+        };
+        assert_eq!(
+            request_id,
+            RequestId::String("srv-file-approval".to_string())
+        );
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.grant_root.as_deref(), Some(Path::new("/workspace")));
+        client
+            .resolve_server_request(
+                request_id,
+                serde_json::to_value(FileChangeRequestApprovalResponse {
+                    decision: FileChangeApprovalDecision::Accept,
+                })
+                .expect("approval response should serialize"),
+            )
+            .await
+            .expect("file change approval request should resolve");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_permissions_approval_roundtrip_works() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let request_id = RequestId::String("srv-permissions-approval".to_string());
+            let server_request: JSONRPCRequest = serde_json::from_value(
+                serde_json::to_value(ServerRequest::PermissionsRequestApproval {
+                    request_id: request_id.clone(),
+                    params: PermissionsRequestApprovalParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "permissions-1".to_string(),
+                        reason: Some("needs extra access".to_string()),
+                        permissions: RequestPermissionProfile {
+                            network: Some(
+                                codex_app_server_protocol::AdditionalNetworkPermissions {
+                                    enabled: Some(true),
+                                },
+                            ),
+                            file_system: None,
+                        },
+                    },
+                })
+                .expect("server request should serialize"),
+            )
+            .expect("server request should convert to JSON-RPC");
+            write_websocket_message(&mut websocket, JSONRPCMessage::Request(server_request)).await;
+
+            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected permissions approval response");
+            };
+            assert_eq!(response.id, request_id);
+            assert_eq!(
+                response.result,
+                serde_json::to_value(PermissionsRequestApprovalResponse {
+                    permissions: codex_app_server_protocol::GrantedPermissionProfile {
+                        network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                            enabled: Some(true),
+                        }),
+                        file_system: None,
+                    },
+                    scope: PermissionGrantScope::Turn,
+                })
+                .expect("permissions approval response should serialize")
+            );
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let AppServerEvent::ServerRequest(request) = client
+            .next_event()
+            .await
+            .expect("request event should arrive")
+        else {
+            panic!("expected server request event");
+        };
+        let ServerRequest::PermissionsRequestApproval { request_id, params } = request else {
+            panic!("expected permissions approval request");
+        };
+        assert_eq!(
+            request_id,
+            RequestId::String("srv-permissions-approval".to_string())
+        );
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.item_id, "permissions-1");
+        client
+            .resolve_server_request(
+                request_id,
+                serde_json::to_value(PermissionsRequestApprovalResponse {
+                    permissions: codex_app_server_protocol::GrantedPermissionProfile {
+                        network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
+                            enabled: Some(true),
+                        }),
+                        file_system: None,
+                    },
+                    scope: PermissionGrantScope::Turn,
+                })
+                .expect("permissions approval response should serialize"),
+            )
+            .await
+            .expect("permissions approval request should resolve");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_request_user_input_roundtrip_works() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let request_id = RequestId::String("srv-user-input".to_string());
+            let server_request: JSONRPCRequest = serde_json::from_value(
+                serde_json::to_value(ServerRequest::ToolRequestUserInput {
+                    request_id: request_id.clone(),
+                    params: ToolRequestUserInputParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "input-1".to_string(),
+                        questions: vec![ToolRequestUserInputQuestion {
+                            id: "mode".to_string(),
+                            header: "Mode".to_string(),
+                            question: "Pick one".to_string(),
+                            is_other: false,
+                            is_secret: false,
+                            options: Some(vec![]),
+                        }],
+                    },
+                })
+                .expect("server request should serialize"),
+            )
+            .expect("server request should convert to JSON-RPC");
+            write_websocket_message(&mut websocket, JSONRPCMessage::Request(server_request)).await;
+
+            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected request_user_input response");
+            };
+            assert_eq!(response.id, request_id);
+            assert_eq!(
+                response.result,
+                serde_json::to_value(ToolRequestUserInputResponse {
+                    answers: HashMap::from([(
+                        "mode".to_string(),
+                        ToolRequestUserInputAnswer {
+                            answers: vec!["fast".to_string()],
+                        },
+                    )]),
+                })
+                .expect("request_user_input response should serialize")
+            );
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let AppServerEvent::ServerRequest(request) = client
+            .next_event()
+            .await
+            .expect("request event should arrive")
+        else {
+            panic!("expected server request event");
+        };
+        let ServerRequest::ToolRequestUserInput { request_id, params } = request else {
+            panic!("expected request_user_input request");
+        };
+        assert_eq!(request_id, RequestId::String("srv-user-input".to_string()));
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.item_id, "input-1");
+        client
+            .resolve_server_request(
+                request_id,
+                serde_json::to_value(ToolRequestUserInputResponse {
+                    answers: HashMap::from([(
+                        "mode".to_string(),
+                        ToolRequestUserInputAnswer {
+                            answers: vec!["fast".to_string()],
+                        },
+                    )]),
+                })
+                .expect("request_user_input response should serialize"),
+            )
+            .await
+            .expect("request_user_input should resolve");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_elicitation_roundtrip_works() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let request_id = RequestId::String("srv-elicitation".to_string());
+            let server_request: JSONRPCRequest = serde_json::from_value(
+                serde_json::to_value(ServerRequest::McpServerElicitationRequest {
+                    request_id: request_id.clone(),
+                    params: McpServerElicitationRequestParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: Some("turn-1".to_string()),
+                        server_name: "filesystem".to_string(),
+                        request: McpServerElicitationRequest::Url {
+                            meta: None,
+                            message: "Open this URL".to_string(),
+                            url: "https://example.com/consent".to_string(),
+                            elicitation_id: "elic-1".to_string(),
+                        },
+                    },
+                })
+                .expect("server request should serialize"),
+            )
+            .expect("server request should convert to JSON-RPC");
+            write_websocket_message(&mut websocket, JSONRPCMessage::Request(server_request)).await;
+
+            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected MCP elicitation response");
+            };
+            assert_eq!(response.id, request_id);
+            assert_eq!(
+                response.result,
+                serde_json::to_value(McpServerElicitationRequestResponse {
+                    action: McpServerElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                })
+                .expect("MCP elicitation response should serialize")
+            );
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let AppServerEvent::ServerRequest(request) = client
+            .next_event()
+            .await
+            .expect("request event should arrive")
+        else {
+            panic!("expected server request event");
+        };
+        let ServerRequest::McpServerElicitationRequest { request_id, params } = request else {
+            panic!("expected MCP elicitation request");
+        };
+        assert_eq!(request_id, RequestId::String("srv-elicitation".to_string()));
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.server_name, "filesystem");
+        client
+            .resolve_server_request(
+                request_id,
+                serde_json::to_value(McpServerElicitationRequestResponse {
+                    action: McpServerElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                })
+                .expect("MCP elicitation response should serialize"),
+            )
+            .await
+            .expect("MCP elicitation should resolve");
 
         client.shutdown().await.expect("shutdown should complete");
     }

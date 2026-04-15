@@ -263,6 +263,23 @@ impl ThreadStateManager {
             .is_some_and(|thread_entry| !thread_entry.connection_ids.is_empty())
     }
 
+    pub(crate) async fn clear_thread_subscribers(&self, thread_id: ThreadId) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(thread_entry) = state.threads.get_mut(&thread_id) else {
+            return false;
+        };
+        let connection_ids = std::mem::take(&mut thread_entry.connection_ids);
+        for connection_id in connection_ids {
+            if let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) {
+                thread_ids.remove(&thread_id);
+                if thread_ids.is_empty() {
+                    state.thread_ids_by_connection.remove(&connection_id);
+                }
+            }
+        }
+        true
+    }
+
     pub(crate) async fn set_thread_resident(&self, thread_id: ThreadId, resident: bool) {
         let mut state = self.state.lock().await;
         state.threads.entry(thread_id).or_default().resident = resident;
@@ -346,7 +363,7 @@ impl ThreadStateManager {
         true
     }
 
-    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) {
+    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
         let thread_states = {
             let mut state = self.state.lock().await;
             state.live_connections.remove(&connection_id);
@@ -377,10 +394,12 @@ impl ThreadStateManager {
                 .collect::<Vec<_>>()
         };
 
+        let mut thread_ids_without_subscribers = Vec::new();
         for (thread_id, no_subscribers, thread_state) in thread_states {
             if !no_subscribers {
                 continue;
             }
+            thread_ids_without_subscribers.push(thread_id);
             let Some(thread_state) = thread_state else {
                 continue;
             };
@@ -392,5 +411,6 @@ impl ThreadStateManager {
                 "retaining thread listener after connection disconnect left zero subscribers"
             );
         }
+        thread_ids_without_subscribers
     }
 }

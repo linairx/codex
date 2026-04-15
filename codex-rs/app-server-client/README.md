@@ -93,6 +93,13 @@ after the last subscriber detaches from a resident thread, follow-up
 `thread/loaded/read`, `thread/read`, and `thread/resume` typed requests must
 still preserve `residentAssistant` instead of degrading to an ordinary
 interactive resume target.
+The same client-side contract should be applied after the last transport
+connection drops unexpectedly: if the server keeps a resident assistant loaded,
+typed follow-up `thread/loaded/read`, `thread/read`, and `thread/resume`
+responses should still be treated as the authoritative reconnect summary
+surface, while non-resident threads may disappear behind the matching
+`thread/status/changed -> notLoaded` plus `thread/closed` unload transition.
+Callers should not depend on a fixed ordering between those two notifications.
 The same resident continuity is now locked down for `thread/rollback`: after a
 resident assistant completes a turn, the rollback response must preserve
 `thread.mode = residentAssistant` instead of reconstructing the rollout as an
