@@ -712,12 +712,11 @@ impl ThreadEventStore {
 }
 
 fn status_has_pending_thread_approvals(status: &ThreadStatus) -> bool {
-    match status {
-        ThreadStatus::Active { active_flags } => {
-            active_flags.contains(&ThreadActiveFlag::WaitingOnApproval)
-        }
-        ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => false,
-    }
+    status_has_waiting_on_approval(status)
+}
+
+fn status_has_waiting_on_approval(status: &ThreadStatus) -> bool {
+    status_has_active_flag(status, ThreadActiveFlag::WaitingOnApproval)
 }
 
 fn status_has_workspace_changed(status: &ThreadStatus) -> bool {
@@ -752,6 +751,30 @@ fn status_marks_thread_closed(status: &ThreadStatus) -> bool {
 
 fn status_has_system_error(status: &ThreadStatus) -> bool {
     matches!(status, ThreadStatus::SystemError)
+}
+
+fn waiting_on_approval_info_message() -> String {
+    "Thread is waiting for approval before it can continue. Review the pending approval request before proceeding."
+        .to_string()
+}
+
+fn workspace_changed_info_message() -> String {
+    "Workspace changed on disk while this thread was active. Review local changes before continuing."
+        .to_string()
+}
+
+fn waiting_on_user_input_info_message() -> String {
+    "Thread is waiting for required user input. Review the pending prompt before continuing."
+        .to_string()
+}
+
+fn background_terminal_running_info_message() -> String {
+    "Background terminal is still running for this thread. Use /ps to inspect or stop it before continuing."
+        .to_string()
+}
+
+fn system_error_info_message() -> String {
+    "Thread entered a system error state. Review the recent output before continuing.".to_string()
 }
 
 #[derive(Debug)]
@@ -1079,6 +1102,7 @@ pub(crate) struct App {
     agent_navigation: AgentNavigationState,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
+    active_thread_waiting_on_approval: bool,
     active_thread_workspace_changed: bool,
     active_thread_waiting_on_user_input: bool,
     active_thread_background_terminal_running: bool,
@@ -1095,6 +1119,12 @@ enum AppServerThreadAttachKind {
     Started,
     Resumed,
     Forked,
+}
+
+#[derive(Debug)]
+struct AttachedThreadSelection {
+    live_attached: bool,
+    status: ThreadStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2945,6 +2975,7 @@ impl App {
     async fn enqueue_primary_thread_session(
         &mut self,
         session: ThreadSessionState,
+        status: ThreadStatus,
         turns: Vec<Turn>,
     ) -> Result<()> {
         let thread_id = session.thread_id;
@@ -2954,9 +2985,9 @@ impl App {
             thread_id,
             /*agent_nickname*/ None,
             /*agent_role*/ None,
-            /*is_closed*/ false,
-            /*active_flags*/ Vec::new(),
-            /*has_system_error*/ false,
+            status_marks_thread_closed(&status),
+            active_flags_from_status(&status),
+            status_has_system_error(&status),
         );
         let channel = self.ensure_thread_channel(thread_id);
         {
@@ -3056,12 +3087,24 @@ impl App {
         started: AppServerStartedThread,
         snapshot: &mut ThreadEventSnapshot,
     ) {
-        let AppServerStartedThread { session, turns } = started;
+        let AppServerStartedThread {
+            session,
+            status,
+            turns,
+        } = started;
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             store.set_session(session.clone(), turns.clone());
             store.rebase_buffer_after_session_refresh();
         }
+        self.upsert_agent_picker_thread(
+            thread_id,
+            /*agent_nickname*/ None,
+            /*agent_role*/ None,
+            status_marks_thread_closed(&status),
+            active_flags_from_status(&status),
+            status_has_system_error(&status),
+        );
         snapshot.session = Some(session);
         snapshot.turns = turns;
         snapshot
@@ -3332,16 +3375,35 @@ impl App {
         &mut self,
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
-    ) -> Result<bool> {
+    ) -> Result<AttachedThreadSelection> {
         if self.thread_event_channels.contains_key(&thread_id) {
-            return Ok(true);
+            let status = self
+                .agent_navigation
+                .get(&thread_id)
+                .map(|entry| {
+                    if entry.has_system_error {
+                        ThreadStatus::SystemError
+                    } else if entry.active_flags.is_empty() {
+                        ThreadStatus::Idle
+                    } else {
+                        ThreadStatus::Active {
+                            active_flags: entry.active_flags.clone(),
+                        }
+                    }
+                })
+                .unwrap_or(ThreadStatus::Idle);
+            return Ok(AttachedThreadSelection {
+                live_attached: true,
+                status,
+            });
         }
 
-        let (session, turns, live_attached) = match app_server
+        let existing_entry = self.agent_navigation.get(&thread_id).cloned();
+        let (session, turns, live_attached, status) = match app_server
             .resume_thread(self.config.clone(), thread_id, /*mode*/ None)
             .await
         {
-            Ok(started) => (started.session, started.turns, true),
+            Ok(started) => (started.session, started.turns, true, started.status),
             Err(resume_err) => {
                 tracing::warn!(
                     thread_id = %thread_id,
@@ -3357,9 +3419,17 @@ impl App {
                         (thread, turns)
                     }
                     Err(err) if Self::can_fallback_from_include_turns_error(&err) => {
-                        let thread = app_server
+                        let thread = match app_server
                             .thread_read(thread_id, /*include_turns*/ false)
-                            .await?;
+                            .await
+                        {
+                            Ok(thread) => thread,
+                            Err(_) => {
+                                return Err(color_eyre::eyre::eyre!(
+                                    "Agent thread {thread_id} is not yet available for replay or live attach."
+                                ));
+                            }
+                        };
                         (thread, Vec::new())
                     }
                     Err(err) => return Err(err),
@@ -3371,17 +3441,33 @@ impl App {
                         "Agent thread {thread_id} is not yet available for replay or live attach."
                     ));
                 }
+                let status = thread.status.clone();
                 let mut session = self.session_state_for_thread_read(thread_id, &thread).await;
                 // `thread/read` can seed replay state, but it does not attach the app-server
                 // listener that `thread/resume` establishes, so treat this path as replay-only.
                 session.model.clear();
-                (session, turns, false)
+                (session, turns, false, status)
             }
         };
+        self.upsert_agent_picker_thread(
+            thread_id,
+            existing_entry
+                .as_ref()
+                .and_then(|entry| entry.agent_nickname.clone()),
+            existing_entry
+                .as_ref()
+                .and_then(|entry| entry.agent_role.clone()),
+            status_marks_thread_closed(&status),
+            active_flags_from_status(&status),
+            status_has_system_error(&status),
+        );
         let channel = self.ensure_thread_channel(thread_id);
         let mut store = channel.store.lock().await;
         store.set_session(session, turns);
-        Ok(live_attached)
+        Ok(AttachedThreadSelection {
+            live_attached,
+            status,
+        })
     }
 
     /// Replaces the chat widget and re-seeds the new widget's collab metadata from the navigation
@@ -3434,13 +3520,15 @@ impl App {
             .get(&thread_id)
             .is_some_and(|entry| entry.is_closed);
         let mut attached_replay_only = false;
+        let mut attach_status = None;
         if self.should_attach_live_thread_for_selection(thread_id) {
             match self
                 .attach_live_thread_for_selection(app_server, thread_id)
                 .await
             {
-                Ok(live_attached) => {
-                    attached_replay_only = !live_attached;
+                Ok(attached) => {
+                    attached_replay_only = !attached.live_attached;
+                    attach_status = Some(attached.status);
                     if attached_replay_only {
                         is_replay_only = true;
                     }
@@ -3491,6 +3579,9 @@ impl App {
             .and_then(|session| session.thread_mode);
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot, !is_replay_only);
+        if let Some(status) = attach_status {
+            self.show_active_thread_status_messages_for_status(&status);
+        }
         self.sync_active_thread_status_flags_from_navigation();
         if is_replay_only {
             let message = replay_only_thread_switch_message(
@@ -3521,6 +3612,7 @@ impl App {
         self.has_emitted_history_lines = false;
         self.backtrack = BacktrackState::default();
         self.backtrack_render_pending = false;
+        self.active_thread_waiting_on_approval = false;
         self.active_thread_workspace_changed = false;
         self.active_thread_waiting_on_user_input = false;
         self.active_thread_background_terminal_running = false;
@@ -3536,6 +3628,7 @@ impl App {
         self.agent_navigation.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
+        self.active_thread_waiting_on_approval = false;
         self.active_thread_workspace_changed = false;
         self.active_thread_waiting_on_user_input = false;
         self.active_thread_background_terminal_running = false;
@@ -3660,16 +3753,43 @@ impl App {
         attach_kind: AppServerThreadAttachKind,
     ) -> Result<()> {
         let reconnect_notice = reconnect_notice_for_attach(&started.session, attach_kind);
+        let status = started.status;
         self.reset_thread_event_state();
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
-        self.enqueue_primary_thread_session(started.session, started.turns)
+        self.enqueue_primary_thread_session(started.session, status.clone(), started.turns)
             .await?;
         if let Some(notice) = reconnect_notice {
             self.chat_widget.add_to_history(notice);
         }
+        self.show_active_thread_status_messages_for_status(&status);
         self.backfill_loaded_subagent_threads(app_server).await;
         Ok(())
+    }
+
+    fn show_active_thread_status_messages_for_status(&mut self, status: &ThreadStatus) {
+        if status_has_waiting_on_approval(status) {
+            self.chat_widget
+                .add_info_message(waiting_on_approval_info_message(), /*hint*/ None);
+        }
+        if status_has_workspace_changed(status) {
+            self.chat_widget
+                .add_info_message(workspace_changed_info_message(), /*hint*/ None);
+        }
+        if status_has_waiting_on_user_input(status) {
+            self.chat_widget
+                .add_info_message(waiting_on_user_input_info_message(), /*hint*/ None);
+        }
+        if status_has_background_terminal_running(status) {
+            self.chat_widget.add_info_message(
+                background_terminal_running_info_message(),
+                /*hint*/ None,
+            );
+        }
+        if status_has_system_error(status) {
+            self.chat_widget
+                .add_info_message(system_error_info_message(), /*hint*/ None);
+        }
     }
 
     /// Fetches loaded thread summaries from the app server and registers descendants of the
@@ -4118,6 +4238,7 @@ impl App {
             agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
+            active_thread_waiting_on_approval: false,
             active_thread_workspace_changed: false,
             active_thread_waiting_on_user_input: false,
             active_thread_background_terminal_running: false,
@@ -4129,7 +4250,7 @@ impl App {
             pending_app_server_requests: PendingAppServerRequests::default(),
         };
         if let Some(started) = initial_started_thread {
-            app.enqueue_primary_thread_session(started.session, started.turns)
+            app.enqueue_primary_thread_session(started.session, started.status, started.turns)
                 .await?;
         }
 
@@ -5999,23 +6120,24 @@ impl App {
         &mut self,
         notification: &ThreadStatusChangedNotification,
     ) {
+        let waiting_on_approval = status_has_waiting_on_approval(&notification.status);
+        if waiting_on_approval && !self.active_thread_waiting_on_approval {
+            self.chat_widget
+                .add_info_message(waiting_on_approval_info_message(), /*hint*/ None);
+        }
+        self.active_thread_waiting_on_approval = waiting_on_approval;
+
         let workspace_changed = status_has_workspace_changed(&notification.status);
         if workspace_changed && !self.active_thread_workspace_changed {
-            self.chat_widget.add_info_message(
-                "Workspace changed on disk while this thread was active. Review local changes before continuing."
-                    .to_string(),
-                /*hint*/ None,
-            );
+            self.chat_widget
+                .add_info_message(workspace_changed_info_message(), /*hint*/ None);
         }
         self.active_thread_workspace_changed = workspace_changed;
 
         let waiting_on_user_input = status_has_waiting_on_user_input(&notification.status);
         if waiting_on_user_input && !self.active_thread_waiting_on_user_input {
-            self.chat_widget.add_info_message(
-                "Thread is waiting for required user input. Review the pending prompt before continuing."
-                    .to_string(),
-                /*hint*/ None,
-            );
+            self.chat_widget
+                .add_info_message(waiting_on_user_input_info_message(), /*hint*/ None);
         }
         self.active_thread_waiting_on_user_input = waiting_on_user_input;
 
@@ -6023,8 +6145,7 @@ impl App {
             status_has_background_terminal_running(&notification.status);
         if background_terminal_running && !self.active_thread_background_terminal_running {
             self.chat_widget.add_info_message(
-                "Background terminal is still running for this thread. Use /ps to inspect or stop it before continuing."
-                    .to_string(),
+                background_terminal_running_info_message(),
                 /*hint*/ None,
             );
         }
@@ -6032,11 +6153,8 @@ impl App {
 
         let system_error = status_has_system_error(&notification.status);
         if system_error && !self.active_thread_system_error {
-            self.chat_widget.add_info_message(
-                "Thread entered a system error state. Review the recent output before continuing."
-                    .to_string(),
-                /*hint*/ None,
-            );
+            self.chat_widget
+                .add_info_message(system_error_info_message(), /*hint*/ None);
         }
         self.active_thread_system_error = system_error;
     }
@@ -6050,6 +6168,7 @@ impl App {
     /// already viewing, rather than as if the thread had just become clean.
     fn sync_active_thread_status_flags_from_navigation(&mut self) {
         let Some(thread_id) = self.active_thread_id else {
+            self.active_thread_waiting_on_approval = false;
             self.active_thread_workspace_changed = false;
             self.active_thread_waiting_on_user_input = false;
             self.active_thread_background_terminal_running = false;
@@ -6058,6 +6177,7 @@ impl App {
         };
 
         let Some(entry) = self.agent_navigation.get(&thread_id) else {
+            self.active_thread_waiting_on_approval = false;
             self.active_thread_workspace_changed = false;
             self.active_thread_waiting_on_user_input = false;
             self.active_thread_background_terminal_running = false;
@@ -6065,6 +6185,9 @@ impl App {
             return;
         };
 
+        self.active_thread_waiting_on_approval = entry
+            .active_flags
+            .contains(&ThreadActiveFlag::WaitingOnApproval);
         self.active_thread_workspace_changed = entry
             .active_flags
             .contains(&ThreadActiveFlag::WorkspaceChanged);
@@ -6965,6 +7088,7 @@ mod tests {
         app.enqueue_primary_thread_request(approval_request).await?;
         app.enqueue_primary_thread_session(
             test_thread_session(thread_id, PathBuf::from("/tmp/project")),
+            ThreadStatus::Idle,
             Vec::new(),
         )
         .await?;
@@ -7037,6 +7161,7 @@ mod tests {
 
         app.enqueue_primary_thread_session(
             test_thread_session(thread_id, PathBuf::from("/tmp/project")),
+            ThreadStatus::Idle,
             vec![test_turn(
                 "turn-1",
                 TurnStatus::Completed,
@@ -9565,6 +9690,141 @@ guardian_approval = true
     }
 
     #[tokio::test]
+    async fn active_thread_waiting_on_approval_status_emits_info_once_per_transition() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        let waiting = ThreadStatusChangedNotification {
+            thread_id: ThreadId::new().to_string(),
+            status: ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            },
+        };
+
+        app.handle_active_thread_status_notification(&waiting);
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Thread is waiting for approval before it can continue. Review the pending approval request before proceeding."
+        );
+
+        app.handle_active_thread_status_notification(&waiting);
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&ThreadStatusChangedNotification {
+            thread_id: waiting.thread_id.clone(),
+            status: ThreadStatus::Idle,
+        });
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&waiting);
+        let second = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell after reset, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&second.display_lines(/*width*/ 120)),
+            "• Thread is waiting for approval before it can continue. Review the pending approval request before proceeding."
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_snapshot_status_emits_waiting_on_approval_info_immediately() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.show_active_thread_status_messages_for_status(&ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+        });
+
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Thread is waiting for approval before it can continue. Review the pending approval request before proceeding."
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_snapshot_status_emits_workspace_changed_info_immediately() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.show_active_thread_status_messages_for_status(&ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+        });
+
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Workspace changed on disk while this thread was active. Review local changes before continuing."
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_snapshot_status_emits_waiting_on_user_input_info_immediately() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.show_active_thread_status_messages_for_status(&ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+        });
+
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Thread is waiting for required user input. Review the pending prompt before continuing."
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_snapshot_status_emits_background_terminal_info_immediately() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.show_active_thread_status_messages_for_status(&ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+        });
+
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Background terminal is still running for this thread. Use /ps to inspect or stop it before continuing."
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_snapshot_status_emits_system_error_info_immediately() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.show_active_thread_status_messages_for_status(&ThreadStatus::SystemError);
+
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Thread entered a system error state. Review the recent output before continuing."
+        );
+    }
+
+    #[tokio::test]
     async fn active_thread_background_terminal_status_emits_info_once_per_transition() {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
 
@@ -9651,6 +9911,7 @@ guardian_approval = true
             Some("explorer".to_string()),
             /*is_closed*/ false,
             vec![
+                ThreadActiveFlag::WaitingOnApproval,
                 ThreadActiveFlag::WaitingOnUserInput,
                 ThreadActiveFlag::BackgroundTerminalRunning,
             ],
@@ -9662,6 +9923,7 @@ guardian_approval = true
             thread_id: thread_id.to_string(),
             status: ThreadStatus::Active {
                 active_flags: vec![
+                    ThreadActiveFlag::WaitingOnApproval,
                     ThreadActiveFlag::WaitingOnUserInput,
                     ThreadActiveFlag::BackgroundTerminalRunning,
                 ],
@@ -10523,6 +10785,7 @@ guardian_approval = true
             agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
+            active_thread_waiting_on_approval: false,
             active_thread_workspace_changed: false,
             active_thread_waiting_on_user_input: false,
             active_thread_background_terminal_running: false,
@@ -10581,6 +10844,7 @@ guardian_approval = true
                 agent_navigation: AgentNavigationState::default(),
                 active_thread_id: None,
                 active_thread_rx: None,
+                active_thread_waiting_on_approval: false,
                 active_thread_workspace_changed: false,
                 active_thread_waiting_on_user_input: false,
                 active_thread_background_terminal_running: false,
@@ -12322,6 +12586,9 @@ guardian_approval = true
             thread_id,
             AppServerStartedThread {
                 session: resumed_session.clone(),
+                status: ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+                },
                 turns: resumed_turns.clone(),
             },
             &mut snapshot,
@@ -12330,6 +12597,13 @@ guardian_approval = true
 
         assert_eq!(snapshot.session, Some(resumed_session.clone()));
         assert_eq!(snapshot.turns, resumed_turns);
+        assert_eq!(
+            app.agent_navigation
+                .get(&thread_id)
+                .expect("thread navigation entry")
+                .active_flags,
+            vec![ThreadActiveFlag::WaitingOnApproval]
+        );
 
         let store = app
             .thread_event_channels

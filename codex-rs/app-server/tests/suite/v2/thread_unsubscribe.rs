@@ -6,6 +6,9 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
+use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -703,6 +706,158 @@ async fn resident_thread_preserves_waiting_on_user_input_across_unsubscribe_and_
 }
 
 #[tokio::test]
+async fn resident_thread_preserves_waiting_on_approval_across_unsubscribe_read_and_resume()
+-> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_shell_command_sse_response(
+            vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print(42)".to_string(),
+            ],
+            /*workdir*/ None,
+            Some(5000),
+            "call-approval",
+        )?,
+        create_final_assistant_message_sse_response("done")?,
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_approval_policy(codex_home.path(), &server.uri(), "untrusted")?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "run command needing approval".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            approval_policy: Some(AskForApproval::UnlessTrusted),
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response(turn_start_resp)?;
+
+    let original_request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::CommandExecutionRequestApproval { .. } = &original_request else {
+        panic!("expected CommandExecutionRequestApproval request, got {original_request:?}");
+    };
+    let expected_active_status =
+        wait_for_thread_status_flag(&mut mcp, &thread.id, ThreadActiveFlag::WaitingOnApproval)
+            .await?;
+
+    let unsubscribe_id = mcp
+        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let unsubscribe_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
+    )
+    .await??;
+    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
+    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+    let loaded_read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+        .await?;
+    let loaded_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_read_id)),
+    )
+    .await??;
+    let ThreadLoadedReadResponse { data, .. } =
+        to_response::<ThreadLoadedReadResponse>(loaded_read_resp)?;
+    let loaded_thread = data
+        .into_iter()
+        .find(|loaded_thread| loaded_thread.id == thread.id)
+        .expect("thread/loaded/read should include resident thread after unsubscribe");
+    assert_eq!(loaded_thread.status, expected_active_status);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert_eq!(read_thread.status, expected_active_status);
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resume = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resume.thread.status, expected_active_status);
+
+    let replayed_request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::CommandExecutionRequestApproval { request_id, .. } = replayed_request else {
+        panic!("expected replayed CommandExecutionRequestApproval request");
+    };
+    mcp.send_response(
+        request_id,
+        serde_json::to_value(CommandExecutionRequestApprovalResponse {
+            decision: CommandExecutionApprovalDecision::Accept,
+        })?,
+    )
+    .await?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_unsubscribe_during_turn_interrupts_turn_and_emits_thread_closed() -> Result<()> {
     #[cfg(target_os = "windows")]
     let shell_command = vec![
@@ -1062,6 +1217,33 @@ model_provider = "mock_provider"
 
 [features]
 collaboration_modes = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_config_toml_with_approval_policy(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+    approval_policy: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "{approval_policy}"
+sandbox_mode = "danger-full-access"
+
+model_provider = "mock_provider"
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

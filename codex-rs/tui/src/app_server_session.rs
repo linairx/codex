@@ -60,6 +60,7 @@ use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadShellCommandResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::Turn;
@@ -150,6 +151,7 @@ impl ThreadParamsMode {
 
 pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
+    pub(crate) status: ThreadStatus,
     pub(crate) turns: Vec<Turn>,
 }
 
@@ -981,6 +983,7 @@ async fn started_thread_from_start_response(
         .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
+        status: response.thread.status,
         turns: response.thread.turns,
     })
 }
@@ -994,6 +997,7 @@ async fn started_thread_from_resume_response(
         .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
+        status: response.thread.status,
         turns: response.thread.turns,
     })
 }
@@ -1007,6 +1011,7 @@ async fn started_thread_from_fork_response(
         .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
+        status: response.thread.status,
         turns: response.thread.turns,
     })
 }
