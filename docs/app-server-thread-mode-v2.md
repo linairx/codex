@@ -137,61 +137,50 @@ runtime status，应该继续读取 `thread/loaded/read`，而不是期待 id-on
 
 第一阶段有两种可接受路径。
 
-### 路径 A：暂时保留 `resident` 请求参数，服务端推导 `mode`
+### 当前实现：新增请求侧模式字段，但保留 `resident`
 
-这是最保守的方案：
+当前实现已经进入路径 B：
 
-- `thread/start` 继续接受 `resident: bool`
-- `thread/resume` 继续接受 `resident: bool`
-- 服务端在返回 `Thread` 时填充 `mode`
+- `thread/start` / `thread/resume` 新增可选 `mode`
+- `mode` 是新的首选产品语义字段
+- `resident` 继续保留为兼容字段
+- 当 `mode` 与 `resident` 冲突时，服务端返回 invalid request
 
-这种方式的优点是：
+这样做的结果是：
 
-- 改动最小
-- 不破坏现有客户端
-- 可以先让读取侧和展示侧稳定下来
-
-缺点是：
-
-- 请求侧语义仍不够直观
-
-### 路径 B：新增请求侧模式字段，但保留 `resident`
-
-这是更完整但稍重一点的方案：
-
-- 新增可选 `mode`
-- 第一阶段要求 `mode` 与 `resident` 保持兼容
-- 当两者同时出现冲突时，服务端明确报错或定义优先级
-
-如果追求范围可控，我更倾向于先做路径 A，再在下一步把请求侧也切到模式字段。
+- 新客户端不必继续写 `resident: true/false` 这种模糊布尔语义
+- 旧客户端仍不会因为只会发 `resident` 而立刻失效
+- 返回侧和请求侧都已经可以围绕 `ThreadMode` 收口
 
 ## 8. 第一阶段推荐兼容策略
 
-第一阶段推荐如下策略：
+当前兼容策略如下：
 
-- 返回侧：新增 `Thread.mode`
-- 请求侧：保留现有 `resident`
+- 返回侧：继续统一返回 `Thread.mode`
+- 请求侧：优先使用 `mode`，保留 `resident`
 - 服务端：
   - 普通线程返回 `mode = interactive`
   - 长期驻留助手线程返回 `mode = residentAssistant`
-  - `resident = false` 通常对应 `interactive`
-  - `resident = true` 在第一阶段可映射到 `residentAssistant`
-
-这样做虽然还不完美，但可以先把最重要的读取和展示问题解决掉。
+  - 省略 `mode` 时，`resident = true` 仍映射到 `residentAssistant`
+  - 显式 `mode = interactive` 与 `resident = true` 冲突时直接报错
+  - 对已持久化为 `residentAssistant` 的线程，`thread/resume` 不允许显式降级成 `interactive`
 
 ## 9. 与 `thread/fork` 的关系
 
 `thread/fork` 也返回 `Thread`，因此也需要明确该字段。
 
-第一阶段建议：
+当前实现建议：
 
 - 默认 fork 出来的线程仍是 `interactive`
 - 不因为源线程是 `residentAssistant`，就自动让 fork 线程继承为 `residentAssistant`
+- 如果调用方确实需要派生出新的长期线程，应显式传 `mode = residentAssistant`
+- `resident` 仍保留为兼容字段，但与 `mode` 冲突时服务端应直接报错
 
 原因是：
 
 - fork 更像新线程派生，而不是原线程身份延续
 - 自动继承长期驻留语义容易制造意外保活
+- 显式 `mode` 比 `resident: true` 更能表达“这是产品模式选择，而不是底层保活细节”
 
 如果未来确实需要“派生出新的长期线程”，应通过显式请求参数控制，而不是隐式继承。
 
@@ -250,6 +239,7 @@ runtime status，应该继续读取 `thread/loaded/read`，而不是期待 id-on
 
 - `Thread.mode` 的语义
 - `resident` 与 `mode` 的区别
+- `thread/start` / `thread/resume` 请求侧优先使用 `mode`，`resident` 仅作兼容
 - `thread/resume` 对 `residentAssistant` 更偏“重新连接”
 - 客户端动作文案应直接按 `Thread.mode` 映射：`interactive -> resume`、`residentAssistant -> reconnect`
 - `thread/status/changed` 只推送 runtime `status`，不重复 `mode`
@@ -284,10 +274,9 @@ runtime status，应该继续读取 `thread/loaded/read`，而不是期待 id-on
 
 在这一版协议稳定之后，再考虑：
 
-1. 是否在请求侧引入显式 `mode`
-2. 是否让 `resident` 逐步退化为内部兼容字段
-3. 是否为多 agent / planner / background worker 扩展更多模式值
-4. 是否让更多客户端完全迁移到 `mode` 驱动展示
+1. 是否让 `resident` 逐步退化为内部兼容字段
+2. 是否为多 agent / planner / background worker 扩展更多模式值
+3. 是否让更多客户端完全迁移到 `mode` 驱动展示
 
 这几个步骤都应晚于第一阶段的读取侧落地。
 

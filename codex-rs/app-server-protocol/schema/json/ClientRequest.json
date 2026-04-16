@@ -2581,6 +2581,17 @@
         "ephemeral": {
           "type": "boolean"
         },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit product mode for the forked thread.\n\nWhen omitted, the server falls back to the legacy `resident` flag for compatibility. Requests should prefer `mode` over `resident`."
+        },
         "model": {
           "description": "Configuration overrides for the forked thread, if any.",
           "type": [
@@ -2851,6 +2862,13 @@
       ],
       "type": "object"
     },
+    "ThreadMode": {
+      "enum": [
+        "interactive",
+        "residentAssistant"
+      ],
+      "type": "string"
+    },
     "ThreadReadParams": {
       "properties": {
         "includeTurns": {
@@ -2953,6 +2971,17 @@
             "string",
             "null"
           ]
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit product mode for the thread after resume/reconnect.\n\nWhen omitted, the server falls back to the legacy `resident` flag for compatibility and persisted thread metadata. Requests should prefer `mode` over `resident`."
         },
         "model": {
           "description": "Configuration overrides for the resumed thread, if any.",
@@ -3141,6 +3170,17 @@
             "boolean",
             "null"
           ]
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit product mode for the thread being created.\n\nWhen omitted, the server falls back to the legacy `resident` flag for compatibility. Requests should prefer `mode` over `resident`."
         },
         "model": {
           "type": [

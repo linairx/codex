@@ -83,6 +83,7 @@ fn main() -> Result<()> {
     let thread_connection = if let Some(thread_id) = cli.thread_id.as_ref() {
         client.resume_thread(build_thread_resume_params(
             thread_id.clone(),
+            None,
             approval_policy,
             cli.model.clone(),
             cli.model_provider.clone(),
@@ -191,8 +192,12 @@ fn handle_command(
             true
         }
         UserCommand::Resume(thread_id) => {
+            let known_mode = client
+                .known_thread(&thread_id)
+                .map(|thread| thread.thread_mode);
             match client.request_thread_resume(build_thread_resume_params(
                 thread_id,
+                known_mode,
                 approval_policy,
                 cli.model.clone(),
                 cli.model_provider.clone(),

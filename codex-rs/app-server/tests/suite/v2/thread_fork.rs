@@ -225,7 +225,7 @@ async fn thread_fork_from_resident_thread_stays_interactive_after_restart() -> R
         let start_id = mcp
             .send_thread_start_request(ThreadStartParams {
                 model: Some("mock-model".to_string()),
-                resident: true,
+                mode: Some(ThreadMode::ResidentAssistant),
                 ..Default::default()
             })
             .await?;
@@ -235,6 +235,7 @@ async fn thread_fork_from_resident_thread_stays_interactive_after_restart() -> R
         )
         .await??;
         let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+        assert!(thread.resident);
         assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
         let turn_req = mcp
@@ -369,7 +370,7 @@ async fn resident_thread_fork_observes_workspace_changes() -> Result<()> {
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -379,6 +380,8 @@ async fn resident_thread_fork_observes_workspace_changes() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
@@ -406,7 +409,7 @@ async fn resident_thread_fork_observes_workspace_changes() -> Result<()> {
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
             thread_id: thread.id.clone(),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -448,6 +451,48 @@ async fn resident_thread_fork_observes_workspace_changes() -> Result<()> {
         ThreadStatus::Active {
             active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
         }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_rejects_conflicting_mode_and_resident_flag() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    // Keep the legacy `resident` flag here so this test continues to cover the
+    // compatibility path where `mode` and `resident` conflict.
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            mode: Some(ThreadMode::Interactive),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let fork_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    assert_eq!(
+        fork_err.error.message,
+        "thread mode `interactive` conflicts with legacy resident flag"
     );
 
     Ok(())

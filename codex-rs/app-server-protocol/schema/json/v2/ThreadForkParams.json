@@ -73,6 +73,13 @@
         "flex"
       ],
       "type": "string"
+    },
+    "ThreadMode": {
+      "enum": [
+        "interactive",
+        "residentAssistant"
+      ],
+      "type": "string"
     }
   },
   "description": "There are two ways to fork a thread: 1. By thread_id: load the thread from disk by thread_id and fork it into a new thread. 2. By path: load the thread from disk by path and fork it into a new thread.\n\nIf using path, the thread_id param will be ignored.\n\nPrefer using thread_id whenever possible.",
@@ -125,6 +132,17 @@
     },
     "ephemeral": {
       "type": "boolean"
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Explicit product mode for the forked thread.\n\nWhen omitted, the server falls back to the legacy `resident` flag for compatibility. Requests should prefer `mode` over `resident`."
     },
     "model": {
       "description": "Configuration overrides for the forked thread, if any.",

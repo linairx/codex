@@ -979,6 +979,13 @@
         "flex"
       ],
       "type": "string"
+    },
+    "ThreadMode": {
+      "enum": [
+        "interactive",
+        "residentAssistant"
+      ],
+      "type": "string"
     }
   },
   "description": "There are three ways to resume or reconnect to a thread: 1. By thread_id: load the thread from disk by thread_id and resume or reconnect it. 2. By history: instantiate the thread from memory and resume or reconnect it. 3. By path: load the thread from disk by path and resume or reconnect it.\n\nThe precedence is: history > path > thread_id. If using history or path, the thread_id param will be ignored.\n\nPrefer using thread_id whenever possible.",
@@ -1028,6 +1035,17 @@
         "string",
         "null"
       ]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Explicit product mode for the thread after resume/reconnect.\n\nWhen omitted, the server falls back to the legacy `resident` flag for compatibility and persisted thread metadata. Requests should prefer `mode` over `resident`."
     },
     "model": {
       "description": "Configuration overrides for the resumed thread, if any.",

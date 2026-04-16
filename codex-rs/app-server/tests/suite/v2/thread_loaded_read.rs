@@ -9,6 +9,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
+use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -209,7 +210,7 @@ async fn thread_loaded_read_reports_workspace_changed_for_resident_threads() -> 
         .send_thread_start_request(ThreadStartParams {
             model: Some("gpt-5.1".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -219,6 +220,8 @@ async fn thread_loaded_read_reports_workspace_changed_for_resident_threads() -> 
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     std::fs::write(workspace.path().join("watched.txt"), "changed")?;
 

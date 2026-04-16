@@ -153,7 +153,7 @@ async fn thread_unsubscribe_keeps_resident_thread_loaded() -> Result<()> {
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -281,7 +281,7 @@ async fn resident_thread_preserves_workspace_changed_across_unsubscribe_and_resu
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -291,6 +291,8 @@ async fn resident_thread_preserves_workspace_changed_across_unsubscribe_and_resu
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {

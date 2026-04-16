@@ -2098,9 +2098,18 @@ impl CodexMessageProcessor {
             experimental_raw_events,
             personality,
             ephemeral,
+            mode,
             resident,
             persist_extended_history,
         } = params;
+        let requested_mode =
+            match resolve_requested_thread_mode(mode, resident, /*persisted_mode*/ None) {
+                Ok(requested_mode) => requested_mode,
+                Err(message) => {
+                    self.send_invalid_request_error(request_id, message).await;
+                    return;
+                }
+            };
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -2144,7 +2153,7 @@ impl CodexMessageProcessor {
                 persist_extended_history,
                 service_name,
                 experimental_raw_events,
-                resident,
+                resident_from_thread_mode(requested_mode),
                 request_trace,
             )
             .await;
@@ -4158,6 +4167,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            mode,
             resident,
             persist_extended_history,
         } = params;
@@ -4200,10 +4210,16 @@ impl CodexMessageProcessor {
                 &mut typesafe_overrides,
             )
             .await;
-        let resident = resident
-            || persisted_resume_metadata
-                .as_ref()
-                .is_some_and(ThreadMetadata::is_resident_assistant);
+        let persisted_mode = persisted_resume_metadata
+            .as_ref()
+            .map(|metadata| thread_mode_from_resident(metadata.is_resident_assistant()));
+        let resident = match resolve_requested_thread_mode(mode, resident, persisted_mode) {
+            Ok(requested_mode) => resident_from_thread_mode(requested_mode),
+            Err(message) => {
+                self.send_invalid_request_error(request_id, message).await;
+                return;
+            }
+        };
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
@@ -4707,9 +4723,19 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             ephemeral,
+            mode,
             resident,
             persist_extended_history,
         } = params;
+        let requested_mode =
+            match resolve_requested_thread_mode(mode, resident, /*persisted_mode*/ None) {
+                Ok(requested_mode) => requested_mode,
+                Err(message) => {
+                    self.send_invalid_request_error(request_id, message).await;
+                    return;
+                }
+            };
+        let resident = resident_from_thread_mode(requested_mode);
 
         let (rollout_path, source_thread_id) = if let Some(path) = path {
             (path, None)
@@ -9695,6 +9721,53 @@ fn thread_mode_from_resident(resident: bool) -> ThreadMode {
     }
 }
 
+fn resident_from_thread_mode(mode: ThreadMode) -> bool {
+    match mode {
+        ThreadMode::Interactive => false,
+        ThreadMode::ResidentAssistant => true,
+    }
+}
+
+fn thread_mode_name(mode: ThreadMode) -> &'static str {
+    match mode {
+        ThreadMode::Interactive => "interactive",
+        ThreadMode::ResidentAssistant => "residentAssistant",
+    }
+}
+
+fn resolve_requested_thread_mode(
+    mode: Option<ThreadMode>,
+    resident: bool,
+    persisted_mode: Option<ThreadMode>,
+) -> Result<ThreadMode, String> {
+    let legacy_mode = if resident {
+        Some(ThreadMode::ResidentAssistant)
+    } else {
+        None
+    };
+    if let Some(mode) = mode {
+        if let Some(legacy_mode) = legacy_mode
+            && legacy_mode != mode
+        {
+            return Err(format!(
+                "thread mode `{}` conflicts with legacy resident flag",
+                thread_mode_name(mode)
+            ));
+        }
+        if let Some(persisted_mode) = persisted_mode
+            && persisted_mode == ThreadMode::ResidentAssistant
+            && mode == ThreadMode::Interactive
+        {
+            return Err(
+                "resident assistant threads cannot be resumed with mode `interactive`".to_string(),
+            );
+        }
+        return Ok(mode);
+    }
+
+    Ok(legacy_mode.unwrap_or_else(|| persisted_mode.unwrap_or(ThreadMode::Interactive)))
+}
+
 fn set_thread_resident_and_mode(thread: &mut Thread, resident: bool) {
     thread.resident = resident;
     thread.mode = thread_mode_from_resident(resident);
@@ -9996,6 +10069,7 @@ mod tests {
             base_instructions: None,
             developer_instructions: None,
             personality: None,
+            mode: None,
             resident: false,
             persist_extended_history: false,
         };

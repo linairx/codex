@@ -338,7 +338,7 @@ async fn thread_status_changed_tracks_workspace_changes() -> Result<()> {
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -348,6 +348,7 @@ async fn thread_status_changed_tracks_workspace_changes() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     std::fs::write(workspace.path().join("watched.txt"), "changed")?;
@@ -398,7 +399,7 @@ async fn thread_status_changed_notification_does_not_repeat_thread_mode() -> Res
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -408,6 +409,7 @@ async fn thread_status_changed_notification_does_not_repeat_thread_mode() -> Res
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     std::fs::write(workspace.path().join("watched.txt"), "changed")?;
@@ -477,7 +479,7 @@ async fn workspace_changed_clears_after_next_turn() -> Result<()> {
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -487,6 +489,7 @@ async fn workspace_changed_clears_after_next_turn() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+    assert!(thread.resident);
 
     std::fs::write(workspace.path().join("watched.txt"), "changed")?;
 
@@ -585,7 +588,7 @@ async fn workspace_changed_status_is_consistent_across_read_list_and_loaded_read
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -595,6 +598,8 @@ async fn workspace_changed_status_is_consistent_across_read_list_and_loaded_read
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_start_id = mcp
         .send_turn_start_request(TurnStartParams {

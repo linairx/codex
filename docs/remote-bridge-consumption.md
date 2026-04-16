@@ -142,6 +142,7 @@
 - 如果线程当前 loaded，`thread/loaded/read` 已可补充更接近运行时的 `mode + status` 摘要面，并且这条读取面本身就应继续被消费侧当成权威当前线程摘要，而不是退回成还需要额外补一次 `thread/read` 的半恢复接口
 - 对于服务重启后的未加载 resident thread，`thread/list` 不再只能看到普通历史线程语义，而是可以读到持久化回补后的 resident 模式
 - 即使 SQLite 中已经有线程行，远端也不应把“有 row”直接等同于“stored summary 已完整”；当前更可靠的契约是继续直接信 `thread/list` / `thread/read` / `thread/resume` / `thread/unarchive` / `thread/metadata/update` 返回的线程摘要，因为服务端会先 reconcile rollout，再把修补后的 summary 暴露出来
+- 远端如果要主动创建、reconnect 或派生长期线程，也应直接沿用请求侧 `mode` 语义：`thread/start` / `thread/resume` / `thread/fork` 优先传 `mode = residentAssistant`，而不是重新把 bridge 壳层写回 `resident: true` 的旧兼容布尔心智
 
 ### 第 2 层：线程状态通知
 

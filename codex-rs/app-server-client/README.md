@@ -126,6 +126,11 @@ re-read” repair step. That boundary is now locked down directly for both
 remote callers can continue to treat each of those responses as the
 authoritative repaired snapshot when reconnect, stored lookup, history
 listing, or loaded-thread polling returns an already repaired `Thread`.
+The same websocket path now also locks down request-side mode selection:
+typed remote callers should prefer `mode` on `thread/start`, `thread/resume`,
+and `thread/fork`, and should not expect the remote facade to quietly
+reintroduce the legacy `resident` flag when `mode = residentAssistant` is
+already explicit at the callsite.
 The same remote typed layer now also locks down `thread/loaded/list` as the
 id-only loaded probe: websocket callers should preserve loaded ids plus
 `next_cursor` exactly as returned, and should continue with

@@ -39,7 +39,7 @@ async fn thread_close_unloads_resident_thread_but_preserves_resident_mode() -> R
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;

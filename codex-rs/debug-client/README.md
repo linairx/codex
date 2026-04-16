@@ -43,6 +43,9 @@ Type a line to send it as a new turn. Commands are prefixed with `:`:
   flattening `:use` / `:refresh-thread` back to generic thread wording.
 - `:new` start a new thread
 - `:resume <thread-id>` resume or reconnect to a thread
+  When the client already knows that thread from a prior start, list, or
+  loaded-read refresh, the outgoing `thread/resume` request now reuses the
+  cached `thread.mode` instead of always falling back to server-side inference.
 - `:use <thread-id>` switch active thread without resuming or reconnecting; when the thread was
   already seen via start, resume/reconnect, or list, the client also preserves whether that id
   is an ordinary thread or a resident assistant thread, plus the latest known

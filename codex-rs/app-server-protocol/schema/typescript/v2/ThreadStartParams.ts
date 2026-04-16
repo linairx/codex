@@ -7,12 +7,19 @@ import type { JsonValue } from "../serde_json/JsonValue";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxMode } from "./SandboxMode";
+import type { ThreadMode } from "./ThreadMode";
 
 export type ThreadStartParams = {model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier | null | null, cwd?: string | null, approvalPolicy?: AskForApproval | null, /**
  * Override where approval requests are routed for review on this thread
  * and subsequent turns.
  */
 approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, serviceName?: string | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, ephemeral?: boolean | null, /**
+ * Explicit product mode for the thread being created.
+ *
+ * When omitted, the server falls back to the legacy `resident` flag for
+ * compatibility. Requests should prefer `mode` over `resident`.
+ */
+mode?: ThreadMode | null, /**
  * When true, keep the thread loaded after the last client unsubscribes so
  * it can continue acting as a long-lived background assistant.
  */

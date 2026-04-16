@@ -881,6 +881,8 @@ mod tests {
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
+    use codex_app_server_protocol::ThreadForkParams;
+    use codex_app_server_protocol::ThreadForkResponse;
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadListResponse;
     use codex_app_server_protocol::ThreadLoadedListParams;
@@ -1138,6 +1140,13 @@ supports_websockets = false
             inserted || updated,
             "thread metadata setup should insert or update an existing row"
         );
+    }
+
+    fn resident_assistant_thread_start_params() -> ThreadStartParams {
+        ThreadStartParams {
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..ThreadStartParams::default()
+        }
     }
 
     fn write_rollout_with_preview(
@@ -1479,8 +1488,7 @@ supports_websockets = false
                 request_id: RequestId::Integer(5),
                 params: ThreadStartParams {
                     ephemeral: Some(true),
-                    resident: true,
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1524,7 +1532,7 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(7),
                 params: ThreadStartParams {
-                    resident: true,
+                    mode: Some(ThreadMode::ResidentAssistant),
                     cwd: Some(workspace.display().to_string()),
                     ..ThreadStartParams::default()
                 },
@@ -1583,10 +1591,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(71),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -1646,9 +1651,8 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(9),
                 params: ThreadStartParams {
-                    resident: true,
                     ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1682,9 +1686,8 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(110),
                 params: ThreadStartParams {
-                    resident: true,
                     ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1693,9 +1696,8 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(111),
                 params: ThreadStartParams {
-                    resident: true,
                     ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1761,9 +1763,8 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(118),
                 params: ThreadStartParams {
-                    resident: true,
                     ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1791,9 +1792,8 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(120),
                 params: ThreadStartParams {
-                    resident: true,
                     ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1802,9 +1802,8 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(121),
                 params: ThreadStartParams {
-                    resident: true,
                     ephemeral: Some(true),
-                    ..ThreadStartParams::default()
+                    ..resident_assistant_thread_start_params()
                 },
             })
             .await
@@ -1860,10 +1859,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(11),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -1927,10 +1923,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(401),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2041,10 +2034,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(405),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2166,10 +2156,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(408),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2352,10 +2339,7 @@ supports_websockets = false
         let started_a: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(114),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("first resident thread/start should succeed");
@@ -2373,10 +2357,7 @@ supports_websockets = false
         let started_b: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(115),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("second resident thread/start should succeed");
@@ -2486,10 +2467,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(13),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2625,10 +2603,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(408),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2749,10 +2724,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(16),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2916,10 +2888,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(45),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -3142,10 +3111,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(20),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -3254,10 +3220,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(23),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -3361,7 +3324,7 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(28),
                 params: ThreadStartParams {
-                    resident: true,
+                    mode: Some(ThreadMode::ResidentAssistant),
                     cwd: Some(workspace.display().to_string()),
                     ..ThreadStartParams::default()
                 },
@@ -3483,7 +3446,7 @@ supports_websockets = false
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(35),
                 params: ThreadStartParams {
-                    resident: true,
+                    mode: Some(ThreadMode::ResidentAssistant),
                     cwd: Some(workspace.display().to_string()),
                     ..ThreadStartParams::default()
                 },
@@ -3591,10 +3554,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(32),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -3708,10 +3668,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(411),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -3852,10 +3809,7 @@ supports_websockets = false
         let started: ThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(37),
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -4247,6 +4201,242 @@ supports_websockets = false
         assert_eq!(response.thread.name.as_deref(), Some("Atlas"));
         assert_eq!(response.model_provider, "mock_provider");
         assert_eq!(response.cwd, PathBuf::from("/workspace"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_resume_serializes_mode_without_legacy_resident_flag() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/resume request");
+            };
+            assert_eq!(request.method, "thread/resume");
+            let params = request.params.expect("thread/resume params");
+            assert_eq!(
+                params.get("mode"),
+                Some(&serde_json::Value::String("residentAssistant".to_string()))
+            );
+            assert_eq!(params.get("resident"), None);
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadResumeResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "sqlite resume repair".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                        model: "mock-model".to_string(),
+                        model_provider: "mock_provider".to_string(),
+                        service_tier: None,
+                        cwd: PathBuf::from("/workspace"),
+                        approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
+                        sandbox: SandboxPolicy::ReadOnly {
+                            access: Default::default(),
+                            network_access: false,
+                        },
+                        reasoning_effort: None,
+                    })
+                    .expect("thread/resume response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let _: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(3),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: "thread-resident".to_string(),
+                    mode: Some(ThreadMode::ResidentAssistant),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("remote typed thread/resume should succeed");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_start_serializes_mode_without_legacy_resident_flag() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/start request");
+            };
+            assert_eq!(request.method, "thread/start");
+            let params = request.params.expect("thread/start params");
+            assert_eq!(
+                params.get("mode"),
+                Some(&serde_json::Value::String("residentAssistant".to_string()))
+            );
+            assert_eq!(params.get("resident"), None);
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadStartResponse {
+                        thread: Thread {
+                            id: "thread-started".to_string(),
+                            forked_from_id: None,
+                            preview: String::new(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-started.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                        model: "mock-model".to_string(),
+                        model_provider: "mock_provider".to_string(),
+                        service_tier: None,
+                        cwd: PathBuf::from("/workspace"),
+                        approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
+                        sandbox: SandboxPolicy::ReadOnly {
+                            access: Default::default(),
+                            network_access: false,
+                        },
+                        reasoning_effort: None,
+                    })
+                    .expect("thread/start response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let _: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(4),
+                params: ThreadStartParams {
+                    mode: Some(ThreadMode::ResidentAssistant),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("remote typed thread/start should succeed");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_fork_serializes_mode_without_legacy_resident_flag() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/fork request");
+            };
+            assert_eq!(request.method, "thread/fork");
+            let params = request.params.expect("thread/fork params");
+            assert_eq!(
+                params.get("mode"),
+                Some(&serde_json::Value::String("residentAssistant".to_string()))
+            );
+            assert_eq!(params.get("resident"), None);
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadForkResponse {
+                        thread: Thread {
+                            id: "thread-forked".to_string(),
+                            forked_from_id: Some("thread-source".to_string()),
+                            preview: "fork preview".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-forked.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas fork".to_string()),
+                            turns: Vec::new(),
+                        },
+                        model: "mock-model".to_string(),
+                        model_provider: "mock_provider".to_string(),
+                        service_tier: None,
+                        cwd: PathBuf::from("/workspace"),
+                        approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
+                        sandbox: SandboxPolicy::ReadOnly {
+                            access: Default::default(),
+                            network_access: false,
+                        },
+                        reasoning_effort: None,
+                    })
+                    .expect("thread/fork response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let _: ThreadForkResponse = client
+            .request_typed(ClientRequest::ThreadFork {
+                request_id: RequestId::Integer(5),
+                params: ThreadForkParams {
+                    thread_id: "thread-source".to_string(),
+                    mode: Some(ThreadMode::ResidentAssistant),
+                    ..ThreadForkParams::default()
+                },
+            })
+            .await
+            .expect("remote typed thread/fork should succeed");
 
         client.shutdown().await.expect("shutdown should complete");
     }

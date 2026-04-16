@@ -410,7 +410,7 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_mo
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -420,6 +420,7 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_mo
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_start_id = mcp
@@ -538,7 +539,7 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_wo
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -548,6 +549,7 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_wo
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_start_id = mcp
@@ -691,7 +693,7 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_na
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -701,6 +703,7 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_na
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let thread_name = "Loaded resident metadata name";
@@ -834,7 +837,7 @@ async fn thread_metadata_update_preserves_resident_mode_for_stored_thread() -> R
         let start_id = mcp
             .send_thread_start_request(ThreadStartParams {
                 model: Some("mock-model".to_string()),
-                resident: true,
+                mode: Some(ThreadMode::ResidentAssistant),
                 ..Default::default()
             })
             .await?;
@@ -844,6 +847,7 @@ async fn thread_metadata_update_preserves_resident_mode_for_stored_thread() -> R
         )
         .await??;
         let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+        assert!(thread.resident);
         assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
         let turn_start_id = mcp
@@ -964,7 +968,7 @@ async fn thread_metadata_update_preserves_resident_mode_for_archived_thread() ->
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -974,6 +978,7 @@ async fn thread_metadata_update_preserves_resident_mode_for_archived_thread() ->
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_start_id = mcp
@@ -1105,7 +1110,7 @@ async fn thread_metadata_update_preserves_archived_thread_name() -> Result<()> {
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -1115,6 +1120,8 @@ async fn thread_metadata_update_preserves_archived_thread_name() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let thread_name = "Archived resident metadata name";
     let set_name_id = mcp

@@ -193,7 +193,7 @@ async fn resident_thread_unarchive_preserves_resident_mode() -> Result<()> {
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -203,6 +203,7 @@ async fn resident_thread_unarchive_preserves_resident_mode() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_start_id = mcp
@@ -315,7 +316,7 @@ async fn named_resident_thread_unarchive_preserves_name_and_mode() -> Result<()>
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -325,6 +326,7 @@ async fn named_resident_thread_unarchive_preserves_name_and_mode() -> Result<()>
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let thread_name = "Named resident unarchive thread";
@@ -456,7 +458,7 @@ async fn resident_thread_unarchive_reconciles_missing_summary_for_existing_sqlit
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -466,6 +468,7 @@ async fn resident_thread_unarchive_reconciles_missing_summary_for_existing_sqlit
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let preview = "materialize resident thread";

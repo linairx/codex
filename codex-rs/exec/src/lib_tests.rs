@@ -329,6 +329,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
 
     let params = thread_start_params_from_config(&config);
 
+    assert_eq!(params.mode, Some(ThreadMode::Interactive));
     assert_eq!(
         params.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::User)
@@ -352,10 +353,33 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
 
     let params = thread_start_params_from_config(&config);
 
+    assert_eq!(params.mode, Some(ThreadMode::Interactive));
     assert_eq!(
         params.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent)
     );
+}
+
+#[tokio::test]
+async fn thread_resume_params_preserve_explicit_mode_for_reconnect_targets() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build default config");
+
+    let params = thread_resume_params_from_config(
+        &config,
+        "thread-1".to_string(),
+        Some(ThreadMode::ResidentAssistant),
+    );
+
+    assert_eq!(params.mode, Some(ThreadMode::ResidentAssistant));
+    assert_eq!(params.thread_id, "thread-1");
+    assert!(!params.resident);
 }
 
 #[test]

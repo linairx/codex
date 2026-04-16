@@ -132,9 +132,9 @@ Example with notification opt-out:
 
 ## API Overview
 
-- `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. The returned `thread.mode` is the client-facing signal for whether the thread should behave like an ordinary interactive resume target (`interactive`) or a reconnectable resident assistant (`residentAssistant`). When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
-- `thread/resume` — resume or reconnect to an existing thread by id so subsequent `turn/start` calls append to it. Pass `resident: true` to keep the thread loaded after the last client unsubscribes. Clients that distinguish an ordinary interactive resume target from reconnect should consume `thread.mode` from this response. If persisted SQLite metadata already exists but rollout-derived summary fields are incomplete, app-server reconciles rollout before returning the thread, so callers should treat this response as the authoritative resumed summary rather than assuming a later `thread/read` is required to recover preview data.
-- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork and `resident: true` to keep the fork loaded after the last client unsubscribes, emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread. By default, the forked thread remains `interactive` even when the source thread was resident; as with start/resume, consumers should treat `thread.mode = residentAssistant` as reconnect semantics only when the returned thread actually opts into that mode.
+- `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. Prefer `mode: "residentAssistant"` when the thread should stay loaded after the last client unsubscribes; the legacy `resident: true` flag remains accepted for compatibility but conflicts with `mode: "interactive"`. The returned `thread.mode` is the client-facing signal for whether the thread should behave like an ordinary interactive resume target (`interactive`) or a reconnectable resident assistant (`residentAssistant`). When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
+- `thread/resume` — resume or reconnect to an existing thread by id so subsequent `turn/start` calls append to it. Prefer `mode: "residentAssistant"` when the resumed thread should stay loaded after the last client unsubscribes; the legacy `resident: true` flag remains accepted for compatibility. Clients that distinguish an ordinary interactive resume target from reconnect should consume `thread.mode` from this response. If persisted SQLite metadata already exists but rollout-derived summary fields are incomplete, app-server reconciles rollout before returning the thread, so callers should treat this response as the authoritative resumed summary rather than assuming a later `thread/read` is required to recover preview data.
+- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork and prefers `mode: "residentAssistant"` when the fork should stay loaded after the last client unsubscribes; the legacy `resident: true` flag remains accepted for compatibility but conflicts with `mode: "interactive"`. The request emits `thread/started` (including the current `thread.status` and copied `thread.turns` snapshot), and auto-subscribes you to turn/item events for the new thread. By default, the forked thread remains `interactive` even when the source thread was resident; as with start/resume, consumers should treat `thread.mode = residentAssistant` as reconnect semantics only when the returned thread actually opts into that mode.
 - `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, plus `mode` (`ThreadMode`) so history UIs can distinguish reconnectable resident assistants from ordinary interactive resume targets. If a persisted SQLite row exists but rollout-derived summary fields are incomplete, app-server reconciles rollout before returning the row, so list results should be treated as authoritative thread summaries instead of a lightweight index that needs follow-up repair reads.
 - `thread/loaded/list` — list the thread ids currently loaded in memory. This is an id-only probe; if a client also needs the current `mode` or `status`, it should follow up with `thread/loaded/read`. Supports optional `modelProviders`, `sourceKinds`, and `cwd` filters for the loaded thread's current config snapshot.
 - `thread/loaded/read` — page through loaded threads currently resident in memory and return their current `Thread` summaries, including current `mode` plus live `status`. Supports the same optional `modelProviders`, `sourceKinds`, and `cwd` filters.
@@ -143,7 +143,7 @@ Example with notification opt-out:
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). This notification is status-only and does not repeat `thread.mode`; clients that need reconnect semantics should retain `mode` from the corresponding thread snapshot. `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
 - `thread/close` — explicitly shut down and unload a loaded thread, even if it is resident or still has subscribers. The response status reports `closing` when teardown has been accepted and `notLoaded` when no loaded runtime exists. Completion still arrives through `thread/status/changed` (`notLoaded`) plus `thread/closed`. Closing a resident thread only ends the loaded runtime; later `thread/read`, `thread/list`, and `thread/resume` calls still preserve the thread’s stored `mode`.
-- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread, unless the thread is `resident: true`; non-resident unloads emit `thread/closed`, while resident threads stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls.
+- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread unless it is operating in resident-assistant mode (`thread.mode = residentAssistant`, or the legacy-compatible `resident: true` request path); non-resident unloads emit `thread/closed`, while resident assistants stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success, preserving its existing `mode`, and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
@@ -243,7 +243,7 @@ Start a fresh thread when you need a new Codex conversation.
 
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
 
-To resume or reconnect to a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. Clients should use `thread.mode` on the response to distinguish an ordinary interactive resume target from reconnecting to a resident assistant. You can also pass the same configuration overrides supported by `thread/start`, including `approvalsReviewer`.
+To resume or reconnect to a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`, and no additional notifications are emitted. Clients should use `thread.mode` on the response to distinguish an ordinary interactive resume target from reconnecting to a resident assistant. Requests may now also include `mode`; prefer that over the legacy `resident` flag, and keep them compatible when both are sent. You can also pass the same configuration overrides supported by `thread/start`, including `approvalsReviewer`.
 
 By default, resume uses the latest persisted `model` and `reasoningEffort` values associated with the thread. Supplying any of `model`, `modelProvider`, `config.model`, or `config.model_reasoning_effort` disables that persisted fallback and uses the explicit overrides plus normal config resolution instead.
 
@@ -259,12 +259,13 @@ Example:
 ```json
 { "method": "thread/resume", "id": 11, "params": {
     "threadId": "thr_123",
+    "mode": "residentAssistant",
     "personality": "friendly"
 } }
 { "id": 11, "result": { "thread": { "id": "thr_123", "mode": "residentAssistant", … } } }
 ```
 
-To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it. If the source thread is actively running, the fork snapshots it as if the current turn had been interrupted first. The `thread/started` payload mirrors the copied history snapshot in the response, including copied `thread.turns` when available. Even when the source thread was resident, the fork only behaves like a reconnect target if the returned `thread.mode` is actually `residentAssistant`; the default fork remains `interactive`. Pass `ephemeral: true` when the fork should stay in-memory only:
+To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it. If the source thread is actively running, the fork snapshots it as if the current turn had been interrupted first. The `thread/started` payload mirrors the copied history snapshot in the response, including copied `thread.turns` when available. Even when the source thread was resident, the fork only behaves like a reconnect target if the returned `thread.mode` is actually `residentAssistant`; the default fork remains `interactive`. Requests may also include `mode`; prefer that over the legacy `resident` flag, and keep them compatible when both are sent. Pass `ephemeral: true` when the fork should stay in-memory only:
 
 ```json
 { "method": "thread/fork", "id": 12, "params": { "threadId": "thr_123", "ephemeral": true } }
@@ -364,7 +365,11 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - `notSubscribed` when the connection was not subscribed to that thread.
 - `notLoaded` when the thread is not loaded.
 
-If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Threads started/resumed/forked with `resident: true` stay loaded instead, so `thread/unsubscribe` only detaches the connection.
+Unless an example explicitly calls out compatibility behavior, requests in this
+README should be read as showing the preferred main path: use `mode` for
+product semantics and treat `resident` as a legacy compatibility flag.
+
+If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Threads operating in resident-assistant mode stay loaded instead, so `thread/unsubscribe` only detaches the connection; new clients should request that behavior with `mode: "residentAssistant"` and treat `resident` as a legacy compatibility flag.
 
 The same lifecycle rule applies when the last transport connection goes away
 without an explicit `thread/unsubscribe`. In other words, a websocket client
@@ -372,14 +377,14 @@ that disconnects after owning the last subscription drives the same thread
 teardown or resident keep-alive behavior as an explicit unsubscribe:
 
 - non-resident threads transition to `notLoaded` and emit `thread/closed`
-- resident threads stay loaded and continue surfacing their existing `mode`
+- resident assistants stay loaded and continue surfacing their existing `mode`
   plus runtime `status` on later `thread/loaded/read`, `thread/read`, and
   `thread/resume` calls
 - notification ordering between `thread/status/changed` and `thread/closed` is
   not guaranteed; consumers should treat both as part of the same unload
   transition rather than depending on a fixed sequence
 
-For resident threads, that means `thread/unsubscribe` does not downgrade the
+For resident assistants, that means `thread/unsubscribe` does not downgrade the
 thread back to an ordinary stored session: subsequent `thread/loaded/read`,
 `thread/read`, and `thread/resume` calls continue to surface the resident
 thread’s existing `mode` and loaded/runtime state instead of requiring clients

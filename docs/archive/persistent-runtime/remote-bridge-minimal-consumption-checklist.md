@@ -29,6 +29,7 @@
 - `app-server-test-client` 的这条补读链路现在也已有单测锁住：未知 thread 的 `thread/status/changed` 触发后，会发出一次真实 `thread/read`，并把 resident `mode + status + name` 回收到本地 `known_threads`
 - `app-server-client` 的 typed 请求/README 现在也已与这条消费契约对齐：调用方应直接信任 `thread/start` / `thread/resume` / `thread/metadata/update` / `thread/unarchive` / `thread/rollback` 返回里的 `thread.mode`，并继续把 `thread/status/changed` 当成 status-only 增量，而不是二次脑补 resident reconnect 语义
 - `app-server-client` 这层 typed 契约现在也已继续补到两条先前更薄的边界：一是 in-process `thread/resume` 的 stored-summary repair 回归，二是 remote websocket facade 对 resident repaired `thread/resume`、`thread/read`、`thread/list` 与 `thread/loaded/read` 摘要的 typed 透传回归
+- 这层 remote typed 契约现在也已继续补到请求侧：websocket facade 上 `thread/start` / `thread/resume` / `thread/fork` 在显式 `mode = residentAssistant` 时，不再回退去发送 legacy `resident` flag
 - 这两条路径都已补上本地回归，并通过最小消费者层的单测锁住 unknown-thread 不猜 resident reconnect、但随后会回到读取面补 summary 这条契约
 
 当前已完成并通过的本地验证包括：
@@ -46,6 +47,9 @@
 - `cargo test -p codex-app-server-client --lib rollback_preserves_resident_thread_mode_through_typed_response_and_follow_up_reads`
 - `cargo test -p codex-app-server-client --lib resume_reconciles_missing_summary_for_existing_sqlite_row_through_typed_requests`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_resume_preserves_repaired_thread_summary`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_resume_serializes_mode_without_legacy_resident_flag`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_start_serializes_mode_without_legacy_resident_flag`
+- `cargo test -p codex-app-server-client --lib remote_typed_thread_fork_serializes_mode_without_legacy_resident_flag`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_read_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_list_preserves_repaired_thread_summary`
 - `cargo test -p codex-app-server-client --lib remote_typed_thread_loaded_read_preserves_repaired_thread_summary`

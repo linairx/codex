@@ -203,7 +203,7 @@ async fn resident_thread_start_does_not_persist_mode_before_rollout_materializes
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -214,6 +214,7 @@ async fn resident_thread_start_does_not_persist_mode_before_rollout_materializes
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
 
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
     assert!(
         !thread.path.as_ref().expect("thread path").exists(),
@@ -228,6 +229,67 @@ async fn resident_thread_start_does_not_persist_mode_before_rollout_materializes
     assert_eq!(
         persisted, None,
         "thread/start should not create SQLite rows before rollout materializes"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_accepts_explicit_resident_assistant_mode() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let req_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..Default::default()
+        })
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
+
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_rejects_conflicting_mode_and_resident_flag() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let req_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            mode: Some(ThreadMode::Interactive),
+            resident: true,
+            ..Default::default()
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+
+    assert_eq!(
+        err.error.message,
+        "thread mode `interactive` conflicts with legacy resident flag"
     );
 
     Ok(())

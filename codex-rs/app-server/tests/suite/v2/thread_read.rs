@@ -776,7 +776,7 @@ async fn resident_thread_name_is_reflected_across_loaded_only_read_surfaces() ->
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -786,6 +786,8 @@ async fn resident_thread_name_is_reflected_across_loaded_only_read_surfaces() ->
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let new_name = "Loaded only resident thread";
@@ -910,7 +912,7 @@ async fn resident_thread_mode_is_consistent_across_read_surfaces() -> Result<()>
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -920,6 +922,8 @@ async fn resident_thread_mode_is_consistent_across_read_surfaces() -> Result<()>
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -1019,7 +1023,7 @@ async fn resident_thread_workspace_changes_are_visible_across_read_surfaces() ->
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.path().display().to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -1029,6 +1033,8 @@ async fn resident_thread_workspace_changes_are_visible_across_read_surfaces() ->
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     std::fs::write(workspace.path().join("watched.txt"), "changed")?;
 

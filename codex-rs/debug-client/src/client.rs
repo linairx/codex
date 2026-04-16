@@ -330,6 +330,15 @@ impl AppServerClient {
         known_thread
     }
 
+    pub fn known_thread(&self, thread_id: &str) -> Option<KnownThread> {
+        let state = self.state.lock().expect("state lock poisoned");
+        state
+            .known_threads
+            .iter()
+            .find(|thread| thread.thread_id == thread_id)
+            .cloned()
+    }
+
     pub fn shutdown(&mut self) {
         if let Ok(mut stdin) = self.stdin.lock() {
             let _ = stdin.take();
@@ -547,6 +556,7 @@ pub fn build_thread_start_params(
     cwd: Option<String>,
 ) -> ThreadStartParams {
     ThreadStartParams {
+        mode: Some(ThreadMode::Interactive),
         model,
         model_provider,
         cwd,
@@ -558,6 +568,7 @@ pub fn build_thread_start_params(
 
 pub fn build_thread_resume_params(
     thread_id: String,
+    mode: Option<ThreadMode>,
     approval_policy: AskForApproval,
     model: Option<String>,
     model_provider: Option<String>,
@@ -565,6 +576,7 @@ pub fn build_thread_resume_params(
 ) -> ThreadResumeParams {
     ThreadResumeParams {
         thread_id,
+        mode,
         model,
         model_provider,
         cwd,
@@ -577,11 +589,15 @@ pub fn build_thread_resume_params(
 mod tests {
     use super::AppServerClient;
     use super::all_thread_source_kinds;
+    use super::build_thread_resume_params;
+    use super::build_thread_start_params;
     use super::default_user_input_answers;
     use super::denied_permissions_response;
     use crate::output::Output;
     use crate::state::KnownThread;
     use crate::state::State;
+    use codex_app_server_protocol::AskForApproval;
+    use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ToolRequestUserInputOption;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -643,6 +659,51 @@ mod tests {
 
         assert_eq!(selected, Some(known_thread));
         client.shutdown();
+    }
+
+    #[test]
+    fn build_thread_start_params_uses_explicit_interactive_mode() {
+        let params = build_thread_start_params(
+            AskForApproval::OnRequest,
+            Some("gpt-5.4".to_string()),
+            Some("openai".to_string()),
+            Some("/workspace".to_string()),
+        );
+
+        assert_eq!(params.mode, Some(ThreadMode::Interactive));
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(params.model_provider.as_deref(), Some("openai"));
+        assert_eq!(params.cwd.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn build_thread_resume_params_leaves_mode_unspecified() {
+        let params = build_thread_resume_params(
+            "thread-1".to_string(),
+            None,
+            AskForApproval::OnRequest,
+            Some("gpt-5.4".to_string()),
+            Some("openai".to_string()),
+            Some("/workspace".to_string()),
+        );
+
+        assert_eq!(params.mode, None);
+        assert_eq!(params.thread_id, "thread-1");
+    }
+
+    #[test]
+    fn build_thread_resume_params_preserves_explicit_mode() {
+        let params = build_thread_resume_params(
+            "thread-1".to_string(),
+            Some(ThreadMode::ResidentAssistant),
+            AskForApproval::OnRequest,
+            Some("gpt-5.4".to_string()),
+            Some("openai".to_string()),
+            Some("/workspace".to_string()),
+        );
+
+        assert_eq!(params.mode, Some(ThreadMode::ResidentAssistant));
+        assert_eq!(params.thread_id, "thread-1");
     }
 
     #[test]

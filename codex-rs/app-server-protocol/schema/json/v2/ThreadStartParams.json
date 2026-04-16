@@ -101,6 +101,13 @@
         "flex"
       ],
       "type": "string"
+    },
+    "ThreadMode": {
+      "enum": [
+        "interactive",
+        "residentAssistant"
+      ],
+      "type": "string"
     }
   },
   "properties": {
@@ -155,6 +162,17 @@
         "boolean",
         "null"
       ]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Explicit product mode for the thread being created.\n\nWhen omitted, the server falls back to the legacy `resident` flag for compatibility. Requests should prefer `mode` over `resident`."
     },
     "model": {
       "type": [

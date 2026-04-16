@@ -55,6 +55,17 @@ Use the v2 thread and turn APIs for all new integrations. `thread/start` creates
 
 Integrations that distinguish an ordinary interactive resume target from resident reconnect should consume `thread.mode` from thread responses and `thread/started` notifications; `residentAssistant` means the thread should be presented as a reconnect target rather than an ordinary interactive resume target.
 
+For request-side role selection, new integrations should also prefer the v2
+`mode` field over the legacy `resident` compatibility flag:
+
+- use `mode: "interactive"` for ordinary threads created via `thread/start` or
+  `thread/fork`
+- use `mode: "residentAssistant"` when creating, reconnecting, or forking into
+  a long-lived resident assistant thread
+- keep `resident` only as a compatibility path for older clients; do not build
+  new MCP integrations around `resident: true/false` as the primary product
+  signal
+
 Two related boundaries matter for MCP consumers:
 
 - `thread/loaded/list` is intentionally only an id probe for currently loaded threads. If the client also needs reconnect semantics, the current thread role, or the current runtime status, it should follow up with `thread/loaded/read` and consume `thread.mode` plus `thread.status` there.

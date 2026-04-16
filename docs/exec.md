@@ -40,6 +40,10 @@ This page focuses on the local Rust CLI behavior in this repository.
 - Ordinary interactive saved sessions still use the action label `resume`.
 - Resident assistant sessions use the same command entry point, but the CLI and
   returned metadata describe that action as `reconnect`.
+- When resume lookup already resolves a saved session through `thread/list`,
+  exec now reuses the returned `thread.mode` in the outgoing `thread/resume`
+  request instead of falling back to server-side inference for known resident
+  assistant reconnect targets.
 - `SESSION_ID_OR_NAME` accepts either a thread UUID or a saved thread name.
   UUIDs take precedence when a value parses as both.
 

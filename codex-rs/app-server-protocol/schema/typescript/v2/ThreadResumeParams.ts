@@ -8,6 +8,7 @@ import type { JsonValue } from "../serde_json/JsonValue";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxMode } from "./SandboxMode";
+import type { ThreadMode } from "./ThreadMode";
 
 /**
  * There are three ways to resume or reconnect to a thread:
@@ -37,6 +38,13 @@ model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier 
  * and subsequent turns.
  */
 approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, /**
+ * Explicit product mode for the thread after resume/reconnect.
+ *
+ * When omitted, the server falls back to the legacy `resident` flag for
+ * compatibility and persisted thread metadata. Requests should prefer
+ * `mode` over `resident`.
+ */
+mode?: ThreadMode | null, /**
  * When true, keep the thread loaded after the last client unsubscribes so
  * it can continue acting as a long-lived background assistant.
  */

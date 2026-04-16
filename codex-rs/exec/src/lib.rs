@@ -171,6 +171,11 @@ struct BootstrapSessionConfigured {
     thread_mode: Option<ThreadMode>,
 }
 
+struct ResumeTarget {
+    thread_id: String,
+    mode: Option<ThreadMode>,
+}
+
 fn exec_root_span() -> tracing::Span {
     info_span!(
         "codex.exec",
@@ -541,12 +546,16 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // APIs so exec no longer reaches into rollout storage directly.
     let (primary_thread_id, bootstrap_session) =
         if let Some(ExecCommand::Resume(args)) = command.as_ref() {
-            if let Some(thread_id) = resolve_resume_thread_id(&client, &config, args).await? {
+            if let Some(target) = resolve_resume_target(&client, &config, args).await? {
                 let response: ThreadResumeResponse = send_request_with_response(
                     &client,
                     ClientRequest::ThreadResume {
                         request_id: request_ids.next(),
-                        params: thread_resume_params_from_config(&config, thread_id),
+                        params: thread_resume_params_from_config(
+                            &config,
+                            target.thread_id,
+                            target.mode,
+                        ),
                     },
                     "thread/resume",
                 )
@@ -876,6 +885,7 @@ fn sandbox_mode_from_policy(
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     ThreadStartParams {
+        mode: Some(ThreadMode::Interactive),
         model: config.model.clone(),
         model_provider: Some(config.model_provider_id.clone()),
         cwd: Some(config.cwd.to_string_lossy().to_string()),
@@ -888,9 +898,14 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     }
 }
 
-fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams {
+fn thread_resume_params_from_config(
+    config: &Config,
+    thread_id: String,
+    mode: Option<ThreadMode>,
+) -> ThreadResumeParams {
     ThreadResumeParams {
         thread_id,
+        mode,
         model: config.model.clone(),
         model_provider: Some(config.model_provider_id.clone()),
         cwd: Some(config.cwd.to_string_lossy().to_string()),
@@ -1167,11 +1182,11 @@ fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
     }
 }
 
-async fn resolve_resume_thread_id(
+async fn resolve_resume_target(
     client: &InProcessAppServerClient,
     config: &Config,
     args: &crate::cli::ResumeArgs,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<ResumeTarget>> {
     let model_providers = resume_lookup_model_providers(config, args);
 
     if args.last {
@@ -1198,7 +1213,10 @@ async fn resolve_resume_thread_id(
             .map_err(anyhow::Error::msg)?;
             for thread in response.data {
                 if args.all || cwds_match(config.cwd.as_path(), &latest_thread_cwd(&thread).await) {
-                    return Ok(Some(thread.id));
+                    return Ok(Some(ResumeTarget {
+                        thread_id: thread.id,
+                        mode: Some(thread.mode),
+                    }));
                 }
             }
             let Some(next_cursor) = response.next_cursor else {
@@ -1212,7 +1230,10 @@ async fn resolve_resume_thread_id(
         return Ok(None);
     };
     if Uuid::parse_str(session_id).is_ok() {
-        return Ok(Some(session_id.to_string()));
+        return Ok(Some(ResumeTarget {
+            thread_id: session_id.to_string(),
+            mode: None,
+        }));
     }
 
     let mut cursor = None;
@@ -1244,7 +1265,10 @@ async fn resolve_resume_thread_id(
                 continue;
             }
             if args.all || cwds_match(config.cwd.as_path(), &latest_thread_cwd(&thread).await) {
-                return Ok(Some(thread.id));
+                return Ok(Some(ResumeTarget {
+                    thread_id: thread.id,
+                    mode: Some(thread.mode),
+                }));
             }
         }
         let Some(next_cursor) = response.next_cursor else {

@@ -2581,6 +2581,12 @@ pub struct ThreadStartParams {
     pub personality: Option<Personality>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
+    /// Explicit product mode for the thread being created.
+    ///
+    /// When omitted, the server falls back to the legacy `resident` flag for
+    /// compatibility. Requests should prefer `mode` over `resident`.
+    #[ts(optional = nullable)]
+    pub mode: Option<ThreadMode>,
     /// When true, keep the thread loaded after the last client unsubscribes so
     /// it can continue acting as a long-lived background assistant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2701,6 +2707,13 @@ pub struct ThreadResumeParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// Explicit product mode for the thread after resume/reconnect.
+    ///
+    /// When omitted, the server falls back to the legacy `resident` flag for
+    /// compatibility and persisted thread metadata. Requests should prefer
+    /// `mode` over `resident`.
+    #[ts(optional = nullable)]
+    pub mode: Option<ThreadMode>,
     /// When true, keep the thread loaded after the last client unsubscribes so
     /// it can continue acting as a long-lived background assistant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2782,6 +2795,12 @@ pub struct ThreadForkParams {
     pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// Explicit product mode for the forked thread.
+    ///
+    /// When omitted, the server falls back to the legacy `resident` flag for
+    /// compatibility. Requests should prefer `mode` over `resident`.
+    #[ts(optional = nullable)]
+    pub mode: Option<ThreadMode>,
     /// When true, keep the thread loaded after the last client unsubscribes so
     /// it can continue acting as a long-lived background assistant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -8441,6 +8460,53 @@ mod tests {
         let serialized_without_override =
             serde_json::to_value(ThreadStartParams::default()).expect("params should serialize");
         assert_eq!(serialized_without_override.get("serviceTier"), None);
+    }
+
+    #[test]
+    fn thread_start_params_serialize_mode_without_resident_by_default() {
+        let serialized = serde_json::to_value(ThreadStartParams {
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..ThreadStartParams::default()
+        })
+        .expect("params should serialize");
+
+        assert_eq!(
+            serialized.get("mode"),
+            Some(&serde_json::Value::String("residentAssistant".to_string()))
+        );
+        assert_eq!(serialized.get("resident"), None);
+    }
+
+    #[test]
+    fn thread_resume_params_serialize_mode_without_resident_by_default() {
+        let serialized = serde_json::to_value(ThreadResumeParams {
+            thread_id: "thread_123".to_string(),
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..ThreadResumeParams::default()
+        })
+        .expect("params should serialize");
+
+        assert_eq!(
+            serialized.get("mode"),
+            Some(&serde_json::Value::String("residentAssistant".to_string()))
+        );
+        assert_eq!(serialized.get("resident"), None);
+    }
+
+    #[test]
+    fn thread_fork_params_serialize_mode_without_resident_by_default() {
+        let serialized = serde_json::to_value(ThreadForkParams {
+            thread_id: "thread_123".to_string(),
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..ThreadForkParams::default()
+        })
+        .expect("params should serialize");
+
+        assert_eq!(
+            serialized.get("mode"),
+            Some(&serde_json::Value::String("residentAssistant".to_string()))
+        );
+        assert_eq!(serialized.get("resident"), None);
     }
 
     #[test]

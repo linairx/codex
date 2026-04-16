@@ -311,7 +311,7 @@ async fn resident_thread_archive_preserves_resident_mode_in_archived_surfaces() 
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -321,6 +321,7 @@ async fn resident_thread_archive_preserves_resident_mode_in_archived_surfaces() 
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_start_id = mcp

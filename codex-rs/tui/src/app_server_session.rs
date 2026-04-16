@@ -323,6 +323,7 @@ impl AppServerSession {
         &mut self,
         config: Config,
         thread_id: ThreadId,
+        mode: Option<ThreadMode>,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
         let response: ThreadResumeResponse = self
@@ -332,6 +333,7 @@ impl AppServerSession {
                 params: thread_resume_params_from_config(
                     config.clone(),
                     thread_id,
+                    mode,
                     self.thread_params_mode(),
                     self.remote_cwd_override.as_deref(),
                 ),
@@ -899,6 +901,7 @@ fn thread_start_params_from_config(
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadStartParams {
     ThreadStartParams {
+        mode: Some(ThreadMode::Interactive),
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(config),
         cwd: thread_cwd_from_config(config, thread_params_mode, remote_cwd_override),
@@ -915,11 +918,13 @@ fn thread_start_params_from_config(
 fn thread_resume_params_from_config(
     config: Config,
     thread_id: ThreadId,
+    mode: Option<ThreadMode>,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadResumeParams {
     ThreadResumeParams {
         thread_id: thread_id.to_string(),
+        mode,
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
@@ -940,6 +945,7 @@ fn thread_fork_params_from_config(
 ) -> ThreadForkParams {
     ThreadForkParams {
         thread_id: thread_id.to_string(),
+        mode: Some(ThreadMode::Interactive),
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
@@ -1235,6 +1241,13 @@ mod tests {
             .expect("config should build")
     }
 
+    fn resident_assistant_thread_start_params() -> ThreadStartParams {
+        ThreadStartParams {
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..ThreadStartParams::default()
+        }
+    }
+
     fn test_thread(thread_id: ThreadId, mode: ThreadMode, resident: bool) -> Thread {
         Thread {
             id: thread_id.to_string(),
@@ -1387,6 +1400,7 @@ stream_max_retries = 0
         );
 
         assert_eq!(params.cwd, Some(config.cwd.to_string_lossy().to_string()));
+        assert_eq!(params.mode, Some(ThreadMode::Interactive));
         assert_eq!(params.model_provider, Some(config.model_provider_id));
     }
 
@@ -1404,6 +1418,7 @@ stream_max_retries = 0
         let resume = thread_resume_params_from_config(
             config.clone(),
             thread_id,
+            None,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
         );
@@ -1417,9 +1432,30 @@ stream_max_retries = 0
         assert_eq!(start.cwd, None);
         assert_eq!(resume.cwd, None);
         assert_eq!(fork.cwd, None);
+        assert_eq!(start.mode, Some(ThreadMode::Interactive));
+        assert_eq!(resume.mode, None);
+        assert_eq!(fork.mode, Some(ThreadMode::Interactive));
         assert_eq!(start.model_provider, None);
         assert_eq!(resume.model_provider, None);
         assert_eq!(fork.model_provider, None);
+    }
+
+    #[tokio::test]
+    async fn thread_resume_params_preserve_explicit_mode_for_reconnect_targets() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+
+        let resume = thread_resume_params_from_config(
+            config,
+            thread_id,
+            Some(ThreadMode::ResidentAssistant),
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(resume.mode, Some(ThreadMode::ResidentAssistant));
+        assert!(!resume.resident);
     }
 
     #[tokio::test]
@@ -1437,6 +1473,7 @@ stream_max_retries = 0
         let resume = thread_resume_params_from_config(
             config.clone(),
             thread_id,
+            None,
             ThreadParamsMode::Remote,
             Some(remote_cwd.as_path()),
         );
@@ -1450,6 +1487,9 @@ stream_max_retries = 0
         assert_eq!(start.cwd.as_deref(), Some("repo/on/server"));
         assert_eq!(resume.cwd.as_deref(), Some("repo/on/server"));
         assert_eq!(fork.cwd.as_deref(), Some("repo/on/server"));
+        assert_eq!(start.mode, Some(ThreadMode::Interactive));
+        assert_eq!(resume.mode, None);
+        assert_eq!(fork.mode, Some(ThreadMode::Interactive));
         assert_eq!(start.model_provider, None);
         assert_eq!(resume.model_provider, None);
         assert_eq!(fork.model_provider, None);
@@ -1953,10 +1993,7 @@ stream_max_retries = 0
             .client
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2039,7 +2076,7 @@ stream_max_retries = 0
         assert_eq!(loaded_thread.name.as_deref(), Some("Loaded typed name"));
 
         let resumed = app_server
-            .resume_thread(config.clone(), thread_id)
+            .resume_thread(config.clone(), thread_id, /*mode*/ None)
             .await
             .expect("thread/resume should succeed");
         assert_eq!(
@@ -2160,10 +2197,7 @@ stream_max_retries = 0
             .client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: start_request_id,
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2212,7 +2246,7 @@ stream_max_retries = 0
         assert_eq!(read.name.as_deref(), Some(thread_name));
 
         let resumed = app_server
-            .resume_thread(config.clone(), thread_id)
+            .resume_thread(config.clone(), thread_id, /*mode*/ None)
             .await
             .expect("thread/resume should preserve thread name after metadata update");
         assert_eq!(resumed.session.thread_name.as_deref(), Some(thread_name));
@@ -2244,7 +2278,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
                 params: ThreadStartParams {
-                    resident: true,
+                    mode: Some(ThreadMode::ResidentAssistant),
                     cwd: Some(workspace.to_string_lossy().into_owned()),
                     ..ThreadStartParams::default()
                 },
@@ -2347,10 +2381,7 @@ stream_max_retries = 0
             .client
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2387,10 +2418,7 @@ stream_max_retries = 0
             .client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: first_request_id,
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("first resident thread/start should succeed");
@@ -2400,10 +2428,7 @@ stream_max_retries = 0
             .client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: second_request_id,
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("second resident thread/start should succeed");
@@ -2459,10 +2484,7 @@ stream_max_retries = 0
             .client
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
-                params: ThreadStartParams {
-                    resident: true,
-                    ..ThreadStartParams::default()
-                },
+                params: resident_assistant_thread_start_params(),
             })
             .await
             .expect("resident thread/start should succeed");
@@ -2482,7 +2504,7 @@ stream_max_retries = 0
         );
 
         let resumed = app_server
-            .resume_thread(config.clone(), thread_id)
+            .resume_thread(config.clone(), thread_id, /*mode*/ None)
             .await
             .expect("thread/resume should succeed");
         assert_eq!(resumed.session.thread_id, thread_id);
@@ -2520,10 +2542,7 @@ stream_max_retries = 0
                             .client
                             .request_typed(ClientRequest::ThreadStart {
                                 request_id,
-                                params: ThreadStartParams {
-                                    resident: true,
-                                    ..ThreadStartParams::default()
-                                },
+                                params: resident_assistant_thread_start_params(),
                             })
                             .await
                             .expect("resident thread/start should succeed");
@@ -2584,7 +2603,7 @@ stream_max_retries = 0
                         assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
 
                         let resumed = app_server
-                            .resume_thread(config.clone(), thread_id)
+                            .resume_thread(config.clone(), thread_id, /*mode*/ None)
                             .await
                             .expect("thread/resume should succeed after close");
                         assert_eq!(resumed.session.thread_id, thread_id);
@@ -2621,7 +2640,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
                 params: ThreadStartParams {
-                    resident: true,
+                    mode: Some(ThreadMode::ResidentAssistant),
                     cwd: Some(workspace.to_string_lossy().into_owned()),
                     ..ThreadStartParams::default()
                 },

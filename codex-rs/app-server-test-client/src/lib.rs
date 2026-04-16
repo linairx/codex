@@ -210,6 +210,9 @@ enum CliCommand {
         thread_id: String,
         /// User message to send to Codex.
         user_message: String,
+        /// Reconnect using explicit resident-assistant mode instead of legacy resume defaults.
+        #[arg(long, default_value_t = false)]
+        resident: bool,
     },
     /// Resume or reconnect to a V2 thread and continuously stream notifications/events.
     ///
@@ -217,6 +220,9 @@ enum CliCommand {
     ThreadResume {
         /// Existing thread id to resume or reconnect to.
         thread_id: String,
+        /// Reconnect using explicit resident-assistant mode instead of legacy resume defaults.
+        #[arg(long, default_value_t = false)]
+        resident: bool,
     },
     /// Initialize the app-server and dump all inbound messages until interrupted.
     ///
@@ -315,7 +321,7 @@ enum CliCommand {
     ThreadFork {
         /// Existing thread id to fork from.
         thread_id: String,
-        /// Keep the fork loaded after the last client unsubscribes.
+        /// Fork into a resident assistant thread instead of the default interactive mode.
         #[arg(long, default_value_t = false)]
         resident: bool,
         /// Keep the fork in memory only.
@@ -455,6 +461,7 @@ pub async fn run() -> Result<()> {
         CliCommand::ResumeMessageV2 {
             thread_id,
             user_message,
+            resident,
         } => {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             resume_message_v2(
@@ -462,14 +469,18 @@ pub async fn run() -> Result<()> {
                 &config_overrides,
                 thread_id,
                 user_message,
+                resident,
                 &dynamic_tools,
             )
             .await
         }
-        CliCommand::ThreadResume { thread_id } => {
+        CliCommand::ThreadResume {
+            thread_id,
+            resident,
+        } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "thread-resume")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            thread_resume_follow(&endpoint, &config_overrides, thread_id).await
+            thread_resume_follow(&endpoint, &config_overrides, thread_id, resident).await
         }
         CliCommand::Watch => {
             ensure_dynamic_tools_unused(&dynamic_tools, "watch")?;
@@ -928,10 +939,9 @@ async fn trigger_zsh_fork_multi_cmd_approval(
             let initialize = client.initialize()?;
             println!("< initialize response: {initialize:?}");
 
-            let thread_response = client.thread_start(ThreadStartParams {
-                dynamic_tools: dynamic_tools.clone(),
-                ..Default::default()
-            })?;
+            let mut thread_params = interactive_thread_start_params();
+            thread_params.dynamic_tools = dynamic_tools.clone();
+            let thread_response = client.thread_start(thread_params)?;
             println!("< thread/start response: {thread_response:?}");
             print_thread_response_summary("thread/start", &thread_response.thread);
 
@@ -1010,11 +1020,19 @@ async fn trigger_zsh_fork_multi_cmd_approval(
     .await
 }
 
+fn interactive_thread_start_params() -> ThreadStartParams {
+    ThreadStartParams {
+        mode: Some(ThreadMode::Interactive),
+        ..Default::default()
+    }
+}
+
 async fn resume_message_v2(
     endpoint: &Endpoint,
     config_overrides: &[String],
     thread_id: String,
     user_message: String,
+    resident: bool,
     dynamic_tools: &Option<Vec<DynamicToolSpec>>,
 ) -> Result<()> {
     ensure_dynamic_tools_unused(dynamic_tools, "resume-message-v2")?;
@@ -1023,10 +1041,8 @@ async fn resume_message_v2(
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
 
-        let resume_response = client.thread_resume(ThreadResumeParams {
-            thread_id,
-            ..Default::default()
-        })?;
+        let resume_response =
+            client.thread_resume(explicit_thread_resume_params(thread_id, resident))?;
         println!("< thread/resume response: {resume_response:?}");
         print_thread_response_summary("thread/resume", &resume_response.thread);
 
@@ -1051,15 +1067,14 @@ async fn thread_resume_follow(
     endpoint: &Endpoint,
     config_overrides: &[String],
     thread_id: String,
+    resident: bool,
 ) -> Result<()> {
     with_client("thread-resume", endpoint, config_overrides, |client| {
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
 
-        let resume_response = client.thread_resume(ThreadResumeParams {
-            thread_id,
-            ..Default::default()
-        })?;
+        let resume_response =
+            client.thread_resume(explicit_thread_resume_params(thread_id, resident))?;
         println!("< thread/resume response: {resume_response:?}");
         print_thread_response_summary("thread/resume", &resume_response.thread);
         println!("< streaming notifications until process is terminated");
@@ -1067,6 +1082,18 @@ async fn thread_resume_follow(
         client.stream_notifications_forever()
     })
     .await
+}
+
+fn explicit_thread_resume_params(thread_id: String, resident: bool) -> ThreadResumeParams {
+    ThreadResumeParams {
+        thread_id,
+        mode: if resident {
+            Some(ThreadMode::ResidentAssistant)
+        } else {
+            None
+        },
+        ..Default::default()
+    }
 }
 
 async fn watch(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
@@ -1205,10 +1232,9 @@ async fn send_message_v2_with_policies(
             let initialize = client.initialize_with_experimental_api(policies.experimental_api)?;
             println!("< initialize response: {initialize:?}");
 
-            let thread_response = client.thread_start(ThreadStartParams {
-                dynamic_tools: policies.dynamic_tools.clone(),
-                ..Default::default()
-            })?;
+            let mut thread_params = interactive_thread_start_params();
+            thread_params.dynamic_tools = policies.dynamic_tools.clone();
+            let thread_response = client.thread_start(thread_params)?;
             println!("< thread/start response: {thread_response:?}");
             print_thread_response_summary("thread/start", &thread_response.thread);
             let mut turn_params = TurnStartParams {
@@ -1245,10 +1271,9 @@ async fn send_follow_up_v2(
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
 
-        let thread_response = client.thread_start(ThreadStartParams {
-            dynamic_tools: dynamic_tools.clone(),
-            ..Default::default()
-        })?;
+        let mut thread_params = interactive_thread_start_params();
+        thread_params.dynamic_tools = dynamic_tools.clone();
+        let thread_response = client.thread_start(thread_params)?;
         println!("< thread/start response: {thread_response:?}");
         print_thread_response_summary("thread/start", &thread_response.thread);
 
@@ -1446,7 +1471,11 @@ async fn thread_fork(
 
         let response = client.thread_fork(ThreadForkParams {
             thread_id,
-            resident,
+            mode: Some(if resident {
+                ThreadMode::ResidentAssistant
+            } else {
+                ThreadMode::Interactive
+            }),
             ephemeral,
             ..Default::default()
         })?;
@@ -1877,7 +1906,9 @@ mod tests {
     use super::KnownThreadSummary;
     use super::all_thread_source_kinds;
     use super::default_user_input_answers;
+    use super::explicit_thread_resume_params;
     use super::granted_permission_profile_from_request;
+    use super::interactive_thread_start_params;
     use super::thread_closed_notification_lines;
     use super::thread_closed_summary_line;
     use super::thread_collection_summary_lines_with_cursor;
@@ -1893,14 +1924,17 @@ mod tests {
     use super::thread_status_label;
     use super::thread_summary_fields;
     use clap::CommandFactory;
+    use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadClosedNotification;
+    use codex_app_server_protocol::ThreadForkParams;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadStatus;
@@ -1978,6 +2012,42 @@ mod tests {
         assert!(help.contains("Resume or reconnect to a V2 thread by id"));
         assert!(help.contains("Resume or reconnect to a V2 thread and continuously stream"));
         assert!(help.contains("watch-summary"));
+    }
+
+    #[test]
+    fn interactive_thread_start_params_use_explicit_mode() {
+        let params = interactive_thread_start_params();
+
+        assert_eq!(params.mode, Some(ThreadMode::Interactive));
+        assert!(!params.resident);
+    }
+
+    #[test]
+    fn thread_fork_request_prefers_mode_over_legacy_resident_flag() {
+        let request = ClientRequest::ThreadFork {
+            request_id: RequestId::Integer(1),
+            params: ThreadForkParams {
+                thread_id: "thread-1".to_string(),
+                mode: Some(ThreadMode::ResidentAssistant),
+                ..Default::default()
+            },
+        };
+        let value = serde_json::to_value(&request).expect("request should serialize");
+        let params = value.get("params").expect("request should include params");
+
+        assert_eq!(
+            params.get("mode"),
+            Some(&serde_json::Value::String("residentAssistant".to_string()))
+        );
+        assert_eq!(params.get("resident"), None);
+    }
+
+    #[test]
+    fn explicit_thread_resume_params_use_mode_for_resident_reconnect() {
+        let params = explicit_thread_resume_params("thread-1".to_string(), /*resident*/ true);
+
+        assert_eq!(params.mode, Some(ThreadMode::ResidentAssistant));
+        assert!(!params.resident);
     }
 
     #[test]
@@ -2978,10 +3048,9 @@ fn live_elicitation_timeout_pause(
     let initialize = client.initialize()?;
     println!("< initialize response: {initialize:?}");
 
-    let thread_response = client.thread_start(ThreadStartParams {
-        model: Some(model),
-        ..Default::default()
-    })?;
+    let mut thread_params = interactive_thread_start_params();
+    thread_params.model = Some(model);
+    let thread_response = client.thread_start(thread_params)?;
     println!("< thread/start response: {thread_response:?}");
     print_thread_response_summary("thread/start", &thread_response.thread);
 

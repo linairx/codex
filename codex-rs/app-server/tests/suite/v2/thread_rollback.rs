@@ -198,6 +198,7 @@ async fn resident_thread_rollback_preserves_mode_for_follow_up_read_and_list() -
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
@@ -206,7 +207,8 @@ async fn resident_thread_rollback_preserves_mode_for_follow_up_read_and_list() -
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            cwd: Some(workspace.path().display().to_string()),
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -216,6 +218,8 @@ async fn resident_thread_rollback_preserves_mode_for_follow_up_read_and_list() -
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -321,7 +325,7 @@ async fn resident_thread_rollback_reconciles_missing_summary_for_existing_sqlite
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -331,6 +335,8 @@ async fn resident_thread_rollback_reconciles_missing_summary_for_existing_sqlite
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let preview = "rollback repaired preview";
     let turn_id = mcp
@@ -468,7 +474,7 @@ async fn named_resident_thread_rollback_preserves_name_and_mode_through_resume()
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
-            resident: true,
+            mode: Some(ThreadMode::ResidentAssistant),
             ..Default::default()
         })
         .await?;
@@ -478,6 +484,7 @@ async fn named_resident_thread_rollback_preserves_name_and_mode_through_resume()
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
     assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
 
     let thread_name = "Named resident rollback thread";

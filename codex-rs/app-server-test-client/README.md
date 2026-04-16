@@ -64,6 +64,13 @@ cargo run -p codex-app-server-test-client -- \
   thread-metadata-update <THREAD_ID> --branch feature/resident-mode
 ```
 
+`thread-fork --resident` now maps to request-side `mode = residentAssistant`
+while keeping the old CLI flag for compatibility.
+The same explicit request-side mode path now also exists on reconnect flows:
+`resume-message-v2 --resident` and `thread-resume --resident` send
+`thread/resume` with `mode = residentAssistant` instead of falling back to the
+legacy `resident` flag.
+
 These commands print the full response plus a compact summary that includes
 wire `thread.mode` values (for example `interactive` or
 `residentAssistant`), the current `status`, plus the derived

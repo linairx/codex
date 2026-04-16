@@ -3024,7 +3024,7 @@ impl App {
         }
 
         match app_server
-            .resume_thread(self.config.clone(), thread_id)
+            .resume_thread(self.config.clone(), thread_id, /*mode*/ None)
             .await
         {
             Ok(started) => {
@@ -3329,7 +3329,7 @@ impl App {
         }
 
         let (session, turns, live_attached) = match app_server
-            .resume_thread(self.config.clone(), thread_id)
+            .resume_thread(self.config.clone(), thread_id, /*mode*/ None)
             .await
         {
             Ok(started) => (started.session, started.turns, true),
@@ -3984,7 +3984,11 @@ impl App {
             }
             SessionSelection::Resume(target_session) => {
                 let resumed = app_server
-                    .resume_thread(config.clone(), target_session.thread_id)
+                    .resume_thread(
+                        config.clone(),
+                        target_session.thread_id,
+                        target_session.mode,
+                    )
                     .await
                     .wrap_err_with(|| {
                         let target_label = target_session.display_label();
@@ -4425,7 +4429,11 @@ impl App {
                             self.chat_widget.thread_mode(),
                         );
                         match app_server
-                            .resume_thread(resume_config.clone(), target_session.thread_id)
+                            .resume_thread(
+                                resume_config.clone(),
+                                target_session.thread_id,
+                                target_session.mode,
+                            )
                             .await
                         {
                             Ok(resumed) => {
