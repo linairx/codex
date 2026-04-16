@@ -144,6 +144,9 @@
 - 后台 terminal 存在时，即使 turn 已结束，线程仍能通过 active flag 体现
 - 审批等待和用户输入等待不依赖客户端复盘 item 历史
 - workspace 变化能作为线程级事实暴露出来
+- 对持久助手线程来说，这四类 active flag 在 unsubscribe、transport disconnect
+  以及后续 `thread/read` / `thread/loaded/read` / `thread/resume` reconnect 路径上
+  都应尽量继续保留，只要对应事实仍然成立，就不应被提前压扁回 `idle`
 
 ### 一个应被文档化的边界
 
@@ -165,6 +168,14 @@
 - 不要求客户端自己拼装复杂 item 历史来恢复线程状态
 
 这意味着客户端应优先消费线程模式和线程状态，而不是试图从零散通知中反推。
+
+这里也应明确一条 reconnect 产品心智：
+
+- `waitingOnApproval`、`waitingOnUserInput`、`backgroundTerminalRunning`、
+  `workspaceChanged` 都属于“线程仍然带着的运行时事实”
+- 它们不是“只有当前连接在线时才临时存在的 UI 状态”
+- 因此客户端在 reconnect 后应继续直接信返回的 `thread.status`，而不是把这些
+  active flag 当作需要本地重建或事后猜测的显示结果
 
 即使把第一阶段和后续 SQLite 收敛拆开看，这里也有一条应该尽早固定的读取面心智：
 
@@ -200,6 +211,8 @@ observer、SQLite、bridge 都不应混进这一阶段 PR。
 - 持久助手线程在最后一个客户端断开后不会被误 shutdown
 - 普通线程的既有行为不被破坏
 - 重新连接后，线程状态与保活语义保持连续
+- 重新连接后，如果线程仍在等待审批、等待用户输入、持有后台 terminal，
+  或工作区已有外部变化，这些事实会继续通过 `activeFlags` 暴露
 
 ### 客户端
 

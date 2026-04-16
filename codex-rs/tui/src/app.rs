@@ -713,21 +713,28 @@ impl ThreadEventStore {
 
 fn status_has_pending_thread_approvals(status: &ThreadStatus) -> bool {
     match status {
-        ThreadStatus::Active { active_flags } => active_flags.iter().any(|flag| {
-            matches!(
-                flag,
-                ThreadActiveFlag::WaitingOnApproval | ThreadActiveFlag::WaitingOnUserInput
-            )
-        }),
+        ThreadStatus::Active { active_flags } => {
+            active_flags.contains(&ThreadActiveFlag::WaitingOnApproval)
+        }
         ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => false,
     }
 }
 
 fn status_has_workspace_changed(status: &ThreadStatus) -> bool {
+    status_has_active_flag(status, ThreadActiveFlag::WorkspaceChanged)
+}
+
+fn status_has_waiting_on_user_input(status: &ThreadStatus) -> bool {
+    status_has_active_flag(status, ThreadActiveFlag::WaitingOnUserInput)
+}
+
+fn status_has_background_terminal_running(status: &ThreadStatus) -> bool {
+    status_has_active_flag(status, ThreadActiveFlag::BackgroundTerminalRunning)
+}
+
+fn status_has_active_flag(status: &ThreadStatus, expected_flag: ThreadActiveFlag) -> bool {
     match status {
-        ThreadStatus::Active { active_flags } => {
-            active_flags.contains(&ThreadActiveFlag::WorkspaceChanged)
-        }
+        ThreadStatus::Active { active_flags } => active_flags.contains(&expected_flag),
         ThreadStatus::NotLoaded | ThreadStatus::Idle | ThreadStatus::SystemError => false,
     }
 }
@@ -1073,6 +1080,8 @@ pub(crate) struct App {
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     active_thread_workspace_changed: bool,
+    active_thread_waiting_on_user_input: bool,
+    active_thread_background_terminal_running: bool,
     active_thread_system_error: bool,
     primary_thread_id: Option<ThreadId>,
     last_subagent_backfill_attempt: Option<ThreadId>,
@@ -3513,6 +3522,8 @@ impl App {
         self.backtrack = BacktrackState::default();
         self.backtrack_render_pending = false;
         self.active_thread_workspace_changed = false;
+        self.active_thread_waiting_on_user_input = false;
+        self.active_thread_background_terminal_running = false;
         self.active_thread_system_error = false;
         tui.terminal.clear_scrollback()?;
         tui.terminal.clear()?;
@@ -3526,6 +3537,8 @@ impl App {
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.active_thread_workspace_changed = false;
+        self.active_thread_waiting_on_user_input = false;
+        self.active_thread_background_terminal_running = false;
         self.active_thread_system_error = false;
         self.primary_thread_id = None;
         self.last_subagent_backfill_attempt = None;
@@ -4106,6 +4119,8 @@ impl App {
             active_thread_id: None,
             active_thread_rx: None,
             active_thread_workspace_changed: false,
+            active_thread_waiting_on_user_input: false,
+            active_thread_background_terminal_running: false,
             active_thread_system_error: false,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
@@ -5994,6 +6009,27 @@ impl App {
         }
         self.active_thread_workspace_changed = workspace_changed;
 
+        let waiting_on_user_input = status_has_waiting_on_user_input(&notification.status);
+        if waiting_on_user_input && !self.active_thread_waiting_on_user_input {
+            self.chat_widget.add_info_message(
+                "Thread is waiting for required user input. Review the pending prompt before continuing."
+                    .to_string(),
+                /*hint*/ None,
+            );
+        }
+        self.active_thread_waiting_on_user_input = waiting_on_user_input;
+
+        let background_terminal_running =
+            status_has_background_terminal_running(&notification.status);
+        if background_terminal_running && !self.active_thread_background_terminal_running {
+            self.chat_widget.add_info_message(
+                "Background terminal is still running for this thread. Use /ps to inspect or stop it before continuing."
+                    .to_string(),
+                /*hint*/ None,
+            );
+        }
+        self.active_thread_background_terminal_running = background_terminal_running;
+
         let system_error = status_has_system_error(&notification.status);
         if system_error && !self.active_thread_system_error {
             self.chat_widget.add_info_message(
@@ -6008,19 +6044,23 @@ impl App {
     /// Seeds active-thread status de-duplication flags from cached navigation metadata.
     ///
     /// Thread switches replay history into the chat widget, but that replay intentionally does not
-    /// re-run the "show an info message on first transition" logic for workspace-change or
-    /// system-error status. This helper restores the current active thread's known status from the
-    /// navigation cache so the next live status notification is interpreted relative to the thread
-    /// the user is already viewing, rather than as if the thread had just become clean.
+    /// re-run the "show an info message on first transition" logic for sticky active-thread
+    /// status. This helper restores the current active thread's known status from the navigation
+    /// cache so the next live status notification is interpreted relative to the thread the user is
+    /// already viewing, rather than as if the thread had just become clean.
     fn sync_active_thread_status_flags_from_navigation(&mut self) {
         let Some(thread_id) = self.active_thread_id else {
             self.active_thread_workspace_changed = false;
+            self.active_thread_waiting_on_user_input = false;
+            self.active_thread_background_terminal_running = false;
             self.active_thread_system_error = false;
             return;
         };
 
         let Some(entry) = self.agent_navigation.get(&thread_id) else {
             self.active_thread_workspace_changed = false;
+            self.active_thread_waiting_on_user_input = false;
+            self.active_thread_background_terminal_running = false;
             self.active_thread_system_error = false;
             return;
         };
@@ -6028,6 +6068,12 @@ impl App {
         self.active_thread_workspace_changed = entry
             .active_flags
             .contains(&ThreadActiveFlag::WorkspaceChanged);
+        self.active_thread_waiting_on_user_input = entry
+            .active_flags
+            .contains(&ThreadActiveFlag::WaitingOnUserInput);
+        self.active_thread_background_terminal_running = entry
+            .active_flags
+            .contains(&ThreadActiveFlag::BackgroundTerminalRunning);
         self.active_thread_system_error = entry.has_system_error;
     }
 
@@ -9472,6 +9518,100 @@ guardian_approval = true
     }
 
     #[tokio::test]
+    async fn active_thread_waiting_on_user_input_status_emits_info_once_per_transition() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        let waiting = ThreadStatusChangedNotification {
+            thread_id: ThreadId::new().to_string(),
+            status: ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            },
+        };
+
+        app.handle_active_thread_status_notification(&waiting);
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Thread is waiting for required user input. Review the pending prompt before continuing."
+        );
+
+        app.handle_active_thread_status_notification(&waiting);
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&ThreadStatusChangedNotification {
+            thread_id: waiting.thread_id.clone(),
+            status: ThreadStatus::Idle,
+        });
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&waiting);
+        let second = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell after reset, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&second.display_lines(/*width*/ 120)),
+            "• Thread is waiting for required user input. Review the pending prompt before continuing."
+        );
+    }
+
+    #[tokio::test]
+    async fn active_thread_background_terminal_status_emits_info_once_per_transition() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        let running = ThreadStatusChangedNotification {
+            thread_id: ThreadId::new().to_string(),
+            status: ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+            },
+        };
+
+        app.handle_active_thread_status_notification(&running);
+        let first = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&first.display_lines(/*width*/ 120)),
+            "• Background terminal is still running for this thread. Use /ps to inspect or stop it before continuing."
+        );
+
+        app.handle_active_thread_status_notification(&running);
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&ThreadStatusChangedNotification {
+            thread_id: running.thread_id.clone(),
+            status: ThreadStatus::Idle,
+        });
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        app.handle_active_thread_status_notification(&running);
+        let second = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected info history cell after reset, got {other:?}"),
+        };
+        assert_eq!(
+            lines_to_single_string(&second.display_lines(/*width*/ 120)),
+            "• Background terminal is still running for this thread. Use /ps to inspect or stop it before continuing."
+        );
+    }
+
+    #[tokio::test]
     async fn syncing_active_thread_status_flags_from_navigation_preserves_workspace_changed_dedup()
     {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -9491,6 +9631,40 @@ guardian_approval = true
             thread_id: thread_id.to_string(),
             status: ThreadStatus::Active {
                 active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+        });
+
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn syncing_active_thread_status_flags_from_navigation_preserves_status_dedup() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        app.active_thread_id = Some(thread_id);
+        app.agent_navigation.upsert(
+            thread_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            /*is_closed*/ false,
+            vec![
+                ThreadActiveFlag::WaitingOnUserInput,
+                ThreadActiveFlag::BackgroundTerminalRunning,
+            ],
+            /*has_system_error*/ false,
+        );
+
+        app.sync_active_thread_status_flags_from_navigation();
+        app.handle_active_thread_status_notification(&ThreadStatusChangedNotification {
+            thread_id: thread_id.to_string(),
+            status: ThreadStatus::Active {
+                active_flags: vec![
+                    ThreadActiveFlag::WaitingOnUserInput,
+                    ThreadActiveFlag::BackgroundTerminalRunning,
+                ],
             },
         });
 
@@ -10350,6 +10524,8 @@ guardian_approval = true
             active_thread_id: None,
             active_thread_rx: None,
             active_thread_workspace_changed: false,
+            active_thread_waiting_on_user_input: false,
+            active_thread_background_terminal_running: false,
             active_thread_system_error: false,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
@@ -10406,6 +10582,8 @@ guardian_approval = true
                 active_thread_id: None,
                 active_thread_rx: None,
                 active_thread_workspace_changed: false,
+                active_thread_waiting_on_user_input: false,
+                active_thread_background_terminal_running: false,
                 active_thread_system_error: false,
                 primary_thread_id: None,
                 last_subagent_backfill_attempt: None,
@@ -10884,9 +11062,28 @@ guardian_approval = true
     }
 
     #[test]
-    fn status_with_user_input_counts_as_pending_thread_approval() {
+    fn status_with_user_input_does_not_count_as_pending_thread_approval() {
         assert!(status_has_pending_thread_approvals(&ThreadStatus::Active {
-            active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+        }));
+        assert!(!status_has_pending_thread_approvals(
+            &ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            }
+        ));
+        assert!(!status_has_pending_thread_approvals(
+            &ThreadStatus::Active {
+                active_flags: vec![
+                    ThreadActiveFlag::WaitingOnUserInput,
+                    ThreadActiveFlag::BackgroundTerminalRunning,
+                ],
+            }
+        ));
+        assert!(status_has_pending_thread_approvals(&ThreadStatus::Active {
+            active_flags: vec![
+                ThreadActiveFlag::WaitingOnApproval,
+                ThreadActiveFlag::WaitingOnUserInput,
+            ],
         }));
         assert!(!status_has_pending_thread_approvals(
             &ThreadStatus::Active {

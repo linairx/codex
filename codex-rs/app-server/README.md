@@ -142,7 +142,7 @@ Example with notification opt-out:
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`. The response preserves stored thread identity metadata such as `mode` and `name`, so reconnect-aware clients do not need to re-read the thread just to recover resident assistant semantics or user-visible naming after a metadata-only update.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). This notification is status-only and does not repeat `thread.mode`; clients that need reconnect semantics should retain `mode` from the corresponding thread snapshot. `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
 - `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
-- `thread/close` — explicitly shut down and unload a loaded thread, even if it is resident or still has subscribers. The response status reports `closing` when teardown has been accepted and `notLoaded` when no loaded runtime exists. Completion still arrives through `thread/status/changed` (`notLoaded`) plus `thread/closed`. Closing a resident thread only ends the loaded runtime; later `thread/read`, `thread/list`, and `thread/resume` calls still preserve the thread’s stored `mode`.
+- `thread/close` — explicitly shut down and unload a loaded thread, even if it is resident or still has subscribers. The response status reports `closing` when teardown has been accepted and `notLoaded` when no loaded runtime exists. Completion still arrives through `thread/status/changed` (`notLoaded`) plus `thread/closed`. Closing the loaded runtime does not rewrite the thread's stored product role, so later `thread/read`, `thread/list`, and `thread/resume` calls still preserve the thread’s existing `mode` (`interactive` stays `interactive`, `residentAssistant` stays `residentAssistant`).
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread unless it is operating in resident-assistant mode (`thread.mode = residentAssistant`, or the legacy-compatible `resident: true` request path); non-resident unloads emit `thread/closed`, while resident assistants stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success, preserving its existing `mode`, and emits `thread/unarchived`.
@@ -345,6 +345,7 @@ When `nextCursor` is `null`, you’ve reached the final page.
 - Status can be `notLoaded`, `idle`, `systemError`, or `active` (with `activeFlags`; `active` implies running).
 - Threads with live unified-exec background terminals remain `active` after the turn completes, with `activeFlags` including `backgroundTerminalRunning`, until those terminals exit or are cleaned.
 - Resident loaded threads also transition to `active` with `activeFlags` including `workspaceChanged` when their working directory changes on disk. Starting the next turn clears that flag.
+- Resident assistants that are waiting on approval or `tool/requestUserInput` also keep those corresponding `activeFlags` (`waitingOnApproval` / `waitingOnUserInput`) across later `thread/loaded/read`, `thread/read`, and `thread/resume` reconnect paths until the outstanding request is resolved.
 - `thread/start`, `thread/fork`, and detached review threads do not emit a separate initial `thread/status/changed`; their `thread/started` notification already carries the current `thread.status`.
 
 ```json
@@ -380,6 +381,10 @@ teardown or resident keep-alive behavior as an explicit unsubscribe:
 - resident assistants stay loaded and continue surfacing their existing `mode`
   plus runtime `status` on later `thread/loaded/read`, `thread/read`, and
   `thread/resume` calls
+- for resident assistants, that preserved runtime `status` can continue to
+  include `waitingOnApproval`, `waitingOnUserInput`,
+  `backgroundTerminalRunning`, or `workspaceChanged` rather than collapsing to
+  `idle` just because the last subscriber disconnected
 - notification ordering between `thread/status/changed` and `thread/closed` is
   not guaranteed; consumers should treat both as part of the same unload
   transition rather than depending on a fixed sequence

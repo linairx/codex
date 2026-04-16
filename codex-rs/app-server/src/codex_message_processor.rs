@@ -5920,7 +5920,7 @@ impl CodexMessageProcessor {
         {
             thread.ensure_rollout_materialized().await;
             thread.flush_rollout().await;
-            if let Some(rollout_path) = thread.rollout_path() {
+            if let Some(rollout_path) = thread.current_rollout_path().await {
                 ensure_thread_mode_persisted_in_state_db(
                     self.config.as_ref(),
                     thread_id,
@@ -6096,13 +6096,17 @@ impl CodexMessageProcessor {
 
         loaded_thread.ensure_rollout_materialized().await;
         loaded_thread.flush_rollout().await;
-        if let Some(rollout_path) = loaded_thread.rollout_path() {
+        let resident = self
+            .thread_state_manager
+            .is_thread_resident(thread_id)
+            .await;
+        if let Some(rollout_path) = loaded_thread.current_rollout_path().await {
             ensure_thread_mode_persisted_in_state_db(
                 self.config.as_ref(),
                 thread_id,
                 rollout_path.as_path(),
                 &loaded_thread.config_snapshot().await,
-                /*resident*/ true,
+                resident,
             )
             .await;
         }
@@ -9796,6 +9800,15 @@ async fn ensure_thread_mode_persisted_in_state_db(
     resident: bool,
 ) {
     let Some(state_db_ctx) = get_state_db(config).await else {
+        ensure_thread_mode_persisted_in_state_db_for_home(
+            config.codex_home.as_path(),
+            config.model_provider_id.as_str(),
+            thread_id,
+            rollout_path,
+            config_snapshot,
+            resident,
+        )
+        .await;
         return;
     };
     ensure_thread_mode_with_state_db(
@@ -9862,9 +9875,6 @@ async fn ensure_thread_mode_with_state_db(
 
     let metadata =
         build_thread_metadata_from_snapshot(thread_id, rollout_path, config_snapshot, resident);
-    if !tokio::fs::try_exists(rollout_path).await.unwrap_or(false) {
-        return;
-    }
     if let Err(err) = state_db_ctx.insert_thread_if_absent(&metadata).await {
         warn!("failed to bootstrap thread metadata for {thread_id}: {err}");
     }

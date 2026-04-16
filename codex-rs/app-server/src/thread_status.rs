@@ -336,6 +336,7 @@ impl ThreadWatchManager {
         let thread_id = thread.id.clone();
         if !thread.resident {
             self.remove_workspace_watch(&thread_id).await;
+            self.clear_workspace_changed_if_loaded(&thread_id).await;
             return;
         }
 
@@ -372,6 +373,7 @@ impl ThreadWatchManager {
             let (done_tx, done_rx) = oneshot::channel();
             let _ = existing.terminate_tx.send(done_tx);
             let _ = done_rx.await;
+            self.clear_workspace_changed_if_loaded(&thread_id).await;
         }
 
         let (subscriber, rx) = self.file_watcher.add_subscriber();
@@ -458,6 +460,16 @@ impl ThreadWatchManager {
                     return;
                 }
                 runtime.workspace_changed = true;
+            })
+        })
+        .await;
+    }
+
+    async fn clear_workspace_changed_if_loaded(&self, thread_id: &str) {
+        let thread_id = thread_id.to_string();
+        self.mutate_and_publish(move |state| {
+            state.update_loaded_runtime(&thread_id, |runtime| {
+                runtime.workspace_changed = false;
             })
         })
         .await;
@@ -1111,6 +1123,88 @@ mod tests {
             .is_err(),
             true,
         );
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_resident_thread_to_non_resident_clears_workspace_changed_flag() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace = temp_dir.path().join("resident-workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let manager = ThreadWatchManager::new_with_file_watcher(
+            None,
+            Arc::new(FileWatcher::new().expect("watcher")),
+        );
+        let mut thread = test_thread(
+            INTERACTIVE_THREAD_ID,
+            codex_app_server_protocol::SessionSource::Cli,
+        );
+        thread.resident = true;
+        thread.cwd = workspace;
+
+        manager.upsert_thread(thread.clone()).await;
+        manager.note_workspace_changed(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+        );
+
+        thread.resident = false;
+        manager.upsert_thread(thread).await;
+
+        assert_eq!(manager.workspace_watch_count().await, 0);
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_resident_watch_to_new_cwd_clears_stale_workspace_changed_flag() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let first_workspace = temp_dir.path().join("first-workspace");
+        let second_workspace = temp_dir.path().join("second-workspace");
+        std::fs::create_dir_all(&first_workspace).expect("create first workspace");
+        std::fs::create_dir_all(&second_workspace).expect("create second workspace");
+
+        let manager = ThreadWatchManager::new_with_file_watcher(
+            None,
+            Arc::new(FileWatcher::new().expect("watcher")),
+        );
+        let mut thread = test_thread(
+            INTERACTIVE_THREAD_ID,
+            codex_app_server_protocol::SessionSource::Cli,
+        );
+        thread.resident = true;
+        thread.cwd = first_workspace;
+
+        manager.upsert_thread(thread.clone()).await;
+        manager.note_workspace_changed(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+        );
+
+        thread.cwd = second_workspace;
+        manager.upsert_thread(thread).await;
+
+        assert_eq!(manager.workspace_watch_count().await, 1);
         assert_eq!(
             manager
                 .loaded_status_for_thread(INTERACTIVE_THREAD_ID)

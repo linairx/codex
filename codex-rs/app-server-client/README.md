@@ -100,6 +100,12 @@ responses should still be treated as the authoritative reconnect summary
 surface, while non-resident threads may disappear behind the matching
 `thread/status/changed -> notLoaded` plus `thread/closed` unload transition.
 Callers should not depend on a fixed ordering between those two notifications.
+That reconnect-summary rule now also explicitly covers the resident active
+flags that matter for long-lived runtime continuity: follow-up typed reads and
+resume calls should preserve `waitingOnApproval`, `waitingOnUserInput`,
+`backgroundTerminalRunning`, and `workspaceChanged` when those facts remain
+true after unsubscribe or transport disconnect, rather than flattening the
+thread back to `idle`.
 The same resident continuity is now locked down for `thread/rollback`: after a
 resident assistant completes a turn, the rollback response must preserve
 `thread.mode = residentAssistant` instead of reconstructing the rollout as an
@@ -136,6 +142,11 @@ id-only loaded probe: websocket callers should preserve loaded ids plus
 `next_cursor` exactly as returned, and should continue with
 `thread/loaded/read` whenever reconnect semantics or current loaded-thread
 status are needed.
+That same websocket-backed typed facade now has direct regression coverage for
+all four resident continuity flags too: `thread/resume` preserves
+`waitingOnApproval` and `waitingOnUserInput`, while `thread/loaded/read`
+preserves `backgroundTerminalRunning` and `workspaceChanged` exactly as the
+remote app-server returned them.
 The event stream is now locked down at the same boundary too: in-process
 `next_event()` consumers can rely on `thread/started` as the resident-aware
 snapshot that still carries `thread.mode`, while later

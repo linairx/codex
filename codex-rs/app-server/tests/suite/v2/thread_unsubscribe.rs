@@ -11,6 +11,7 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
@@ -34,8 +35,14 @@ use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
+use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -418,6 +425,283 @@ async fn resident_thread_preserves_workspace_changed_across_unsubscribe_and_resu
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_thread_preserves_background_terminal_status_across_unsubscribe_and_resume()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let responses = vec![
+        create_background_exec_command_sse_response("uexec-bg")?,
+        create_final_assistant_message_sse_response("done")?,
+    ];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    create_config_toml_with_unified_exec(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            mode: Some(ThreadMode::ResidentAssistant),
+            cwd: Some(workspace.path().display().to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "start a background process".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response(turn_start_resp)?;
+
+    let expected_active_status = wait_for_thread_status_flag(
+        &mut mcp,
+        &thread.id,
+        ThreadActiveFlag::BackgroundTerminalRunning,
+    )
+    .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let unsubscribe_id = mcp
+        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let unsubscribe_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
+    )
+    .await??;
+    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
+    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+    let closed = timeout(
+        std::time::Duration::from_millis(200),
+        mcp.read_stream_until_notification_message("thread/closed"),
+    )
+    .await;
+    assert!(
+        closed.is_err(),
+        "resident unsubscribe should not emit thread/closed while background terminal is running"
+    );
+
+    let loaded_read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+        .await?;
+    let loaded_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_read_id)),
+    )
+    .await??;
+    let ThreadLoadedReadResponse { data, .. } =
+        to_response::<ThreadLoadedReadResponse>(loaded_read_resp)?;
+    let loaded_thread = data
+        .into_iter()
+        .find(|loaded_thread| loaded_thread.id == thread.id)
+        .expect("thread/loaded/read should include resident thread after unsubscribe");
+    assert_eq!(loaded_thread.status, expected_active_status);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert_eq!(read_thread.status, expected_active_status);
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resume = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert!(resume.thread.resident);
+    assert_eq!(resume.thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(resume.thread.status, expected_active_status);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_thread_preserves_waiting_on_user_input_across_unsubscribe_and_resume()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let responses = vec![
+        app_test_support::create_request_user_input_sse_response("call-user-input")?,
+        create_final_assistant_message_sse_response("done")?,
+    ];
+    let server = app_test_support::create_mock_responses_server_sequence(responses).await;
+    create_config_toml_with_collaboration_modes(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "ask something".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            effort: Some(ReasoningEffort::Medium),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "mock-model".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response(turn_start_resp)?;
+
+    let original_request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::ToolRequestUserInput { .. } = &original_request else {
+        panic!("expected ToolRequestUserInput request, got {original_request:?}");
+    };
+    let expected_active_status =
+        wait_for_thread_status_flag(&mut mcp, &thread.id, ThreadActiveFlag::WaitingOnUserInput)
+            .await?;
+
+    let unsubscribe_id = mcp
+        .send_thread_unsubscribe_request(ThreadUnsubscribeParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let unsubscribe_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(unsubscribe_id)),
+    )
+    .await??;
+    let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
+    assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+    let loaded_read_id = mcp
+        .send_thread_loaded_read_request(ThreadLoadedReadParams::default())
+        .await?;
+    let loaded_read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(loaded_read_id)),
+    )
+    .await??;
+    let ThreadLoadedReadResponse { data, .. } =
+        to_response::<ThreadLoadedReadResponse>(loaded_read_resp)?;
+    let loaded_thread = data
+        .into_iter()
+        .find(|loaded_thread| loaded_thread.id == thread.id)
+        .expect("thread/loaded/read should include resident thread after unsubscribe");
+    assert_eq!(loaded_thread.status, expected_active_status);
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resume = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resume.thread.status, expected_active_status);
+
+    let replayed_request = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::ToolRequestUserInput { request_id, params } = replayed_request else {
+        panic!("expected replayed ToolRequestUserInput request");
+    };
+    assert_eq!(params.thread_id, thread.id);
+    mcp.send_response(
+        request_id,
+        serde_json::json!({
+            "answers": {
+                "confirm_path": { "answers": ["yes"] }
+            }
+        }),
+    )
+    .await?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_unsubscribe_during_turn_interrupts_turn_and_emits_thread_closed() -> Result<()> {
     #[cfg(target_os = "windows")]
@@ -682,6 +966,33 @@ async fn wait_for_thread_status_not_loaded(
     }
 }
 
+async fn wait_for_thread_status_flag(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+    expected_flag: ThreadActiveFlag,
+) -> Result<ThreadStatus> {
+    loop {
+        let status_changed_notif: JSONRPCNotification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/status/changed"),
+        )
+        .await??;
+        let status_changed_params = status_changed_notif
+            .params
+            .context("thread/status/changed params must be present")?;
+        let status_changed: ThreadStatusChangedNotification =
+            serde_json::from_value(status_changed_params)?;
+        if status_changed.thread_id != thread_id {
+            continue;
+        }
+        if let ThreadStatus::Active { active_flags } = &status_changed.status
+            && active_flags.contains(&expected_flag)
+        {
+            return Ok(status_changed.status);
+        }
+    }
+}
+
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
     let config_toml = codex_home.join("config.toml");
     std::fs::write(
@@ -703,6 +1014,81 @@ stream_max_retries = 0
 "#
         ),
     )
+}
+
+fn create_config_toml_with_unified_exec(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+model_provider = "mock_provider"
+
+[features]
+unified_exec = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_config_toml_with_collaboration_modes(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[features]
+collaboration_modes = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_background_exec_command_sse_response(call_id: &str) -> Result<String> {
+    let cmd = if cfg!(windows) {
+        r#"cmd.exe /d /c "ping -n 4 127.0.0.1 > nul""#
+    } else {
+        "/bin/sh -c 'sleep 3'"
+    };
+    let tool_call_arguments = serde_json::to_string(&json!({
+        "cmd": cmd,
+        "yield_time_ms": 100
+    }))?;
+    Ok(responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call(call_id, "exec_command", &tool_call_arguments),
+        responses::ev_completed("resp-1"),
+    ]))
 }
 
 async fn start_thread(mcp: &mut McpProcess) -> Result<String> {

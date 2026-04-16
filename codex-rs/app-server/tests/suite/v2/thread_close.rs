@@ -10,6 +10,8 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadCloseParams;
 use codex_app_server_protocol::ThreadCloseResponse;
 use codex_app_server_protocol::ThreadCloseStatus;
+use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadMode;
@@ -21,6 +23,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -32,6 +35,7 @@ async fn thread_close_unloads_resident_thread_but_preserves_resident_mode() -> R
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
+    mark_state_db_backfill_complete(codex_home.path()).await?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -110,6 +114,32 @@ async fn thread_close_unloads_resident_thread_but_preserves_resident_mode() -> R
     assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
     assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
 
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include resident thread after close");
+    assert_eq!(listed.mode, ThreadMode::ResidentAssistant);
+    assert!(listed.resident);
+    assert_eq!(listed.status, ThreadStatus::NotLoaded);
+
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
@@ -175,6 +205,117 @@ async fn thread_close_reports_not_loaded_once_thread_is_gone() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn thread_close_preserves_interactive_mode_for_non_resident_thread() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    mark_state_db_backfill_complete(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let req_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            mode: Some(ThreadMode::Interactive),
+            ..Default::default()
+        })
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(resp)?;
+    assert!(!thread.resident);
+    assert_eq!(thread.mode, ThreadMode::Interactive);
+
+    let close_id = mcp
+        .send_thread_close_request(ThreadCloseParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let close_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(close_id)),
+    )
+    .await??;
+    let close = to_response::<ThreadCloseResponse>(close_resp)?;
+    assert_eq!(close.status, ThreadCloseStatus::Closing);
+
+    let _: JSONRPCNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/closed"),
+    )
+    .await??;
+    let _ = wait_for_thread_status_not_loaded(&mut mcp, &thread.id).await?;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert_eq!(read_thread.mode, ThreadMode::Interactive);
+    assert!(!read_thread.resident);
+    assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include interactive thread after close");
+    assert_eq!(listed.mode, ThreadMode::Interactive);
+    assert!(!listed.resident);
+    assert_eq!(listed.status, ThreadStatus::NotLoaded);
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resumed.mode, ThreadMode::Interactive);
+    assert!(!resumed.resident);
+    assert_eq!(resumed.id, thread.id);
+
+    Ok(())
+}
+
 async fn wait_for_thread_status_not_loaded(
     mcp: &mut McpProcess,
     thread_id: &str,
@@ -218,6 +359,14 @@ stream_max_retries = 0
 "#
         ),
     )
+}
+
+async fn mark_state_db_backfill_complete(codex_home: &std::path::Path) -> Result<()> {
+    StateRuntime::init(codex_home.to_path_buf(), "mock_provider".to_string())
+        .await?
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+    Ok(())
 }
 
 async fn start_thread(mcp: &mut McpProcess) -> Result<String> {

@@ -37,6 +37,7 @@
 - `Thread.mode` 已进入主要 `Thread` 返回面
 - `thread/read`、`thread/list` 以及后续 `thread/resume` 已能在服务重启后回补 SQLite 中持久化的 resident 模式
 - websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要时，typed remote client 也已开始原样保留 `thread.mode + preview + status + path + name`，不再只在 in-process 路径上成立
+- websocket typed remote facade 现在也已开始直接锁定 resident continuity 里最关键的四类运行态事实：`thread/resume` 会继续保留 `waitingOnApproval` / `waitingOnUserInput`，`thread/loaded/read` 会继续保留 `backgroundTerminalRunning` / `workspaceChanged`
 - `workspaceChanged` 已开始具备更稳定的保留与清理语义
 - resident thread 的 watcher 生命周期已开始与 shutdown / reconnect 语义对齐
 
@@ -335,6 +336,7 @@ observer 文档里已经强调，第一阶段最重要的是：
 1. 把 `thread/list` 作为首页线程摘要的主来源，并显式消费 `Thread.mode`
    并直接把它映射成列表动作语义：`interactive` 行默认展示 `resume`，`residentAssistant` 行默认展示 `reconnect`
 2. 把 `thread/loaded/read` 和 `thread/status/changed` 组合成 loaded 线程的运行态刷新面，其中 `thread/loaded/read` 负责当前 `mode + status` 摘要，`thread/status/changed` 只负责后续 status 增量
+   并继续把 `waitingOnApproval`、`waitingOnUserInput`、`backgroundTerminalRunning`、`workspaceChanged` 当成 reconnect 后仍应直接相信的线程级事实，而不是客户端自行脑补出来的临时显示状态
 3. 把 `thread/read` 作为详情页主读取入口，不让首页依赖全量 item 流重建
 4. 把 `thread/resume` 视为统一进入入口，但在 `residentAssistant` 上把它产品化为 reconnect，而不只是历史恢复入口
 5. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”

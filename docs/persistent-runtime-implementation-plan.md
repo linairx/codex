@@ -60,6 +60,9 @@
 
 - 明确线程生命周期：创建、断开、继续运行、reconnect、关闭
 - 明确哪些状态是长期线程的正式状态面
+- 明确 `waitingOnApproval`、`waitingOnUserInput`、
+  `backgroundTerminalRunning`、`workspaceChanged` 这四类 active flag
+  属于 reconnect 后仍应直接保留的线程级运行时事实，而不是临时 UI 状态
 - 保持 `thread/read` / `thread/list` / `thread/resume` / `thread/loaded/read` 的线程摘要心智一致
 - 让客户端不再需要自行脑补 resident 语义
 
@@ -83,6 +86,10 @@
 需要完成的事情：
 
 - 稳定 `workspaceChanged` 的置位、保留、清理语义
+- 保持 `workspaceChanged` 与其他 resident active flag 在 reconnect / typed
+  读取面上的职责边界清晰：`workspaceChanged` 表示外部变化，
+  `waitingOnApproval` / `waitingOnUserInput` / `backgroundTerminalRunning`
+  表示仍然存在的运行时事实
 - 明确 watcher 生命周期与 resident thread 生命周期的边界
 - 保持读取面与状态通知的职责分离
 
@@ -171,6 +178,8 @@
 
 - remote bridge、多 agent、planning 都建立在“线程可长期存在且可恢复”这个前提上
 - 这层不稳，后面几项都会停在半成品
+- 这层里的关键完成标准之一，就是 reconnect 后仍能稳定保留关键 active
+  flags，而不是把 resident 线程重新扁平化成普通历史恢复对象
 
 ## 5. 当前活文档入口
 

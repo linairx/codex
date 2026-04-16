@@ -914,6 +914,10 @@ mod tests {
     use codex_core::find_archived_thread_path_by_id_str;
     use codex_core::state_db_bridge::open_if_present;
     use codex_protocol::ThreadId;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Settings;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
@@ -991,6 +995,48 @@ supports_websockets = false
             .build()
             .await
             .expect("mock test config should load")
+    }
+
+    async fn build_mock_responses_collaboration_modes_test_config(server_uri: &str) -> Config {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let codex_home_path = std::env::temp_dir().join(format!(
+            "codex-app-server-client-collaboration-mock-test-{}-{unique_suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&codex_home_path).expect("temp codex home should exist");
+        std::fs::write(
+            codex_home_path.join("config.toml"),
+            format!(
+                r#"
+model = "mock-model"
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[features]
+collaboration_modes = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+"#
+            ),
+        )
+        .expect("mock collaboration config.toml should be writable");
+
+        ConfigBuilder::default()
+            .codex_home(codex_home_path)
+            .build()
+            .await
+            .expect("mock collaboration test config should load")
     }
 
     async fn build_multi_provider_test_config() -> Config {
@@ -3430,6 +3476,182 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn resident_waiting_on_user_input_preserves_status_across_typed_reads_and_resume() {
+        let server = responses::start_mock_server().await;
+        let _response_mock = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_function_call(
+                    "call-user-input",
+                    "request_user_input",
+                    &serde_json::to_string(&serde_json::json!({
+                        "questions": [{
+                            "id": "confirm_path",
+                            "header": "Path",
+                            "question": "Continue?",
+                            "options": [{
+                                "label": "Yes",
+                                "description": "Proceed",
+                            }]
+                        }]
+                    }))
+                    .expect("request_user_input payload should serialize"),
+                ),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let config =
+            Arc::new(build_mock_responses_collaboration_modes_test_config(&server.uri()).await);
+        let mut client =
+            start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(33),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _turn_start: codex_app_server_protocol::TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(34),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "ask something".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    model: Some("mock-model".to_string()),
+                    effort: Some(ReasoningEffort::Medium),
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Plan,
+                        settings: Settings {
+                            model: "mock-model".to_string(),
+                            reasoning_effort: Some(ReasoningEffort::Medium),
+                            developer_instructions: None,
+                        },
+                    }),
+                    ..TurnStartParams::default()
+                },
+            })
+            .await
+            .expect("turn/start should succeed");
+
+        let (request_id, params) = loop {
+            let event = client.next_event().await.expect("event should arrive");
+            let InProcessServerEvent::ServerRequest(ServerRequest::ToolRequestUserInput {
+                request_id,
+                params,
+                ..
+            }) = event
+            else {
+                continue;
+            };
+            break (request_id, params);
+        };
+        assert_eq!(params.thread_id, started.thread.id);
+
+        let expected_status = timeout(Duration::from_secs(5), async {
+            loop {
+                let read: ThreadReadResponse = client
+                    .request_typed(ClientRequest::ThreadRead {
+                        request_id: RequestId::Integer(35),
+                        params: ThreadReadParams {
+                            thread_id: started.thread.id.clone(),
+                            include_turns: false,
+                        },
+                    })
+                    .await
+                    .expect("thread/read should succeed while polling");
+                if let ThreadStatus::Active { active_flags } = &read.thread.status
+                    && active_flags.contains(&ThreadActiveFlag::WaitingOnUserInput)
+                {
+                    return read.thread.status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("waitingOnUserInput should surface before timeout");
+        assert_eq!(
+            expected_status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            }
+        );
+
+        let unsubscribed: codex_app_server_protocol::ThreadUnsubscribeResponse = client
+            .request_typed(ClientRequest::ThreadUnsubscribe {
+                request_id: RequestId::Integer(36),
+                params: codex_app_server_protocol::ThreadUnsubscribeParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unsubscribe should succeed");
+        assert_eq!(unsubscribed.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+        let loaded: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(37),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("thread/loaded/read should still include resident thread");
+        let loaded_thread = loaded
+            .data
+            .iter()
+            .find(|thread| thread.id == started.thread.id)
+            .expect("thread/loaded/read should include resident thread");
+        assert_eq!(loaded_thread.status, expected_status);
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(38),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read should preserve waitingOnUserInput status");
+        assert_eq!(read.thread.status, expected_status);
+
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(39),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("thread/resume should preserve waitingOnUserInput status");
+        assert_eq!(resumed.thread.status, expected_status);
+
+        client
+            .resolve_server_request(
+                request_id,
+                serde_json::to_value(ToolRequestUserInputResponse {
+                    answers: HashMap::from([(
+                        "confirm_path".to_string(),
+                        ToolRequestUserInputAnswer {
+                            answers: vec!["yes".to_string()],
+                        },
+                    )]),
+                })
+                .expect("request_user_input response should serialize"),
+            )
+            .await
+            .expect("request_user_input should resolve");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn resident_thread_events_split_mode_and_status_across_started_and_changed() {
         let mut client = start_test_client(SessionSource::Cli).await;
         let unique_suffix = SystemTime::now()
@@ -4206,6 +4428,170 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn remote_typed_thread_resume_preserves_waiting_on_approval_status() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/resume request");
+            };
+            assert_eq!(request.method, "thread/resume");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadResumeResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "approval repair".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Active {
+                                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+                            },
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                        model: "mock-model".to_string(),
+                        model_provider: "mock_provider".to_string(),
+                        service_tier: None,
+                        cwd: PathBuf::from("/workspace"),
+                        approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
+                        sandbox: SandboxPolicy::ReadOnly {
+                            access: Default::default(),
+                            network_access: false,
+                        },
+                        reasoning_effort: None,
+                    })
+                    .expect("thread/resume response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(82),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: "thread-resident".to_string(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("typed thread/resume should succeed");
+        assert_eq!(
+            response.thread.status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            }
+        );
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(response.thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_resume_preserves_waiting_on_user_input_status() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/resume request");
+            };
+            assert_eq!(request.method, "thread/resume");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadResumeResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "user input repair".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Active {
+                                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+                            },
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                        model: "mock-model".to_string(),
+                        model_provider: "mock_provider".to_string(),
+                        service_tier: None,
+                        cwd: PathBuf::from("/workspace"),
+                        approval_policy: AskForApproval::Never,
+                        approvals_reviewer: ApprovalsReviewer::User,
+                        sandbox: SandboxPolicy::ReadOnly {
+                            access: Default::default(),
+                            network_access: false,
+                        },
+                        reasoning_effort: None,
+                    })
+                    .expect("thread/resume response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(84),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: "thread-resident".to_string(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("typed thread/resume should succeed");
+        assert_eq!(
+            response.thread.status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            }
+        );
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert!(response.thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn remote_typed_thread_resume_serializes_mode_without_legacy_resident_flag() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
@@ -4581,6 +4967,148 @@ supports_websockets = false
         );
         assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
         assert_eq!(response.data[0].status, ThreadStatus::Idle);
+        assert!(response.data[0].resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_loaded_read_preserves_background_terminal_status() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/loaded/read request");
+            };
+            assert_eq!(request.method, "thread/loaded/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadLoadedReadResponse {
+                        data: vec![Thread {
+                            id: "thread-external".to_string(),
+                            forked_from_id: None,
+                            preview: "background terminal still running".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Active {
+                                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+                            },
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from(
+                                "/tmp/external-rollouts/2025/thread-external.jsonl",
+                            )),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        }],
+                        next_cursor: None,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(83),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("typed thread/loaded/read should succeed");
+        assert_eq!(
+            response.data[0].status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+            }
+        );
+        assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
+        assert!(response.data[0].resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_loaded_read_preserves_workspace_changed_status() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/loaded/read request");
+            };
+            assert_eq!(request.method, "thread/loaded/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadLoadedReadResponse {
+                        data: vec![Thread {
+                            id: "thread-external".to_string(),
+                            forked_from_id: None,
+                            preview: "workspace changed while disconnected".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Active {
+                                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                            },
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from(
+                                "/tmp/external-rollouts/2025/thread-external.jsonl",
+                            )),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        }],
+                        next_cursor: None,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(85),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("typed thread/loaded/read should succeed");
+        assert_eq!(
+            response.data[0].status,
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            }
+        );
+        assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
         assert!(response.data[0].resident);
 
         client.shutdown().await.expect("shutdown should complete");

@@ -84,6 +84,11 @@ impl CodexThread {
         self.codex.session.flush_rollout().await;
     }
 
+    #[doc(hidden)]
+    pub async fn current_rollout_path(&self) -> Option<PathBuf> {
+        self.codex.session.current_rollout_path().await
+    }
+
     pub async fn submit_with_trace(
         &self,
         op: Op,

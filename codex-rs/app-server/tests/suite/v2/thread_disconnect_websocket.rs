@@ -9,8 +9,10 @@ use super::connection_handling_websocket::send_request;
 use super::connection_handling_websocket::spawn_websocket_server;
 use anyhow::Context;
 use anyhow::Result;
+use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::create_request_user_input_sse_response;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
 use codex_app_server_protocol::AskForApproval;
@@ -36,7 +38,12 @@ use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -201,6 +208,85 @@ async fn websocket_disconnect_preserves_resident_waiting_on_approval_status() ->
 }
 
 #[tokio::test]
+async fn websocket_disconnect_preserves_resident_waiting_on_user_input_status() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_request_user_input_sse_response("call-user-input")?,
+        create_final_assistant_message_sse_response("done")?,
+    ])
+    .await;
+    create_config_toml_with_collaboration_modes(codex_home.path(), &server.uri())?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+
+    let result = async {
+        let mut ws1 = connect_websocket(bind_addr).await?;
+        initialize_client_with_experimental_api(
+            &mut ws1,
+            /*id*/ 1,
+            "ws_resident_user_input_owner",
+        )
+        .await?;
+
+        let thread = start_thread(&mut ws1, /*id*/ 10, /*resident*/ true).await?;
+        start_turn_waiting_for_user_input(&mut ws1, &thread.id, /*id*/ 11).await?;
+        wait_for_tool_request_user_input(&mut ws1, &thread.id).await?;
+        let expected_status = wait_for_thread_status_via_read(
+            &mut ws1,
+            &thread.id,
+            /*start_id*/ 12,
+            ThreadActiveFlag::WaitingOnUserInput,
+        )
+        .await?;
+
+        drop(ws1);
+
+        let mut ws2 = connect_websocket(bind_addr).await?;
+        initialize_client_with_experimental_api(
+            &mut ws2,
+            /*id*/ 2,
+            "ws_resident_user_input_reconnect",
+        )
+        .await?;
+
+        let loaded_thread = loaded_read(&mut ws2, /*id*/ 12)
+            .await?
+            .data
+            .into_iter()
+            .find(|loaded_thread| loaded_thread.id == thread.id)
+            .expect("thread/loaded/read should include resident waiting thread after disconnect");
+        assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(loaded_thread.status, expected_status);
+
+        let read = read_thread(&mut ws2, &thread.id, /*id*/ 13).await?;
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, expected_status);
+
+        let resumed = resume_thread(&mut ws2, &thread.id, /*id*/ 14).await?;
+        assert_eq!(resumed.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(resumed.thread.status, expected_status);
+
+        let status_changed = timeout(
+            Duration::from_millis(250),
+            read_notification_for_method(&mut ws2, "thread/status/changed"),
+        )
+        .await;
+        assert!(
+            status_changed.is_err(),
+            "resident disconnect should not emit thread/status/changed -> notLoaded while waiting on user input"
+        );
+        Ok(())
+    }
+    .await;
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    result
+}
+
+#[tokio::test]
 async fn websocket_disconnect_preserves_workspace_changed_after_external_change() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -277,8 +363,113 @@ async fn websocket_disconnect_preserves_workspace_changed_after_external_change(
     result
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn websocket_disconnect_preserves_resident_background_terminal_status() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    let responses = vec![
+        create_background_exec_command_sse_response("uexec-bg")?,
+        create_final_assistant_message_sse_response("done")?,
+    ];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    create_config_toml_with_unified_exec(codex_home.path(), &server.uri())?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+
+    let result = async {
+        let mut ws1 = connect_websocket(bind_addr).await?;
+        initialize_client(&mut ws1, /*id*/ 1, "ws_resident_background_owner").await?;
+
+        let thread = start_thread_with_cwd(
+            &mut ws1,
+            /*id*/ 10,
+            /*resident*/ true,
+            workspace.path(),
+        )
+        .await?;
+        start_turn_with_background_terminal(&mut ws1, &thread.id, /*id*/ 11).await?;
+        let expected_status = wait_for_thread_status_flag(
+            &mut ws1,
+            &thread.id,
+            ThreadActiveFlag::BackgroundTerminalRunning,
+        )
+        .await?;
+        assert_background_terminal_running(&expected_status);
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            read_notification_for_method(&mut ws1, "turn/completed"),
+        )
+        .await??;
+
+        drop(ws1);
+
+        let mut ws2 = connect_websocket(bind_addr).await?;
+        initialize_client(&mut ws2, /*id*/ 2, "ws_resident_background_reconnect").await?;
+
+        let loaded_thread = loaded_read(&mut ws2, /*id*/ 12)
+            .await?
+            .data
+            .into_iter()
+            .find(|loaded_thread| loaded_thread.id == thread.id)
+            .expect("thread/loaded/read should include resident background thread after disconnect");
+        assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(loaded_thread.status, expected_status);
+
+        let read = read_thread(&mut ws2, &thread.id, /*id*/ 13).await?;
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, expected_status);
+
+        let resumed = resume_thread(&mut ws2, &thread.id, /*id*/ 14).await?;
+        assert_eq!(resumed.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(resumed.thread.status, expected_status);
+
+        let status_changed = timeout(
+            Duration::from_millis(250),
+            read_notification_for_method(&mut ws2, "thread/status/changed"),
+        )
+        .await;
+        assert!(
+            status_changed.is_err(),
+            "resident disconnect should not emit thread/status/changed -> notLoaded while background terminal is running"
+        );
+        Ok(())
+    }
+    .await;
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    result
+}
+
 async fn initialize_client(ws: &mut WsClient, id: i64, client_name: &str) -> Result<()> {
     send_initialize_request(ws, id, client_name).await?;
+    timeout(DEFAULT_READ_TIMEOUT, read_response_for_id(ws, id)).await??;
+    Ok(())
+}
+
+async fn initialize_client_with_experimental_api(
+    ws: &mut WsClient,
+    id: i64,
+    client_name: &str,
+) -> Result<()> {
+    send_request(
+        ws,
+        "initialize",
+        id,
+        Some(json!({
+            "clientInfo": {
+                "name": client_name,
+                "title": "WebSocket Test Client",
+                "version": "0.1.0",
+            },
+            "capabilities": {
+                "experimentalApi": true,
+            }
+        })),
+    )
+    .await?;
     timeout(DEFAULT_READ_TIMEOUT, read_response_for_id(ws, id)).await??;
     Ok(())
 }
@@ -416,6 +607,66 @@ async fn start_turn_waiting_for_approval(
     to_response::<TurnStartResponse>(response)
 }
 
+async fn start_turn_with_background_terminal(
+    ws: &mut WsClient,
+    thread_id: &str,
+    id: i64,
+) -> Result<TurnStartResponse> {
+    send_request(
+        ws,
+        "turn/start",
+        id,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread_id.to_string(),
+            input: vec![UserInput::Text {
+                text: "start a background process".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let response: JSONRPCResponse =
+        timeout(DEFAULT_READ_TIMEOUT, read_response_for_id(ws, id)).await??;
+    to_response::<TurnStartResponse>(response)
+}
+
+async fn start_turn_waiting_for_user_input(
+    ws: &mut WsClient,
+    thread_id: &str,
+    id: i64,
+) -> Result<TurnStartResponse> {
+    send_request(
+        ws,
+        "turn/start",
+        id,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread_id.to_string(),
+            input: vec![UserInput::Text {
+                text: "ask something".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            effort: Some(ReasoningEffort::Medium),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "mock-model".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let response: JSONRPCResponse =
+        timeout(DEFAULT_READ_TIMEOUT, read_response_for_id(ws, id)).await??;
+    to_response::<TurnStartResponse>(response)
+}
+
 async fn complete_turn(ws: &mut WsClient, thread_id: &str, id: i64, text: &str) -> Result<()> {
     send_request(
         ws,
@@ -462,6 +713,25 @@ async fn wait_for_command_execution_request_approval(
     }
 }
 
+async fn wait_for_tool_request_user_input(
+    ws: &mut WsClient,
+    thread_id: &str,
+) -> Result<codex_app_server_protocol::ToolRequestUserInputParams> {
+    loop {
+        let message = super::connection_handling_websocket::read_jsonrpc_message(ws).await?;
+        let JSONRPCMessage::Request(request) = message else {
+            continue;
+        };
+        let server_request: ServerRequest = request.try_into()?;
+        let ServerRequest::ToolRequestUserInput { params, .. } = server_request else {
+            continue;
+        };
+        if params.thread_id == thread_id {
+            return Ok(params);
+        }
+    }
+}
+
 fn assert_waiting_on_approval(status: &ThreadStatus) {
     assert_eq!(
         status,
@@ -476,6 +746,15 @@ fn assert_workspace_changed(status: &ThreadStatus) {
         status,
         &ThreadStatus::Active {
             active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+        }
+    );
+}
+
+fn assert_background_terminal_running(status: &ThreadStatus) {
+    assert_eq!(
+        status,
+        &ThreadStatus::Active {
+            active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
         }
     );
 }
@@ -550,4 +829,129 @@ async fn wait_for_workspace_changed(
         }
     })
     .await?
+}
+
+async fn wait_for_thread_status_flag(
+    ws: &mut WsClient,
+    thread_id: &str,
+    expected_flag: ThreadActiveFlag,
+) -> Result<ThreadStatus> {
+    loop {
+        let notification = read_notification_for_method(ws, "thread/status/changed").await?;
+        let parsed: ThreadStatusChangedNotification = serde_json::from_value(
+            notification
+                .params
+                .context("thread/status/changed params")?,
+        )
+        .context("failed to parse thread/status/changed notification")?;
+        if parsed.thread_id != thread_id {
+            continue;
+        }
+        if let ThreadStatus::Active { active_flags } = &parsed.status
+            && active_flags.contains(&expected_flag)
+        {
+            return Ok(parsed.status);
+        }
+    }
+}
+
+async fn wait_for_thread_status_via_read(
+    ws: &mut WsClient,
+    thread_id: &str,
+    start_id: i64,
+    expected_flag: ThreadActiveFlag,
+) -> Result<ThreadStatus> {
+    let mut request_id = start_id;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let read = read_thread(ws, thread_id, request_id).await?;
+            if let ThreadStatus::Active { active_flags } = &read.thread.status
+                && active_flags.contains(&expected_flag)
+            {
+                return Ok::<ThreadStatus, anyhow::Error>(read.thread.status);
+            }
+            request_id += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?
+}
+
+fn create_config_toml_with_unified_exec(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+model_provider = "mock_provider"
+
+[features]
+unified_exec = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_config_toml_with_collaboration_modes(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "untrusted"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[features]
+collaboration_modes = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_background_exec_command_sse_response(call_id: &str) -> Result<String> {
+    let cmd = if cfg!(windows) {
+        r#"cmd.exe /d /c "ping -n 4 127.0.0.1 > nul""#
+    } else {
+        "/bin/sh -c 'sleep 3'"
+    };
+    let tool_call_arguments = serde_json::to_string(&json!({
+        "cmd": cmd,
+        "yield_time_ms": 100
+    }))?;
+    Ok(core_test_support::responses::sse(vec![
+        core_test_support::responses::ev_response_created("resp-1"),
+        core_test_support::responses::ev_function_call(
+            call_id,
+            "exec_command",
+            &tool_call_arguments,
+        ),
+        core_test_support::responses::ev_completed("resp-1"),
+    ]))
 }
