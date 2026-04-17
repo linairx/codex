@@ -73,19 +73,23 @@ If you have not attached any thread yet, or you switch to an unknown thread id
 with `:use`, the fallback prompts now also keep the same wording and tell you to
 use `:resume <thread-id>` to resume or reconnect.
 
-When the client later receives `thread/started` or `thread/status/changed`
-notifications for a thread it already knows, it now refreshes the cached
-mode/status for that id as well. This keeps local `:use` confirmations aligned
-with live thread status instead of only updating after the next manual
-`:refresh-thread`.
+When the client later receives `thread/started`, `thread/status/changed`,
+`thread/name/updated`, `thread/archived`, `thread/unarchived`, or
+`thread/closed` notifications for a thread it already knows, it now keeps the
+cached summary aligned with that lifecycle edge instead of waiting for the next
+manual `:refresh-thread`.
 
-Those lifecycle notifications now also emit compact stderr summaries. Known
-threads reuse the cached `mode` and action label, while unknown
-`thread/status/changed` notifications intentionally stay status-only instead of
-guessing resident reconnect semantics. When that happens, the reader also
-queues a background `thread/loaded/read` refresh so later local summaries can
-recover the missing `mode/status/action` snapshot without waiting for a manual
-`:refresh-thread`.
+Those lifecycle notifications also emit compact stderr summaries. Known threads
+reuse the cached `mode` and action label, while unknown notifications stay
+incremental-only instead of guessing resident reconnect semantics:
+
+- unknown `thread/status/changed` stays status-only and queues a background
+  `thread/loaded/read` refresh
+- unknown `thread/unarchived` stays identity-only and queues a background
+  `thread/list` refresh so the restored summary can be recovered from an
+  authoritative read surface
+- unknown `thread/name/updated`, `thread/archived`, and `thread/closed` stay
+  incremental / identity-only and do not invent missing `mode` or action labels
 
 The prompt shows the active thread id. Client messages (help, errors, approvals)
 print to stderr; raw server JSON prints to stdout so you can pipe/record it

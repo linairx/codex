@@ -12,6 +12,9 @@ should shrink and eventually disappear.
 */
 
 use super::App;
+use super::active_flags_from_status;
+use super::status_has_system_error;
+use super::status_marks_thread_closed;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::app_server_rate_limit_snapshot_to_core;
@@ -123,7 +126,7 @@ impl App {
 
     pub(super) async fn handle_app_server_event(
         &mut self,
-        app_server_client: &AppServerSession,
+        app_server_client: &mut AppServerSession,
         event: AppServerEvent,
     ) {
         match event {
@@ -153,7 +156,7 @@ impl App {
 
     async fn handle_server_notification_event(
         &mut self,
-        _app_server_client: &AppServerSession,
+        app_server_client: &mut AppServerSession,
         notification: ServerNotification,
     ) {
         match &notification {
@@ -164,6 +167,65 @@ impl App {
             ServerNotification::ThreadClosed(notification) => {
                 self.pending_app_server_requests
                     .resolve_thread_closed(&notification.thread_id);
+                if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id)
+                    && self.current_displayed_thread_id() == Some(thread_id)
+                    && !self.thread_event_channels.contains_key(&thread_id)
+                {
+                    self.mark_agent_picker_thread_closed(thread_id);
+                    self.clear_active_thread_status_flags();
+                    return;
+                }
+            }
+            ServerNotification::ThreadUnarchived(notification) => {
+                if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id) {
+                    self.refresh_thread_summary_from_read(app_server_client, thread_id)
+                        .await;
+                }
+            }
+            ServerNotification::ThreadStatusChanged(notification) => {
+                if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id)
+                    && self.current_displayed_thread_id() == Some(thread_id)
+                    && !self.thread_event_channels.contains_key(&thread_id)
+                {
+                    let existing_entry = self.agent_navigation.get(&thread_id).cloned();
+                    self.upsert_agent_picker_thread(
+                        thread_id,
+                        existing_entry
+                            .as_ref()
+                            .and_then(|entry| entry.agent_nickname.clone()),
+                        existing_entry
+                            .as_ref()
+                            .and_then(|entry| entry.agent_role.clone()),
+                        status_marks_thread_closed(&notification.status)
+                            || existing_entry.as_ref().is_some_and(|entry| entry.is_closed),
+                        active_flags_from_status(&notification.status),
+                        status_has_system_error(&notification.status),
+                    );
+                    self.handle_active_thread_status_notification(notification);
+                    return;
+                }
+            }
+            ServerNotification::ThreadArchived(notification) => {
+                if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id)
+                    && self.current_displayed_thread_id() == Some(thread_id)
+                    && !self.thread_event_channels.contains_key(&thread_id)
+                {
+                    self.mark_agent_picker_thread_closed(thread_id);
+                    self.clear_active_thread_status_flags();
+                    return;
+                }
+            }
+            ServerNotification::ThreadNameUpdated(notification) => {
+                if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id)
+                    && self.current_displayed_thread_id() == Some(thread_id)
+                    && !self.thread_event_channels.contains_key(&thread_id)
+                {
+                    self.chat_widget.handle_server_notification(
+                        ServerNotification::ThreadNameUpdated(notification.clone()),
+                        /*replay_kind*/ None,
+                    );
+                    return;
+                }
             }
             ServerNotification::McpServerStatusUpdated(_) => {
                 self.refresh_mcp_startup_expected_servers_from_config();

@@ -538,6 +538,171 @@ async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_mo
 }
 
 #[tokio::test]
+async fn thread_metadata_update_can_clear_git_fields_without_losing_loaded_resident_name()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            mode: Some(ThreadMode::ResidentAssistant),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.resident);
+    assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+    let thread_name = "Loaded resident git clear";
+    let set_name_id = mcp
+        .send_thread_set_name_request(ThreadSetNameParams {
+            thread_id: thread.id.clone(),
+            name: thread_name.to_string(),
+        })
+        .await?;
+    let set_name_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(set_name_id)),
+    )
+    .await??;
+    let _: ThreadSetNameResponse = to_response::<ThreadSetNameResponse>(set_name_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/name/updated"),
+    )
+    .await??;
+
+    let seed_git_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread.id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: Some(Some("abc123".to_string())),
+                branch: Some(Some("feature/resident-loaded-thread".to_string())),
+                origin_url: Some(Some("https://example.com/codex.git".to_string())),
+            }),
+        })
+        .await?;
+    let seed_git_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(seed_git_id)),
+    )
+    .await??;
+    let _: ThreadMetadataUpdateResponse =
+        to_response::<ThreadMetadataUpdateResponse>(seed_git_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "materialize resident thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let thread_uuid = ThreadId::from_string(&thread.id)?;
+    assert_eq!(state_db.delete_thread(thread_uuid).await?, 1);
+
+    let clear_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread.id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: Some(None),
+                branch: Some(None),
+                origin_url: Some(None),
+            }),
+        })
+        .await?;
+    let clear_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(clear_id)),
+    )
+    .await??;
+    let ThreadMetadataUpdateResponse { thread: cleared } =
+        to_response::<ThreadMetadataUpdateResponse>(clear_resp)?;
+
+    assert_eq!(cleared.id, thread.id);
+    assert!(cleared.resident);
+    assert_eq!(cleared.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(cleared.status, ThreadStatus::Idle);
+    assert_eq!(cleared.name.as_deref(), Some(thread_name));
+    assert_eq!(cleared.git_info, None);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(read_thread.status, ThreadStatus::Idle);
+    assert_eq!(read_thread.name.as_deref(), Some(thread_name));
+    assert_eq!(read_thread.git_info, None);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread.id)
+        .expect("thread/list should include repaired resident thread");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(listed_thread.status, ThreadStatus::Idle);
+    assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+    assert_eq!(listed_thread.git_info, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_metadata_update_repairs_loaded_resident_thread_without_losing_system_error()
 -> Result<()> {
     let responses = vec![
@@ -1670,6 +1835,180 @@ async fn thread_metadata_update_preserves_resident_mode_for_stored_thread() -> R
 }
 
 #[tokio::test]
+async fn thread_metadata_update_can_clear_git_fields_without_losing_stored_resident_summary()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let thread_id = {
+        let mut mcp = McpProcess::new(codex_home.path()).await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                model: Some("mock-model".to_string()),
+                mode: Some(ThreadMode::ResidentAssistant),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+        assert!(thread.resident);
+        assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+        let thread_name = "Stored resident git clear";
+        let set_name_id = mcp
+            .send_thread_set_name_request(ThreadSetNameParams {
+                thread_id: thread.id.clone(),
+                name: thread_name.to_string(),
+            })
+            .await?;
+        let set_name_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(set_name_id)),
+        )
+        .await??;
+        let _: ThreadSetNameResponse = to_response::<ThreadSetNameResponse>(set_name_resp)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/name/updated"),
+        )
+        .await??;
+
+        let seed_git_id = mcp
+            .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+                thread_id: thread.id.clone(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(Some("abc123".to_string())),
+                    branch: Some(Some("feature/stored-resident-thread".to_string())),
+                    origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                }),
+            })
+            .await?;
+        let seed_git_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(seed_git_id)),
+        )
+        .await??;
+        let _: ThreadMetadataUpdateResponse =
+            to_response::<ThreadMetadataUpdateResponse>(seed_git_resp)?;
+
+        let turn_start_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "materialize stored resident thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let turn_start_response: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+        )
+        .await??;
+        let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        thread.id
+    };
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let clear_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread_id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: Some(None),
+                branch: Some(None),
+                origin_url: Some(None),
+            }),
+        })
+        .await?;
+    let clear_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(clear_id)),
+    )
+    .await??;
+    let ThreadMetadataUpdateResponse { thread: cleared } =
+        to_response::<ThreadMetadataUpdateResponse>(clear_resp)?;
+
+    assert_eq!(cleared.id, thread_id.clone());
+    assert!(cleared.resident);
+    assert_eq!(cleared.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(cleared.status, ThreadStatus::NotLoaded);
+    assert_eq!(cleared.name.as_deref(), Some("Stored resident git clear"));
+    assert_eq!(cleared.git_info, None);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(
+        read_thread.name.as_deref(),
+        Some("Stored resident git clear")
+    );
+    assert_eq!(read_thread.git_info, None);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread_id)
+        .expect("thread/list should include stored resident thread");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(
+        listed_thread.name.as_deref(),
+        Some("Stored resident git clear")
+    );
+    assert_eq!(listed_thread.git_info, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_metadata_update_preserves_resident_mode_for_archived_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -1959,6 +2298,197 @@ async fn thread_metadata_update_preserves_archived_thread_name() -> Result<()> {
     assert!(listed_thread.resident);
     assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
     assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_metadata_update_can_clear_git_fields_without_losing_archived_resident_summary()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let thread_id = {
+        let mut mcp = McpProcess::new(codex_home.path()).await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                model: Some("mock-model".to_string()),
+                mode: Some(ThreadMode::ResidentAssistant),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+        assert!(thread.resident);
+        assert_eq!(thread.mode, ThreadMode::ResidentAssistant);
+
+        let thread_name = "Archived resident git clear";
+        let set_name_id = mcp
+            .send_thread_set_name_request(ThreadSetNameParams {
+                thread_id: thread.id.clone(),
+                name: thread_name.to_string(),
+            })
+            .await?;
+        let set_name_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(set_name_id)),
+        )
+        .await??;
+        let _: ThreadSetNameResponse = to_response::<ThreadSetNameResponse>(set_name_resp)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/name/updated"),
+        )
+        .await??;
+
+        let seed_git_id = mcp
+            .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+                thread_id: thread.id.clone(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(Some("abc123".to_string())),
+                    branch: Some(Some("feature/archived-resident-thread".to_string())),
+                    origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                }),
+            })
+            .await?;
+        let seed_git_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(seed_git_id)),
+        )
+        .await??;
+        let _: ThreadMetadataUpdateResponse =
+            to_response::<ThreadMetadataUpdateResponse>(seed_git_resp)?;
+
+        let turn_start_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: "materialize archived resident thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let turn_start_response: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+        )
+        .await??;
+        let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_response)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        let archive_id = mcp
+            .send_thread_archive_request(ThreadArchiveParams {
+                thread_id: thread.id.clone(),
+            })
+            .await?;
+        let archive_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(archive_id)),
+        )
+        .await??;
+        let _: ThreadArchiveResponse = to_response::<ThreadArchiveResponse>(archive_resp)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/archived"),
+        )
+        .await??;
+
+        thread.id
+    };
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let clear_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread_id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: Some(None),
+                branch: Some(None),
+                origin_url: Some(None),
+            }),
+        })
+        .await?;
+    let clear_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(clear_id)),
+    )
+    .await??;
+    let ThreadMetadataUpdateResponse { thread: cleared } =
+        to_response::<ThreadMetadataUpdateResponse>(clear_resp)?;
+
+    assert_eq!(cleared.id, thread_id.clone());
+    assert!(cleared.resident);
+    assert_eq!(cleared.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(cleared.status, ThreadStatus::NotLoaded);
+    assert_eq!(cleared.name.as_deref(), Some("Archived resident git clear"));
+    assert_eq!(cleared.git_info, None);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(read_thread.resident);
+    assert_eq!(read_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(read_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(
+        read_thread.name.as_deref(),
+        Some("Archived resident git clear")
+    );
+    assert_eq!(read_thread.git_info, None);
+
+    let list_id = mcp
+        .send_thread_list_request(ThreadListParams {
+            cursor: None,
+            limit: Some(50),
+            sort_key: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: Some(true),
+            cwd: None,
+            search_term: None,
+        })
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(list_resp)?;
+    let listed_thread = data
+        .into_iter()
+        .find(|listed_thread| listed_thread.id == thread_id)
+        .expect("thread/list archived=true should include archived resident thread");
+    assert!(listed_thread.resident);
+    assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+    assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+    assert_eq!(
+        listed_thread.name.as_deref(),
+        Some("Archived resident git clear")
+    );
+    assert_eq!(listed_thread.git_info, None);
 
     Ok(())
 }

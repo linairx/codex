@@ -152,6 +152,9 @@
 - `thread/status/changed`
 - `thread/started`
 - `thread/closed`
+- `thread/archived`
+- `thread/unarchived`
+- `thread/name/updated`
 
 目的：
 
@@ -162,8 +165,13 @@
 
 当前可依赖事实：
 
-- `thread/status/changed` 已适合承担“线程摘要增量刷新”的主通知面
-- 但远端仍应把它视为状态增量，而不是完整线程快照来源；这条通知不会重复 `thread.mode`
+- `thread/started` 仍是带 `Thread` 摘要的引入面；远端如果首次认识某线程，应该优先从这里拿到初始 `mode + status + preview + name`
+- `thread/status/changed` 只适合承担 runtime status 增量刷新；远端仍应把它视为状态增量，而不是完整线程快照来源，这条通知不会重复 `thread.mode`
+- `thread/closed`、`thread/archived`、`thread/unarchived` 都应继续被视为生命周期边事件，而不是摘要返回面：
+  - `thread/closed` 是 identity-only（`threadId`）
+  - `thread/archived` 是 identity-only（`threadId`）
+  - `thread/unarchived` 也是 identity-only（`threadId`），恢复后的权威摘要应来自 `thread/unarchive` 返回面，或后续显式 `thread/read` / `thread/list`
+- `thread/name/updated` 也应继续被视为增量通知，而不是完整线程快照：它只适合更新现有摘要上的名字，不应被 bridge 当成会重复 `mode` / `status` 的替代读取面
 - 对 `workspaceChanged` 的消费应建立在“这是需要关注的外部变化”这一语义上，而不是把它等同于“线程仍在执行”
 
 ### 第 3 层：按需深读
@@ -337,10 +345,14 @@ observer 文档里已经强调，第一阶段最重要的是：
    并直接把它映射成列表动作语义：`interactive` 行默认展示 `resume`，`residentAssistant` 行默认展示 `reconnect`
 2. 把 `thread/loaded/read` 和 `thread/status/changed` 组合成 loaded 线程的运行态刷新面，其中 `thread/loaded/read` 负责当前 `mode + status` 摘要，`thread/status/changed` 只负责后续 status 增量
    并继续把 `waitingOnApproval`、`waitingOnUserInput`、`backgroundTerminalRunning`、`workspaceChanged` 当成 reconnect 后仍应直接相信的线程级事实，而不是客户端自行脑补出来的临时显示状态
-3. 把 `thread/read` 作为详情页主读取入口，不让首页依赖全量 item 流重建
-4. 把 `thread/resume` 视为统一进入入口，但在 `residentAssistant` 上把它产品化为 reconnect，而不只是历史恢复入口
-5. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”
-6. 如果详情页支持 metadata-only 操作（例如 git metadata repair），直接消费 `thread/metadata/update` 返回的 `thread.mode`，不要把这类更新路径额外当成需要再做一次 `thread/read` 才能恢复 resident 语义的特殊情况
-7. 如果 restore / reconnect / metadata repair 命中了“SQLite 行已存在但 stored summary 仍残缺”的边界，也继续直接信服务端返回的线程摘要，而不是把 rollout-vs-SQLite 的修补职责重新推回 bridge
+3. 把 `thread/closed`、`thread/archived`、`thread/unarchived`、`thread/name/updated` 都当成对“最后一次权威 `Thread` 摘要”的边缘更新：
+   - `thread/closed` / `thread/archived` 只改生命周期状态，不重建摘要
+   - `thread/unarchived` 只表示“恢复事件发生了”；恢复后的权威摘要仍来自 `thread/unarchive` 返回面或显式 `thread/read`
+   - `thread/name/updated` 只更新 name，不替代读取面
+4. 把 `thread/read` 作为详情页主读取入口，不让首页依赖全量 item 流重建
+5. 把 `thread/resume` 视为统一进入入口，但在 `residentAssistant` 上把它产品化为 reconnect，而不只是历史恢复入口
+6. 在展示 `workspaceChanged` 时明确它表示“有新外部变化”，而不是简单显示成“运行中”
+7. 如果详情页支持 metadata-only 操作（例如 git metadata repair），直接消费 `thread/metadata/update` 返回的 `thread.mode`，不要把这类更新路径额外当成需要再做一次 `thread/read` 才能恢复 resident 语义的特殊情况
+8. 如果 restore / reconnect / metadata repair 命中了“SQLite 行已存在但 stored summary 仍残缺”的边界，也继续直接信服务端返回的线程摘要，而不是把 rollout-vs-SQLite 的修补职责重新推回 bridge
 
 这样做的好处是，远端消费可以立即开始受益于已经落地的 `Thread.mode`、observer 语义和 SQLite 摘要，而不需要等待完整 bridge 或更大范围的状态重构。

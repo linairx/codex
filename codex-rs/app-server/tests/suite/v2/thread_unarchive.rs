@@ -387,6 +387,7 @@ async fn named_resident_thread_unarchive_preserves_name_and_mode() -> Result<()>
         mcp.read_stream_until_response_message(RequestId::Integer(unarchive_id)),
     )
     .await??;
+    let unarchive_result = unarchive_resp.result.clone();
     let ThreadUnarchiveResponse {
         thread: unarchived_thread,
     } = to_response::<ThreadUnarchiveResponse>(unarchive_resp)?;
@@ -394,6 +395,39 @@ async fn named_resident_thread_unarchive_preserves_name_and_mode() -> Result<()>
     assert_eq!(unarchived_thread.mode, ThreadMode::ResidentAssistant);
     assert_eq!(unarchived_thread.status, ThreadStatus::NotLoaded);
     assert_eq!(unarchived_thread.name.as_deref(), Some(thread_name));
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/unarchived"),
+    )
+    .await??;
+    let notification_params = notification
+        .params
+        .as_ref()
+        .and_then(Value::as_object)
+        .expect("thread/unarchived params should be an object");
+    assert_eq!(
+        notification_params.get("threadId").and_then(Value::as_str),
+        Some(thread.id.as_str())
+    );
+    assert_eq!(
+        notification_params.len(),
+        1,
+        "thread/unarchived should stay identity-only even when restored thread summary has name + mode"
+    );
+    let thread_json = unarchive_result
+        .get("thread")
+        .and_then(Value::as_object)
+        .expect("thread/unarchive result.thread must be an object");
+    assert_eq!(
+        thread_json.get("name").and_then(Value::as_str),
+        Some(thread_name),
+        "thread/unarchive response must carry the authoritative restored thread name"
+    );
+    assert_eq!(
+        thread_json.get("mode").and_then(Value::as_str),
+        Some("residentAssistant"),
+        "thread/unarchive response must carry the authoritative restored thread mode"
+    );
 
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {

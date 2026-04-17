@@ -28,6 +28,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadLoadedReadParams;
@@ -517,6 +518,78 @@ fn handle_notification(
             }
             Ok(())
         }
+        ServerNotification::ThreadArchived(payload) => {
+            let mut state = state.lock().expect("state lock poisoned");
+            let known_thread = if let Some(existing) = state
+                .known_threads
+                .iter_mut()
+                .find(|thread| thread.thread_id == payload.thread_id)
+            {
+                existing.thread_status = ThreadStatus::NotLoaded;
+                Some(existing.clone())
+            } else {
+                None
+            };
+            drop(state);
+            for line in thread_archived_summary_lines(&payload.thread_id, known_thread.as_ref()) {
+                output.client_line(&line)?;
+            }
+            Ok(())
+        }
+        ServerNotification::ThreadUnarchived(payload) => {
+            let mut app_state = state.lock().expect("state lock poisoned");
+            let known_thread = if let Some(existing) = app_state
+                .known_threads
+                .iter_mut()
+                .find(|thread| thread.thread_id == payload.thread_id)
+            {
+                existing.thread_status = ThreadStatus::NotLoaded;
+                Some(existing.clone())
+            } else {
+                None
+            };
+            let refresh_request_id = if !app_state
+                .pending
+                .values()
+                .any(|pending| *pending == PendingRequest::List)
+            {
+                let request_id =
+                    RequestId::Integer(request_sink.next_request_id.fetch_add(1, Ordering::SeqCst));
+                app_state
+                    .pending
+                    .insert(request_id.clone(), PendingRequest::List);
+                Some(request_id)
+            } else {
+                None
+            };
+            drop(app_state);
+            for line in thread_unarchived_summary_lines(&payload.thread_id, known_thread.as_ref()) {
+                output.client_line(&line)?;
+            }
+            if let Some(request_id) = refresh_request_id
+                && let Err(err) = send_client_request(
+                    &request_sink.stdin,
+                    ClientRequest::ThreadList {
+                        request_id: request_id.clone(),
+                        params: ThreadListParams {
+                            cursor: None,
+                            limit: None,
+                            sort_key: None,
+                            model_providers: None,
+                            source_kinds: Some(all_thread_source_kinds()),
+                            archived: None,
+                            cwd: None,
+                            search_term: None,
+                        },
+                    },
+                )
+            {
+                let mut app_state = state.lock().expect("state lock poisoned");
+                app_state.pending.remove(&request_id);
+                return Err(err);
+            }
+            Ok(())
+        }
         ServerNotification::ThreadClosed(payload) => {
             let mut state = state.lock().expect("state lock poisoned");
             let known_thread = state
@@ -582,6 +655,26 @@ fn thread_name_updated_summary_lines(
     vec![format!(
         "thread name updated: {}",
         thread_name_updated_summary_line(thread_id, thread_name, known_thread)
+    )]
+}
+
+fn thread_archived_summary_lines(
+    thread_id: &str,
+    known_thread: Option<&KnownThread>,
+) -> Vec<String> {
+    vec![format!(
+        "thread archived: {}",
+        thread_archived_summary_line(thread_id, known_thread)
+    )]
+}
+
+fn thread_unarchived_summary_lines(
+    thread_id: &str,
+    known_thread: Option<&KnownThread>,
+) -> Vec<String> {
+    vec![format!(
+        "thread unarchived: {}",
+        thread_unarchived_summary_line(thread_id, known_thread)
     )]
 }
 
@@ -657,6 +750,32 @@ fn thread_closed_summary_line(thread_id: &str, known_thread: Option<&KnownThread
             thread_resume_action_label(thread.thread_mode)
         ),
         None => format!("id={thread_id}"),
+    }
+}
+
+fn thread_archived_summary_line(thread_id: &str, known_thread: Option<&KnownThread>) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, status={}, action={}",
+            thread_name_label(thread.thread_name.as_deref()),
+            thread_mode_label(thread.thread_mode),
+            thread_status_label(&thread.thread_status),
+            thread_resume_action_label(thread.thread_mode)
+        ),
+        None => format!("id={thread_id}"),
+    }
+}
+
+fn thread_unarchived_summary_line(thread_id: &str, known_thread: Option<&KnownThread>) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, status={}, action={}",
+            thread_name_label(thread.thread_name.as_deref()),
+            thread_mode_label(thread.thread_mode),
+            thread_status_label(&thread.thread_status),
+            thread_resume_action_label(thread.thread_mode)
+        ),
+        None => format!("id={thread_id} (refresh thread summary to recover mode/action)"),
     }
 }
 
@@ -848,10 +967,12 @@ mod tests {
     use super::handle_notification;
     use super::handle_response;
     use super::permissions_response_from_request;
+    use super::thread_archived_summary_line;
     use super::thread_closed_summary_line;
     use super::thread_name_updated_summary_line;
     use super::thread_started_summary_lines;
     use super::thread_status_changed_summary_line;
+    use super::thread_unarchived_summary_line;
     use super::user_input_answers_from_questions;
     use crate::output::Output;
     use crate::state::KnownThread;
@@ -865,7 +986,9 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
+    use codex_app_server_protocol::ThreadArchivedNotification;
     use codex_app_server_protocol::ThreadClosedNotification;
+    use codex_app_server_protocol::ThreadListResponse;
     use codex_app_server_protocol::ThreadLoadedListResponse;
     use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadLoadedReadResponse;
@@ -874,6 +997,7 @@ mod tests {
     use codex_app_server_protocol::ThreadStartedNotification;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
+    use codex_app_server_protocol::ThreadUnarchivedNotification;
     use codex_app_server_protocol::ToolRequestUserInputOption;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_app_server_protocol::all_thread_source_kinds;
@@ -893,6 +1017,34 @@ mod tests {
         JSONRPCNotification {
             method: method.to_string(),
             params: Some(serde_json::to_value(params).expect("notification params serialize")),
+        }
+    }
+
+    fn resident_thread(
+        thread_id: &str,
+        thread_name: Option<&str>,
+        thread_status: ThreadStatus,
+    ) -> Thread {
+        Thread {
+            id: thread_id.to_string(),
+            forked_from_id: None,
+            preview: "resident thread".to_string(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status: thread_status,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: None,
+            cwd: "/tmp".into(),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: thread_name.map(str::to_owned),
+            turns: Vec::new(),
         }
     }
 
@@ -1618,6 +1770,164 @@ mod tests {
     }
 
     #[test]
+    fn resident_thread_lifecycle_notifications_apply_on_top_of_started_snapshot() {
+        let state = Arc::new(Mutex::new(State::default()));
+
+        handle_notification(
+            notification(
+                "thread/started",
+                ThreadStartedNotification {
+                    thread: resident_thread("thread-known", Some("atlas"), ThreadStatus::Idle),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread started notification should decode");
+
+        handle_notification(
+            notification(
+                "thread/name/updated",
+                ThreadNameUpdatedNotification {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas renamed".to_string()),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(2)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread name updated notification should decode");
+
+        handle_notification(
+            notification(
+                "thread/archived",
+                ThreadArchivedNotification {
+                    thread_id: "thread-known".to_string(),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(3)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread archived notification should decode");
+
+        let next_request_id = Arc::new(AtomicI64::new(21));
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat should start");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+
+        handle_notification(
+            notification(
+                "thread/unarchived",
+                ThreadUnarchivedNotification {
+                    thread_id: "thread-known".to_string(),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::clone(&stdin),
+                next_request_id: Arc::clone(&next_request_id),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread unarchived notification should queue thread/list refresh");
+
+        let stdout = child.stdout.take().expect("cat stdout should exist");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("cat stdout should receive one request");
+        let request: JSONRPCRequest =
+            serde_json::from_str(line.trim()).expect("request should decode");
+        assert_eq!(request.id, RequestId::Integer(21));
+        assert_eq!(request.method, "thread/list");
+
+        let (events_tx, events_rx) = channel();
+        handle_response(
+            JSONRPCResponse {
+                id: RequestId::Integer(21),
+                result: serde_json::to_value(ThreadListResponse {
+                    data: vec![resident_thread(
+                        "thread-known",
+                        Some("atlas repaired"),
+                        ThreadStatus::NotLoaded,
+                    )],
+                    next_cursor: None,
+                })
+                .expect("thread list response should serialize"),
+            },
+            &state,
+            &events_tx,
+        )
+        .expect("thread list response should decode");
+
+        let event = events_rx.recv().expect("thread list event should emit");
+        match event {
+            ReaderEvent::ThreadList {
+                threads,
+                next_cursor,
+            } => {
+                assert_eq!(
+                    threads,
+                    vec![KnownThread {
+                        thread_id: "thread-known".to_string(),
+                        thread_name: Some("atlas repaired".to_string()),
+                        thread_mode: ThreadMode::ResidentAssistant,
+                        thread_status: ThreadStatus::NotLoaded,
+                    }]
+                );
+                assert_eq!(next_cursor, None);
+            }
+            other => panic!("expected thread list event, got {other:?}"),
+        }
+
+        handle_notification(
+            notification(
+                "thread/closed",
+                ThreadClosedNotification {
+                    thread_id: "thread-known".to_string(),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(22)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread closed notification should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert!(state.known_threads.is_empty());
+        assert!(state.pending.is_empty());
+
+        drop(state);
+        drop(stdin);
+        drop(stdout);
+        child.wait().expect("cat should exit cleanly");
+    }
+
+    #[test]
     fn thread_name_updated_notification_does_not_create_unknown_thread() {
         let state = Arc::new(Mutex::new(State::default()));
 
@@ -1665,6 +1975,217 @@ mod tests {
         assert_eq!(
             thread_name_updated_summary_line("thread-unknown", Some("atlas"), None),
             "id=thread-unknown, name=atlas"
+        );
+    }
+
+    #[test]
+    fn thread_archived_notification_marks_known_thread_not_loaded() {
+        let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state.known_threads.push(KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::Idle,
+            });
+        }
+
+        handle_notification(
+            notification(
+                "thread/archived",
+                ThreadArchivedNotification {
+                    thread_id: "thread-known".to_string(),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::new(Mutex::new(None)),
+                next_request_id: Arc::new(AtomicI64::new(1)),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread archived notification should decode");
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::NotLoaded,
+            }]
+        );
+    }
+
+    #[test]
+    fn thread_archived_summary_line_uses_known_thread_context_when_available() {
+        assert_eq!(
+            thread_archived_summary_line(
+                "thread-known",
+                Some(&KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::NotLoaded,
+                }),
+            ),
+            "id=thread-known, name=atlas, mode=resident assistant, status=not loaded, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_archived_summary_line_stays_identity_only_for_unknown_threads() {
+        assert_eq!(
+            thread_archived_summary_line("thread-unknown", None),
+            "id=thread-unknown"
+        );
+    }
+
+    #[test]
+    fn thread_unarchived_notification_refresh_round_trip_restores_known_thread_summary() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let next_request_id = Arc::new(AtomicI64::new(21));
+        {
+            let mut state = state.lock().expect("state lock poisoned");
+            state.known_threads.push(KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::NotLoaded,
+            });
+        }
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat should start");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+
+        handle_notification(
+            notification(
+                "thread/unarchived",
+                ThreadUnarchivedNotification {
+                    thread_id: "thread-known".to_string(),
+                },
+            ),
+            &ReaderRequestSink {
+                stdin: Arc::clone(&stdin),
+                next_request_id: Arc::clone(&next_request_id),
+            },
+            &state,
+            &Output::new(),
+            /*filtered_output*/ false,
+        )
+        .expect("thread unarchived notification should queue thread/list refresh");
+
+        let stdout = child.stdout.take().expect("cat stdout should exist");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("cat stdout should receive one request");
+        let request: JSONRPCRequest =
+            serde_json::from_str(line.trim()).expect("request should decode");
+        assert_eq!(request.id, RequestId::Integer(21));
+        assert_eq!(request.method, "thread/list");
+
+        let (events_tx, events_rx) = channel();
+        handle_response(
+            JSONRPCResponse {
+                id: RequestId::Integer(21),
+                result: serde_json::to_value(ThreadListResponse {
+                    data: vec![Thread {
+                        id: "thread-known".to_string(),
+                        forked_from_id: None,
+                        preview: "restored thread".to_string(),
+                        ephemeral: false,
+                        model_provider: "openai".to_string(),
+                        created_at: 1,
+                        updated_at: 2,
+                        status: ThreadStatus::NotLoaded,
+                        mode: ThreadMode::ResidentAssistant,
+                        resident: true,
+                        path: None,
+                        cwd: "/tmp".into(),
+                        cli_version: "0.0.0".to_string(),
+                        source: SessionSource::Cli,
+                        agent_nickname: None,
+                        agent_role: None,
+                        git_info: None,
+                        name: Some("atlas restored".to_string()),
+                        turns: Vec::new(),
+                    }],
+                    next_cursor: None,
+                })
+                .expect("thread list response should serialize"),
+            },
+            &state,
+            &events_tx,
+        )
+        .expect("thread list response should decode");
+
+        let event = events_rx.recv().expect("thread list event should emit");
+        match event {
+            ReaderEvent::ThreadList {
+                threads,
+                next_cursor,
+            } => {
+                assert_eq!(
+                    threads,
+                    vec![KnownThread {
+                        thread_id: "thread-known".to_string(),
+                        thread_name: Some("atlas restored".to_string()),
+                        thread_mode: ThreadMode::ResidentAssistant,
+                        thread_status: ThreadStatus::NotLoaded,
+                    }]
+                );
+                assert_eq!(next_cursor, None);
+            }
+            other => panic!("expected thread list event, got {other:?}"),
+        }
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            state.known_threads,
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas restored".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::NotLoaded,
+            }]
+        );
+        assert!(state.pending.is_empty());
+
+        drop(state);
+        drop(stdin);
+        drop(stdout);
+        child.wait().expect("cat should exit cleanly");
+    }
+
+    #[test]
+    fn thread_unarchived_summary_line_uses_known_thread_context_when_available() {
+        assert_eq!(
+            thread_unarchived_summary_line(
+                "thread-known",
+                Some(&KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::NotLoaded,
+                }),
+            ),
+            "id=thread-known, name=atlas, mode=resident assistant, status=not loaded, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_unarchived_summary_line_requests_refresh_for_unknown_threads() {
+        assert_eq!(
+            thread_unarchived_summary_line("thread-unknown", None),
+            "id=thread-unknown (refresh thread summary to recover mode/action)"
         );
     }
 

@@ -30,8 +30,9 @@ cargo run -p codex-app-server-test-client -- watch
 If you want a closer approximation of a minimal bridge consumer, use
 `watch-summary` instead. It bootstraps with one `thread/list` pass plus one
 `thread-loaded/read` pass, prints the compact summary view for both, then keeps
-streaming resident-aware `thread/started`, `thread/status/changed`, and
-`thread/name/updated` summaries until interrupted:
+streaming resident-aware `thread/started`, `thread/status/changed`,
+`thread/name/updated`, `thread/archived`, and `thread/unarchived` summaries
+until interrupted:
 
 ```bash
 cargo run -p codex-app-server-test-client -- watch-summary --limit 20
@@ -118,11 +119,19 @@ notLoaded` for an unknown thread id: that unload edge stays status-only so the
 client does not issue a noisy refresh read after a matching `thread/closed`
 transition. `thread/name/updated` now follows the same rule: known threads
 reuse cached mode/status/action context while unknown thread ids stay
-identity-only, and `thread/closed` evicts any cached summary after printing the
-final compact unload line. That shared notification handling now covers both
-turn streaming and long-running observation modes such as `thread-resume` /
-`watch`, so the resident-aware summaries stay consistent even when you keep the
-client attached just to watch later runtime state changes.
+identity-only. `thread/archived` marks known threads as `NotLoaded` while
+preserving cached `mode`/resident identity for the compact summary, and
+`thread/unarchived` now refreshes the authoritative thread summary via
+`thread/read` before printing its compact line, so known resident threads do
+not briefly regress to a stale `NotLoaded` summary while reconnect semantics
+are being restored. That refresh also repopulates the local cache, so later
+notifications recover the restored `mode + status + action` snapshot without
+requiring a manual extra probe. `thread/closed`
+evicts any cached summary after printing the final compact unload line. That
+shared notification handling now covers both turn streaming and long-running
+observation modes such as `thread-resume` / `watch`, so the resident-aware
+summaries stay consistent even when you keep the client attached just to watch
+later runtime state changes.
 
 When the test client receives server-side approval or elicitation requests, it
 now auto-responds across the full current app-server v2 set instead of only the

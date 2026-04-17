@@ -70,11 +70,13 @@ Two related boundaries matter for MCP consumers:
 
 - `thread/loaded/list` is intentionally only an id probe for currently loaded threads. If the client also needs reconnect semantics, the current thread role, or the current runtime status, it should follow up with `thread/loaded/read` and consume `thread.mode` plus `thread.status` there.
 - `thread/status/changed` is a status-only increment. It does not repeat `thread.mode`, so reconnect-aware clients should retain the last `mode` they observed from `thread/started`, `thread/read`, `thread/list`, or `thread/loaded/read`.
+- `thread/name/updated`, `thread/archived`, `thread/unarchived`, and `thread/closed` are likewise incremental or identity-only lifecycle notifications rather than full `Thread` snapshots. MCP consumers should apply those changes to the last authoritative `Thread` summary they already retained instead of expecting each notification to restate `thread.mode`, `status`, or repaired summary fields.
 
 One more boundary now matters for persisted-summary consumers too:
 
 - `thread/read`, `thread/list`, `thread/resume`, `thread/metadata/update`, and `thread/unarchive` should be treated as already-reconciled thread summary surfaces. If SQLite already has a thread row but rollout-derived summary fields such as preview / first-user-message are still missing, the server repairs that stored summary before returning the thread instead of expecting MCP clients to patch over rollout-vs-SQLite drift themselves with an extra read.
 - `thread/loaded/read` should likewise be treated as the authoritative current loaded-thread summary surface. If the loaded thread already carries repaired rollout metadata, a provider override, or an external rollout path, MCP clients should continue to consume that returned `Thread` directly instead of treating loaded polling as an id/status probe that still needs a follow-up `thread/read`.
+- For the same reason, `thread/unarchive` should be treated as the authoritative restored summary surface for archive restore flows. If a consumer receives a later `thread/unarchived` notification, that event should be interpreted as the lifecycle edge for a thread it already knows about, not as a replacement for the restored `Thread` returned by the RPC.
 
 `getConversationSummary` remains as a compatibility helper for clients that still need a summary lookup by `conversationId` or `rolloutPath`.
 

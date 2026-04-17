@@ -61,6 +61,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadActiveFlag;
+use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadCloseParams;
 use codex_app_server_protocol::ThreadCloseResponse;
 use codex_app_server_protocol::ThreadClosedNotification;
@@ -91,6 +92,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
+use codex_app_server_protocol::ThreadUnarchivedNotification;
 use codex_app_server_protocol::ToolRequestUserInputAnswer;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -1846,6 +1848,40 @@ fn thread_closed_summary_line(
     }
 }
 
+fn thread_archived_summary_line(
+    thread_id: &str,
+    known_thread: Option<&KnownThreadSummary>,
+) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, resident={}, status={}, action={}",
+            thread_name_label(thread.name.as_deref()),
+            thread_mode_label(thread.mode),
+            thread.resident,
+            thread_status_label(&thread.status),
+            thread_resume_action_label(thread.mode)
+        ),
+        None => format!("id={thread_id}"),
+    }
+}
+
+fn thread_unarchived_summary_line(
+    thread_id: &str,
+    known_thread: Option<&KnownThreadSummary>,
+) -> String {
+    match known_thread {
+        Some(thread) => format!(
+            "id={thread_id}, name={}, mode={}, resident={}, status={}, action={}",
+            thread_name_label(thread.name.as_deref()),
+            thread_mode_label(thread.mode),
+            thread.resident,
+            thread_status_label(&thread.status),
+            thread_resume_action_label(thread.mode)
+        ),
+        None => format!("id={thread_id}"),
+    }
+}
+
 fn thread_started_notification_lines(
     thread: &AppServerThread,
     include_raw_debug: bool,
@@ -1890,6 +1926,26 @@ fn thread_closed_notification_lines(
     )]
 }
 
+fn thread_archived_notification_lines(
+    thread_id: &str,
+    known_thread: Option<&KnownThreadSummary>,
+) -> Vec<String> {
+    vec![format!(
+        "< thread/archived summary: {}",
+        thread_archived_summary_line(thread_id, known_thread)
+    )]
+}
+
+fn thread_unarchived_notification_lines(
+    thread_id: &str,
+    known_thread: Option<&KnownThreadSummary>,
+) -> Vec<String> {
+    vec![format!(
+        "< thread/unarchived summary: {}",
+        thread_unarchived_summary_line(thread_id, known_thread)
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1909,6 +1965,8 @@ mod tests {
     use super::explicit_thread_resume_params;
     use super::granted_permission_profile_from_request;
     use super::interactive_thread_start_params;
+    use super::thread_archived_notification_lines;
+    use super::thread_archived_summary_line;
     use super::thread_closed_notification_lines;
     use super::thread_closed_summary_line;
     use super::thread_collection_summary_lines_with_cursor;
@@ -1923,6 +1981,8 @@ mod tests {
     use super::thread_status_changed_summary_line;
     use super::thread_status_label;
     use super::thread_summary_fields;
+    use super::thread_unarchived_notification_lines;
+    use super::thread_unarchived_summary_line;
     use clap::CommandFactory;
     use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::JSONRPCMessage;
@@ -1933,12 +1993,15 @@ mod tests {
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
+    use codex_app_server_protocol::ThreadArchivedNotification;
     use codex_app_server_protocol::ThreadClosedNotification;
     use codex_app_server_protocol::ThreadForkParams;
     use codex_app_server_protocol::ThreadMode;
+    use codex_app_server_protocol::ThreadNameUpdatedNotification;
     use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
+    use codex_app_server_protocol::ThreadUnarchivedNotification;
     use codex_app_server_protocol::ToolRequestUserInputOption;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
@@ -2657,6 +2720,52 @@ mod tests {
     }
 
     #[test]
+    fn thread_archived_summary_line_uses_known_thread_context_when_available() {
+        let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::NotLoaded,
+        };
+
+        assert_eq!(
+            thread_archived_summary_line("thread-1", Some(&known_thread)),
+            "id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_archived_summary_line_stays_identity_only_for_unknown_threads() {
+        assert_eq!(
+            thread_archived_summary_line("thread-unknown", None),
+            "id=thread-unknown"
+        );
+    }
+
+    #[test]
+    fn thread_unarchived_summary_line_uses_known_thread_context_when_available() {
+        let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::NotLoaded,
+        };
+
+        assert_eq!(
+            thread_unarchived_summary_line("thread-1", Some(&known_thread)),
+            "id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
+        );
+    }
+
+    #[test]
+    fn thread_unarchived_summary_line_stays_identity_only_for_unknown_threads() {
+        assert_eq!(
+            thread_unarchived_summary_line("thread-unknown", None),
+            "id=thread-unknown"
+        );
+    }
+
+    #[test]
     fn thread_name_updated_notification_lines_wrap_summary_line() {
         let known_thread = KnownThreadSummary {
             name: Some("old-name".to_string()),
@@ -2686,6 +2795,40 @@ mod tests {
             thread_closed_notification_lines("thread-1", Some(&known_thread)),
             vec![String::from(
                 "< thread/closed summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
+            )]
+        );
+    }
+
+    #[test]
+    fn thread_archived_notification_lines_wrap_summary_line() {
+        let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::NotLoaded,
+        };
+
+        assert_eq!(
+            thread_archived_notification_lines("thread-1", Some(&known_thread)),
+            vec![String::from(
+                "< thread/archived summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
+            )]
+        );
+    }
+
+    #[test]
+    fn thread_unarchived_notification_lines_wrap_summary_line() {
+        let known_thread = KnownThreadSummary {
+            name: Some("atlas".to_string()),
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            status: ThreadStatus::NotLoaded,
+        };
+
+        assert_eq!(
+            thread_unarchived_notification_lines("thread-1", Some(&known_thread)),
+            vec![String::from(
+                "< thread/unarchived summary: id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=NotLoaded, action=reconnect"
             )]
         );
     }
@@ -2969,6 +3112,339 @@ mod tests {
             "thread/closed should evict cached thread summary"
         );
     }
+
+    #[test]
+    fn thread_name_updated_notification_refreshes_known_thread_summary() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("child should spawn");
+        let mut client = CodexClient {
+            transport: ClientTransport::Stdio {
+                stdin: child.stdin.take(),
+                stdout: std::io::BufReader::new(
+                    child.stdout.take().expect("child stdout should exist"),
+                ),
+                child,
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: BTreeMap::from([(
+                "thread-1".to_string(),
+                KnownThreadSummary {
+                    name: Some("atlas".to_string()),
+                    mode: ThreadMode::ResidentAssistant,
+                    resident: true,
+                    status: ThreadStatus::Idle,
+                },
+            )]),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadNameUpdated(ThreadNameUpdatedNotification {
+                thread_id: "thread-1".to_string(),
+                thread_name: Some("atlas renamed".to_string()),
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "thread/name/updated notification should not terminate streaming"
+        );
+        assert_eq!(
+            client.known_threads.get("thread-1"),
+            Some(&KnownThreadSummary {
+                name: Some("atlas renamed".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::Idle,
+            })
+        );
+    }
+
+    #[test]
+    fn thread_archived_notification_marks_known_thread_not_loaded() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("child should spawn");
+        let mut client = CodexClient {
+            transport: ClientTransport::Stdio {
+                stdin: child.stdin.take(),
+                stdout: std::io::BufReader::new(
+                    child.stdout.take().expect("child stdout should exist"),
+                ),
+                child,
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: BTreeMap::from([(
+                "thread-1".to_string(),
+                KnownThreadSummary {
+                    name: Some("atlas".to_string()),
+                    mode: ThreadMode::ResidentAssistant,
+                    resident: true,
+                    status: ThreadStatus::Idle,
+                },
+            )]),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadArchived(ThreadArchivedNotification {
+                thread_id: "thread-1".to_string(),
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "thread/archived notification should not terminate streaming"
+        );
+        assert_eq!(
+            client.known_threads.get("thread-1"),
+            Some(&KnownThreadSummary {
+                name: Some("atlas".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::NotLoaded,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_thread_unarchived_refresh_round_trip_restores_known_thread_summary() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("server should accept");
+            let mut websocket = accept(stream).expect("websocket handshake should succeed");
+
+            let request_message = websocket.read().expect("thread/read request should arrive");
+            let Message::Text(payload) = request_message else {
+                panic!("expected text websocket frame");
+            };
+            let JSONRPCMessage::Request(JSONRPCRequest {
+                id, method, params, ..
+            }) = serde_json::from_str(&payload).expect("request should decode")
+            else {
+                panic!("expected JSON-RPC request");
+            };
+            assert_eq!(method, "thread/read");
+            assert_eq!(
+                params,
+                Some(serde_json::json!({
+                    "threadId": "thread-unknown",
+                    "includeTurns": false
+                }))
+            );
+
+            let response = JSONRPCMessage::Response(JSONRPCResponse {
+                id,
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: make_thread(
+                        "thread-unknown",
+                        Some("atlas"),
+                        ThreadMode::ResidentAssistant,
+                        true,
+                        ThreadStatus::Idle,
+                    ),
+                })
+                .expect("thread/read response should serialize"),
+            });
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&response)
+                        .expect("response should serialize")
+                        .into(),
+                ))
+                .expect("websocket should send response");
+            websocket
+                .close(None)
+                .expect("websocket should close cleanly");
+        });
+
+        let (socket, _response) =
+            connect(format!("ws://{addr}")).expect("websocket client should connect");
+        let mut client = CodexClient {
+            transport: ClientTransport::WebSocket {
+                url: format!("ws://{addr}"),
+                socket: Box::new(socket),
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: Default::default(),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+                thread_id: "thread-unknown".to_string(),
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "thread/unarchived notification should not terminate streaming"
+        );
+        assert_eq!(
+            client.known_threads.get("thread-unknown"),
+            Some(&KnownThreadSummary {
+                name: Some("atlas".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::Idle,
+            })
+        );
+
+        server.join().expect("websocket server should exit cleanly");
+    }
+
+    #[test]
+    fn known_thread_unarchived_refresh_round_trip_updates_cached_summary() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener address should resolve");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("server should accept");
+            let mut websocket = accept(stream).expect("websocket handshake should succeed");
+
+            let request_message = websocket.read().expect("thread/read request should arrive");
+            let Message::Text(payload) = request_message else {
+                panic!("expected text websocket frame");
+            };
+            let JSONRPCMessage::Request(JSONRPCRequest {
+                id, method, params, ..
+            }) = serde_json::from_str(&payload).expect("request should decode")
+            else {
+                panic!("expected JSON-RPC request");
+            };
+            assert_eq!(method, "thread/read");
+            assert_eq!(
+                params,
+                Some(serde_json::json!({
+                    "threadId": "thread-known",
+                    "includeTurns": false
+                }))
+            );
+
+            let response = JSONRPCMessage::Response(JSONRPCResponse {
+                id,
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: make_thread(
+                        "thread-known",
+                        Some("atlas restored"),
+                        ThreadMode::ResidentAssistant,
+                        true,
+                        ThreadStatus::Idle,
+                    ),
+                })
+                .expect("thread/read response should serialize"),
+            });
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&response)
+                        .expect("response should serialize")
+                        .into(),
+                ))
+                .expect("websocket should send response");
+            websocket
+                .close(None)
+                .expect("websocket should close cleanly");
+        });
+
+        let (socket, _response) =
+            connect(format!("ws://{addr}")).expect("websocket client should connect");
+        let mut client = CodexClient {
+            transport: ClientTransport::WebSocket {
+                url: format!("ws://{addr}"),
+                socket: Box::new(socket),
+            },
+            pending_notifications: VecDeque::new(),
+            known_threads: BTreeMap::from([(
+                "thread-known".to_string(),
+                KnownThreadSummary {
+                    name: Some("atlas archived".to_string()),
+                    mode: ThreadMode::ResidentAssistant,
+                    resident: true,
+                    status: ThreadStatus::NotLoaded,
+                },
+            )]),
+            command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            command_execution_outputs: Vec::new(),
+            command_output_stream: String::new(),
+            command_item_started: false,
+            helper_done_seen: false,
+            turn_completed_before_helper_done: false,
+            unexpected_items_before_helper_done: Vec::new(),
+            last_turn_status: None,
+            last_turn_error_message: None,
+        };
+
+        let handled = client.print_stream_notification(
+            ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+                thread_id: "thread-known".to_string(),
+            }),
+            None,
+            None,
+        );
+        assert!(
+            !handled,
+            "thread/unarchived notification should not terminate streaming"
+        );
+        assert_eq!(
+            client.known_threads.get("thread-known"),
+            Some(&KnownThreadSummary {
+                name: Some("atlas restored".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::Idle,
+            })
+        );
+
+        server.join().expect("websocket server should exit cleanly");
+    }
 }
 
 fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
@@ -3227,6 +3703,17 @@ struct KnownThreadSummary {
     status: codex_app_server_protocol::ThreadStatus,
 }
 
+impl From<&AppServerThread> for KnownThreadSummary {
+    fn from(thread: &AppServerThread) -> Self {
+        Self {
+            name: thread.name.clone(),
+            mode: thread.mode,
+            resident: thread.resident,
+            status: thread.status.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CommandApprovalBehavior {
     AlwaysAccept,
@@ -3358,15 +3845,8 @@ impl CodexClient {
     }
 
     fn remember_thread(&mut self, thread: &AppServerThread) {
-        self.known_threads.insert(
-            thread.id.clone(),
-            KnownThreadSummary {
-                name: thread.name.clone(),
-                mode: thread.mode,
-                resident: thread.resident,
-                status: thread.status.clone(),
-            },
-        );
+        self.known_threads
+            .insert(thread.id.clone(), KnownThreadSummary::from(thread));
     }
 
     fn remember_threads(&mut self, threads: &[AppServerThread]) {
@@ -3414,7 +3894,10 @@ impl CodexClient {
                 if known_thread.is_none()
                     && payload.status != codex_app_server_protocol::ThreadStatus::NotLoaded
                 {
-                    self.refresh_unknown_thread_summary(&payload.thread_id);
+                    self.refresh_unknown_thread_summary_with_method(
+                        "thread/status/changed refresh",
+                        &payload.thread_id,
+                    );
                 }
                 false
             }
@@ -3426,6 +3909,53 @@ impl CodexClient {
                     for line in
                         thread_closed_notification_lines(&closed_thread_id, known_thread.as_ref())
                     {
+                        println!("{line}");
+                    }
+                }
+                false
+            }
+            ServerNotification::ThreadArchived(ThreadArchivedNotification {
+                thread_id: archived_thread_id,
+            }) => {
+                let known_thread = self
+                    .known_threads
+                    .get_mut(&archived_thread_id)
+                    .map(|thread| {
+                        thread.status = codex_app_server_protocol::ThreadStatus::NotLoaded;
+                        thread.clone()
+                    });
+                if thread_id.is_none_or(|id| archived_thread_id == id) {
+                    for line in thread_archived_notification_lines(
+                        &archived_thread_id,
+                        known_thread.as_ref(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                false
+            }
+            ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+                thread_id: unarchived_thread_id,
+            }) => {
+                let known_thread = self.known_threads.get(&unarchived_thread_id).cloned();
+                let refreshed_thread = match self.refresh_thread_summary(&unarchived_thread_id) {
+                    Ok(thread) => Some(thread),
+                    Err(err) => {
+                        println!(
+                            "< thread/unarchived refresh failed: thread_id={unarchived_thread_id}, error={err:#}"
+                        );
+                        None
+                    }
+                };
+                if thread_id.is_none_or(|id| unarchived_thread_id == id) {
+                    for line in thread_unarchived_notification_lines(
+                        &unarchived_thread_id,
+                        refreshed_thread
+                            .as_ref()
+                            .map(KnownThreadSummary::from)
+                            .as_ref()
+                            .or(known_thread.as_ref()),
+                    ) {
                         println!("{line}");
                     }
                 }
@@ -3701,21 +4231,21 @@ impl CodexClient {
         self.send_request(request, request_id, "thread/close")
     }
 
-    fn refresh_unknown_thread_summary(&mut self, thread_id: &str) {
-        match self.thread_read(ThreadReadParams {
-            thread_id: thread_id.to_string(),
-            include_turns: false,
-        }) {
-            Ok(response) => println!(
-                "{}",
-                thread_response_summary_line("thread/status/changed refresh", &response.thread)
-            ),
+    fn refresh_unknown_thread_summary_with_method(&mut self, method: &str, thread_id: &str) {
+        match self.refresh_thread_summary(thread_id) {
+            Ok(thread) => println!("{}", thread_response_summary_line(method, &thread)),
             Err(err) => {
-                println!(
-                    "< thread/status/changed refresh failed: thread_id={thread_id}, error={err:#}"
-                );
+                println!("< {method} failed: thread_id={thread_id}, error={err:#}");
             }
         }
+    }
+
+    fn refresh_thread_summary(&mut self, thread_id: &str) -> Result<AppServerThread> {
+        let response = self.thread_read(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: false,
+        })?;
+        Ok(response.thread)
     }
 
     fn thread_loaded_read(

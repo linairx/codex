@@ -26,6 +26,7 @@ use codex_app_server_protocol::UserInput;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_core::find_thread_path_by_id_str;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -357,11 +358,27 @@ async fn resident_thread_archive_preserves_resident_mode_in_archived_surfaces() 
     )
     .await??;
     let _: ThreadArchiveResponse = to_response::<ThreadArchiveResponse>(archive_resp)?;
-    timeout(
+    let notification = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("thread/archived"),
     )
     .await??;
+    let notification: ThreadArchivedNotification =
+        serde_json::from_value(notification.params.expect("thread/archived params"))?;
+    assert_eq!(notification.thread_id, thread.id);
+    let notification_json = serde_json::to_value(&notification)?;
+    let notification_json = notification_json
+        .as_object()
+        .expect("thread/archived notification should serialize as an object");
+    assert_eq!(
+        notification_json.len(),
+        1,
+        "thread/archived should stay identity-only even when archived thread summary still has resident mode"
+    );
+    assert_eq!(
+        notification_json.get("threadId").and_then(Value::as_str),
+        Some(thread.id.as_str())
+    );
 
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {

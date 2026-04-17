@@ -100,12 +100,25 @@ responses should still be treated as the authoritative reconnect summary
 surface, while non-resident threads may disappear behind the matching
 `thread/status/changed -> notLoaded` plus `thread/closed` unload transition.
 Callers should not depend on a fixed ordering between those two notifications.
+The websocket-backed remote facade now has direct regression coverage for both
+arrival orders too.
 That reconnect-summary rule now also explicitly covers the resident active
 flags that matter for long-lived runtime continuity: follow-up typed reads and
 resume calls should preserve `waitingOnApproval`, `waitingOnUserInput`,
 `backgroundTerminalRunning`, and `workspaceChanged` when those facts remain
 true after unsubscribe or transport disconnect, rather than flattening the
-thread back to `idle`.
+thread back to `idle`. The remote typed layer now also locks this down across a
+real follow-up polling sequence: `thread/loaded/read`, `thread/read`, and
+`thread/resume` must all preserve the same resident reconnect summary instead
+of drifting between “loaded view”, “stored view”, and “reconnect view”. The
+remote follow-up sequence coverage now also explicitly includes the resident
+approval/input wait states: `thread/read` plus `thread/resume` must preserve
+`waitingOnApproval` and `waitingOnUserInput` instead of collapsing those
+threads back to generic idle history. The same remote sequence coverage now
+also extends the observer/background flags across the full
+`thread/loaded/read -> thread/read -> thread/resume` path, so
+`backgroundTerminalRunning` and `workspaceChanged` do not drift between
+loaded-thread polling, stored lookup, and reconnect.
 The same resident continuity is now locked down for `thread/rollback`: after a
 resident assistant completes a turn, the rollback response must preserve
 `thread.mode = residentAssistant` instead of reconstructing the rollout as an
@@ -127,11 +140,13 @@ The same contract now applies to the websocket-backed remote facade too: when
 the remote app-server already returns a repaired thread summary, the typed
 remote client should preserve `thread.mode`, preview, status, path, and name
 exactly as returned instead of reintroducing a client-side “resume, then
-re-read” repair step. That boundary is now locked down directly for both
-`thread/resume`, `thread/read`, `thread/list`, and `thread/loaded/read`, so
-remote callers can continue to treat each of those responses as the
-authoritative repaired snapshot when reconnect, stored lookup, history
-listing, or loaded-thread polling returns an already repaired `Thread`.
+re-read” repair step. That boundary is now locked down directly for
+`thread/resume`, `thread/read`, `thread/rollback`, `thread/metadata/update`,
+`thread/unarchive`, `thread/list`, and `thread/loaded/read`, so remote callers
+can continue to treat each of those responses as the authoritative repaired
+snapshot when reconnect, rollback, metadata repair, restore, stored lookup,
+history listing, or loaded-thread polling returns an already repaired
+`Thread`.
 The same websocket path now also locks down request-side mode selection:
 typed remote callers should prefer `mode` on `thread/start`, `thread/resume`,
 and `thread/fork`, and should not expect the remote facade to quietly
@@ -153,7 +168,22 @@ snapshot that still carries `thread.mode`, while later
 `thread/status/changed` notifications continue to update only runtime
 `status`. Callers that need reconnect semantics across both events should
 therefore retain the previously observed `mode` instead of expecting the
-status-only increment to repeat it.
+status-only increment to repeat it. The websocket-backed remote facade now has
+the same regression coverage, so remote `next_event()` consumers can keep the
+same “mode from started, status from changed” contract. The same event-stream
+boundary now also explicitly covers the other lifecycle increments: remote
+`next_event()` consumers should continue to treat `thread/closed`,
+`thread/archived`, and `thread/unarchived` as lifecycle edges rather than
+replacement thread snapshots, and should treat `thread/name/updated` as a
+name-only increment rather than as a summary refresh that repeats
+`thread.mode`, `status`, or repaired preview/path fields. In other words, the
+typed event stream should still be consumed as:
+
+- `thread/started` introduces the authoritative thread snapshot
+- `thread/status/changed` updates only runtime `status`
+- `thread/name/updated` updates only `name`
+- `thread/closed` / `thread/archived` / `thread/unarchived` describe lifecycle
+  edges on that retained thread summary
 
 ## Backpressure and shutdown
 

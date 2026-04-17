@@ -45,6 +45,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -130,6 +131,19 @@ async fn thread_unsubscribe_unloads_thread_and_emits_thread_closed_notification(
         anyhow::bail!("expected thread/closed notification");
     };
     assert_eq!(payload.thread_id, thread_id);
+    let payload_json = serde_json::to_value(&payload)?;
+    let payload_json = payload_json
+        .as_object()
+        .expect("thread/closed notification should serialize as an object");
+    assert_eq!(
+        payload_json.len(),
+        1,
+        "thread/closed should stay identity-only and not restate thread summary fields"
+    );
+    assert_eq!(
+        payload_json.get("threadId").and_then(Value::as_str),
+        Some(thread_id.as_str())
+    );
 
     let status_changed = wait_for_thread_status_not_loaded(&mut mcp, &payload.thread_id).await?;
     assert_eq!(status_changed.thread_id, payload.thread_id);
@@ -1113,9 +1127,25 @@ async fn wait_for_thread_status_not_loaded(
             .params
             .context("thread/status/changed params must be present")?;
         let status_changed: ThreadStatusChangedNotification =
-            serde_json::from_value(status_changed_params)?;
+            serde_json::from_value(status_changed_params.clone())?;
+        let status_changed_json = status_changed_params
+            .as_object()
+            .expect("thread/status/changed params should be an object");
         if status_changed.thread_id == thread_id && status_changed.status == ThreadStatus::NotLoaded
         {
+            assert_eq!(
+                status_changed_json.len(),
+                2,
+                "thread/status/changed should stay status-only and not restate thread summary fields"
+            );
+            assert_eq!(
+                status_changed_json.get("threadId").and_then(Value::as_str),
+                Some(thread_id)
+            );
+            assert!(
+                status_changed_json.contains_key("status"),
+                "thread/status/changed must include a status payload"
+            );
             return Ok(status_changed);
         }
     }

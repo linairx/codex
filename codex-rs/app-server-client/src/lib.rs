@@ -99,11 +99,13 @@ fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
 
 /// Returns `true` for notifications that must survive backpressure.
 ///
-/// Transcript events (`AgentMessageDelta`, `PlanDelta`, reasoning deltas) and
-/// the authoritative `ItemCompleted` / `TurnCompleted` form the lossless tier
-/// of the event stream. Dropping any of these corrupts the visible assistant
-/// output or leaves surfaces waiting for a completion signal that already
-/// fired. Everything else (`CommandExecutionOutputDelta`, progress, etc.) is
+/// Transcript events (`AgentMessageDelta`, `PlanDelta`, reasoning deltas),
+/// the authoritative `ItemCompleted` / `TurnCompleted`, and the thread-summary
+/// notifications that define resident reconnect state form the lossless tier of
+/// the event stream. Dropping any of these either corrupts visible assistant
+/// output, leaves surfaces waiting for a completion signal that already fired,
+/// or silently desynchronizes thread lifecycle/state caches after reconnect.
+/// Everything else (`CommandExecutionOutputDelta`, progress, etc.) is
 /// best-effort and may be dropped with only cosmetic impact.
 ///
 /// Both the in-process and remote transports delegate to this function so the
@@ -111,7 +113,13 @@ fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
 pub(crate) fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
     matches!(
         notification,
-        ServerNotification::TurnCompleted(_)
+        ServerNotification::ThreadStarted(_)
+            | ServerNotification::ThreadStatusChanged(_)
+            | ServerNotification::ThreadNameUpdated(_)
+            | ServerNotification::ThreadArchived(_)
+            | ServerNotification::ThreadUnarchived(_)
+            | ServerNotification::ThreadClosed(_)
+            | ServerNotification::TurnCompleted(_)
             | ServerNotification::ItemCompleted(_)
             | ServerNotification::AgentMessageDelta(_)
             | ServerNotification::PlanDelta(_)
@@ -896,12 +904,15 @@ mod tests {
     use codex_app_server_protocol::ThreadReadParams;
     use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadResumeResponse;
+    use codex_app_server_protocol::ThreadRollbackParams;
     use codex_app_server_protocol::ThreadRollbackResponse;
     use codex_app_server_protocol::ThreadSetNameParams;
     use codex_app_server_protocol::ThreadSetNameResponse;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ThreadStatus;
+    use codex_app_server_protocol::ThreadUnarchiveParams;
+    use codex_app_server_protocol::ThreadUnarchiveResponse;
     use codex_app_server_protocol::ThreadUnsubscribeStatus;
     use codex_app_server_protocol::ToolRequestUserInputAnswer;
     use codex_app_server_protocol::ToolRequestUserInputParams;
@@ -1264,6 +1275,86 @@ supports_websockets = false
         );
     }
 
+    async fn materialize_thread_and_wait_for_turn_completed(
+        client: &mut InProcessAppServerClient,
+        thread_id: &str,
+        request_id: i64,
+        prompt: &str,
+    ) {
+        let _: codex_app_server_protocol::TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(request_id),
+                params: TurnStartParams {
+                    thread_id: thread_id.to_string(),
+                    input: vec![UserInput::Text {
+                        text: prompt.to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..TurnStartParams::default()
+                },
+            })
+            .await
+            .expect("turn/start should succeed");
+
+        loop {
+            let event = timeout(Duration::from_secs(15), client.next_event())
+                .await
+                .expect("turn completion event should arrive before timeout")
+                .expect("event stream should stay open");
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification,
+            )) = event
+                && notification.thread_id == thread_id
+                && notification.turn.status == TurnStatus::Completed
+            {
+                break;
+            }
+        }
+    }
+
+    async fn assert_in_process_thread_unload_events_arrive(
+        client: &mut InProcessAppServerClient,
+        thread_id: &str,
+    ) {
+        let events = timeout(Duration::from_secs(5), async {
+            let mut seen_status_changed = None;
+            let mut seen_closed = None;
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    InProcessServerEvent::ServerNotification(
+                        ServerNotification::ThreadStatusChanged(notification),
+                    ) if notification.thread_id == thread_id
+                        && notification.status == ThreadStatus::NotLoaded =>
+                    {
+                        seen_status_changed = Some(notification);
+                    }
+                    InProcessServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                        notification,
+                    )) if notification.thread_id == thread_id => {
+                        seen_closed = Some(notification);
+                    }
+                    _ => {}
+                }
+
+                if let (Some(status_changed), Some(closed)) =
+                    (seen_status_changed.clone(), seen_closed.clone())
+                {
+                    break (status_changed, closed);
+                }
+            }
+        })
+        .await
+        .expect("thread unload notifications should arrive before timeout");
+
+        assert_eq!(events.0.thread_id, thread_id);
+        assert_eq!(events.0.status, ThreadStatus::NotLoaded);
+        assert_eq!(events.1.thread_id, thread_id);
+    }
+
     async fn start_test_remote_server<F, Fut>(handler: F) -> String
     where
         F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
@@ -1369,6 +1460,133 @@ supports_websockets = false
             ))
             .await
             .expect("message should send");
+    }
+
+    fn remote_resident_thread_with_path(
+        preview: &str,
+        status: ThreadStatus,
+        path: PathBuf,
+    ) -> Thread {
+        Thread {
+            id: "thread-resident".to_string(),
+            forked_from_id: None,
+            preview: preview.to_string(),
+            ephemeral: false,
+            model_provider: "mock_provider".to_string(),
+            created_at: 1_736_078_400,
+            updated_at: 1_736_078_400,
+            status,
+            mode: ThreadMode::ResidentAssistant,
+            resident: true,
+            path: Some(path),
+            cwd: PathBuf::from("/workspace"),
+            cli_version: "0.0.0-test".to_string(),
+            source: ApiSessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: Some("Atlas".to_string()),
+            turns: Vec::new(),
+        }
+    }
+
+    fn remote_resident_thread(preview: &str, status: ThreadStatus) -> Thread {
+        remote_resident_thread_with_path(
+            preview,
+            status,
+            PathBuf::from("/tmp/thread-resident.jsonl"),
+        )
+    }
+
+    fn remote_resident_resume_response(
+        preview: &str,
+        status: ThreadStatus,
+    ) -> ThreadResumeResponse {
+        ThreadResumeResponse {
+            thread: remote_resident_thread(preview, status),
+            model: "mock-model".to_string(),
+            model_provider: "mock_provider".to_string(),
+            service_tier: None,
+            cwd: PathBuf::from("/workspace"),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox: SandboxPolicy::ReadOnly {
+                access: Default::default(),
+                network_access: false,
+            },
+            reasoning_effort: None,
+        }
+    }
+
+    async fn expect_remote_thread_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        method: &str,
+    ) -> JSONRPCRequest {
+        let JSONRPCMessage::Request(request) = read_websocket_message(websocket).await else {
+            panic!("expected {method} request");
+        };
+        assert_eq!(request.method, method);
+        request
+    }
+
+    async fn respond_with_thread_loaded_read(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        request_id: RequestId,
+        preview: &str,
+        status: ThreadStatus,
+    ) {
+        write_websocket_message(
+            websocket,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: request_id,
+                result: serde_json::to_value(ThreadLoadedReadResponse {
+                    data: vec![remote_resident_thread_with_path(
+                        preview,
+                        status,
+                        PathBuf::from("/tmp/external-rollouts/2025/thread-external.jsonl"),
+                    )],
+                    next_cursor: None,
+                })
+                .expect("thread/loaded/read response should serialize"),
+            }),
+        )
+        .await;
+    }
+
+    async fn respond_with_thread_read(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        request_id: RequestId,
+        preview: &str,
+        status: ThreadStatus,
+    ) {
+        write_websocket_message(
+            websocket,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: request_id,
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: remote_resident_thread(preview, status),
+                })
+                .expect("thread/read response should serialize"),
+            }),
+        )
+        .await;
+    }
+
+    async fn respond_with_thread_resume(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        request_id: RequestId,
+        preview: &str,
+        status: ThreadStatus,
+    ) {
+        write_websocket_message(
+            websocket,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: request_id,
+                result: serde_json::to_value(remote_resident_resume_response(preview, status))
+                    .expect("thread/resume response should serialize"),
+            }),
+        )
+        .await;
     }
 
     fn command_execution_output_delta_notification(delta: &str) -> ServerNotification {
@@ -1685,6 +1903,83 @@ supports_websockets = false
             .await
             .expect("thread/read should preserve thread name after metadata update");
         assert_eq!(read.thread.name.as_deref(), Some(thread_name));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn metadata_update_can_clear_git_fields_without_losing_resident_summary() {
+        let client = start_test_client(SessionSource::Cli).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(79),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let thread_name = "Resident git clear thread";
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(80),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: thread_name.to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let _: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(81),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("main".to_string())),
+                        origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should seed git info");
+
+        let cleared: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(82),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(None),
+                        branch: Some(None),
+                        origin_url: Some(None),
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should clear git info");
+
+        assert_eq!(cleared.thread.id, started.thread.id);
+        assert_eq!(cleared.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(cleared.thread.status, ThreadStatus::Idle);
+        assert_eq!(cleared.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(cleared.thread.git_info, None);
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(83),
+                params: ThreadReadParams {
+                    thread_id: started.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("thread/read should preserve repaired resident summary after git clear");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(read.thread.git_info, None);
 
         client.shutdown().await.expect("shutdown should complete");
     }
@@ -2477,6 +2772,201 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn loaded_metadata_update_can_clear_git_fields_without_losing_resident_summary_through_typed_requests()
+     {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(114),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let thread_name = "Loaded resident git clear";
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(115),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: thread_name.to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let _: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(116),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("loaded-main".to_string())),
+                        origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should seed loaded git info");
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(117),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "materialize resident thread".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        loop {
+            let event = timeout(Duration::from_secs(5), client.next_event())
+                .await
+                .expect("turn completion event should arrive before timeout")
+                .expect("event stream should stay open");
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification,
+            )) = event
+                && notification.thread_id == started.thread.id
+                && notification.turn.status == TurnStatus::Completed
+            {
+                break;
+            }
+        }
+
+        let thread_id = ThreadId::from_string(&started.thread.id).expect("valid thread id");
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let deleted = state_db
+            .delete_thread(thread_id)
+            .await
+            .expect("delete_thread should succeed");
+        assert_eq!(
+            deleted, 1,
+            "loaded resident thread should persist one state row"
+        );
+        mark_state_backfill_complete(&config).await;
+
+        let cleared: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(118),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(None),
+                        branch: Some(None),
+                        origin_url: Some(None),
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should clear loaded git info");
+
+        assert_eq!(cleared.thread.id, started.thread.id);
+        assert_eq!(cleared.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(cleared.thread.status, ThreadStatus::Idle);
+        assert!(cleared.thread.resident);
+        assert_eq!(cleared.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(cleared.thread.git_info, None);
+
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(119),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: started.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the loaded resident thread");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::Idle);
+        assert!(read.thread.resident);
+        assert_eq!(read.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(read.thread.git_info, None);
+
+        let listed_thread = timeout(Duration::from_secs(5), async {
+            loop {
+                let listed: codex_app_server_protocol::ThreadListResponse = client
+                    .request_typed(ClientRequest::ThreadList {
+                        request_id: RequestId::Integer(120),
+                        params: codex_app_server_protocol::ThreadListParams {
+                            cursor: None,
+                            limit: Some(10),
+                            sort_key: None,
+                            model_providers: None,
+                            source_kinds: None,
+                            archived: None,
+                            cwd: None,
+                            search_term: None,
+                        },
+                    })
+                    .await
+                    .expect("thread/list should return loaded resident thread");
+                if let Some(listed_thread) = listed
+                    .data
+                    .iter()
+                    .find(|thread| thread.id == started.thread.id)
+                {
+                    return listed_thread.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("thread/list should converge before timeout");
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::Idle);
+        assert!(listed_thread.resident);
+        assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+        assert_eq!(listed_thread.git_info, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn unarchive_preserves_resident_thread_mode_through_typed_requests() {
         let server = responses::start_mock_server().await;
         let _response = responses::mount_sse_once(
@@ -2893,6 +3383,198 @@ supports_websockets = false
         assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
         assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
         assert!(listed_thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn archived_metadata_update_can_clear_git_fields_without_losing_resident_summary_through_typed_requests()
+     {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .expect("in-process app-server client should start");
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(22),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _turn = client
+            .request_typed::<codex_app_server_protocol::TurnStartResponse>(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(23),
+                    params: TurnStartParams {
+                        thread_id: started.thread.id.clone(),
+                        input: vec![UserInput::Text {
+                            text: "materialize archived resident thread".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                        ..TurnStartParams::default()
+                    },
+                },
+            )
+            .await
+            .expect("turn/start should succeed");
+
+        loop {
+            let event = timeout(Duration::from_secs(5), client.next_event())
+                .await
+                .expect("turn completion event should arrive before timeout")
+                .expect("event stream should stay open");
+            if let InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification,
+            )) = event
+                && notification.thread_id == started.thread.id
+                && notification.turn.status == TurnStatus::Completed
+            {
+                break;
+            }
+        }
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let thread_name = "Archived resident git clear";
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(24),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: thread_name.to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let _: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(25),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("archived-main".to_string())),
+                        origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should seed archived git info");
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(26),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let cleared: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(27),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: started.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(None),
+                        branch: Some(None),
+                        origin_url: Some(None),
+                    }),
+                },
+            })
+            .await
+            .expect("thread/metadata/update should clear archived git info");
+
+        assert_eq!(cleared.thread.id, started.thread.id);
+        assert_eq!(cleared.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(cleared.thread.status, ThreadStatus::NotLoaded);
+        assert!(cleared.thread.resident);
+        assert_eq!(cleared.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(cleared.thread.git_info, None);
+
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(28),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: started.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the archived resident thread");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, ThreadStatus::NotLoaded);
+        assert!(read.thread.resident);
+        assert_eq!(read.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(read.thread.git_info, None);
+
+        let archived_listed_thread = timeout(Duration::from_secs(5), async {
+            loop {
+                let listed: codex_app_server_protocol::ThreadListResponse = client
+                    .request_typed(ClientRequest::ThreadList {
+                        request_id: RequestId::Integer(29),
+                        params: codex_app_server_protocol::ThreadListParams {
+                            cursor: None,
+                            limit: Some(10),
+                            sort_key: None,
+                            model_providers: None,
+                            source_kinds: None,
+                            archived: Some(true),
+                            cwd: None,
+                            search_term: None,
+                        },
+                    })
+                    .await
+                    .expect("thread/list archived=true should return archived resident thread");
+                if let Some(listed_thread) = listed
+                    .data
+                    .iter()
+                    .find(|thread| thread.id == started.thread.id)
+                {
+                    return listed_thread.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("thread/list archived=true should converge before timeout");
+        assert_eq!(archived_listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(archived_listed_thread.status, ThreadStatus::NotLoaded);
+        assert!(archived_listed_thread.resident);
+        assert_eq!(archived_listed_thread.name.as_deref(), Some(thread_name));
+        assert_eq!(archived_listed_thread.git_info, None);
 
         client.shutdown().await.expect("shutdown should complete");
     }
@@ -4196,7 +4878,7 @@ supports_websockets = false
 
         let receive_task = tokio::spawn(async move {
             let mut events = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..8 {
                 events.push(
                     timeout(Duration::from_secs(2), event_rx.recv())
                         .await
@@ -4256,6 +4938,165 @@ supports_websockets = false
             InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                 notification
             )) if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_in_process_event_preserves_thread_lifecycle_notifications_under_backpressure()
+    {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(InProcessServerEvent::ServerNotification(
+                command_execution_output_delta_notification("stdout-1"),
+            ))
+            .await
+            .expect("initial event should enqueue");
+
+        let mut skipped_events = 0usize;
+        let result = forward_in_process_event(
+            &event_tx,
+            &mut skipped_events,
+            InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
+                "stdout-2",
+            )),
+            |_| {},
+        )
+        .await;
+        assert_eq!(result, ForwardEventResult::Continue);
+        assert_eq!(skipped_events, 1);
+
+        let receive_task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            for _ in 0..5 {
+                events.push(
+                    timeout(Duration::from_secs(2), event_rx.recv())
+                        .await
+                        .expect("event should arrive before timeout")
+                        .expect("event stream should stay open"),
+                );
+            }
+            events
+        });
+
+        for notification in [
+            ServerNotification::ThreadStarted(
+                codex_app_server_protocol::ThreadStartedNotification {
+                    thread: Thread {
+                        id: "thread-resident".to_string(),
+                        forked_from_id: None,
+                        preview: "resident thread".to_string(),
+                        ephemeral: false,
+                        model_provider: "mock_provider".to_string(),
+                        created_at: 1_736_078_400,
+                        updated_at: 1_736_078_400,
+                        status: ThreadStatus::Idle,
+                        mode: ThreadMode::ResidentAssistant,
+                        resident: true,
+                        path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                        cwd: PathBuf::from("/workspace"),
+                        cli_version: "0.0.0-test".to_string(),
+                        source: ApiSessionSource::Cli,
+                        agent_nickname: None,
+                        agent_role: None,
+                        git_info: None,
+                        name: Some("Atlas".to_string()),
+                        turns: Vec::new(),
+                    },
+                },
+            ),
+            ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: "thread-resident".to_string(),
+                    status: ThreadStatus::Active {
+                        active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                    },
+                },
+            ),
+            ServerNotification::ThreadNameUpdated(
+                codex_app_server_protocol::ThreadNameUpdatedNotification {
+                    thread_id: "thread-resident".to_string(),
+                    thread_name: Some("Atlas Renamed".to_string()),
+                },
+            ),
+            ServerNotification::ThreadArchived(
+                codex_app_server_protocol::ThreadArchivedNotification {
+                    thread_id: "thread-resident".to_string(),
+                },
+            ),
+            ServerNotification::ThreadUnarchived(
+                codex_app_server_protocol::ThreadUnarchivedNotification {
+                    thread_id: "thread-resident".to_string(),
+                },
+            ),
+            ServerNotification::ThreadClosed(codex_app_server_protocol::ThreadClosedNotification {
+                thread_id: "thread-resident".to_string(),
+            }),
+        ] {
+            let result = forward_in_process_event(
+                &event_tx,
+                &mut skipped_events,
+                InProcessServerEvent::ServerNotification(notification),
+                |_| {},
+            )
+            .await;
+            assert_eq!(result, ForwardEventResult::Continue);
+        }
+        assert_eq!(skipped_events, 0);
+
+        let events = receive_task
+            .await
+            .expect("receiver task should join successfully");
+        assert!(matches!(
+            &events[0],
+            InProcessServerEvent::ServerNotification(
+                ServerNotification::CommandExecutionOutputDelta(notification)
+            ) if notification.delta == "stdout-1"
+        ));
+        assert!(matches!(
+            &events[1],
+            InProcessServerEvent::Lagged { skipped: 1 }
+        ));
+        assert!(matches!(
+            &events[2],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadStarted(
+                notification
+            )) if notification.thread.id == "thread-resident"
+                && notification.thread.mode == ThreadMode::ResidentAssistant
+                && notification.thread.name.as_deref() == Some("Atlas")
+        ));
+        assert!(matches!(
+            &events[3],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadStatusChanged(
+                notification
+            )) if notification.thread_id == "thread-resident"
+                && notification.status == ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                }
+        ));
+        assert!(matches!(
+            &events[4],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                notification
+            )) if notification.thread_id == "thread-resident"
+                && notification.thread_name.as_deref() == Some("Atlas Renamed")
+        ));
+        assert!(matches!(
+            &events[5],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadArchived(
+                notification
+            )) if notification.thread_id == "thread-resident"
+        ));
+        assert!(matches!(
+            &events[6],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(
+                notification
+            )) if notification.thread_id == "thread-resident"
+        ));
+        assert!(matches!(
+            &events[7],
+            InProcessServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                notification
+            )) if notification.thread_id == "thread-resident"
         ));
     }
 
@@ -4350,51 +5191,12 @@ supports_websockets = false
     async fn remote_typed_thread_resume_preserves_repaired_thread_summary() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected thread/resume request");
-            };
-            assert_eq!(request.method, "thread/resume");
-            write_websocket_message(
+            let request = expect_remote_thread_request(&mut websocket, "thread/resume").await;
+            respond_with_thread_resume(
                 &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::to_value(ThreadResumeResponse {
-                        thread: Thread {
-                            id: "thread-resident".to_string(),
-                            forked_from_id: None,
-                            preview: "sqlite resume repair".to_string(),
-                            ephemeral: false,
-                            model_provider: "mock_provider".to_string(),
-                            created_at: 1_736_078_400,
-                            updated_at: 1_736_078_400,
-                            status: ThreadStatus::Idle,
-                            mode: ThreadMode::ResidentAssistant,
-                            resident: true,
-                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
-                            cwd: PathBuf::from("/workspace"),
-                            cli_version: "0.0.0-test".to_string(),
-                            source: ApiSessionSource::Cli,
-                            agent_nickname: None,
-                            agent_role: None,
-                            git_info: None,
-                            name: Some("Atlas".to_string()),
-                            turns: Vec::new(),
-                        },
-                        model: "mock-model".to_string(),
-                        model_provider: "mock_provider".to_string(),
-                        service_tier: None,
-                        cwd: PathBuf::from("/workspace"),
-                        approval_policy: AskForApproval::Never,
-                        approvals_reviewer: ApprovalsReviewer::User,
-                        sandbox: SandboxPolicy::ReadOnly {
-                            access: Default::default(),
-                            network_access: false,
-                        },
-                        reasoning_effort: None,
-                    })
-                    .expect("thread/resume response should serialize"),
-                }),
+                request.id,
+                "sqlite resume repair",
+                ThreadStatus::Idle,
             )
             .await;
             websocket.close(None).await.expect("close should succeed");
@@ -4427,59 +5229,12 @@ supports_websockets = false
         client.shutdown().await.expect("shutdown should complete");
     }
 
-    #[tokio::test]
-    async fn remote_typed_thread_resume_preserves_waiting_on_approval_status() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+    async fn assert_remote_resume_preserves_status(status: ThreadStatus, preview: &'static str) {
+        let expected_status = status.clone();
+        let websocket_url = start_test_remote_server(move |mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected thread/resume request");
-            };
-            assert_eq!(request.method, "thread/resume");
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::to_value(ThreadResumeResponse {
-                        thread: Thread {
-                            id: "thread-resident".to_string(),
-                            forked_from_id: None,
-                            preview: "approval repair".to_string(),
-                            ephemeral: false,
-                            model_provider: "mock_provider".to_string(),
-                            created_at: 1_736_078_400,
-                            updated_at: 1_736_078_400,
-                            status: ThreadStatus::Active {
-                                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
-                            },
-                            mode: ThreadMode::ResidentAssistant,
-                            resident: true,
-                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
-                            cwd: PathBuf::from("/workspace"),
-                            cli_version: "0.0.0-test".to_string(),
-                            source: ApiSessionSource::Cli,
-                            agent_nickname: None,
-                            agent_role: None,
-                            git_info: None,
-                            name: Some("Atlas".to_string()),
-                            turns: Vec::new(),
-                        },
-                        model: "mock-model".to_string(),
-                        model_provider: "mock_provider".to_string(),
-                        service_tier: None,
-                        cwd: PathBuf::from("/workspace"),
-                        approval_policy: AskForApproval::Never,
-                        approvals_reviewer: ApprovalsReviewer::User,
-                        sandbox: SandboxPolicy::ReadOnly {
-                            access: Default::default(),
-                            network_access: false,
-                        },
-                        reasoning_effort: None,
-                    })
-                    .expect("thread/resume response should serialize"),
-                }),
-            )
-            .await;
+            let request = expect_remote_thread_request(&mut websocket, "thread/resume").await;
+            respond_with_thread_resume(&mut websocket, request.id, preview, status.clone()).await;
             websocket.close(None).await.expect("close should succeed");
         })
         .await;
@@ -4497,12 +5252,7 @@ supports_websockets = false
             })
             .await
             .expect("typed thread/resume should succeed");
-        assert_eq!(
-            response.thread.status,
-            ThreadStatus::Active {
-                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
-            }
-        );
+        assert_eq!(response.thread.status, expected_status);
         assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
         assert!(response.thread.resident);
 
@@ -4510,68 +5260,67 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn remote_typed_thread_resume_preserves_waiting_on_approval_status() {
+        assert_remote_resume_preserves_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            },
+            "approval repair",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn remote_typed_thread_resume_preserves_waiting_on_user_input_status() {
-        let websocket_url = start_test_remote_server(|mut websocket| async move {
+        assert_remote_resume_preserves_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            },
+            "user input repair",
+        )
+        .await;
+    }
+
+    async fn assert_remote_follow_up_read_and_resume_preserve_status(
+        status: ThreadStatus,
+        preview: &'static str,
+    ) {
+        let expected_status = status.clone();
+        let websocket_url = start_test_remote_server(move |mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected thread/resume request");
-            };
-            assert_eq!(request.method, "thread/resume");
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::to_value(ThreadResumeResponse {
-                        thread: Thread {
-                            id: "thread-resident".to_string(),
-                            forked_from_id: None,
-                            preview: "user input repair".to_string(),
-                            ephemeral: false,
-                            model_provider: "mock_provider".to_string(),
-                            created_at: 1_736_078_400,
-                            updated_at: 1_736_078_400,
-                            status: ThreadStatus::Active {
-                                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
-                            },
-                            mode: ThreadMode::ResidentAssistant,
-                            resident: true,
-                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
-                            cwd: PathBuf::from("/workspace"),
-                            cli_version: "0.0.0-test".to_string(),
-                            source: ApiSessionSource::Cli,
-                            agent_nickname: None,
-                            agent_role: None,
-                            git_info: None,
-                            name: Some("Atlas".to_string()),
-                            turns: Vec::new(),
-                        },
-                        model: "mock-model".to_string(),
-                        model_provider: "mock_provider".to_string(),
-                        service_tier: None,
-                        cwd: PathBuf::from("/workspace"),
-                        approval_policy: AskForApproval::Never,
-                        approvals_reviewer: ApprovalsReviewer::User,
-                        sandbox: SandboxPolicy::ReadOnly {
-                            access: Default::default(),
-                            network_access: false,
-                        },
-                        reasoning_effort: None,
-                    })
-                    .expect("thread/resume response should serialize"),
-                }),
-            )
-            .await;
-            websocket.close(None).await.expect("close should succeed");
+
+            let read_request = expect_remote_thread_request(&mut websocket, "thread/read").await;
+            respond_with_thread_read(&mut websocket, read_request.id, preview, status.clone())
+                .await;
+
+            let resume_request =
+                expect_remote_thread_request(&mut websocket, "thread/resume").await;
+            respond_with_thread_resume(&mut websocket, resume_request.id, preview, status.clone())
+                .await;
         })
         .await;
         let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
             .await
             .expect("remote client should connect");
 
-        let response: ThreadResumeResponse = client
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(92),
+                params: ThreadReadParams {
+                    thread_id: "thread-resident".to_string(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("typed thread/read should succeed");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, expected_status);
+        assert_eq!(read.thread.preview, preview);
+        assert!(read.thread.resident);
+
+        let resume: ThreadResumeResponse = client
             .request_typed(ClientRequest::ThreadResume {
-                request_id: RequestId::Integer(84),
+                request_id: RequestId::Integer(93),
                 params: codex_app_server_protocol::ThreadResumeParams {
                     thread_id: "thread-resident".to_string(),
                     ..codex_app_server_protocol::ThreadResumeParams::default()
@@ -4579,16 +5328,34 @@ supports_websockets = false
             })
             .await
             .expect("typed thread/resume should succeed");
-        assert_eq!(
-            response.thread.status,
-            ThreadStatus::Active {
-                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
-            }
-        );
-        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
-        assert!(response.thread.resident);
+        assert_eq!(resume.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(resume.thread.status, read.thread.status);
+        assert_eq!(resume.thread.preview, preview);
+        assert!(resume.thread.resident);
 
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_follow_up_read_and_resume_preserve_waiting_on_approval_status() {
+        assert_remote_follow_up_read_and_resume_preserve_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+            },
+            "approval reconnect summary",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_follow_up_read_and_resume_preserve_waiting_on_user_input_status() {
+        assert_remote_follow_up_read_and_resume_preserve_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            },
+            "user input reconnect summary",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4901,33 +5668,114 @@ supports_websockets = false
     }
 
     #[tokio::test]
-    async fn remote_typed_thread_loaded_read_preserves_repaired_thread_summary() {
+    async fn remote_typed_thread_metadata_update_preserves_repaired_thread_summary() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
-                panic!("expected thread/loaded/read request");
+                panic!("expected thread/metadata/update request");
             };
-            assert_eq!(request.method, "thread/loaded/read");
+            assert_eq!(request.method, "thread/metadata/update");
             write_websocket_message(
                 &mut websocket,
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
-                    result: serde_json::to_value(ThreadLoadedReadResponse {
-                        data: vec![Thread {
-                            id: "thread-external".to_string(),
+                    result: serde_json::to_value(ThreadMetadataUpdateResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
                             forked_from_id: None,
-                            preview: "external loaded preview".to_string(),
+                            preview: "metadata repair".to_string(),
                             ephemeral: false,
                             model_provider: "mock_provider".to_string(),
                             created_at: 1_736_078_400,
-                            updated_at: 1_736_078_400,
+                            updated_at: 1_736_078_401,
                             status: ThreadStatus::Idle,
                             mode: ThreadMode::ResidentAssistant,
                             resident: true,
-                            path: Some(PathBuf::from(
-                                "/tmp/external-rollouts/2025/thread-external.jsonl",
-                            )),
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: Some(GitInfo {
+                                branch: Some("main".to_string()),
+                                sha: Some("abc123".to_string()),
+                                origin_url: Some("https://example.com/codex.git".to_string()),
+                            }),
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(86),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: "thread-resident".to_string(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("main".to_string())),
+                        origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                    }),
+                },
+            })
+            .await
+            .expect("typed thread/metadata/update should succeed");
+        assert_eq!(response.thread.preview, "metadata repair");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
+        assert!(response.thread.resident);
+        assert_eq!(response.thread.name.as_deref(), Some("Atlas"));
+        assert_eq!(
+            response.thread.git_info,
+            Some(GitInfo {
+                branch: Some("main".to_string()),
+                sha: Some("abc123".to_string()),
+                origin_url: Some("https://example.com/codex.git".to_string()),
+            })
+        );
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_metadata_update_can_clear_git_fields_without_losing_repaired_summary()
+     {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/metadata/update request");
+            };
+            assert_eq!(request.method, "thread/metadata/update");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadMetadataUpdateResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "metadata repair".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_401,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
                             cwd: PathBuf::from("/workspace"),
                             cli_version: "0.0.0-test".to_string(),
                             source: ApiSessionSource::Cli,
@@ -4936,11 +5784,184 @@ supports_websockets = false
                             git_info: None,
                             name: Some("Atlas".to_string()),
                             turns: Vec::new(),
-                        }],
-                        next_cursor: None,
+                        },
                     })
                     .expect("response should serialize"),
                 }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadMetadataUpdateResponse = client
+            .request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(87),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: "thread-resident".to_string(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(None),
+                        branch: Some(None),
+                        origin_url: Some(None),
+                    }),
+                },
+            })
+            .await
+            .expect("typed thread/metadata/update should succeed");
+        assert_eq!(response.thread.preview, "metadata repair");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
+        assert!(response.thread.resident);
+        assert_eq!(response.thread.name.as_deref(), Some("Atlas"));
+        assert_eq!(response.thread.git_info, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_unarchive_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/unarchive request");
+            };
+            assert_eq!(request.method, "thread/unarchive");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadUnarchiveResponse {
+                        thread: Thread {
+                            id: "thread-archived".to_string(),
+                            forked_from_id: None,
+                            preview: "unarchived resident repair".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_402,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-archived.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas archive".to_string()),
+                            turns: Vec::new(),
+                        },
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadUnarchiveResponse = client
+            .request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(87),
+                params: ThreadUnarchiveParams {
+                    thread_id: "thread-archived".to_string(),
+                },
+            })
+            .await
+            .expect("typed thread/unarchive should succeed");
+        assert_eq!(response.thread.preview, "unarchived resident repair");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
+        assert!(response.thread.resident);
+        assert_eq!(response.thread.name.as_deref(), Some("Atlas archive"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_rollback_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected thread/rollback request");
+            };
+            assert_eq!(request.method, "thread/rollback");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(ThreadRollbackResponse {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "rollback repaired preview".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_403,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas rollback".to_string()),
+                            turns: Vec::new(),
+                        },
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: ThreadRollbackResponse = client
+            .request_typed(ClientRequest::ThreadRollback {
+                request_id: RequestId::Integer(88),
+                params: ThreadRollbackParams {
+                    thread_id: "thread-resident".to_string(),
+                    num_turns: 1,
+                },
+            })
+            .await
+            .expect("typed thread/rollback should succeed");
+        assert_eq!(response.thread.preview, "rollback repaired preview");
+        assert_eq!(response.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(response.thread.status, ThreadStatus::Idle);
+        assert!(response.thread.resident);
+        assert_eq!(response.thread.name.as_deref(), Some("Atlas rollback"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_thread_loaded_read_preserves_repaired_thread_summary() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let request = expect_remote_thread_request(&mut websocket, "thread/loaded/read").await;
+            respond_with_thread_loaded_read(
+                &mut websocket,
+                request.id,
+                "external loaded preview",
+                ThreadStatus::Idle,
             )
             .await;
             websocket.close(None).await.expect("close should succeed");
@@ -4965,6 +5986,7 @@ supports_websockets = false
                 "/tmp/external-rollouts/2025/thread-external.jsonl"
             ))
         );
+        assert_eq!(response.data[0].name.as_deref(), Some("Atlas"));
         assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
         assert_eq!(response.data[0].status, ThreadStatus::Idle);
         assert!(response.data[0].resident);
@@ -4976,45 +5998,14 @@ supports_websockets = false
     async fn remote_typed_thread_loaded_read_preserves_background_terminal_status() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected thread/loaded/read request");
-            };
-            assert_eq!(request.method, "thread/loaded/read");
-            write_websocket_message(
+            let request = expect_remote_thread_request(&mut websocket, "thread/loaded/read").await;
+            respond_with_thread_loaded_read(
                 &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::to_value(ThreadLoadedReadResponse {
-                        data: vec![Thread {
-                            id: "thread-external".to_string(),
-                            forked_from_id: None,
-                            preview: "background terminal still running".to_string(),
-                            ephemeral: false,
-                            model_provider: "mock_provider".to_string(),
-                            created_at: 1_736_078_400,
-                            updated_at: 1_736_078_400,
-                            status: ThreadStatus::Active {
-                                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
-                            },
-                            mode: ThreadMode::ResidentAssistant,
-                            resident: true,
-                            path: Some(PathBuf::from(
-                                "/tmp/external-rollouts/2025/thread-external.jsonl",
-                            )),
-                            cwd: PathBuf::from("/workspace"),
-                            cli_version: "0.0.0-test".to_string(),
-                            source: ApiSessionSource::Cli,
-                            agent_nickname: None,
-                            agent_role: None,
-                            git_info: None,
-                            name: Some("Atlas".to_string()),
-                            turns: Vec::new(),
-                        }],
-                        next_cursor: None,
-                    })
-                    .expect("response should serialize"),
-                }),
+                request.id,
+                "background terminal still running",
+                ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+                },
             )
             .await;
             websocket.close(None).await.expect("close should succeed");
@@ -5047,45 +6038,14 @@ supports_websockets = false
     async fn remote_typed_thread_loaded_read_preserves_workspace_changed_status() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected thread/loaded/read request");
-            };
-            assert_eq!(request.method, "thread/loaded/read");
-            write_websocket_message(
+            let request = expect_remote_thread_request(&mut websocket, "thread/loaded/read").await;
+            respond_with_thread_loaded_read(
                 &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::to_value(ThreadLoadedReadResponse {
-                        data: vec![Thread {
-                            id: "thread-external".to_string(),
-                            forked_from_id: None,
-                            preview: "workspace changed while disconnected".to_string(),
-                            ephemeral: false,
-                            model_provider: "mock_provider".to_string(),
-                            created_at: 1_736_078_400,
-                            updated_at: 1_736_078_400,
-                            status: ThreadStatus::Active {
-                                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
-                            },
-                            mode: ThreadMode::ResidentAssistant,
-                            resident: true,
-                            path: Some(PathBuf::from(
-                                "/tmp/external-rollouts/2025/thread-external.jsonl",
-                            )),
-                            cwd: PathBuf::from("/workspace"),
-                            cli_version: "0.0.0-test".to_string(),
-                            source: ApiSessionSource::Cli,
-                            agent_nickname: None,
-                            agent_role: None,
-                            git_info: None,
-                            name: Some("Atlas".to_string()),
-                            turns: Vec::new(),
-                        }],
-                        next_cursor: None,
-                    })
-                    .expect("response should serialize"),
-                }),
+                request.id,
+                "workspace changed while disconnected",
+                ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                },
             )
             .await;
             websocket.close(None).await.expect("close should succeed");
@@ -5112,6 +6072,134 @@ supports_websockets = false
         assert!(response.data[0].resident);
 
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_follow_up_reads_preserve_resident_reconnect_summary() {
+        assert_remote_follow_up_loaded_read_read_and_resume_preserve_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+            "resident reconnect summary",
+        )
+        .await;
+    }
+
+    async fn assert_remote_follow_up_loaded_read_read_and_resume_preserve_status(
+        status: ThreadStatus,
+        preview: &'static str,
+    ) {
+        let expected_status = status.clone();
+        let websocket_url = start_test_remote_server(move |mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+
+            let loaded_read_request =
+                expect_remote_thread_request(&mut websocket, "thread/loaded/read").await;
+            respond_with_thread_loaded_read(
+                &mut websocket,
+                loaded_read_request.id,
+                preview,
+                status.clone(),
+            )
+            .await;
+
+            let read_request = expect_remote_thread_request(&mut websocket, "thread/read").await;
+            respond_with_thread_read(&mut websocket, read_request.id, preview, status.clone())
+                .await;
+
+            let resume_request =
+                expect_remote_thread_request(&mut websocket, "thread/resume").await;
+            respond_with_thread_resume(&mut websocket, resume_request.id, preview, status.clone())
+                .await;
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let loaded_read: ThreadLoadedReadResponse = client
+            .request_typed(ClientRequest::ThreadLoadedRead {
+                request_id: RequestId::Integer(94),
+                params: ThreadLoadedReadParams::default(),
+            })
+            .await
+            .expect("typed thread/loaded/read should succeed");
+        assert_eq!(loaded_read.data.len(), 1);
+        assert_eq!(loaded_read.data[0].mode, ThreadMode::ResidentAssistant);
+        assert_eq!(loaded_read.data[0].status, expected_status);
+        assert_eq!(loaded_read.data[0].preview, preview);
+        assert_eq!(
+            loaded_read.data[0].path.as_ref(),
+            Some(&PathBuf::from(
+                "/tmp/external-rollouts/2025/thread-external.jsonl"
+            ))
+        );
+        assert_eq!(loaded_read.data[0].name.as_deref(), Some("Atlas"));
+        assert!(loaded_read.data[0].resident);
+
+        let read: ThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(95),
+                params: ThreadReadParams {
+                    thread_id: "thread-resident".to_string(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("typed thread/read should succeed");
+        assert_eq!(read.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.thread.status, loaded_read.data[0].status);
+        assert_eq!(read.thread.preview, preview);
+        assert_eq!(
+            read.thread.path.as_ref(),
+            Some(&PathBuf::from("/tmp/thread-resident.jsonl"))
+        );
+        assert_eq!(read.thread.name.as_deref(), Some("Atlas"));
+        assert!(read.thread.resident);
+
+        let resume: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(96),
+                params: codex_app_server_protocol::ThreadResumeParams {
+                    thread_id: "thread-resident".to_string(),
+                    ..codex_app_server_protocol::ThreadResumeParams::default()
+                },
+            })
+            .await
+            .expect("typed thread/resume should succeed");
+        assert_eq!(resume.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(resume.thread.status, read.thread.status);
+        assert_eq!(resume.thread.preview, preview);
+        assert_eq!(
+            resume.thread.path.as_ref(),
+            Some(&PathBuf::from("/tmp/thread-resident.jsonl"))
+        );
+        assert_eq!(resume.thread.name.as_deref(), Some("Atlas"));
+        assert!(resume.thread.resident);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_follow_up_loaded_read_read_and_resume_preserve_background_terminal_status() {
+        assert_remote_follow_up_loaded_read_read_and_resume_preserve_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::BackgroundTerminalRunning],
+            },
+            "background terminal still running",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_follow_up_loaded_read_read_and_resume_preserve_workspace_changed_status() {
+        assert_remote_follow_up_loaded_read_read_and_resume_preserve_status(
+            ThreadStatus::Active {
+                active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+            },
+            "workspace changed while disconnected",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -5188,6 +6276,7 @@ supports_websockets = false
                 "/tmp/external-rollouts/2025/thread-external.jsonl"
             ))
         );
+        assert_eq!(response.data[0].name.as_deref(), Some("Atlas"));
         assert_eq!(response.data[0].mode, ThreadMode::ResidentAssistant);
         assert_eq!(response.data[0].status, ThreadStatus::Idle);
         assert!(response.data[0].resident);
@@ -5449,6 +6538,299 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn in_process_thread_name_updated_notification_arrives_over_next_event() {
+        let mut client = start_test_client(SessionSource::Cli).await;
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(401),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _: ThreadSetNameResponse = client
+            .request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(402),
+                params: ThreadSetNameParams {
+                    thread_id: started.thread.id.clone(),
+                    name: "Atlas".to_string(),
+                },
+            })
+            .await
+            .expect("thread/name/set should succeed");
+
+        let notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let InProcessServerEvent::ServerNotification(
+                    ServerNotification::ThreadNameUpdated(notification),
+                ) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/name/updated should arrive before timeout");
+        assert_eq!(notification.thread_name.as_deref(), Some("Atlas"));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn in_process_thread_archived_notification_arrives_over_next_event() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client =
+            start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(403),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        materialize_thread_and_wait_for_turn_completed(
+            &mut client,
+            &started.thread.id,
+            404,
+            "materialize archived resident thread",
+        )
+        .await;
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(405),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let InProcessServerEvent::ServerNotification(ServerNotification::ThreadArchived(
+                    notification,
+                )) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/archived should arrive before timeout");
+        assert_eq!(notification.thread_id, started.thread.id);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn in_process_thread_unarchived_notification_arrives_over_next_event() {
+        let server = responses::start_mock_server().await;
+        let _response = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "Done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let config = Arc::new(build_mock_responses_test_config(&server.uri()).await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client =
+            start_test_client_with_config(SessionSource::Cli, Arc::clone(&config)).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(406),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        materialize_thread_and_wait_for_turn_completed(
+            &mut client,
+            &started.thread.id,
+            407,
+            "materialize unarchived resident thread",
+        )
+        .await;
+        persist_thread_mode_in_state_db(&config, &started, "residentAssistant").await;
+
+        let _: codex_app_server_protocol::ThreadArchiveResponse = client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(408),
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let _: codex_app_server_protocol::ThreadUnarchiveResponse = client
+            .request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(409),
+                params: codex_app_server_protocol::ThreadUnarchiveParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unarchive should succeed");
+
+        let notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let InProcessServerEvent::ServerNotification(
+                    ServerNotification::ThreadUnarchived(notification),
+                ) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/unarchived should arrive before timeout");
+        assert_eq!(notification.thread_id, started.thread.id);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn in_process_thread_closed_notification_arrives_over_next_event() {
+        let config = Arc::new(build_mock_responses_test_config("http://127.0.0.1:9").await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client = start_test_client_with_config(SessionSource::Cli, config).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(410),
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+
+        let _: codex_app_server_protocol::ThreadCloseResponse = client
+            .request_typed(ClientRequest::ThreadClose {
+                request_id: RequestId::Integer(411),
+                params: codex_app_server_protocol::ThreadCloseParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/close should succeed");
+
+        let notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let InProcessServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                    notification,
+                )) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/closed should arrive before timeout");
+        assert_eq!(notification.thread_id, started.thread.id);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn in_process_thread_close_emits_not_loaded_and_closed_unload_events() {
+        let config = Arc::new(build_mock_responses_test_config("http://127.0.0.1:9").await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client = start_test_client_with_config(SessionSource::Cli, config).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(412),
+                params: ThreadStartParams {
+                    mode: Some(ThreadMode::Interactive),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("interactive thread/start should succeed");
+
+        let _: codex_app_server_protocol::ThreadCloseResponse = client
+            .request_typed(ClientRequest::ThreadClose {
+                request_id: RequestId::Integer(413),
+                params: codex_app_server_protocol::ThreadCloseParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/close should succeed");
+
+        assert_in_process_thread_unload_events_arrive(&mut client, &started.thread.id).await;
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn in_process_thread_unsubscribe_emits_not_loaded_and_closed_unload_events() {
+        let config = Arc::new(build_mock_responses_test_config("http://127.0.0.1:9").await);
+        mark_state_backfill_complete(config.as_ref()).await;
+        let mut client = start_test_client_with_config(SessionSource::Cli, config).await;
+
+        let started: ThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(414),
+                params: ThreadStartParams {
+                    mode: Some(ThreadMode::Interactive),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("interactive thread/start should succeed");
+
+        let unsubscribed: codex_app_server_protocol::ThreadUnsubscribeResponse = client
+            .request_typed(ClientRequest::ThreadUnsubscribe {
+                request_id: RequestId::Integer(415),
+                params: codex_app_server_protocol::ThreadUnsubscribeParams {
+                    thread_id: started.thread.id.clone(),
+                },
+            })
+            .await
+            .expect("thread/unsubscribe should succeed");
+        assert_eq!(unsubscribed.status, ThreadUnsubscribeStatus::Unsubscribed);
+
+        assert_in_process_thread_unload_events_arrive(&mut client, &started.thread.id).await;
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
@@ -5519,6 +6901,115 @@ supports_websockets = false
     }
 
     #[tokio::test]
+    async fn remote_thread_archived_notification_arrives_over_websocket() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(ServerNotification::ThreadArchived(
+                            codex_app_server_protocol::ThreadArchivedNotification {
+                                thread_id: "thread-archived".to_string(),
+                            },
+                        ))
+                        .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(notification))
+                if notification.thread_id == "thread-archived"
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_thread_unarchived_notification_arrives_over_websocket() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(ServerNotification::ThreadUnarchived(
+                            codex_app_server_protocol::ThreadUnarchivedNotification {
+                                thread_id: "thread-restored".to_string(),
+                            },
+                        ))
+                        .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(
+                notification
+            )) if notification.thread_id == "thread-restored"
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_thread_name_updated_notification_arrives_over_websocket() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Notification(
+                    serde_json::from_value(
+                        serde_json::to_value(ServerNotification::ThreadNameUpdated(
+                            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                                thread_id: "thread-renamed".to_string(),
+                                thread_name: Some("Atlas".to_string()),
+                            },
+                        ))
+                        .expect("notification should serialize"),
+                    )
+                    .expect("notification should convert to JSON-RPC"),
+                ),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                notification
+            )) if notification.thread_id == "thread-renamed"
+                && notification.thread_name.as_deref() == Some("Atlas")
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn remote_thread_not_loaded_status_notification_arrives_over_websocket() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
@@ -5551,6 +7042,293 @@ supports_websockets = false
                 notification
             )) if notification.thread_id == "thread-unloaded"
                 && notification.status == ThreadStatus::NotLoaded
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    async fn assert_remote_thread_unload_events_arrive_without_fixed_order(
+        notifications: [ServerNotification; 2],
+    ) {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            for notification in notifications {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let first_event = client
+            .next_event()
+            .await
+            .expect("first event should arrive");
+        let second_event = client
+            .next_event()
+            .await
+            .expect("second event should arrive");
+
+        let events = [first_event, second_event];
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AppServerEvent::ServerNotification(ServerNotification::ThreadStatusChanged(
+                    notification
+                )) if notification.thread_id == "thread-unloaded"
+                    && notification.status == ThreadStatus::NotLoaded
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                    notification
+                )) if notification.thread_id == "thread-unloaded"
+            )
+        }));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_thread_unload_events_allow_not_loaded_before_closed() {
+        assert_remote_thread_unload_events_arrive_without_fixed_order([
+            ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: "thread-unloaded".to_string(),
+                    status: ThreadStatus::NotLoaded,
+                },
+            ),
+            ServerNotification::ThreadClosed(codex_app_server_protocol::ThreadClosedNotification {
+                thread_id: "thread-unloaded".to_string(),
+            }),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_thread_unload_events_allow_closed_before_not_loaded() {
+        assert_remote_thread_unload_events_arrive_without_fixed_order([
+            ServerNotification::ThreadClosed(codex_app_server_protocol::ThreadClosedNotification {
+                thread_id: "thread-unloaded".to_string(),
+            }),
+            ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: "thread-unloaded".to_string(),
+                    status: ThreadStatus::NotLoaded,
+                },
+            ),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_resident_thread_events_split_mode_and_status_across_started_and_changed() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            for notification in [
+                ServerNotification::ThreadStarted(
+                    codex_app_server_protocol::ThreadStartedNotification {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "resident thread".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                    },
+                ),
+                ServerNotification::ThreadStatusChanged(
+                    codex_app_server_protocol::ThreadStatusChangedNotification {
+                        thread_id: "thread-resident".to_string(),
+                        status: ThreadStatus::Active {
+                            active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                        },
+                    },
+                ),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let started_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            started_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadStarted(notification))
+                if notification.thread.id == "thread-resident"
+                    && notification.thread.preview == "resident thread"
+                    && notification.thread.path.as_ref()
+                        == Some(&PathBuf::from("/tmp/thread-resident.jsonl"))
+                    && notification.thread.mode == ThreadMode::ResidentAssistant
+                    && notification.thread.status == ThreadStatus::Idle
+        ));
+
+        let status_changed_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            status_changed_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadStatusChanged(
+                notification
+            )) if notification.thread_id == "thread-resident"
+                && notification.status == ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WorkspaceChanged],
+                }
+        ));
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_resident_thread_event_stream_preserves_started_snapshot_and_lifecycle_edges() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            for notification in [
+                ServerNotification::ThreadStarted(
+                    codex_app_server_protocol::ThreadStartedNotification {
+                        thread: Thread {
+                            id: "thread-resident".to_string(),
+                            forked_from_id: None,
+                            preview: "resident thread".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread-resident.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                    },
+                ),
+                ServerNotification::ThreadNameUpdated(
+                    codex_app_server_protocol::ThreadNameUpdatedNotification {
+                        thread_id: "thread-resident".to_string(),
+                        thread_name: Some("Atlas Renamed".to_string()),
+                    },
+                ),
+                ServerNotification::ThreadArchived(
+                    codex_app_server_protocol::ThreadArchivedNotification {
+                        thread_id: "thread-resident".to_string(),
+                    },
+                ),
+                ServerNotification::ThreadUnarchived(
+                    codex_app_server_protocol::ThreadUnarchivedNotification {
+                        thread_id: "thread-resident".to_string(),
+                    },
+                ),
+                ServerNotification::ThreadClosed(
+                    codex_app_server_protocol::ThreadClosedNotification {
+                        thread_id: "thread-resident".to_string(),
+                    },
+                ),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let started_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            started_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadStarted(notification))
+                if notification.thread.id == "thread-resident"
+                    && notification.thread.preview == "resident thread"
+                    && notification.thread.path.as_ref()
+                        == Some(&PathBuf::from("/tmp/thread-resident.jsonl"))
+                    && notification.thread.mode == ThreadMode::ResidentAssistant
+                    && notification.thread.name.as_deref() == Some("Atlas")
+                    && notification.thread.status == ThreadStatus::Idle
+        ));
+
+        let renamed_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            renamed_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                notification
+            )) if notification.thread_id == "thread-resident"
+                && notification.thread_name.as_deref() == Some("Atlas Renamed")
+        ));
+
+        let archived_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            archived_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(notification))
+                if notification.thread_id == "thread-resident"
+        ));
+
+        let unarchived_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            unarchived_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(
+                notification
+            )) if notification.thread_id == "thread-resident"
+        ));
+
+        let closed_event = client.next_event().await.expect("event should arrive");
+        assert!(matches!(
+            closed_event,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(notification))
+                if notification.thread_id == "thread-resident"
         ));
 
         client.shutdown().await.expect("shutdown should complete");
@@ -6417,6 +8195,82 @@ supports_websockets = false
                             phase: None,
                             memory_citation: None,
                         },
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadStarted(
+                    codex_app_server_protocol::ThreadStartedNotification {
+                        thread: Thread {
+                            id: "thread".to_string(),
+                            forked_from_id: None,
+                            preview: "resident thread".to_string(),
+                            ephemeral: false,
+                            model_provider: "mock_provider".to_string(),
+                            created_at: 1_736_078_400,
+                            updated_at: 1_736_078_400,
+                            status: ThreadStatus::Idle,
+                            mode: ThreadMode::ResidentAssistant,
+                            resident: true,
+                            path: Some(PathBuf::from("/tmp/thread.jsonl")),
+                            cwd: PathBuf::from("/workspace"),
+                            cli_version: "0.0.0-test".to_string(),
+                            source: ApiSessionSource::Cli,
+                            agent_nickname: None,
+                            agent_role: None,
+                            git_info: None,
+                            name: Some("Atlas".to_string()),
+                            turns: Vec::new(),
+                        },
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadClosed(
+                    codex_app_server_protocol::ThreadClosedNotification {
+                        thread_id: "thread".to_string(),
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadStatusChanged(
+                    codex_app_server_protocol::ThreadStatusChangedNotification {
+                        thread_id: "thread".to_string(),
+                        status: ThreadStatus::Idle,
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadNameUpdated(
+                    codex_app_server_protocol::ThreadNameUpdatedNotification {
+                        thread_id: "thread".to_string(),
+                        thread_name: Some("Atlas".to_string()),
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadArchived(
+                    codex_app_server_protocol::ThreadArchivedNotification {
+                        thread_id: "thread".to_string(),
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ThreadUnarchived(
+                    codex_app_server_protocol::ThreadUnarchivedNotification {
+                        thread_id: "thread".to_string(),
                     }
                 )
             )

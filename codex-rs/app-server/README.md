@@ -141,11 +141,11 @@ Example with notification opt-out:
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded, and `mode` (`ThreadMode`) so clients can preserve reconnect semantics even on read-only lookup paths.
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`. The response preserves stored thread identity metadata such as `mode` and `name`, so reconnect-aware clients do not need to re-read the thread just to recover resident assistant semantics or user-visible naming after a metadata-only update.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`). This notification is status-only and does not repeat `thread.mode`; clients that need reconnect semantics should retain `mode` from the corresponding thread snapshot. `ThreadStatus.active.activeFlags` can include `waitingOnApproval`, `waitingOnUserInput`, `backgroundTerminalRunning`, and `workspaceChanged`.
-- `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`.
-- `thread/close` — explicitly shut down and unload a loaded thread, even if it is resident or still has subscribers. The response status reports `closing` when teardown has been accepted and `notLoaded` when no loaded runtime exists. Completion still arrives through `thread/status/changed` (`notLoaded`) plus `thread/closed`. Closing the loaded runtime does not rewrite the thread's stored product role, so later `thread/read`, `thread/list`, and `thread/resume` calls still preserve the thread’s existing `mode` (`interactive` stays `interactive`, `residentAssistant` stays `residentAssistant`).
-- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread unless it is operating in resident-assistant mode (`thread.mode = residentAssistant`, or the legacy-compatible `resident: true` request path); non-resident unloads emit `thread/closed`, while resident assistants stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls.
-- `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
-- `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success, preserving its existing `mode`, and emits `thread/unarchived`.
+- `thread/archive` — move a thread’s rollout file into the archived directory; returns `{}` on success and emits `thread/archived`. The notification is identity-only (`threadId` only), so consumers that want reconnect semantics should retain the last authoritative thread summary they already observed and treat archive as a lifecycle transition on that summary rather than as a fresh role change.
+- `thread/close` — explicitly shut down and unload a loaded thread, even if it is resident or still has subscribers. The response status reports `closing` when teardown has been accepted and `notLoaded` when no loaded runtime exists. Completion still arrives through `thread/status/changed` (`notLoaded`) plus `thread/closed`. `thread/status/changed` stays status-only and `thread/closed` stays identity-only (`threadId` only), so reconnect-aware clients should continue to apply those lifecycle edges to the last retained authoritative `Thread` summary instead of expecting either notification to restate `mode`, `name`, or other repaired summary fields. Closing the loaded runtime does not rewrite the thread's stored product role, so later `thread/read`, `thread/list`, and `thread/resume` calls still preserve the thread’s existing `mode` (`interactive` stays `interactive`, `residentAssistant` stays `residentAssistant`).
+- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server shuts down and unloads the thread unless it is operating in resident-assistant mode (`thread.mode = residentAssistant`, or the legacy-compatible `resident: true` request path); non-resident unloads emit `thread/closed`, while resident assistants stay loaded and continue to surface their existing `mode` and runtime state on later `thread/loaded/read`, `thread/read`, and `thread/resume` calls. As with `thread/close`, the unload notifications remain incremental-only: `thread/status/changed` only carries the new `status`, and `thread/closed` only carries `threadId`.
+- `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread. Like `thread/status/changed`, the notification is incremental rather than a full thread snapshot, so reconnect-aware clients should combine it with the last retained thread summary instead of expecting it to restate `thread.mode`.
+- `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success, preserving its existing `mode`, and emits `thread/unarchived`. The notification is identity-only (`threadId` only); clients that need the restored `mode + status + preview + name` summary should treat the RPC response itself as authoritative or refresh with `thread/read` / `thread/list` rather than expecting the notification to repeat the full thread snapshot.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
 - `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
@@ -370,7 +370,7 @@ Unless an example explicitly calls out compatibility behavior, requests in this
 README should be read as showing the preferred main path: use `mode` for
 product semantics and treat `resident` as a legacy compatibility flag.
 
-If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Threads operating in resident-assistant mode stay loaded instead, so `thread/unsubscribe` only detaches the connection; new clients should request that behavior with `mode: "residentAssistant"` and treat `resident` as a legacy compatibility flag.
+If this was the last subscriber, the server unloads the thread and emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`. Those follow-up notifications stay incremental-only: `thread/status/changed` carries `threadId + status`, while `thread/closed` carries only `threadId`. Threads operating in resident-assistant mode stay loaded instead, so `thread/unsubscribe` only detaches the connection; new clients should request that behavior with `mode: "residentAssistant"` and treat `resident` as a legacy compatibility flag.
 
 The same lifecycle rule applies when the last transport connection goes away
 without an explicit `thread/unsubscribe`. In other words, a websocket client
@@ -406,10 +406,12 @@ status is one of:
 
 As with `thread/unsubscribe`, completion is observed through
 `thread/status/changed` plus `thread/closed`; the response only confirms that
-shutdown has been queued. For resident threads, closing the runtime does not
-erase the thread's stored resident identity, so later `thread/read`,
-`thread/list`, and `thread/resume` continue to preserve `thread.mode =
-residentAssistant`.
+shutdown has been queued. Those follow-up notifications remain incremental-only
+rather than repaired summary surfaces: `thread/status/changed` carries only the
+new `status`, and `thread/closed` carries only `threadId`. For resident
+threads, closing the runtime does not erase the thread's stored resident
+identity, so later `thread/read`, `thread/list`, and `thread/resume` continue
+to preserve `thread.mode = residentAssistant`.
 
 ```json
 { "method": "thread/unsubscribe", "id": 22, "params": { "threadId": "thr_123" } }
@@ -504,6 +506,10 @@ Use `thread/archive` to move the persisted rollout (stored as a JSONL file on di
 An archived thread will not appear in `thread/list` unless `archived` is set
 to `true`. When it is returned through `thread/list archived=true` or
 `thread/read`, the archived thread still preserves its existing `mode`.
+Because `thread/archived` itself only carries `threadId`, consumers that care
+about reconnect semantics should treat archive as a lifecycle transition on the
+last retained thread summary instead of waiting for the notification to repeat
+`thread.mode` or preview/name fields.
 
 ### Example: Unarchive a thread
 
@@ -520,6 +526,12 @@ in sync.
 { "id": 24, "result": { "thread": { "id": "thr_b", "mode": "residentAssistant" } } }
 { "method": "thread/unarchived", "params": { "threadId": "thr_b" } }
 ```
+
+As with `thread/archived`, the `thread/unarchived` notification is identity-
+only. Reconnect-aware consumers should treat the direct `thread/unarchive`
+response as the authoritative restored summary, or explicitly refresh through
+`thread/read` / `thread/list`, rather than expecting the notification itself to
+repeat `thread.mode`, `status`, or repaired summary fields.
 
 ### Example: Trigger thread compaction
 
@@ -940,7 +952,7 @@ All filesystem paths in this section must be absolute.
 
 ## Events
 
-Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume/reconnect a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications. When a lifecycle notification includes a `thread` snapshot, clients should treat that snapshot's `thread.mode` the same way they would in a direct RPC response: it is the authoritative signal for reconnectable resident assistant semantics.
+Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume/reconnect a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications. When a lifecycle notification includes a `thread` snapshot, clients should treat that snapshot's `thread.mode` the same way they would in a direct RPC response: it is the authoritative signal for reconnectable resident assistant semantics. When the notification is incremental or identity-only (`thread/status/changed`, `thread/name/updated`, `thread/archived`, `thread/unarchived`, `thread/closed`), clients should retain the last authoritative `Thread` summary they observed from `thread/started`, `thread/read`, `thread/list`, `thread/resume`, `thread/unarchive`, or `thread/loaded/read` and apply the lifecycle change to that retained summary rather than expecting each notification to restate `thread.mode` or repaired summary fields.
 
 Thread realtime uses a separate thread-scoped notification surface. `thread/realtime/*` notifications are ephemeral transport events, not `ThreadItem`s, and are not returned by `thread/read`, `thread/resume`, or `thread/fork`.
 

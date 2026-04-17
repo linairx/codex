@@ -648,10 +648,27 @@ async fn thread_name_set_is_reflected_in_read_list_and_resume() -> Result<()> {
         mcp.read_stream_until_notification_message("thread/name/updated"),
     )
     .await??;
+    let notification_params = notification.params.expect("thread/name/updated params");
     let notification: ThreadNameUpdatedNotification =
-        serde_json::from_value(notification.params.expect("thread/name/updated params"))?;
+        serde_json::from_value(notification_params.clone())?;
+    let notification_json = notification_params
+        .as_object()
+        .expect("thread/name/updated params should be an object");
     assert_eq!(notification.thread_id, conversation_id);
     assert_eq!(notification.thread_name.as_deref(), Some(new_name));
+    assert_eq!(
+        notification_json.len(),
+        2,
+        "thread/name/updated should stay incremental-only and not restate mode/status summary fields"
+    );
+    assert_eq!(
+        notification_json.get("threadId").and_then(Value::as_str),
+        Some(conversation_id.as_str())
+    );
+    assert_eq!(
+        notification_json.get("threadName").and_then(Value::as_str),
+        Some(new_name)
+    );
 
     // Read should now surface `thread.name`, and the wire payload must include `name`.
     let read_id = mcp

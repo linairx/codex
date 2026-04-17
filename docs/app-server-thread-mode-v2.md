@@ -206,6 +206,21 @@ runtime status，应该继续读取 `thread/loaded/read`，而不是期待 id-on
 - 客户端需要从前面的 `thread/started`、`thread/read`、`thread/list`、
   `thread/loaded/read` 等恢复面保留线程角色
 
+同一阶段也应把其他线程生命周期通知保持在同样清晰的边界上：
+
+- `thread/closed` 继续保持 identity-only（`threadId`）
+- `thread/archived` 继续保持 identity-only（`threadId`）
+- `thread/unarchived` 继续保持 identity-only（`threadId`），恢复后的权威摘要
+  继续来自 `thread/unarchive` 返回面或后续显式读取面
+- `thread/name/updated` 继续保持 name 增量（`threadId + threadName`），而不是
+  被抬成新的线程恢复摘要面
+
+也就是说，第一阶段的稳定读取心智应是：
+
+- `Thread` 返回面负责权威摘要
+- 生命周期通知负责边事件或局部增量
+- 客户端把这些边事件应用到最近一次权威 `Thread` 摘要上
+
 ## 11. 返回面影响
 
 第一阶段新增 `Thread.mode` 后，应该统一出现在所有返回 `Thread` 的接口与通知中，包括：

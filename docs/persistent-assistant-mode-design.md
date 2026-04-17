@@ -184,6 +184,16 @@
 - 这条“直接信返回的 `Thread`”心智也应继续覆盖远端 typed facade：如果 websocket 远端直接返回 repaired `thread/resume`、`thread/read`、`thread/list` 或 `thread/loaded/read` 摘要，消费侧也不应重新退回“再补一次 `thread/read` 才算恢复完成”
 - 如果服务端后面需要在 rollout 与 SQLite 之间做 stored-summary repair，这层修补也应尽量停留在服务端返回面，而不是重新推回客户端做额外 `thread/read` 或本地脑补
 
+与这条读取面心智配套，第一阶段也应尽早固定通知边界：
+
+- `thread/status/changed` 继续只做 status-only 增量
+- `thread/closed`、`thread/archived`、`thread/unarchived` 继续只做 lifecycle
+  边事件
+- `thread/name/updated` 继续只做 name 增量
+- 客户端和远端消费侧都应把这些通知应用到最近一次权威 `Thread` 摘要上，而
+  不是期待这些通知本身重复 `mode`、`preview`、`resident` 或其他 repaired
+  summary 字段
+
 换句话说，第一阶段虽然不把 SQLite 重构混进同一个 PR，但也不应给客户端留下“以后还得自己修 resident summary 漂移”的心智空档。
 
 ## 9. 实现范围建议

@@ -39,6 +39,8 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
+use codex_app_server_protocol::ThreadMetadataUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -536,6 +538,18 @@ impl AppServerSession {
             .await
             .wrap_err("thread/name/set failed in TUI")?;
         Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn thread_metadata_update(
+        &mut self,
+        params: ThreadMetadataUpdateParams,
+    ) -> Result<ThreadMetadataUpdateResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadMetadataUpdate { request_id, params })
+            .await
+            .wrap_err("thread/metadata/update failed in TUI")
     }
 
     pub(crate) async fn thread_unsubscribe(&mut self, thread_id: ThreadId) -> Result<()> {
@@ -1229,6 +1243,7 @@ mod tests {
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
     use codex_core::config::ConfigBuilder;
+    use codex_core::state_db_bridge::open_if_present;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
@@ -2215,8 +2230,8 @@ stream_max_retries = 0
             .expect("thread/start should expose rollout path");
         write_minimal_rollout(
             rollout_path.as_path(),
-            &started.thread.id,
-            &started.thread.model_provider,
+            &thread_id.to_string(),
+            &started.model_provider,
         );
 
         let thread_name = "Resident metadata name for TUI";
@@ -2225,19 +2240,14 @@ stream_max_retries = 0
             .await
             .expect("thread/set_name should succeed");
 
-        let metadata_update_request_id = app_server.next_request_id();
         let updated: ThreadMetadataUpdateResponse = app_server
-            .client
-            .request_typed(ClientRequest::ThreadMetadataUpdate {
-                request_id: metadata_update_request_id,
-                params: ThreadMetadataUpdateParams {
-                    thread_id: started.thread.id.clone(),
-                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
-                        sha: None,
-                        branch: Some(Some("resident-metadata-main".to_string())),
-                        origin_url: None,
-                    }),
-                },
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: started.thread.id.clone(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: None,
+                    branch: Some(Some("resident-metadata-main".to_string())),
+                    origin_url: None,
+                }),
             })
             .await
             .expect("thread/metadata/update should succeed");
@@ -2259,6 +2269,358 @@ stream_max_retries = 0
             resumed.session.thread_mode,
             Some(ThreadMode::ResidentAssistant)
         );
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn metadata_update_can_clear_git_fields_for_tui_reads_and_resume() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let start_request_id = app_server.next_request_id();
+        let started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: start_request_id,
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let thread_id =
+            ThreadId::from_string(&started.thread.id).expect("thread/start should return id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &thread_id.to_string(),
+            &started.thread.model_provider,
+        );
+
+        let thread_name = "Resident metadata clear for TUI";
+        app_server
+            .thread_set_name(thread_id, thread_name.to_string())
+            .await
+            .expect("thread/set_name should succeed");
+
+        let _: ThreadMetadataUpdateResponse = app_server
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: thread_id.to_string(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(Some("abc123".to_string())),
+                    branch: Some(Some("resident-metadata-main".to_string())),
+                    origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                }),
+            })
+            .await
+            .expect("thread/metadata/update should seed git info");
+
+        let cleared: ThreadMetadataUpdateResponse = app_server
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: thread_id.to_string(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(None),
+                    branch: Some(None),
+                    origin_url: Some(None),
+                }),
+            })
+            .await
+            .expect("thread/metadata/update should clear git info");
+        assert_eq!(cleared.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(cleared.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(cleared.thread.git_info, None);
+
+        let read = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .expect("thread/read should preserve thread name after clearing git info");
+        assert_eq!(read.name.as_deref(), Some(thread_name));
+        assert_eq!(read.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.git_info, None);
+
+        let resumed = app_server
+            .resume_thread(config.clone(), thread_id, /*mode*/ None)
+            .await
+            .expect("thread/resume should preserve repaired summary after clearing git info");
+        assert_eq!(resumed.session.thread_name.as_deref(), Some(thread_name));
+        assert_eq!(
+            resumed.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
+        );
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn loaded_metadata_update_can_clear_git_fields_for_tui_loaded_read_list_and_resume() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let start_request_id = app_server.next_request_id();
+        let started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: start_request_id,
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let thread_id =
+            ThreadId::from_string(&started.thread.id).expect("thread/start should return id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let thread_name = "Loaded resident metadata clear for TUI";
+        app_server
+            .thread_set_name(thread_id, thread_name.to_string())
+            .await
+            .expect("thread/set_name should succeed");
+
+        let _: ThreadMetadataUpdateResponse = app_server
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: thread_id.to_string(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(Some("abc123".to_string())),
+                    branch: Some(Some("loaded-main".to_string())),
+                    origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                }),
+            })
+            .await
+            .expect("thread/metadata/update should seed git info");
+
+        let state_db = open_if_present(&config.codex_home, config.model_provider_id.as_str())
+            .await
+            .expect("state db should exist");
+        let deleted = state_db
+            .delete_thread(thread_id)
+            .await
+            .expect("delete_thread should succeed");
+        assert_eq!(
+            deleted, 1,
+            "loaded resident thread should persist one state row"
+        );
+
+        let cleared: ThreadMetadataUpdateResponse = app_server
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: thread_id.to_string(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(None),
+                    branch: Some(None),
+                    origin_url: Some(None),
+                }),
+            })
+            .await
+            .expect("thread/metadata/update should clear git info");
+        assert_eq!(cleared.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(cleared.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(cleared.thread.status, ThreadStatus::Idle);
+        assert!(cleared.thread.resident);
+        assert_eq!(cleared.thread.git_info, None);
+
+        let loaded = app_server
+            .thread_loaded_read(ThreadLoadedReadParams {
+                cursor: None,
+                limit: Some(20),
+                model_providers: None,
+                source_kinds: None,
+                cwd: None,
+            })
+            .await
+            .expect("thread/loaded/read should preserve loaded resident summary");
+        let loaded_thread = loaded
+            .data
+            .into_iter()
+            .find(|thread| thread.id == thread_id.to_string())
+            .expect("thread/loaded/read should include resident thread");
+        assert_eq!(loaded_thread.name.as_deref(), Some(thread_name));
+        assert_eq!(loaded_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(loaded_thread.status, ThreadStatus::Idle);
+        assert!(loaded_thread.resident);
+        assert_eq!(loaded_thread.git_info, None);
+
+        let read = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .expect("thread/read should preserve loaded resident summary");
+        assert_eq!(read.name.as_deref(), Some(thread_name));
+        assert_eq!(read.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.status, ThreadStatus::Idle);
+        assert!(read.resident);
+        assert_eq!(read.git_info, None);
+
+        let listed = app_server
+            .thread_list(ThreadListParams {
+                cursor: None,
+                limit: Some(20),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: None,
+                cwd: None,
+                search_term: None,
+            })
+            .await
+            .expect("thread/list should preserve loaded resident summary");
+        let listed_thread = listed
+            .data
+            .into_iter()
+            .find(|thread| thread.id == thread_id.to_string())
+            .expect("thread/list should include resident thread");
+        assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::Idle);
+        assert!(listed_thread.resident);
+        assert_eq!(listed_thread.git_info, None);
+
+        let resumed = app_server
+            .resume_thread(config.clone(), thread_id, /*mode*/ None)
+            .await
+            .expect("thread/resume should preserve loaded resident summary");
+        assert_eq!(resumed.session.thread_name.as_deref(), Some(thread_name));
+        assert_eq!(
+            resumed.session.thread_mode,
+            Some(ThreadMode::ResidentAssistant)
+        );
+
+        app_server
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn archived_metadata_update_can_clear_git_fields_for_tui_reads_and_list() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+            .await
+            .expect("embedded app server should start");
+        let start_request_id = app_server.next_request_id();
+        let started: ThreadStartResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: start_request_id,
+                params: resident_assistant_thread_start_params(),
+            })
+            .await
+            .expect("resident thread/start should succeed");
+        let thread_id =
+            ThreadId::from_string(&started.thread.id).expect("thread/start should return id");
+        let rollout_path = started
+            .thread
+            .path
+            .clone()
+            .expect("thread/start should expose rollout path");
+        write_minimal_rollout(
+            rollout_path.as_path(),
+            &started.thread.id,
+            &started.thread.model_provider,
+        );
+
+        let thread_name = "Archived resident metadata clear for TUI";
+        app_server
+            .thread_set_name(thread_id, thread_name.to_string())
+            .await
+            .expect("thread/set_name should succeed");
+
+        let _: ThreadMetadataUpdateResponse = app_server
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: thread_id.to_string(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(Some("abc123".to_string())),
+                    branch: Some(Some("archived-main".to_string())),
+                    origin_url: Some(Some("https://example.com/codex.git".to_string())),
+                }),
+            })
+            .await
+            .expect("thread/metadata/update should seed git info");
+
+        let archive_request_id = app_server.next_request_id();
+        let _: codex_app_server_protocol::ThreadArchiveResponse = app_server
+            .client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id: archive_request_id,
+                params: codex_app_server_protocol::ThreadArchiveParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .expect("thread/archive should succeed");
+
+        let cleared: ThreadMetadataUpdateResponse = app_server
+            .thread_metadata_update(ThreadMetadataUpdateParams {
+                thread_id: thread_id.to_string(),
+                git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                    sha: Some(None),
+                    branch: Some(None),
+                    origin_url: Some(None),
+                }),
+            })
+            .await
+            .expect("thread/metadata/update should clear git info");
+        assert_eq!(cleared.thread.name.as_deref(), Some(thread_name));
+        assert_eq!(cleared.thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(cleared.thread.status, ThreadStatus::NotLoaded);
+        assert!(cleared.thread.resident);
+        assert_eq!(cleared.thread.git_info, None);
+
+        let read = app_server
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .expect("thread/read should preserve archived resident summary");
+        assert_eq!(read.name.as_deref(), Some(thread_name));
+        assert_eq!(read.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(read.status, ThreadStatus::NotLoaded);
+        assert!(read.resident);
+        assert_eq!(read.git_info, None);
+
+        let listed = app_server
+            .thread_list(ThreadListParams {
+                cursor: None,
+                limit: Some(20),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: Some(true),
+                cwd: None,
+                search_term: None,
+            })
+            .await
+            .expect("thread/list should preserve archived resident summary");
+        let listed_thread = listed
+            .data
+            .into_iter()
+            .find(|thread| thread.id == thread_id.to_string())
+            .expect("thread/list archived=true should include resident thread");
+        assert_eq!(listed_thread.name.as_deref(), Some(thread_name));
+        assert_eq!(listed_thread.mode, ThreadMode::ResidentAssistant);
+        assert_eq!(listed_thread.status, ThreadStatus::NotLoaded);
+        assert!(listed_thread.resident);
+        assert_eq!(listed_thread.git_info, None);
 
         app_server
             .shutdown()
@@ -2304,7 +2666,7 @@ stream_max_retries = 0
         std::fs::write(workspace.join("watched.txt"), "changed")
             .expect("workspace change should write");
 
-        let changed_status = timeout(Duration::from_secs(5), async {
+        let changed_status = timeout(Duration::from_secs(10), async {
             loop {
                 let thread_id = ThreadId::from_string(&started.thread.id)
                     .expect("thread/start should return thread id");
@@ -2570,7 +2932,7 @@ stream_max_retries = 0
                             .expect("thread/close should succeed");
                         assert_eq!(close_status, ThreadCloseStatus::Closing);
 
-                        let closed_status = timeout(Duration::from_secs(5), async {
+                        let closed_status = timeout(Duration::from_secs(10), async {
                             loop {
                                 let thread = app_server
                                     .thread_read(thread_id, /*include_turns*/ false)

@@ -149,8 +149,16 @@
 
 - `thread/status/changed` 只负责推送增量 `status`
 - 不负责重复 `Thread.mode`
+- `thread/closed`、`thread/archived`、`thread/unarchived` 仍应保持 lifecycle
+  边事件语义，而不是被 observer 强化后重新抬成线程摘要返回面
+- `thread/name/updated` 也仍只是 name 增量，不应因为 observer 或后续提示构建
+  需要而开始偷偷承担完整线程快照职责
 - 客户端和远端控制面应继续从 `thread/started`、`thread/read`、
   `thread/list`、`thread/loaded/read` 这些恢复面保留线程角色
+- 如果后续消费者要在收到 `thread/closed`、`thread/archived`、
+  `thread/unarchived`、`thread/name/updated` 后更新本地视图，也应把它们应用到
+  最近一次权威 `Thread` 摘要上，而不是期待这些通知本身重复 `mode`、`name`、
+  `preview` 或其他 repaired summary 字段
 - 如果客户端需要直接展示动作文案，也应继续从这些恢复面拿到的
   `Thread.mode` 做稳定映射：
   - `interactive -> resume`

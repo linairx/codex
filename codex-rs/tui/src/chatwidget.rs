@@ -10755,6 +10755,10 @@ impl ChatWidget {
         self.thread_name.clone()
     }
 
+    pub(crate) fn current_cwd(&self) -> Option<&Path> {
+        self.current_cwd.as_deref()
+    }
+
     /// Returns the current thread's precomputed rollout path.
     ///
     /// For fresh non-ephemeral threads this path may exist before the file is

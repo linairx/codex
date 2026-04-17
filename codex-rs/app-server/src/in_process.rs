@@ -95,7 +95,16 @@ pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
 
 fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
-    matches!(notification, ServerNotification::TurnCompleted(_))
+    matches!(
+        notification,
+        ServerNotification::ThreadStarted(_)
+            | ServerNotification::ThreadStatusChanged(_)
+            | ServerNotification::ThreadNameUpdated(_)
+            | ServerNotification::ThreadArchived(_)
+            | ServerNotification::ThreadUnarchived(_)
+            | ServerNotification::ThreadClosed(_)
+            | ServerNotification::TurnCompleted(_)
+    )
 }
 
 /// Input needed to start an in-process app-server runtime.
@@ -825,6 +834,70 @@ mod tests {
                     error: None,
                 },
             })
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadStarted(
+                codex_app_server_protocol::ThreadStartedNotification {
+                    thread: codex_app_server_protocol::Thread {
+                        id: "thread-1".to_string(),
+                        forked_from_id: None,
+                        preview: "resident thread".to_string(),
+                        ephemeral: false,
+                        model_provider: "mock_provider".to_string(),
+                        created_at: 1_736_078_400,
+                        updated_at: 1_736_078_400,
+                        status: codex_app_server_protocol::ThreadStatus::Idle,
+                        mode: codex_app_server_protocol::ThreadMode::ResidentAssistant,
+                        resident: true,
+                        path: Some(std::path::PathBuf::from("/tmp/thread-1.jsonl")),
+                        cwd: std::path::PathBuf::from("/workspace"),
+                        cli_version: "0.0.0-test".to_string(),
+                        source: codex_app_server_protocol::SessionSource::Cli,
+                        agent_nickname: None,
+                        agent_role: None,
+                        git_info: None,
+                        name: Some("Atlas".to_string()),
+                        turns: Vec::new(),
+                    },
+                }
+            )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadClosed(
+                codex_app_server_protocol::ThreadClosedNotification {
+                    thread_id: "thread-1".to_string(),
+                }
+            )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: "thread-1".to_string(),
+                    status: codex_app_server_protocol::ThreadStatus::Idle,
+                }
+            )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadNameUpdated(
+                codex_app_server_protocol::ThreadNameUpdatedNotification {
+                    thread_id: "thread-1".to_string(),
+                    thread_name: Some("Atlas".to_string()),
+                }
+            )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadArchived(
+                codex_app_server_protocol::ThreadArchivedNotification {
+                    thread_id: "thread-1".to_string(),
+                }
+            )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadUnarchived(
+                codex_app_server_protocol::ThreadUnarchivedNotification {
+                    thread_id: "thread-1".to_string(),
+                }
+            )
         ));
     }
 }

@@ -110,6 +110,8 @@ impl AgentNavigationState {
     pub(crate) fn mark_closed(&mut self, thread_id: ThreadId) {
         if let Some(entry) = self.threads.get_mut(&thread_id) {
             entry.is_closed = true;
+            entry.active_flags.clear();
+            entry.has_system_error = false;
         } else {
             self.upsert(
                 thread_id,
@@ -404,6 +406,32 @@ mod tests {
         assert_eq!(
             state.active_agent_label(Some(first_agent_id), Some(main_thread_id)),
             Some("Robie [explorer] [error] [changed]".to_string())
+        );
+    }
+
+    #[test]
+    fn mark_closed_clears_runtime_status_badges() {
+        let (mut state, _main_thread_id, first_agent_id, _) = populated_state();
+        state.upsert(
+            first_agent_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            /*is_closed*/ false,
+            vec![codex_app_server_protocol::ThreadActiveFlag::WorkspaceChanged],
+            /*has_system_error*/ true,
+        );
+
+        state.mark_closed(first_agent_id);
+
+        assert_eq!(
+            state.get(&first_agent_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: true,
+                active_flags: Vec::new(),
+                has_system_error: false,
+            })
         );
     }
 }

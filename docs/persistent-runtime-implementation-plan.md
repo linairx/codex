@@ -64,6 +64,13 @@
   `backgroundTerminalRunning`、`workspaceChanged` 这四类 active flag
   属于 reconnect 后仍应直接保留的线程级运行时事实，而不是临时 UI 状态
 - 保持 `thread/read` / `thread/list` / `thread/resume` / `thread/loaded/read` 的线程摘要心智一致
+- 固定通知边界：
+  - `thread/status/changed` 继续只做 status-only 增量
+  - `thread/closed` / `thread/archived` / `thread/unarchived` 继续只做 lifecycle
+    边事件
+  - `thread/name/updated` 继续只做 name 增量
+  - 客户端与远端消费侧继续把这些通知应用到最近一次权威 `Thread` 摘要上，
+    而不是把通知本身重新当成恢复摘要面
 - 让客户端不再需要自行脑补 resident 语义
 
 不应混入：
@@ -91,7 +98,10 @@
   `waitingOnApproval` / `waitingOnUserInput` / `backgroundTerminalRunning`
   表示仍然存在的运行时事实
 - 明确 watcher 生命周期与 resident thread 生命周期的边界
-- 保持读取面与状态通知的职责分离
+- 保持读取面与状态通知的职责分离，不让 observer 强化重新打穿
+  `thread/status/changed` 的 status-only 边界，也不让
+  `thread/closed` / `thread/archived` / `thread/unarchived` /
+  `thread/name/updated` 退化成新的摘要来源
 
 不应混入：
 
@@ -113,6 +123,10 @@
 - 保持 stored summary / persisted metadata / runtime overlay 的分层清晰
 - 继续消除读取面之间的 repaired-summary 分叉
 - 只把稳定元数据和长期派生摘要收进 SQLite
+- 保持“权威摘要来自读取面、通知只做边事件/增量”的分层清晰，不把
+  `thread/status/changed`、`thread/closed`、`thread/archived`、
+  `thread/unarchived`、`thread/name/updated` 重新包装成 SQLite 收敛后的
+  摘要返回面
 
 不应混入：
 
