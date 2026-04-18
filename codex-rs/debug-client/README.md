@@ -84,10 +84,10 @@ reuse the cached `mode` and action label, while unknown notifications stay
 incremental-only instead of guessing resident reconnect semantics:
 
 - unknown `thread/status/changed` stays status-only and queues a background
-  `thread/loaded/read` refresh
+  `thread/read` refresh for that specific thread id
 - unknown `thread/unarchived` stays identity-only and queues a background
-  `thread/list` refresh so the restored summary can be recovered from an
-  authoritative read surface
+  `thread/read` refresh so the restored summary comes back from the
+  authoritative per-thread read surface
 - unknown `thread/name/updated`, `thread/archived`, and `thread/closed` stay
   incremental / identity-only and do not invent missing `mode` or action labels
 

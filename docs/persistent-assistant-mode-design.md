@@ -194,6 +194,16 @@
   不是期待这些通知本身重复 `mode`、`preview`、`resident` 或其他 repaired
   summary 字段
 
+这里还应再固定一条更具体的消费约束：
+
+- `thread/closed`、`thread/archived` 这类 lifecycle 边事件，不应被消费侧解释成
+  “把这个线程从本地摘要缓存里删除”
+- 更合理的做法是：继续保留最近一次权威 `Thread` 摘要里的 `name`、`mode`、
+  `resident`、`preview` 等身份字段，只把当前 lifecycle / status 事实应用到
+  这份 retained summary 上
+- 这样 reconnect-aware 客户端在 close / archive 之后，仍能继续把该线程解释成
+  resident assistant，而不是错误退化成“丢了角色信息的普通历史项”
+
 换句话说，第一阶段虽然不把 SQLite 重构混进同一个 PR，但也不应给客户端留下“以后还得自己修 resident summary 漂移”的心智空档。
 
 ## 9. 实现范围建议

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use codex_app_server_client::ThreadSummaryTracker;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadMode;
 use codex_app_server_protocol::ThreadStatus;
@@ -16,13 +17,14 @@ pub struct KnownThread {
 pub struct State {
     pub pending: HashMap<RequestId, PendingRequest>,
     pub thread_id: Option<String>,
-    pub known_threads: Vec<KnownThread>,
+    pub thread_summaries: ThreadSummaryTracker,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingRequest {
     Start,
     Resume,
+    Read { thread_id: String },
     List,
     LoadedList,
     LoadedRead,

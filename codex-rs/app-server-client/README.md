@@ -185,6 +185,53 @@ typed event stream should still be consumed as:
 - `thread/closed` / `thread/archived` / `thread/unarchived` describe lifecycle
   edges on that retained thread summary
 
+If a caller wants that retained-summary contract as reusable code instead of
+re-implementing it per surface, this crate now also exposes
+`ThreadSummaryTracker`. It bootstraps from paginated `thread/list` /
+`thread/loaded/read`, retains the last authoritative `Thread` per id, applies
+incremental lifecycle notifications on top of that cache, and reports when a
+bridge-style consumer should explicitly refresh via `thread/read`. The helper
+also exposes single-page `fetch_thread_list_page(...)` /
+`fetch_thread_loaded_read_page(...)` helpers, a `bootstrap_all_pages(...)`
+entrypoint, `apply_event` for direct consumption of `AppServerEvent`, plus an
+async `track_event(...)` helper that applies lifecycle edges and performs the
+follow-up `thread/read` refresh when the edge is identity-only, so
+remote-control or bridge-style surfaces can keep one retained-summary state
+machine instead of re-deriving the same
+`thread/list + thread/loaded/read + lifecycle notification` contract per
+client. That single-page API is intended for consumers that still want to
+render or log each paginated response as it arrives while keeping the retained
+cache update in the shared helper layer rather than hand-rolling per-page
+`upsert_thread(...)` loops. `track_event(...)` returns a structured
+`ThreadSummaryTrackedEvent` so bridge-style consumers can keep presentation or
+logging policy outside the shared state machine while still reusing the common
+refresh semantics. Approval and elicitation server requests now also reuse that
+same retained-summary context: the tracked server-request event includes the
+request thread id plus the cached authoritative `Thread` summary when the
+consumer already knows that thread, so bridge-style control surfaces can keep
+approval prompts aligned with reconnect/action semantics instead of treating
+them as detached raw requests. For callers that want the next layer up, the crate also now
+exposes `ThreadSummaryClient`: it wraps an `AppServerClient`, keeps one shared
+`ThreadSummaryTracker`, forwards bootstrap reads through the same retained-
+summary cache, and turns `next_event()` into `next_tracked_event()` so remote
+or bridge-style control surfaces do not need to wire `request_handle()` +
+`track_event(...)` loops themselves. That wrapper now also forwards
+`resolve_server_request(...)`, `resolve_server_request_typed(...)`, and
+`reject_server_request(...)` through the same shared request handle, so a
+bridge-style consumer can bootstrap summaries, consume tracked approval /
+elicitation requests, and send the matching remote resolution without dropping
+down to the raw transport client. For the current “minimal bridge” policy, it
+also exposes `resolve_default_bridge_server_request(...)`, which auto-accepts
+the existing approval request set, auto-answers `request_user_input` with the
+first option (or empty fallback), auto-cancels MCP elicitation, and explicitly
+rejects unsupported server requests. For callers that want that policy wired
+directly into the event loop, the crate now also exposes
+`ThreadSummaryBridgeClient`: it wraps `ThreadSummaryClient`, keeps the same
+retained-summary bootstrap surface, and turns `next_tracked_event()` plus the
+default bridge request resolver into one `next_bridge_event()` stream so a
+bridge-style control surface can consume tracked thread events and approval
+resolutions from a single facade.
+
 ## Backpressure and shutdown
 
 - Queues are bounded and use `DEFAULT_IN_PROCESS_CHANNEL_CAPACITY` by default.

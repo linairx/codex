@@ -172,6 +172,10 @@
   - `thread/archived` 是 identity-only（`threadId`）
   - `thread/unarchived` 也是 identity-only（`threadId`），恢复后的权威摘要应来自 `thread/unarchive` 返回面，或后续显式 `thread/read` / `thread/list`
 - `thread/name/updated` 也应继续被视为增量通知，而不是完整线程快照：它只适合更新现有摘要上的名字，不应被 bridge 当成会重复 `mode` / `status` 的替代读取面
+- 远端 bridge 在 `thread/closed`、`thread/archived` 之后，不应把该线程从本地摘要
+  缓存里直接删掉；更合理的做法是继续保留最近一次权威 `Thread` 摘要里的
+  `mode + name + preview + resident` 等身份字段，并只把 close / archive 的
+  lifecycle 事实应用到这份 retained summary 上
 - 对 `workspaceChanged` 的消费应建立在“这是需要关注的外部变化”这一语义上，而不是把它等同于“线程仍在执行”
 
 ### 第 3 层：按需深读

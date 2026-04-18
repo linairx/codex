@@ -21,6 +21,7 @@ use crate::SHUTDOWN_TIMEOUT;
 use crate::TypedRequestError;
 use crate::request_method_name;
 use crate::server_notification_requires_delivery;
+use crate::typed_server_request_result;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -38,6 +39,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use futures::SinkExt;
 use futures::StreamExt;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -669,6 +671,72 @@ impl RemoteAppServerRequestHandle {
         })?;
         serde_json::from_value(result)
             .map_err(|source| TypedRequestError::Deserialize { method, source })
+    }
+
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RemoteClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "remote app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    pub async fn resolve_server_request_typed<T>(
+        &self,
+        request_id: RequestId,
+        result: &T,
+    ) -> IoResult<()>
+    where
+        T: Serialize,
+    {
+        self.resolve_server_request(request_id, typed_server_request_result(result)?)
+            .await
+    }
+
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RemoteClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "remote app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server reject channel is closed",
+            )
+        })?
     }
 }
 

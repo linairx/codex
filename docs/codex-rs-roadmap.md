@@ -40,6 +40,16 @@
 - reconnect 心智
 - loaded vs persisted 的边界
 
+而且有一条关键消费契约已经开始落地：
+
+- `thread/status/changed`、`thread/name/updated`、`thread/closed`、
+  `thread/archived`、`thread/unarchived` 这些通知继续只承担增量或
+  lifecycle 边事件职责
+- 客户端与测试消费面已经开始把这些通知应用到“最近一次权威 `Thread` 摘要”
+  上，而不是在 close / archive 后把 resident thread 的摘要直接删掉
+- 这意味着 resident assistant 在 close / archive 之后，仍能继续保留
+  `mode/name/reconnect` 语义，而不会退化成丢失角色信息的普通历史项
+
 ### SQLite repaired-summary 收口
 
 SQLite 已经不是空设计，而是正在承担稳定元数据与 repaired-summary 收敛层的职责。
@@ -80,6 +90,14 @@ SQLite 已经不是空设计，而是正在承担稳定元数据与 repaired-sum
 - 面向产品而不是实现细节的长期线程定义
 - 明确的断开、继续运行、reconnect、关闭语义
 - 统一后台状态与通知模型
+
+但这里也已经不再只是“纯设计”：
+
+- retained-summary / lifecycle-notification 这条客户端契约已经进入实现层
+- 多个消费面已经开始统一为“保留最后一次权威 `Thread` 摘要，再应用 close /
+  archive / status 边事件”
+- 当前剩下的缺口更偏“把这套契约补齐到所有产品面并固定成用户可感知语义”，
+  而不是重新发明 resident continuity 的基础模型
 
 ### 2. 完整远程 bridge / 远程审批
 
@@ -151,6 +169,19 @@ SQLite 已经不是空设计，而是正在承担稳定元数据与 repaired-sum
 
 - 把 `residentAssistant` 从“基础语义”推进成正式产品模式
 - 明确 reconnect、后台运行、状态展示、关闭语义
+
+当前更具体的收尾重点：
+
+- 把 retained-summary / lifecycle-notification 契约补齐到所有主要消费面：
+  TUI、typed/remote facade、测试客户端以及后续 bridge 入口，都应继续保留最后一次
+  权威 `Thread` 摘要，而不是在 close / archive 后把 resident thread 直接从本地
+  摘要缓存里删掉
+- 继续收紧 `thread/read` / `thread/list` / `thread/resume` /
+  `thread/loaded/read` 与 metadata-only / restore 路径的线程摘要一致性，避免
+  reconnect、loaded polling、stored lookup 之间继续分叉
+- 把这套契约稳定成用户真正能感知的产品语义：
+  resident thread 在 close / archive 之后仍然是 reconnect target，后台状态与
+  active flag 仍然有统一展示与恢复心智，而不是退化成“普通历史会话 + 局部补丁”
 
 ### B. remote bridge 最小产品闭环
 

@@ -11,6 +11,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use anyhow::Context;
+use codex_app_server_client::ThreadSummaryUpdate;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
@@ -28,19 +29,18 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
-use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListResponse;
-use codex_app_server_protocol::ThreadLoadedReadParams;
 use codex_app_server_protocol::ThreadLoadedReadResponse;
 use codex_app_server_protocol::ThreadMode;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ToolRequestUserInputAnswer;
 use codex_app_server_protocol::ToolRequestUserInputQuestion;
 use codex_app_server_protocol::ToolRequestUserInputResponse;
-use codex_app_server_protocol::all_thread_source_kinds;
 use serde::Serialize;
 use std::io::Write;
 
@@ -270,29 +270,12 @@ fn handle_response(
         PendingRequest::Start => {
             let parsed = serde_json::from_value::<ThreadStartResponse>(response.result)
                 .context("decode thread/start response")?;
-            let thread_id = parsed.thread.id;
-            let thread_name = parsed.thread.name;
+            let thread_id = parsed.thread.id.clone();
             let thread_mode = parsed.thread.mode;
-            let thread_status = parsed.thread.status;
             {
                 let mut state = state.lock().expect("state lock poisoned");
                 state.thread_id = Some(thread_id.clone());
-                if let Some(existing) = state
-                    .known_threads
-                    .iter_mut()
-                    .find(|thread| thread.thread_id == thread_id)
-                {
-                    existing.thread_name = thread_name;
-                    existing.thread_mode = thread_mode;
-                    existing.thread_status = thread_status;
-                } else {
-                    state.known_threads.push(KnownThread {
-                        thread_id: thread_id.clone(),
-                        thread_name,
-                        thread_mode,
-                        thread_status,
-                    });
-                }
+                state.thread_summaries.upsert_thread(parsed.thread);
             }
             events
                 .send(ReaderEvent::ThreadReady {
@@ -304,29 +287,12 @@ fn handle_response(
         PendingRequest::Resume => {
             let parsed = serde_json::from_value::<ThreadResumeResponse>(response.result)
                 .context("decode thread/resume response")?;
-            let thread_id = parsed.thread.id;
-            let thread_name = parsed.thread.name;
+            let thread_id = parsed.thread.id.clone();
             let thread_mode = parsed.thread.mode;
-            let thread_status = parsed.thread.status;
             {
                 let mut state = state.lock().expect("state lock poisoned");
                 state.thread_id = Some(thread_id.clone());
-                if let Some(existing) = state
-                    .known_threads
-                    .iter_mut()
-                    .find(|thread| thread.thread_id == thread_id)
-                {
-                    existing.thread_name = thread_name;
-                    existing.thread_mode = thread_mode;
-                    existing.thread_status = thread_status;
-                } else {
-                    state.known_threads.push(KnownThread {
-                        thread_id: thread_id.clone(),
-                        thread_name,
-                        thread_mode,
-                        thread_status,
-                    });
-                }
+                state.thread_summaries.upsert_thread(parsed.thread);
             }
             events
                 .send(ReaderEvent::ThreadReady {
@@ -338,30 +304,12 @@ fn handle_response(
         PendingRequest::List => {
             let parsed = serde_json::from_value::<ThreadListResponse>(response.result)
                 .context("decode thread/list response")?;
-            let threads: Vec<KnownThread> = parsed
-                .data
-                .into_iter()
-                .map(|thread| KnownThread {
-                    thread_id: thread.id,
-                    thread_name: thread.name,
-                    thread_mode: thread.mode,
-                    thread_status: thread.status,
-                })
-                .collect();
+            let threads: Vec<KnownThread> =
+                parsed.data.iter().map(known_thread_from_summary).collect();
             {
                 let mut state = state.lock().expect("state lock poisoned");
-                for thread in &threads {
-                    if let Some(existing) = state
-                        .known_threads
-                        .iter_mut()
-                        .find(|known| known.thread_id == thread.thread_id)
-                    {
-                        existing.thread_name = thread.thread_name.clone();
-                        existing.thread_mode = thread.thread_mode;
-                        existing.thread_status = thread.thread_status.clone();
-                    } else {
-                        state.known_threads.push(thread.clone());
-                    }
+                for thread in parsed.data {
+                    state.thread_summaries.upsert_thread(thread);
                 }
             }
             events
@@ -384,30 +332,12 @@ fn handle_response(
         PendingRequest::LoadedRead => {
             let parsed = serde_json::from_value::<ThreadLoadedReadResponse>(response.result)
                 .context("decode thread/loaded/read response")?;
-            let threads: Vec<KnownThread> = parsed
-                .data
-                .into_iter()
-                .map(|thread| KnownThread {
-                    thread_id: thread.id,
-                    thread_name: thread.name,
-                    thread_mode: thread.mode,
-                    thread_status: thread.status,
-                })
-                .collect();
+            let threads: Vec<KnownThread> =
+                parsed.data.iter().map(known_thread_from_summary).collect();
             {
                 let mut state = state.lock().expect("state lock poisoned");
-                for thread in &threads {
-                    if let Some(existing) = state
-                        .known_threads
-                        .iter_mut()
-                        .find(|known| known.thread_id == thread.thread_id)
-                    {
-                        existing.thread_name = thread.thread_name.clone();
-                        existing.thread_mode = thread.thread_mode;
-                        existing.thread_status = thread.thread_status.clone();
-                    } else {
-                        state.known_threads.push(thread.clone());
-                    }
+                for thread in parsed.data {
+                    state.thread_summaries.upsert_thread(thread);
                 }
             }
             events
@@ -416,6 +346,12 @@ fn handle_response(
                     next_cursor: parsed.next_cursor,
                 })
                 .ok();
+        }
+        PendingRequest::Read { thread_id: _ } => {
+            let parsed = serde_json::from_value::<ThreadReadResponse>(response.result)
+                .context("decode thread/read response")?;
+            let mut state = state.lock().expect("state lock poisoned");
+            state.thread_summaries.upsert_thread(parsed.thread);
         }
     }
 
@@ -435,61 +371,36 @@ fn handle_notification(
 
     match &server_notification {
         ServerNotification::ThreadStarted(payload) => {
-            let mut state = state.lock().expect("state lock poisoned");
-            let thread = if let Some(existing) = state
-                .known_threads
-                .iter_mut()
-                .find(|thread| thread.thread_id == payload.thread.id)
-            {
-                existing.thread_name = payload.thread.name.clone();
-                existing.thread_mode = payload.thread.mode;
-                existing.thread_status = payload.thread.status.clone();
-                existing.clone()
-            } else {
-                let thread = KnownThread {
-                    thread_id: payload.thread.id.clone(),
-                    thread_name: payload.thread.name.clone(),
-                    thread_mode: payload.thread.mode,
-                    thread_status: payload.thread.status.clone(),
-                };
-                state.known_threads.push(thread.clone());
-                thread
+            let thread = {
+                let mut state = state.lock().expect("state lock poisoned");
+                state
+                    .thread_summaries
+                    .apply_notification(&server_notification);
+                state
+                    .thread_summaries
+                    .get(&payload.thread.id)
+                    .map(known_thread_from_summary)
+                    .expect("thread started should populate cached summary")
             };
-            drop(state);
             for line in thread_started_summary_lines(&thread) {
                 output.client_line(&line)?;
             }
             Ok(())
         }
         ServerNotification::ThreadStatusChanged(payload) => {
-            let mut app_state = state.lock().expect("state lock poisoned");
-            let known_thread = if let Some(existing) = app_state
-                .known_threads
-                .iter_mut()
-                .find(|thread| thread.thread_id == payload.thread_id)
-            {
-                existing.thread_status = payload.status.clone();
-                Some(existing.clone())
-            } else {
-                None
+            let (known_thread, refresh_request_id) = {
+                let mut state = state.lock().expect("state lock poisoned");
+                let update = state
+                    .thread_summaries
+                    .apply_notification(&server_notification);
+                let refresh_request_id =
+                    queue_thread_read_refresh(&mut state, request_sink, &update);
+                let known_thread = state
+                    .thread_summaries
+                    .get(&payload.thread_id)
+                    .map(known_thread_from_summary);
+                (known_thread, refresh_request_id)
             };
-            let refresh_request_id = if known_thread.is_none()
-                && payload.status != ThreadStatus::NotLoaded
-                && !app_state
-                    .pending
-                    .values()
-                    .any(|pending| *pending == PendingRequest::LoadedRead)
-            {
-                let request_id =
-                    RequestId::Integer(request_sink.next_request_id.fetch_add(1, Ordering::SeqCst));
-                app_state
-                    .pending
-                    .insert(request_id.clone(), PendingRequest::LoadedRead);
-                Some(request_id)
-            } else {
-                None
-            };
-            drop(app_state);
             for line in thread_status_changed_summary_lines(
                 &payload.thread_id,
                 &payload.status,
@@ -497,125 +408,72 @@ fn handle_notification(
             ) {
                 output.client_line(&line)?;
             }
-            if let Some(request_id) = refresh_request_id
-                && let Err(err) = send_client_request(
-                    &request_sink.stdin,
-                    ClientRequest::ThreadLoadedRead {
-                        request_id: request_id.clone(),
-                        params: ThreadLoadedReadParams {
-                            cursor: None,
-                            limit: None,
-                            model_providers: None,
-                            source_kinds: Some(all_thread_source_kinds()),
-                            cwd: None,
-                        },
-                    },
-                )
-            {
-                let mut app_state = state.lock().expect("state lock poisoned");
-                app_state.pending.remove(&request_id);
-                return Err(err);
-            }
+            send_pending_thread_read_refresh(refresh_request_id, request_sink, state)?;
             Ok(())
         }
         ServerNotification::ThreadArchived(payload) => {
-            let mut state = state.lock().expect("state lock poisoned");
-            let known_thread = if let Some(existing) = state
-                .known_threads
-                .iter_mut()
-                .find(|thread| thread.thread_id == payload.thread_id)
-            {
-                existing.thread_status = ThreadStatus::NotLoaded;
-                Some(existing.clone())
-            } else {
-                None
+            let known_thread = {
+                let mut state = state.lock().expect("state lock poisoned");
+                state
+                    .thread_summaries
+                    .apply_notification(&server_notification);
+                state
+                    .thread_summaries
+                    .get(&payload.thread_id)
+                    .map(known_thread_from_summary)
             };
-            drop(state);
             for line in thread_archived_summary_lines(&payload.thread_id, known_thread.as_ref()) {
                 output.client_line(&line)?;
             }
             Ok(())
         }
         ServerNotification::ThreadUnarchived(payload) => {
-            let mut app_state = state.lock().expect("state lock poisoned");
-            let known_thread = if let Some(existing) = app_state
-                .known_threads
-                .iter_mut()
-                .find(|thread| thread.thread_id == payload.thread_id)
-            {
-                existing.thread_status = ThreadStatus::NotLoaded;
-                Some(existing.clone())
-            } else {
-                None
+            let (known_thread, refresh_request_id) = {
+                let mut state = state.lock().expect("state lock poisoned");
+                let update = state
+                    .thread_summaries
+                    .apply_notification(&server_notification);
+                let refresh_request_id =
+                    queue_thread_read_refresh(&mut state, request_sink, &update);
+                let known_thread = state
+                    .thread_summaries
+                    .get(&payload.thread_id)
+                    .map(known_thread_from_summary);
+                (known_thread, refresh_request_id)
             };
-            let refresh_request_id = if !app_state
-                .pending
-                .values()
-                .any(|pending| *pending == PendingRequest::List)
-            {
-                let request_id =
-                    RequestId::Integer(request_sink.next_request_id.fetch_add(1, Ordering::SeqCst));
-                app_state
-                    .pending
-                    .insert(request_id.clone(), PendingRequest::List);
-                Some(request_id)
-            } else {
-                None
-            };
-            drop(app_state);
             for line in thread_unarchived_summary_lines(&payload.thread_id, known_thread.as_ref()) {
                 output.client_line(&line)?;
             }
-            if let Some(request_id) = refresh_request_id
-                && let Err(err) = send_client_request(
-                    &request_sink.stdin,
-                    ClientRequest::ThreadList {
-                        request_id: request_id.clone(),
-                        params: ThreadListParams {
-                            cursor: None,
-                            limit: None,
-                            sort_key: None,
-                            model_providers: None,
-                            source_kinds: Some(all_thread_source_kinds()),
-                            archived: None,
-                            cwd: None,
-                            search_term: None,
-                        },
-                    },
-                )
-            {
-                let mut app_state = state.lock().expect("state lock poisoned");
-                app_state.pending.remove(&request_id);
-                return Err(err);
-            }
+            send_pending_thread_read_refresh(refresh_request_id, request_sink, state)?;
             Ok(())
         }
         ServerNotification::ThreadClosed(payload) => {
-            let mut state = state.lock().expect("state lock poisoned");
-            let known_thread = state
-                .known_threads
-                .iter()
-                .position(|thread| thread.thread_id == payload.thread_id)
-                .map(|index| state.known_threads.remove(index));
-            drop(state);
+            let known_thread = {
+                let mut state = state.lock().expect("state lock poisoned");
+                state
+                    .thread_summaries
+                    .apply_notification(&server_notification);
+                state
+                    .thread_summaries
+                    .get(&payload.thread_id)
+                    .map(known_thread_from_summary)
+            };
             for line in thread_closed_summary_lines(&payload.thread_id, known_thread.as_ref()) {
                 output.client_line(&line)?;
             }
             Ok(())
         }
         ServerNotification::ThreadNameUpdated(payload) => {
-            let mut state = state.lock().expect("state lock poisoned");
-            let known_thread = if let Some(existing) = state
-                .known_threads
-                .iter_mut()
-                .find(|thread| thread.thread_id == payload.thread_id)
-            {
-                existing.thread_name = payload.thread_name.clone();
-                Some(existing.clone())
-            } else {
-                None
+            let known_thread = {
+                let mut state = state.lock().expect("state lock poisoned");
+                state
+                    .thread_summaries
+                    .apply_notification(&server_notification);
+                state
+                    .thread_summaries
+                    .get(&payload.thread_id)
+                    .map(known_thread_from_summary)
             };
-            drop(state);
             for line in thread_name_updated_summary_lines(
                 &payload.thread_id,
                 payload.thread_name.as_deref(),
@@ -629,6 +487,69 @@ fn handle_notification(
             emit_filtered_item(payload.item.clone(), &payload.thread_id, output)
         }
         _ => Ok(()),
+    }
+}
+
+fn queue_thread_read_refresh(
+    state: &mut State,
+    request_sink: &ReaderRequestSink,
+    update: &ThreadSummaryUpdate,
+) -> Option<(RequestId, String)> {
+    let ThreadSummaryUpdate::RequiresThreadRead { thread_id } = update else {
+        return None;
+    };
+    if state.pending.values().any(|pending| {
+        matches!(
+            pending,
+            PendingRequest::Read {
+                thread_id: pending_thread_id,
+            } if pending_thread_id == thread_id
+        )
+    }) {
+        return None;
+    }
+    let request_id =
+        RequestId::Integer(request_sink.next_request_id.fetch_add(1, Ordering::SeqCst));
+    state.pending.insert(
+        request_id.clone(),
+        PendingRequest::Read {
+            thread_id: thread_id.clone(),
+        },
+    );
+    Some((request_id, thread_id.clone()))
+}
+
+fn send_pending_thread_read_refresh(
+    refresh_request: Option<(RequestId, String)>,
+    request_sink: &ReaderRequestSink,
+    state: &Arc<Mutex<State>>,
+) -> anyhow::Result<()> {
+    let Some((request_id, thread_id)) = refresh_request else {
+        return Ok(());
+    };
+    if let Err(err) = send_client_request(
+        &request_sink.stdin,
+        ClientRequest::ThreadRead {
+            request_id: request_id.clone(),
+            params: ThreadReadParams {
+                thread_id,
+                include_turns: false,
+            },
+        },
+    ) {
+        let mut state = state.lock().expect("state lock poisoned");
+        state.pending.remove(&request_id);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn known_thread_from_summary(thread: &codex_app_server_protocol::Thread) -> KnownThread {
+    KnownThread {
+        thread_id: thread.id.clone(),
+        thread_name: thread.name.clone(),
+        thread_mode: thread.mode,
+        thread_status: thread.status.clone(),
     }
 }
 
@@ -988,19 +909,18 @@ mod tests {
     use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadArchivedNotification;
     use codex_app_server_protocol::ThreadClosedNotification;
-    use codex_app_server_protocol::ThreadListResponse;
     use codex_app_server_protocol::ThreadLoadedListResponse;
-    use codex_app_server_protocol::ThreadLoadedReadParams;
     use codex_app_server_protocol::ThreadLoadedReadResponse;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadNameUpdatedNotification;
+    use codex_app_server_protocol::ThreadReadParams;
+    use codex_app_server_protocol::ThreadReadResponse;
     use codex_app_server_protocol::ThreadStartedNotification;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
     use codex_app_server_protocol::ThreadUnarchivedNotification;
     use codex_app_server_protocol::ToolRequestUserInputOption;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
-    use codex_app_server_protocol::all_thread_source_kinds;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1046,6 +966,44 @@ mod tests {
             name: thread_name.map(str::to_owned),
             turns: Vec::new(),
         }
+    }
+
+    fn known_thread_summary(thread: KnownThread) -> Thread {
+        Thread {
+            id: thread.thread_id,
+            forked_from_id: None,
+            preview: String::new(),
+            ephemeral: false,
+            model_provider: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            status: thread.thread_status,
+            mode: thread.thread_mode,
+            resident: thread.thread_mode == ThreadMode::ResidentAssistant,
+            path: None,
+            cwd: std::path::PathBuf::new(),
+            cli_version: String::new(),
+            source: SessionSource::Cli,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: thread.thread_name,
+            turns: Vec::new(),
+        }
+    }
+
+    fn remember_known_thread(state: &mut State, thread: KnownThread) {
+        state
+            .thread_summaries
+            .upsert_thread(known_thread_summary(thread));
+    }
+
+    fn known_threads(state: &State) -> Vec<KnownThread> {
+        state
+            .thread_summaries
+            .iter()
+            .map(|(_, thread)| super::known_thread_from_summary(thread))
+            .collect()
     }
 
     #[test]
@@ -1139,12 +1097,15 @@ mod tests {
             state
                 .pending
                 .insert(request_id.clone(), PendingRequest::LoadedList);
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: None,
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::Idle,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: None,
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
         let (events_tx, events_rx) = channel();
 
@@ -1164,7 +1125,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: None,
@@ -1195,12 +1156,15 @@ mod tests {
             state
                 .pending
                 .insert(request_id.clone(), PendingRequest::LoadedRead);
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: Some("old-name".to_string()),
-                thread_mode: ThreadMode::Interactive,
-                thread_status: ThreadStatus::Idle,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("old-name".to_string()),
+                    thread_mode: ThreadMode::Interactive,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
         let (events_tx, events_rx) = channel();
 
@@ -1242,7 +1206,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: Some("atlas".to_string()),
@@ -1296,12 +1260,15 @@ mod tests {
             state
                 .pending
                 .insert(request_id.clone(), PendingRequest::List);
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: None,
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::Idle,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: None,
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
         let (events_tx, events_rx) = channel();
 
@@ -1340,7 +1307,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: Some("atlas".to_string()),
@@ -1411,7 +1378,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: None,
@@ -1428,12 +1395,15 @@ mod tests {
         let state = Arc::new(Mutex::new(State::default()));
         {
             let mut state = state.lock().expect("state lock poisoned");
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: None,
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::Idle,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: None,
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
 
         handle_notification(
@@ -1456,7 +1426,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: None,
@@ -1471,9 +1441,12 @@ mod tests {
         let state = Arc::new(Mutex::new(State::default()));
         {
             let mut state = state.lock().expect("state lock poisoned");
-            state
-                .pending
-                .insert(RequestId::Integer(99), PendingRequest::LoadedRead);
+            state.pending.insert(
+                RequestId::Integer(99),
+                PendingRequest::Read {
+                    thread_id: "thread-unknown".to_string(),
+                },
+            );
         }
 
         handle_notification(
@@ -1495,11 +1468,11 @@ mod tests {
         .expect("thread status changed notification should decode");
 
         let state = state.lock().expect("state lock poisoned");
-        assert!(state.known_threads.is_empty());
+        assert!(known_threads(&state).is_empty());
     }
 
     #[test]
-    fn unknown_thread_status_change_requests_loaded_read_refresh() {
+    fn unknown_thread_status_change_requests_thread_read_refresh() {
         let state = Arc::new(Mutex::new(State::default()));
         let next_request_id = Arc::new(AtomicI64::new(11));
         let mut child = Command::new("cat")
@@ -1525,7 +1498,7 @@ mod tests {
             &Output::new(),
             /*filtered_output*/ false,
         )
-        .expect("unknown thread status change should queue loaded/read refresh");
+        .expect("unknown thread status change should queue thread/read refresh");
 
         let stdout = child.stdout.take().expect("cat stdout should exist");
         let mut stdout = BufReader::new(stdout);
@@ -1536,26 +1509,25 @@ mod tests {
         let request: JSONRPCRequest =
             serde_json::from_str(line.trim()).expect("request should decode");
         assert_eq!(request.id, RequestId::Integer(11));
-        assert_eq!(request.method, "thread/loaded/read");
+        assert_eq!(request.method, "thread/read");
         assert_eq!(
             request.params,
             Some(
-                serde_json::to_value(ThreadLoadedReadParams {
-                    cursor: None,
-                    limit: None,
-                    model_providers: None,
-                    source_kinds: Some(all_thread_source_kinds()),
-                    cwd: None,
+                serde_json::to_value(ThreadReadParams {
+                    thread_id: "thread-unknown".to_string(),
+                    include_turns: false,
                 })
-                .expect("loaded read params should serialize")
+                .expect("thread read params should serialize")
             )
         );
 
         let state = state.lock().expect("state lock poisoned");
-        assert!(state.known_threads.is_empty());
+        assert!(known_threads(&state).is_empty());
         assert_eq!(
             state.pending.get(&RequestId::Integer(11)),
-            Some(&PendingRequest::LoadedRead)
+            Some(&PendingRequest::Read {
+                thread_id: "thread-unknown".to_string(),
+            })
         );
 
         drop(state);
@@ -1565,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_thread_not_loaded_status_change_skips_loaded_read_refresh() {
+    fn unknown_thread_not_loaded_status_change_skips_thread_read_refresh() {
         let state = Arc::new(Mutex::new(State::default()));
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
@@ -1590,10 +1562,10 @@ mod tests {
             &Output::new(),
             /*filtered_output*/ false,
         )
-        .expect("unknown notLoaded status change should not queue loaded/read refresh");
+        .expect("unknown notLoaded status change should not queue thread/read refresh");
 
         let state = state.lock().expect("state lock poisoned");
-        assert!(state.known_threads.is_empty());
+        assert!(known_threads(&state).is_empty());
         assert!(state.pending.is_empty());
 
         drop(state);
@@ -1628,7 +1600,7 @@ mod tests {
             &Output::new(),
             /*filtered_output*/ false,
         )
-        .expect("unknown thread status change should queue loaded/read refresh");
+        .expect("unknown thread status change should queue thread/read refresh");
 
         let stdout = child.stdout.take().expect("cat stdout should exist");
         let mut stdout = BufReader::new(stdout);
@@ -1639,13 +1611,14 @@ mod tests {
         let request: JSONRPCRequest =
             serde_json::from_str(line.trim()).expect("request should decode");
         assert_eq!(request.id, RequestId::Integer(11));
+        assert_eq!(request.method, "thread/read");
 
         let (events_tx, _events_rx) = channel();
         handle_response(
             JSONRPCResponse {
                 id: RequestId::Integer(11),
-                result: serde_json::to_value(ThreadLoadedReadResponse {
-                    data: vec![Thread {
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: Thread {
                         id: "thread-unknown".to_string(),
                         forked_from_id: None,
                         preview: "Resident recovered thread".to_string(),
@@ -1665,19 +1638,18 @@ mod tests {
                         git_info: None,
                         name: Some("atlas".to_string()),
                         turns: Vec::new(),
-                    }],
-                    next_cursor: None,
+                    },
                 })
-                .expect("loaded read response should serialize"),
+                .expect("thread read response should serialize"),
             },
             &state,
             &events_tx,
         )
-        .expect("loaded read response should decode");
+        .expect("thread read response should decode");
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-unknown".to_string(),
                 thread_name: Some("atlas".to_string()),
@@ -1731,12 +1703,15 @@ mod tests {
         let state = Arc::new(Mutex::new(State::default()));
         {
             let mut state = state.lock().expect("state lock poisoned");
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: Some("old-name".to_string()),
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::Idle,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("old-name".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
 
         handle_notification(
@@ -1759,7 +1734,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: Some("atlas".to_string()),
@@ -1848,7 +1823,7 @@ mod tests {
             &Output::new(),
             /*filtered_output*/ false,
         )
-        .expect("thread unarchived notification should queue thread/list refresh");
+        .expect("thread unarchived notification should queue thread/read refresh");
 
         let stdout = child.stdout.take().expect("cat stdout should exist");
         let mut stdout = BufReader::new(stdout);
@@ -1859,46 +1834,25 @@ mod tests {
         let request: JSONRPCRequest =
             serde_json::from_str(line.trim()).expect("request should decode");
         assert_eq!(request.id, RequestId::Integer(21));
-        assert_eq!(request.method, "thread/list");
+        assert_eq!(request.method, "thread/read");
 
-        let (events_tx, events_rx) = channel();
+        let (events_tx, _events_rx) = channel();
         handle_response(
             JSONRPCResponse {
                 id: RequestId::Integer(21),
-                result: serde_json::to_value(ThreadListResponse {
-                    data: vec![resident_thread(
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: resident_thread(
                         "thread-known",
                         Some("atlas repaired"),
                         ThreadStatus::NotLoaded,
-                    )],
-                    next_cursor: None,
+                    ),
                 })
-                .expect("thread list response should serialize"),
+                .expect("thread read response should serialize"),
             },
             &state,
             &events_tx,
         )
-        .expect("thread list response should decode");
-
-        let event = events_rx.recv().expect("thread list event should emit");
-        match event {
-            ReaderEvent::ThreadList {
-                threads,
-                next_cursor,
-            } => {
-                assert_eq!(
-                    threads,
-                    vec![KnownThread {
-                        thread_id: "thread-known".to_string(),
-                        thread_name: Some("atlas repaired".to_string()),
-                        thread_mode: ThreadMode::ResidentAssistant,
-                        thread_status: ThreadStatus::NotLoaded,
-                    }]
-                );
-                assert_eq!(next_cursor, None);
-            }
-            other => panic!("expected thread list event, got {other:?}"),
-        }
+        .expect("thread read response should decode");
 
         handle_notification(
             notification(
@@ -1918,7 +1872,15 @@ mod tests {
         .expect("thread closed notification should decode");
 
         let state = state.lock().expect("state lock poisoned");
-        assert!(state.known_threads.is_empty());
+        assert_eq!(
+            known_threads(&state),
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas repaired".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::NotLoaded,
+            }]
+        );
         assert!(state.pending.is_empty());
 
         drop(state);
@@ -1950,7 +1912,7 @@ mod tests {
         .expect("thread name updated notification should decode");
 
         let state = state.lock().expect("state lock poisoned");
-        assert!(state.known_threads.is_empty());
+        assert!(known_threads(&state).is_empty());
     }
 
     #[test]
@@ -1983,12 +1945,15 @@ mod tests {
         let state = Arc::new(Mutex::new(State::default()));
         {
             let mut state = state.lock().expect("state lock poisoned");
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: Some("atlas".to_string()),
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::Idle,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
 
         handle_notification(
@@ -2010,7 +1975,7 @@ mod tests {
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: Some("atlas".to_string()),
@@ -2050,12 +2015,15 @@ mod tests {
         let next_request_id = Arc::new(AtomicI64::new(21));
         {
             let mut state = state.lock().expect("state lock poisoned");
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: Some("atlas".to_string()),
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::NotLoaded,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::NotLoaded,
+                },
+            );
         }
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
@@ -2079,7 +2047,7 @@ mod tests {
             &Output::new(),
             /*filtered_output*/ false,
         )
-        .expect("thread unarchived notification should queue thread/list refresh");
+        .expect("thread unarchived notification should queue thread/read refresh");
 
         let stdout = child.stdout.take().expect("cat stdout should exist");
         let mut stdout = BufReader::new(stdout);
@@ -2090,14 +2058,14 @@ mod tests {
         let request: JSONRPCRequest =
             serde_json::from_str(line.trim()).expect("request should decode");
         assert_eq!(request.id, RequestId::Integer(21));
-        assert_eq!(request.method, "thread/list");
+        assert_eq!(request.method, "thread/read");
 
-        let (events_tx, events_rx) = channel();
+        let (events_tx, _events_rx) = channel();
         handle_response(
             JSONRPCResponse {
                 id: RequestId::Integer(21),
-                result: serde_json::to_value(ThreadListResponse {
-                    data: vec![Thread {
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: Thread {
                         id: "thread-known".to_string(),
                         forked_from_id: None,
                         preview: "restored thread".to_string(),
@@ -2117,39 +2085,18 @@ mod tests {
                         git_info: None,
                         name: Some("atlas restored".to_string()),
                         turns: Vec::new(),
-                    }],
-                    next_cursor: None,
+                    },
                 })
-                .expect("thread list response should serialize"),
+                .expect("thread read response should serialize"),
             },
             &state,
             &events_tx,
         )
-        .expect("thread list response should decode");
-
-        let event = events_rx.recv().expect("thread list event should emit");
-        match event {
-            ReaderEvent::ThreadList {
-                threads,
-                next_cursor,
-            } => {
-                assert_eq!(
-                    threads,
-                    vec![KnownThread {
-                        thread_id: "thread-known".to_string(),
-                        thread_name: Some("atlas restored".to_string()),
-                        thread_mode: ThreadMode::ResidentAssistant,
-                        thread_status: ThreadStatus::NotLoaded,
-                    }]
-                );
-                assert_eq!(next_cursor, None);
-            }
-            other => panic!("expected thread list event, got {other:?}"),
-        }
+        .expect("thread read response should decode");
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(
-            state.known_threads,
+            known_threads(&state),
             vec![KnownThread {
                 thread_id: "thread-known".to_string(),
                 thread_name: Some("atlas restored".to_string()),
@@ -2190,16 +2137,19 @@ mod tests {
     }
 
     #[test]
-    fn thread_closed_notification_removes_known_thread() {
+    fn thread_closed_notification_retains_known_thread_summary() {
         let state = Arc::new(Mutex::new(State::default()));
         {
             let mut state = state.lock().expect("state lock poisoned");
-            state.known_threads.push(KnownThread {
-                thread_id: "thread-known".to_string(),
-                thread_name: Some("atlas".to_string()),
-                thread_mode: ThreadMode::ResidentAssistant,
-                thread_status: ThreadStatus::NotLoaded,
-            });
+            remember_known_thread(
+                &mut state,
+                KnownThread {
+                    thread_id: "thread-known".to_string(),
+                    thread_name: Some("atlas".to_string()),
+                    thread_mode: ThreadMode::ResidentAssistant,
+                    thread_status: ThreadStatus::Idle,
+                },
+            );
         }
 
         handle_notification(
@@ -2220,7 +2170,15 @@ mod tests {
         .expect("thread closed notification should decode");
 
         let state = state.lock().expect("state lock poisoned");
-        assert!(state.known_threads.is_empty());
+        assert_eq!(
+            known_threads(&state),
+            vec![KnownThread {
+                thread_id: "thread-known".to_string(),
+                thread_name: Some("atlas".to_string()),
+                thread_mode: ThreadMode::ResidentAssistant,
+                thread_status: ThreadStatus::NotLoaded,
+            }]
+        );
     }
 
     #[test]

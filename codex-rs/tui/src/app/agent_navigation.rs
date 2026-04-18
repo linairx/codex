@@ -133,16 +133,6 @@ impl AgentNavigationState {
         self.order.clear();
     }
 
-    /// Removes a tracked thread entirely from picker metadata and traversal order.
-    ///
-    /// This is reserved for entries that were only discovered opportunistically and never became
-    /// replayable local threads. Keeping those around after the backend confirms they are gone
-    /// would leave ghost rows in `/agent`.
-    pub(crate) fn remove(&mut self, thread_id: ThreadId) {
-        self.threads.remove(&thread_id);
-        self.order.retain(|candidate| *candidate != thread_id);
-    }
-
     /// Returns whether there is at least one tracked thread other than the primary one.
     ///
     /// `App` uses this to decide whether the picker should be available even when the collaboration

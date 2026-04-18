@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
@@ -26,6 +25,18 @@ use anyhow::bail;
 use clap::ArgAction;
 use clap::Parser;
 use clap::Subcommand;
+use codex_app_server_client::AppServerClient;
+use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+use codex_app_server_client::RemoteAppServerClient;
+use codex_app_server_client::RemoteAppServerConnectArgs;
+use codex_app_server_client::ThreadSummaryBootstrapParams;
+use codex_app_server_client::ThreadSummaryBridgeClient;
+use codex_app_server_client::ThreadSummaryBridgeEvent;
+use codex_app_server_client::ThreadSummaryRefresh;
+use codex_app_server_client::ThreadSummaryServerRequestResolution;
+use codex_app_server_client::ThreadSummaryTrackedEvent;
+use codex_app_server_client::ThreadSummaryTracker;
+use codex_app_server_client::ThreadSummaryUpdate;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientInfo;
@@ -111,6 +122,7 @@ use codex_utils_cli::CliConfigOverrides;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::Instrument;
 use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -238,6 +250,15 @@ enum CliCommand {
         /// Number of stored and loaded thread summaries to print during bootstrap.
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Continue following pagination cursors until the bootstrap summary has consumed every page.
+        #[arg(long, default_value_t = false)]
+        all_pages: bool,
+        /// Existing thread id to reconnect before streaming summary events.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Reconnect using explicit resident-assistant mode instead of legacy resume defaults.
+        #[arg(long, default_value_t = false)]
+        resident: bool,
     },
     /// Start a V2 turn that elicits an ExecCommand approval.
     #[command(name = "trigger-cmd-approval")]
@@ -489,10 +510,23 @@ pub async fn run() -> Result<()> {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             watch(&endpoint, &config_overrides).await
         }
-        CliCommand::WatchSummary { limit } => {
+        CliCommand::WatchSummary {
+            limit,
+            all_pages,
+            thread_id,
+            resident,
+        } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "watch-summary")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            watch_summary(&endpoint, &config_overrides, limit).await
+            watch_summary(
+                &endpoint,
+                &config_overrides,
+                limit,
+                all_pages,
+                thread_id,
+                resident,
+            )
+            .await
         }
         CliCommand::TriggerCmdApproval { user_message } => {
             let endpoint = resolve_endpoint(codex_bin, url)?;
@@ -1109,40 +1143,213 @@ async fn watch(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
     .await
 }
 
-async fn watch_summary(endpoint: &Endpoint, config_overrides: &[String], limit: u32) -> Result<()> {
+async fn watch_summary(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    limit: u32,
+    all_pages: bool,
+    thread_id: Option<String>,
+    resident: bool,
+) -> Result<()> {
+    if let Endpoint::ConnectWs(url) = endpoint {
+        return watch_summary_remote(url, config_overrides, limit, all_pages, thread_id, resident)
+            .await;
+    }
+
+    if thread_id.is_some() {
+        bail!(
+            "watch-summary --thread-id requires --url or another shared websocket app-server; --codex-bin would spawn a private stdio app-server instead"
+        );
+    }
+
     with_client("watch-summary", endpoint, config_overrides, |client| {
         let initialize = client.initialize()?;
         println!("< initialize response: {initialize:?}");
 
-        let thread_list = client.thread_list(ThreadListParams {
-            cursor: None,
-            limit: Some(limit),
-            sort_key: None,
-            model_providers: None,
-            source_kinds: Some(all_thread_source_kinds()),
-            archived: None,
-            cwd: None,
-            search_term: None,
-        })?;
-        print_thread_list_summary(&thread_list);
+        let mut thread_list_cursor = None;
+        loop {
+            let thread_list = client.thread_list(ThreadListParams {
+                cursor: thread_list_cursor.clone(),
+                limit: Some(limit),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: Some(all_thread_source_kinds()),
+                archived: None,
+                cwd: None,
+                search_term: None,
+            })?;
+            print_thread_list_summary(&thread_list);
+            if !all_pages || thread_list.next_cursor.is_none() {
+                break;
+            }
+            thread_list_cursor = thread_list.next_cursor;
+        }
 
-        let loaded_read = client.thread_loaded_read(ThreadLoadedReadParams {
-            cursor: None,
-            limit: Some(limit),
-            model_providers: None,
-            source_kinds: Some(all_thread_source_kinds()),
-            cwd: None,
-        })?;
-        print_thread_collection_summary_with_cursor(
-            "thread/loaded/read",
-            &loaded_read.data,
-            loaded_read.next_cursor.as_deref(),
-        );
+        let mut loaded_read_cursor = None;
+        loop {
+            let loaded_read = client.thread_loaded_read(ThreadLoadedReadParams {
+                cursor: loaded_read_cursor.clone(),
+                limit: Some(limit),
+                model_providers: None,
+                source_kinds: Some(all_thread_source_kinds()),
+                cwd: None,
+            })?;
+            print_thread_collection_summary_with_cursor(
+                "thread/loaded/read",
+                &loaded_read.data,
+                loaded_read.next_cursor.as_deref(),
+            );
+            if !all_pages || loaded_read.next_cursor.is_none() {
+                break;
+            }
+            loaded_read_cursor = loaded_read.next_cursor;
+        }
 
         println!("< streaming summary notifications until process is terminated");
         client.stream_notifications_forever()
     })
     .await
+}
+
+async fn watch_summary_remote(
+    websocket_url: &str,
+    config_overrides: &[String],
+    limit: u32,
+    all_pages: bool,
+    thread_id: Option<String>,
+    resident: bool,
+) -> Result<()> {
+    let tracing = TestClientTracing::initialize(config_overrides).await?;
+    let command_span = info_span!(
+        "app_server_test_client.command",
+        otel.kind = "client",
+        otel.name = "watch-summary",
+        app_server_test_client.command = "watch-summary",
+    );
+    let trace_summary = command_span.in_scope(|| TraceSummary::capture(tracing.traces_enabled));
+    let result = async move {
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: websocket_url.to_string(),
+            auth_token: None,
+            client_name: "codex-toy-app-server".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: NOTIFICATIONS_TO_OPT_OUT
+                .iter()
+                .map(|method| (*method).to_string())
+                .collect(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        })
+        .await
+        .with_context(|| format!("connect remote app-server websocket `{websocket_url}`"))?;
+
+        println!("< initialize response: remote websocket connected");
+
+        let mut summary_client = ThreadSummaryBridgeClient::new(AppServerClient::Remote(client));
+        if let Some(thread_id) = thread_id {
+            let resume_response =
+                resume_remote_summary_thread(&mut summary_client, thread_id, resident).await?;
+            println!("< thread/resume response: {resume_response:?}");
+            print_thread_response_summary("thread/resume", &resume_response.thread);
+            println!("< streaming summary notifications until process is terminated");
+            while let Some(event) = summary_client.next_bridge_event().await {
+                if !handle_remote_summary_bridge_event(event?).await? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        let bootstrap_params = ThreadSummaryBootstrapParams {
+            thread_list: ThreadListParams {
+                cursor: None,
+                limit: Some(limit),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: Some(all_thread_source_kinds()),
+                archived: None,
+                cwd: None,
+                search_term: None,
+            },
+            thread_loaded_read: ThreadLoadedReadParams {
+                cursor: None,
+                limit: Some(limit),
+                model_providers: None,
+                source_kinds: Some(all_thread_source_kinds()),
+                cwd: None,
+            },
+        };
+
+        let mut thread_list_cursor = bootstrap_params.thread_list.cursor.clone();
+        loop {
+            let thread_list = summary_client
+                .summary_client_mut()
+                .fetch_thread_list_page(ThreadListParams {
+                    cursor: thread_list_cursor.clone(),
+                    ..bootstrap_params.thread_list.clone()
+                })
+                .await
+                .context("thread/list bootstrap through remote app-server")?;
+            print_thread_list_summary(&thread_list);
+            if !all_pages || thread_list.next_cursor.is_none() {
+                break;
+            }
+            thread_list_cursor = thread_list.next_cursor;
+        }
+
+        let mut loaded_read_cursor = bootstrap_params.thread_loaded_read.cursor.clone();
+        loop {
+            let loaded_read = summary_client
+                .summary_client_mut()
+                .fetch_thread_loaded_read_page(ThreadLoadedReadParams {
+                    cursor: loaded_read_cursor.clone(),
+                    ..bootstrap_params.thread_loaded_read.clone()
+                })
+                .await
+                .context("thread/loaded/read bootstrap through remote app-server")?;
+            print_thread_collection_summary_with_cursor(
+                "thread/loaded/read",
+                &loaded_read.data,
+                loaded_read.next_cursor.as_deref(),
+            );
+            if !all_pages || loaded_read.next_cursor.is_none() {
+                break;
+            }
+            loaded_read_cursor = loaded_read.next_cursor;
+        }
+
+        println!("< streaming summary notifications until process is terminated");
+        while let Some(event) = summary_client.next_bridge_event().await {
+            if !handle_remote_summary_bridge_event(event?).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+    .instrument(command_span)
+    .await;
+    print_trace_summary(&trace_summary);
+    result
+}
+
+async fn resume_remote_summary_thread(
+    summary_client: &mut ThreadSummaryBridgeClient,
+    thread_id: String,
+    resident: bool,
+) -> Result<ThreadResumeResponse> {
+    let resume_response: ThreadResumeResponse = summary_client
+        .summary_client()
+        .request_handle()
+        .request_typed(ClientRequest::ThreadResume {
+            request_id: RequestId::Integer(1),
+            params: explicit_thread_resume_params(thread_id, resident),
+        })
+        .await
+        .context("thread/resume through remote app-server")?;
+    summary_client
+        .tracker_mut()
+        .upsert_thread(resume_response.thread.clone());
+    Ok(resume_response)
 }
 
 async fn trigger_cmd_approval(
@@ -1795,6 +2002,204 @@ fn thread_active_flag_label(active_flag: ThreadActiveFlag) -> &'static str {
     }
 }
 
+#[cfg(test)]
+async fn handle_remote_summary_event(
+    _request_handle: &AppServerRequestHandle,
+    tracker: &mut ThreadSummaryTracker,
+    event: AppServerEvent,
+) -> Result<bool> {
+    handle_remote_summary_tracked_event_without_client(
+        tracker.track_event(_request_handle, event).await,
+    )
+    .await
+}
+
+async fn handle_remote_summary_bridge_event(event: ThreadSummaryBridgeEvent) -> Result<bool> {
+    handle_remote_summary_tracked_event_impl(event).await
+}
+
+#[cfg(test)]
+async fn handle_remote_summary_tracked_event_without_client(
+    event: ThreadSummaryTrackedEvent,
+) -> Result<bool> {
+    handle_remote_summary_tracked_event_impl(ThreadSummaryBridgeEvent {
+        tracked_event: event,
+        server_request_resolution: None,
+    })
+    .await
+}
+
+async fn handle_remote_summary_tracked_event_impl(event: ThreadSummaryBridgeEvent) -> Result<bool> {
+    let ThreadSummaryBridgeEvent {
+        tracked_event,
+        server_request_resolution,
+    } = event;
+    match tracked_event {
+        ThreadSummaryTrackedEvent::Lagged { skipped } => {
+            println!("< lagged event stream: skipped={skipped}");
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::ServerRequest {
+            request,
+            thread_id,
+            summary,
+        } => {
+            let known_thread = summary
+                .as_ref()
+                .map(|thread| KnownThreadSummary::from(thread.as_ref()));
+            for line in
+                server_request_summary_lines(&request, thread_id.as_deref(), known_thread.as_ref())
+            {
+                println!("{line}");
+            }
+            if let Some(resolution) = server_request_resolution {
+                println!(
+                    "{}",
+                    remote_summary_server_request_resolution_line(&resolution)
+                );
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::Disconnected { message } => {
+            println!("< disconnected: {message}");
+            Ok(false)
+        }
+        ThreadSummaryTrackedEvent::ThreadStarted { payload, .. } => {
+            for line in
+                thread_started_notification_lines(&payload.thread, /*include_raw_debug*/ false)
+            {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::ThreadStatusChanged {
+            payload,
+            summary,
+            refresh,
+            update: _,
+        } => {
+            let known_thread = summary
+                .as_ref()
+                .map(|thread| KnownThreadSummary::from(thread.as_ref()));
+            for line in thread_status_changed_notification_lines(
+                &payload.thread_id,
+                &payload.status,
+                known_thread.as_ref(),
+            ) {
+                println!("{line}");
+            }
+            match refresh {
+                ThreadSummaryRefresh::Refreshed(thread) => {
+                    println!(
+                        "{}",
+                        thread_response_summary_line("thread/status/changed refresh", &thread)
+                    );
+                }
+                ThreadSummaryRefresh::Failed { thread_id, error } => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "refresh thread summary after thread/status/changed for {thread_id}"
+                        )
+                    });
+                }
+                ThreadSummaryRefresh::NotNeeded => {}
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::ThreadClosed {
+            payload, summary, ..
+        } => {
+            let known_thread = summary
+                .as_ref()
+                .map(|thread| KnownThreadSummary::from(thread.as_ref()));
+            for line in thread_closed_notification_lines(&payload.thread_id, known_thread.as_ref())
+            {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::ThreadArchived {
+            payload, summary, ..
+        } => {
+            let known_thread = summary
+                .as_ref()
+                .map(|thread| KnownThreadSummary::from(thread.as_ref()));
+            for line in
+                thread_archived_notification_lines(&payload.thread_id, known_thread.as_ref())
+            {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::ThreadUnarchived {
+            payload,
+            previous_summary,
+            summary,
+            refresh,
+            update: _,
+        } => {
+            if let ThreadSummaryRefresh::Failed { thread_id, error } = &refresh {
+                println!(
+                    "< thread/unarchived refresh failed: thread_id={thread_id}, error={error:#}"
+                );
+            }
+            let known_thread = summary
+                .as_ref()
+                .map(|thread| KnownThreadSummary::from(thread.as_ref()))
+                .or(previous_summary
+                    .as_ref()
+                    .map(|thread| KnownThreadSummary::from(thread.as_ref())));
+            for line in
+                thread_unarchived_notification_lines(&payload.thread_id, known_thread.as_ref())
+            {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::ThreadNameUpdated {
+            payload, summary, ..
+        } => {
+            let known_thread = summary
+                .as_ref()
+                .map(|thread| KnownThreadSummary::from(thread.as_ref()));
+            for line in thread_name_updated_notification_lines(
+                &payload.thread_id,
+                payload.thread_name.as_deref(),
+                known_thread.as_ref(),
+            ) {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+        ThreadSummaryTrackedEvent::OtherNotification(_) => Ok(true),
+    }
+}
+
+fn remote_summary_server_request_resolution_line(
+    resolution: &ThreadSummaryServerRequestResolution,
+) -> &'static str {
+    match resolution {
+        ThreadSummaryServerRequestResolution::CommandExecutionApproved => {
+            "< auto-accepted remote command approval"
+        }
+        ThreadSummaryServerRequestResolution::FileChangeApproved => {
+            "< auto-accepted remote file change approval"
+        }
+        ThreadSummaryServerRequestResolution::PermissionsApproved => {
+            "< auto-granted remote permissions approval"
+        }
+        ThreadSummaryServerRequestResolution::RequestUserInputAnswered => {
+            "< auto-answered remote request_user_input"
+        }
+        ThreadSummaryServerRequestResolution::McpServerElicitationCancelled => {
+            "< auto-cancelled remote MCP elicitation"
+        }
+        ThreadSummaryServerRequestResolution::RejectedUnsupported { .. } => {
+            "< rejected unsupported remote server request"
+        }
+    }
+}
+
 fn thread_status_changed_summary_line(
     thread_id: &str,
     status: &codex_app_server_protocol::ThreadStatus,
@@ -1946,9 +2351,52 @@ fn thread_unarchived_notification_lines(
     )]
 }
 
+fn known_thread_summary_line(thread_id: &str, known_thread: &KnownThreadSummary) -> String {
+    format!(
+        "id={thread_id}, name={}, mode={}, resident={}, status={}, action={}",
+        thread_name_label(known_thread.name.as_deref()),
+        thread_mode_label(known_thread.mode),
+        known_thread.resident,
+        thread_status_label(&known_thread.status),
+        thread_resume_action_label(known_thread.mode)
+    )
+}
+
+fn server_request_method_label(request: &ServerRequest) -> &'static str {
+    match request {
+        ServerRequest::CommandExecutionRequestApproval { .. } => {
+            "item/commandExecution/requestApproval"
+        }
+        ServerRequest::FileChangeRequestApproval { .. } => "item/fileChange/requestApproval",
+        ServerRequest::ToolRequestUserInput { .. } => "item/tool/requestUserInput",
+        ServerRequest::McpServerElicitationRequest { .. } => "mcpServer/elicitation/request",
+        ServerRequest::PermissionsRequestApproval { .. } => "item/permissions/requestApproval",
+        ServerRequest::DynamicToolCall { .. } => "item/tool/call",
+        ServerRequest::ChatgptAuthTokensRefresh { .. } => "account/chatgptAuthTokens/refresh",
+        ServerRequest::ApplyPatchApproval { .. } => "applyPatchApproval",
+        ServerRequest::ExecCommandApproval { .. } => "execCommandApproval",
+    }
+}
+
+fn server_request_summary_lines(
+    request: &ServerRequest,
+    thread_id: Option<&str>,
+    known_thread: Option<&KnownThreadSummary>,
+) -> Vec<String> {
+    let method = server_request_method_label(request);
+    let request_id = request.id();
+    let summary = match (thread_id, known_thread) {
+        (Some(thread_id), Some(known_thread)) => known_thread_summary_line(thread_id, known_thread),
+        (Some(thread_id), None) => format!("id={thread_id}"),
+        (None, _) => "thread=<none>".to_string(),
+    };
+    vec![format!(
+        "< {method} summary: request_id={request_id:?}, {summary}"
+    )]
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::net::TcpListener;
@@ -1964,7 +2412,11 @@ mod tests {
     use super::default_user_input_answers;
     use super::explicit_thread_resume_params;
     use super::granted_permission_profile_from_request;
+    use super::handle_remote_summary_bridge_event;
+    use super::handle_remote_summary_event;
     use super::interactive_thread_start_params;
+    use super::resume_remote_summary_thread;
+    use super::server_request_summary_lines;
     use super::thread_archived_notification_lines;
     use super::thread_archived_summary_line;
     use super::thread_closed_notification_lines;
@@ -1984,12 +2436,26 @@ mod tests {
     use super::thread_unarchived_notification_lines;
     use super::thread_unarchived_summary_line;
     use clap::CommandFactory;
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::AppServerEvent;
+    use codex_app_server_client::AppServerRequestHandle;
+    use codex_app_server_client::RemoteAppServerClient;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_client::ThreadSummaryBridgeClient;
+    use codex_app_server_client::ThreadSummaryTracker;
+    use codex_app_server_protocol::ApprovalsReviewer;
+    use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::JSONRPCMessage;
+    use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::PermissionGrantScope;
+    use codex_app_server_protocol::PermissionsRequestApprovalResponse;
     use codex_app_server_protocol::RequestId;
+    use codex_app_server_protocol::SandboxPolicy;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::SessionSource;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadActiveFlag;
@@ -1999,12 +2465,19 @@ mod tests {
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadNameUpdatedNotification;
     use codex_app_server_protocol::ThreadReadResponse;
+    use codex_app_server_protocol::ThreadResumeResponse;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::ThreadStatusChangedNotification;
     use codex_app_server_protocol::ThreadUnarchivedNotification;
     use codex_app_server_protocol::ToolRequestUserInputOption;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
     use codex_app_server_protocol::all_thread_source_kinds as protocol_all_thread_source_kinds;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use pretty_assertions::assert_eq;
+    use tokio::net::TcpListener as TokioTcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message as TokioMessage;
     use tungstenite::accept;
     use tungstenite::connect;
     use tungstenite::protocol::Message;
@@ -2036,6 +2509,84 @@ mod tests {
             git_info: None,
             name: name.map(ToString::to_string),
             turns: Vec::new(),
+        }
+    }
+
+    async fn start_remote_server<F, Fut>(handler: F) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let websocket = accept_async(stream)
+                .await
+                .expect("websocket handshake should succeed");
+            handler(websocket).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn expect_initialize(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        let TokioMessage::Text(message) = websocket
+            .next()
+            .await
+            .expect("initialize request should arrive")
+            .expect("websocket should stay open")
+        else {
+            panic!("expected initialize request");
+        };
+        let request: JSONRPCRequest =
+            serde_json::from_str(&message).expect("initialize request should decode");
+        assert_eq!(request.method, "initialize");
+        let response = JSONRPCMessage::Response(JSONRPCResponse {
+            id: request.id,
+            result: serde_json::json!({
+                "protocolVersion": 2,
+                "serverInfo": { "name": "test", "version": "0.0.0-test" }
+            }),
+        });
+        websocket
+            .send(TokioMessage::Text(
+                serde_json::to_string(&response)
+                    .expect("initialize response should encode")
+                    .into(),
+            ))
+            .await
+            .expect("initialize response should send");
+
+        let TokioMessage::Text(message) = websocket
+            .next()
+            .await
+            .expect("initialized notification should arrive")
+            .expect("websocket should stay open")
+        else {
+            panic!("expected initialized notification");
+        };
+        let notification: JSONRPCNotification =
+            serde_json::from_str(&message).expect("initialized notification should decode");
+        assert_eq!(notification.method, "initialized");
+    }
+
+    fn remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
+        RemoteAppServerConnectArgs {
+            websocket_url,
+            auth_token: None,
+            client_name: "codex-app-server-test-client".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
         }
     }
 
@@ -2213,9 +2764,21 @@ mod tests {
             "Initialize the app-server, print thread summaries, then continue streaming summary notifications"
         ));
         assert!(watch_summary_help.contains("--limit <LIMIT>"));
+        assert!(watch_summary_help.contains("--all-pages"));
+        assert!(watch_summary_help.contains("--thread-id <THREAD_ID>"));
+        assert!(watch_summary_help.contains("--resident"));
         assert!(
             watch_summary_help
                 .contains("Number of stored and loaded thread summaries to print during bootstrap")
+        );
+        assert!(
+            watch_summary_help.contains(
+                "Continue following pagination cursors until the bootstrap summary has consumed every page"
+            )
+        );
+        assert!(
+            watch_summary_help
+                .contains("Existing thread id to reconnect before streaming summary events")
         );
         assert!(thread_unarchive_help.contains(
             "Prints a compact per-thread summary including `thread.mode`, `status`, and the"
@@ -2834,6 +3397,37 @@ mod tests {
     }
 
     #[test]
+    fn server_request_summary_lines_use_known_thread_context_when_available() {
+        assert_eq!(
+            server_request_summary_lines(
+                &ServerRequest::PermissionsRequestApproval {
+                    request_id: RequestId::String("srv-1".to_string()),
+                    params: codex_app_server_protocol::PermissionsRequestApprovalParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        item_id: "item-1".to_string(),
+                        reason: Some("need access".to_string()),
+                        permissions: codex_app_server_protocol::RequestPermissionProfile {
+                            network: None,
+                            file_system: None,
+                        },
+                    },
+                },
+                Some("thread-1"),
+                Some(&KnownThreadSummary {
+                    name: Some("atlas".to_string()),
+                    mode: ThreadMode::ResidentAssistant,
+                    resident: true,
+                    status: ThreadStatus::Idle,
+                }),
+            ),
+            vec![String::from(
+                "< item/permissions/requestApproval summary: request_id=String(\"srv-1\"), id=thread-1, name=atlas, mode=residentAssistant, resident=true, status=Idle, action=reconnect"
+            )]
+        );
+    }
+
+    #[test]
     fn granted_permission_profile_from_request_keeps_requested_permissions() {
         assert_eq!(
             granted_permission_profile_from_request(
@@ -2959,7 +3553,7 @@ mod tests {
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
-            known_threads: Default::default(),
+            thread_summaries: ThreadSummaryTracker::new(),
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -2987,7 +3581,7 @@ mod tests {
             "status notification should not terminate streaming"
         );
         assert_eq!(
-            client.known_threads.get("thread-unknown"),
+            client.known_thread_summary("thread-unknown").as_ref(),
             Some(&KnownThreadSummary {
                 name: Some("atlas".to_string()),
                 mode: ThreadMode::ResidentAssistant,
@@ -3022,7 +3616,7 @@ mod tests {
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
-            known_threads: Default::default(),
+            thread_summaries: ThreadSummaryTracker::new(),
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3050,7 +3644,7 @@ mod tests {
             "status notification should not terminate streaming"
         );
         assert!(
-            client.known_threads.is_empty(),
+            client.thread_summaries.iter().next().is_none(),
             "notLoaded for an unknown thread should not trigger a refresh read"
         );
 
@@ -3058,12 +3652,20 @@ mod tests {
     }
 
     #[test]
-    fn thread_closed_notification_removes_known_thread_summary() {
+    fn thread_closed_notification_retains_known_thread_summary() {
         let mut child = std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("child should spawn");
+        let mut thread_summaries = ThreadSummaryTracker::new();
+        thread_summaries.upsert_thread(make_thread(
+            "thread-1",
+            Some("atlas"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::NotLoaded,
+        ));
         let mut client = CodexClient {
             transport: ClientTransport::Stdio {
                 stdin: child.stdin.take(),
@@ -3073,15 +3675,7 @@ mod tests {
                 child,
             },
             pending_notifications: VecDeque::new(),
-            known_threads: BTreeMap::from([(
-                "thread-1".to_string(),
-                KnownThreadSummary {
-                    name: Some("atlas".to_string()),
-                    mode: ThreadMode::ResidentAssistant,
-                    resident: true,
-                    status: ThreadStatus::NotLoaded,
-                },
-            )]),
+            thread_summaries,
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3107,9 +3701,15 @@ mod tests {
             !handled,
             "thread/closed notification should not terminate streaming"
         );
-        assert!(
-            !client.known_threads.contains_key("thread-1"),
-            "thread/closed should evict cached thread summary"
+        assert_eq!(
+            client.known_thread_summary("thread-1").as_ref(),
+            Some(&KnownThreadSummary {
+                name: Some("atlas".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::NotLoaded,
+            }),
+            "thread/closed should retain the cached thread summary as not loaded"
         );
     }
 
@@ -3120,6 +3720,14 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("child should spawn");
+        let mut thread_summaries = ThreadSummaryTracker::new();
+        thread_summaries.upsert_thread(make_thread(
+            "thread-1",
+            Some("atlas"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        ));
         let mut client = CodexClient {
             transport: ClientTransport::Stdio {
                 stdin: child.stdin.take(),
@@ -3129,15 +3737,7 @@ mod tests {
                 child,
             },
             pending_notifications: VecDeque::new(),
-            known_threads: BTreeMap::from([(
-                "thread-1".to_string(),
-                KnownThreadSummary {
-                    name: Some("atlas".to_string()),
-                    mode: ThreadMode::ResidentAssistant,
-                    resident: true,
-                    status: ThreadStatus::Idle,
-                },
-            )]),
+            thread_summaries,
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3165,7 +3765,7 @@ mod tests {
             "thread/name/updated notification should not terminate streaming"
         );
         assert_eq!(
-            client.known_threads.get("thread-1"),
+            client.known_thread_summary("thread-1").as_ref(),
             Some(&KnownThreadSummary {
                 name: Some("atlas renamed".to_string()),
                 mode: ThreadMode::ResidentAssistant,
@@ -3182,6 +3782,14 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("child should spawn");
+        let mut thread_summaries = ThreadSummaryTracker::new();
+        thread_summaries.upsert_thread(make_thread(
+            "thread-1",
+            Some("atlas"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        ));
         let mut client = CodexClient {
             transport: ClientTransport::Stdio {
                 stdin: child.stdin.take(),
@@ -3191,15 +3799,7 @@ mod tests {
                 child,
             },
             pending_notifications: VecDeque::new(),
-            known_threads: BTreeMap::from([(
-                "thread-1".to_string(),
-                KnownThreadSummary {
-                    name: Some("atlas".to_string()),
-                    mode: ThreadMode::ResidentAssistant,
-                    resident: true,
-                    status: ThreadStatus::Idle,
-                },
-            )]),
+            thread_summaries,
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3226,13 +3826,211 @@ mod tests {
             "thread/archived notification should not terminate streaming"
         );
         assert_eq!(
-            client.known_threads.get("thread-1"),
+            client.known_thread_summary("thread-1").as_ref(),
             Some(&KnownThreadSummary {
                 name: Some("atlas".to_string()),
                 mode: ThreadMode::ResidentAssistant,
                 resident: true,
                 status: ThreadStatus::NotLoaded,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_remote_summary_event_retains_closed_thread_summary() {
+        let websocket_url = start_remote_server(|mut websocket| async move {
+            expect_initialize(&mut websocket).await;
+        })
+        .await;
+
+        let client = RemoteAppServerClient::connect(remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+        let request_handle = AppServerRequestHandle::Remote(client.request_handle());
+        let mut tracker = ThreadSummaryTracker::new();
+        tracker.upsert_thread(make_thread(
+            "thread-1",
+            Some("atlas"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::Idle,
+        ));
+
+        let handled = handle_remote_summary_event(
+            &request_handle,
+            &mut tracker,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                ThreadClosedNotification {
+                    thread_id: "thread-1".to_string(),
+                },
+            )),
+        )
+        .await
+        .expect("remote thread/closed notification should apply");
+
+        assert!(handled);
+        assert_eq!(
+            tracker.get("thread-1").map(KnownThreadSummary::from),
+            Some(KnownThreadSummary {
+                name: Some("atlas".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::NotLoaded,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_remote_summary_tracked_event_resolves_permissions_requests() {
+        let websocket_url = start_remote_server(|mut websocket| async move {
+            expect_initialize(&mut websocket).await;
+
+            let request = JSONRPCMessage::Request(
+                serde_json::from_value(
+                    serde_json::to_value(ServerRequest::PermissionsRequestApproval {
+                        request_id: RequestId::String("srv-1".to_string()),
+                        params: codex_app_server_protocol::PermissionsRequestApprovalParams {
+                            thread_id: "thread-1".to_string(),
+                            turn_id: "turn-1".to_string(),
+                            item_id: "item-1".to_string(),
+                            reason: Some("need access".to_string()),
+                            permissions: codex_app_server_protocol::RequestPermissionProfile {
+                                network: None,
+                                file_system: None,
+                            },
+                        },
+                    })
+                    .expect("permissions request should serialize"),
+                )
+                .expect("permissions request should convert to JSON-RPC"),
+            );
+            websocket
+                .send(TokioMessage::Text(
+                    serde_json::to_string(&request)
+                        .expect("permissions request should encode")
+                        .into(),
+                ))
+                .await
+                .expect("permissions request should send");
+
+            let TokioMessage::Text(message) = websocket
+                .next()
+                .await
+                .expect("permissions response should arrive")
+                .expect("websocket should stay open")
+            else {
+                panic!("expected permissions response");
+            };
+            let response: JSONRPCResponse =
+                serde_json::from_str(&message).expect("permissions response should decode");
+            assert_eq!(response.id, RequestId::String("srv-1".to_string()));
+            let response: PermissionsRequestApprovalResponse =
+                serde_json::from_value(response.result)
+                    .expect("permissions response should deserialize");
+            assert_eq!(response.scope, PermissionGrantScope::Turn);
+        })
+        .await;
+
+        let client = RemoteAppServerClient::connect(remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+        let mut summary_client = ThreadSummaryBridgeClient::new(AppServerClient::Remote(client));
+
+        let event = summary_client
+            .next_bridge_event()
+            .await
+            .expect("bridge event should arrive")
+            .expect("tracked server request event should resolve");
+        let handled = handle_remote_summary_bridge_event(event)
+            .await
+            .expect("tracked server request should resolve");
+
+        assert!(handled);
+    }
+
+    #[tokio::test]
+    async fn remote_summary_resume_upserts_tracker_with_resumed_thread() {
+        let websocket_url = start_remote_server(|mut websocket| async move {
+            expect_initialize(&mut websocket).await;
+
+            let TokioMessage::Text(message) = websocket
+                .next()
+                .await
+                .expect("thread/resume request should arrive")
+                .expect("websocket should stay open")
+            else {
+                panic!("expected thread/resume request");
+            };
+            let request: JSONRPCRequest =
+                serde_json::from_str(&message).expect("thread/resume request should decode");
+            assert_eq!(request.method, "thread/resume");
+            let params = request
+                .params
+                .expect("thread/resume request should include params");
+            assert_eq!(
+                params.get("threadId"),
+                Some(&serde_json::Value::String("thread-1".to_string()))
+            );
+            assert_eq!(
+                params.get("mode"),
+                Some(&serde_json::Value::String("residentAssistant".to_string()))
+            );
+
+            let response = JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id,
+                result: serde_json::to_value(ThreadResumeResponse {
+                    thread: make_thread(
+                        "thread-1",
+                        Some("atlas"),
+                        ThreadMode::ResidentAssistant,
+                        true,
+                        ThreadStatus::Idle,
+                    ),
+                    model: "gpt-5".to_string(),
+                    model_provider: "openai".to_string(),
+                    service_tier: None,
+                    cwd: PathBuf::from("/tmp/atlas"),
+                    approval_policy: AskForApproval::Never,
+                    approvals_reviewer: ApprovalsReviewer::User,
+                    sandbox: SandboxPolicy::DangerFullAccess,
+                    reasoning_effort: None,
+                })
+                .expect("thread/resume response should serialize"),
+            });
+            websocket
+                .send(TokioMessage::Text(
+                    serde_json::to_string(&response)
+                        .expect("thread/resume response should encode")
+                        .into(),
+                ))
+                .await
+                .expect("thread/resume response should send");
+        })
+        .await;
+
+        let client = RemoteAppServerClient::connect(remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+        let mut summary_client = ThreadSummaryBridgeClient::new(AppServerClient::Remote(client));
+
+        let response =
+            resume_remote_summary_thread(&mut summary_client, "thread-1".to_string(), true)
+                .await
+                .expect("remote summary thread resume should succeed");
+
+        assert_eq!(
+            response.thread,
+            make_thread(
+                "thread-1",
+                Some("atlas"),
+                ThreadMode::ResidentAssistant,
+                true,
+                ThreadStatus::Idle,
+            )
+        );
+        assert_eq!(
+            summary_client.tracker().get("thread-1"),
+            Some(&response.thread)
         );
     }
 
@@ -3298,7 +4096,7 @@ mod tests {
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
-            known_threads: Default::default(),
+            thread_summaries: ThreadSummaryTracker::new(),
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3325,7 +4123,7 @@ mod tests {
             "thread/unarchived notification should not terminate streaming"
         );
         assert_eq!(
-            client.known_threads.get("thread-unknown"),
+            client.known_thread_summary("thread-unknown").as_ref(),
             Some(&KnownThreadSummary {
                 name: Some("atlas".to_string()),
                 mode: ThreadMode::ResidentAssistant,
@@ -3335,6 +4133,91 @@ mod tests {
         );
 
         server.join().expect("websocket server should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn handle_remote_summary_event_refreshes_unarchived_thread_summary() {
+        let websocket_url = start_remote_server(|mut websocket| async move {
+            expect_initialize(&mut websocket).await;
+
+            let TokioMessage::Text(message) = websocket
+                .next()
+                .await
+                .expect("thread/read request should arrive")
+                .expect("websocket should stay open")
+            else {
+                panic!("expected thread/read request");
+            };
+            let request: JSONRPCRequest =
+                serde_json::from_str(&message).expect("thread/read request should decode");
+            assert_eq!(request.method, "thread/read");
+            assert_eq!(
+                request.params,
+                Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "includeTurns": false
+                }))
+            );
+
+            let response = JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id,
+                result: serde_json::to_value(ThreadReadResponse {
+                    thread: make_thread(
+                        "thread-1",
+                        Some("atlas restored"),
+                        ThreadMode::ResidentAssistant,
+                        true,
+                        ThreadStatus::Idle,
+                    ),
+                })
+                .expect("thread/read response should serialize"),
+            });
+            websocket
+                .send(TokioMessage::Text(
+                    serde_json::to_string(&response)
+                        .expect("thread/read response should encode")
+                        .into(),
+                ))
+                .await
+                .expect("thread/read response should send");
+        })
+        .await;
+
+        let client = RemoteAppServerClient::connect(remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+        let request_handle = AppServerRequestHandle::Remote(client.request_handle());
+        let mut tracker = ThreadSummaryTracker::new();
+        tracker.upsert_thread(make_thread(
+            "thread-1",
+            Some("atlas archived"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::NotLoaded,
+        ));
+
+        let handled = handle_remote_summary_event(
+            &request_handle,
+            &mut tracker,
+            AppServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(
+                ThreadUnarchivedNotification {
+                    thread_id: "thread-1".to_string(),
+                },
+            )),
+        )
+        .await
+        .expect("remote thread/unarchived notification should refresh");
+
+        assert!(handled);
+        assert_eq!(
+            tracker.get("thread-1").map(KnownThreadSummary::from),
+            Some(KnownThreadSummary {
+                name: Some("atlas restored".to_string()),
+                mode: ThreadMode::ResidentAssistant,
+                resident: true,
+                status: ThreadStatus::Idle,
+            })
+        );
     }
 
     #[test]
@@ -3393,21 +4276,21 @@ mod tests {
 
         let (socket, _response) =
             connect(format!("ws://{addr}")).expect("websocket client should connect");
+        let mut thread_summaries = ThreadSummaryTracker::new();
+        thread_summaries.upsert_thread(make_thread(
+            "thread-known",
+            Some("atlas archived"),
+            ThreadMode::ResidentAssistant,
+            true,
+            ThreadStatus::NotLoaded,
+        ));
         let mut client = CodexClient {
             transport: ClientTransport::WebSocket {
                 url: format!("ws://{addr}"),
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
-            known_threads: BTreeMap::from([(
-                "thread-known".to_string(),
-                KnownThreadSummary {
-                    name: Some("atlas archived".to_string()),
-                    mode: ThreadMode::ResidentAssistant,
-                    resident: true,
-                    status: ThreadStatus::NotLoaded,
-                },
-            )]),
+            thread_summaries,
             command_approval_behavior: super::CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3434,7 +4317,7 @@ mod tests {
             "thread/unarchived notification should not terminate streaming"
         );
         assert_eq!(
-            client.known_threads.get("thread-known"),
+            client.known_thread_summary("thread-known").as_ref(),
             Some(&KnownThreadSummary {
                 name: Some("atlas restored".to_string()),
                 mode: ThreadMode::ResidentAssistant,
@@ -3680,7 +4563,7 @@ enum ClientTransport {
 struct CodexClient {
     transport: ClientTransport,
     pending_notifications: VecDeque<JSONRPCNotification>,
-    known_threads: BTreeMap<String, KnownThreadSummary>,
+    thread_summaries: ThreadSummaryTracker,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
     command_approval_item_ids: Vec<String>,
@@ -3778,7 +4661,7 @@ impl CodexClient {
                 stdout: BufReader::new(stdout),
             },
             pending_notifications: VecDeque::new(),
-            known_threads: BTreeMap::new(),
+            thread_summaries: ThreadSummaryTracker::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3818,7 +4701,7 @@ impl CodexClient {
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
-            known_threads: BTreeMap::new(),
+            thread_summaries: ThreadSummaryTracker::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
             command_approval_item_ids: Vec::new(),
@@ -3845,14 +4728,19 @@ impl CodexClient {
     }
 
     fn remember_thread(&mut self, thread: &AppServerThread) {
-        self.known_threads
-            .insert(thread.id.clone(), KnownThreadSummary::from(thread));
+        self.thread_summaries.upsert_thread(thread.clone());
     }
 
     fn remember_threads(&mut self, threads: &[AppServerThread]) {
         for thread in threads {
             self.remember_thread(thread);
         }
+    }
+
+    fn known_thread_summary(&self, thread_id: &str) -> Option<KnownThreadSummary> {
+        self.thread_summaries
+            .get(thread_id)
+            .map(KnownThreadSummary::from)
     }
 
     fn print_stream_notification(
@@ -3863,7 +4751,9 @@ impl CodexClient {
     ) -> bool {
         match server_notification {
             ServerNotification::ThreadStarted(payload) => {
-                self.remember_thread(&payload.thread);
+                let _ = self
+                    .thread_summaries
+                    .apply_notification(&ServerNotification::ThreadStarted(payload.clone()));
                 if thread_id.is_none_or(|id| payload.thread.id == id) {
                     for line in thread_started_notification_lines(
                         &payload.thread,
@@ -3875,13 +4765,10 @@ impl CodexClient {
                 false
             }
             ServerNotification::ThreadStatusChanged(payload) => {
-                let known_thread = self
-                    .known_threads
-                    .get_mut(&payload.thread_id)
-                    .map(|thread| {
-                        thread.status = payload.status.clone();
-                        thread.clone()
-                    });
+                let update = self
+                    .thread_summaries
+                    .apply_notification(&ServerNotification::ThreadStatusChanged(payload.clone()));
+                let known_thread = self.known_thread_summary(&payload.thread_id);
                 if thread_id.is_none_or(|id| payload.thread_id == id) {
                     for line in thread_status_changed_notification_lines(
                         &payload.thread_id,
@@ -3891,12 +4778,12 @@ impl CodexClient {
                         println!("{line}");
                     }
                 }
-                if known_thread.is_none()
+                if let ThreadSummaryUpdate::RequiresThreadRead { thread_id } = update
                     && payload.status != codex_app_server_protocol::ThreadStatus::NotLoaded
                 {
                     self.refresh_unknown_thread_summary_with_method(
                         "thread/status/changed refresh",
-                        &payload.thread_id,
+                        &thread_id,
                     );
                 }
                 false
@@ -3904,7 +4791,14 @@ impl CodexClient {
             ServerNotification::ThreadClosed(ThreadClosedNotification {
                 thread_id: closed_thread_id,
             }) => {
-                let known_thread = self.known_threads.remove(&closed_thread_id);
+                let _ =
+                    self.thread_summaries
+                        .apply_notification(&ServerNotification::ThreadClosed(
+                            ThreadClosedNotification {
+                                thread_id: closed_thread_id.clone(),
+                            },
+                        ));
+                let known_thread = self.known_thread_summary(&closed_thread_id);
                 if thread_id.is_none_or(|id| closed_thread_id == id) {
                     for line in
                         thread_closed_notification_lines(&closed_thread_id, known_thread.as_ref())
@@ -3917,13 +4811,14 @@ impl CodexClient {
             ServerNotification::ThreadArchived(ThreadArchivedNotification {
                 thread_id: archived_thread_id,
             }) => {
-                let known_thread = self
-                    .known_threads
-                    .get_mut(&archived_thread_id)
-                    .map(|thread| {
-                        thread.status = codex_app_server_protocol::ThreadStatus::NotLoaded;
-                        thread.clone()
-                    });
+                let _ =
+                    self.thread_summaries
+                        .apply_notification(&ServerNotification::ThreadArchived(
+                            ThreadArchivedNotification {
+                                thread_id: archived_thread_id.clone(),
+                            },
+                        ));
+                let known_thread = self.known_thread_summary(&archived_thread_id);
                 if thread_id.is_none_or(|id| archived_thread_id == id) {
                     for line in thread_archived_notification_lines(
                         &archived_thread_id,
@@ -3937,15 +4832,27 @@ impl CodexClient {
             ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
                 thread_id: unarchived_thread_id,
             }) => {
-                let known_thread = self.known_threads.get(&unarchived_thread_id).cloned();
-                let refreshed_thread = match self.refresh_thread_summary(&unarchived_thread_id) {
-                    Ok(thread) => Some(thread),
-                    Err(err) => {
-                        println!(
-                            "< thread/unarchived refresh failed: thread_id={unarchived_thread_id}, error={err:#}"
-                        );
-                        None
+                let previous = self.known_thread_summary(&unarchived_thread_id);
+                let update = self.thread_summaries.apply_notification(
+                    &ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+                        thread_id: unarchived_thread_id.clone(),
+                    }),
+                );
+                let refreshed_thread = if let ThreadSummaryUpdate::RequiresThreadRead {
+                    thread_id,
+                } = update
+                {
+                    match self.refresh_thread_summary(&thread_id) {
+                        Ok(thread) => Some(thread),
+                        Err(err) => {
+                            println!(
+                                "< thread/unarchived refresh failed: thread_id={thread_id}, error={err:#}"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
                 if thread_id.is_none_or(|id| unarchived_thread_id == id) {
                     for line in thread_unarchived_notification_lines(
@@ -3954,7 +4861,7 @@ impl CodexClient {
                             .as_ref()
                             .map(KnownThreadSummary::from)
                             .as_ref()
-                            .or(known_thread.as_ref()),
+                            .or(previous.as_ref()),
                     ) {
                         println!("{line}");
                     }
@@ -3962,13 +4869,10 @@ impl CodexClient {
                 false
             }
             ServerNotification::ThreadNameUpdated(payload) => {
-                let known_thread = self
-                    .known_threads
-                    .get_mut(&payload.thread_id)
-                    .map(|thread| {
-                        thread.name = payload.thread_name.clone();
-                        thread.clone()
-                    });
+                let _ = self
+                    .thread_summaries
+                    .apply_notification(&ServerNotification::ThreadNameUpdated(payload.clone()));
+                let known_thread = self.known_thread_summary(&payload.thread_id);
                 if thread_id.is_none_or(|id| payload.thread_id == id) {
                     for line in thread_name_updated_notification_lines(
                         &payload.thread_id,
@@ -4949,3 +5853,7 @@ impl Drop for CodexClient {
         let _ = child.wait();
     }
 }
+#[cfg(test)]
+use codex_app_server_client::AppServerEvent;
+#[cfg(test)]
+use codex_app_server_client::AppServerRequestHandle;

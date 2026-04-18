@@ -16,6 +16,11 @@
 //! surfaces as channel-full errors rather than unbounded memory growth.
 
 mod remote;
+mod thread_summary_bridge_client;
+mod thread_summary_client;
+mod thread_summary_event;
+mod thread_summary_server_request;
+mod thread_summary_tracker;
 
 use std::error::Error;
 use std::fmt;
@@ -45,6 +50,7 @@ use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -54,6 +60,17 @@ use tracing::warn;
 
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
+pub use crate::thread_summary_bridge_client::ThreadSummaryBridgeClient;
+pub use crate::thread_summary_bridge_client::ThreadSummaryBridgeEvent;
+pub use crate::thread_summary_client::ThreadSummaryClient;
+pub use crate::thread_summary_event::ThreadSummaryRefresh;
+pub use crate::thread_summary_event::ThreadSummaryTrackedEvent;
+pub use crate::thread_summary_server_request::ThreadSummaryServerRequestResolution;
+pub use crate::thread_summary_tracker::ThreadSummaryBootstrapParams;
+pub use crate::thread_summary_tracker::ThreadSummaryBootstrapResult;
+pub use crate::thread_summary_tracker::ThreadSummaryBootstrapStats;
+pub use crate::thread_summary_tracker::ThreadSummaryTracker;
+pub use crate::thread_summary_tracker::ThreadSummaryUpdate;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -750,6 +767,72 @@ impl InProcessAppServerRequestHandle {
         serde_json::from_value(result)
             .map_err(|source| TypedRequestError::Deserialize { method, source })
     }
+
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    pub async fn resolve_server_request_typed<T>(
+        &self,
+        request_id: RequestId,
+        result: &T,
+    ) -> IoResult<()>
+    where
+        T: Serialize,
+    {
+        self.resolve_server_request(request_id, typed_server_request_result(result)?)
+            .await
+    }
+
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server reject channel is closed",
+            )
+        })?
+    }
 }
 
 impl AppServerRequestHandle {
@@ -767,6 +850,50 @@ impl AppServerRequestHandle {
         match self {
             Self::InProcess(handle) => handle.request_typed(request).await,
             Self::Remote(handle) => handle.request_typed(request).await,
+        }
+    }
+
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Remote(handle) => handle.resolve_server_request(request_id, result).await,
+        }
+    }
+
+    pub async fn resolve_server_request_typed<T>(
+        &self,
+        request_id: RequestId,
+        result: &T,
+    ) -> IoResult<()>
+    where
+        T: Serialize,
+    {
+        match self {
+            Self::InProcess(handle) => {
+                handle
+                    .resolve_server_request_typed(request_id, result)
+                    .await
+            }
+            Self::Remote(handle) => {
+                handle
+                    .resolve_server_request_typed(request_id, result)
+                    .await
+            }
+        }
+    }
+
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Remote(handle) => handle.reject_server_request(request_id, error).await,
         }
     }
 }
@@ -852,6 +979,14 @@ pub(crate) fn request_method_name(request: &ClientRequest) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+fn typed_server_request_result<T>(result: &T) -> IoResult<JsonRpcResult>
+where
+    T: Serialize,
+{
+    serde_json::to_value(result)
+        .map_err(|err| IoError::other(format!("serialize server request response: {err}")))
 }
 
 #[cfg(test)]
@@ -4878,7 +5013,7 @@ supports_websockets = false
 
         let receive_task = tokio::spawn(async move {
             let mut events = Vec::new();
-            for _ in 0..8 {
+            for _ in 0..5 {
                 events.push(
                     timeout(Duration::from_secs(2), event_rx.recv())
                         .await
@@ -4967,7 +5102,7 @@ supports_websockets = false
 
         let receive_task = tokio::spawn(async move {
             let mut events = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..8 {
                 events.push(
                     timeout(Duration::from_secs(2), event_rx.recv())
                         .await

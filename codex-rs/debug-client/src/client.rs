@@ -30,6 +30,7 @@ use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::PermissionGrantScope;
 use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedReadParams;
@@ -322,10 +323,9 @@ impl AppServerClient {
     pub fn use_thread(&self, thread_id: String) -> Option<KnownThread> {
         let mut state = self.state.lock().expect("state lock poisoned");
         let known_thread = state
-            .known_threads
-            .iter()
-            .find(|thread| thread.thread_id == thread_id)
-            .cloned();
+            .thread_summaries
+            .get(&thread_id)
+            .map(known_thread_from_summary);
         state.thread_id = Some(thread_id);
         known_thread
     }
@@ -333,10 +333,9 @@ impl AppServerClient {
     pub fn known_thread(&self, thread_id: &str) -> Option<KnownThread> {
         let state = self.state.lock().expect("state lock poisoned");
         state
-            .known_threads
-            .iter()
-            .find(|thread| thread.thread_id == thread_id)
-            .cloned()
+            .thread_summaries
+            .get(thread_id)
+            .map(known_thread_from_summary)
     }
 
     pub fn shutdown(&mut self) {
@@ -359,22 +358,12 @@ impl AppServerClient {
         thread_status: ThreadStatus,
     ) {
         let mut state = self.state.lock().expect("state lock poisoned");
-        if let Some(existing) = state
-            .known_threads
-            .iter_mut()
-            .find(|thread| thread.thread_id == thread_id)
-        {
-            existing.thread_name = thread_name;
-            existing.thread_mode = thread_mode;
-            existing.thread_status = thread_status;
-        } else {
-            state.known_threads.push(KnownThread {
-                thread_id,
-                thread_name,
-                thread_mode,
-                thread_status,
-            });
-        }
+        state.thread_summaries.upsert_thread(thread_summary(
+            thread_id,
+            thread_name,
+            thread_mode,
+            thread_status,
+        ));
     }
 
     fn next_request_id(&self) -> RequestId {
@@ -432,6 +421,44 @@ impl AppServerClient {
                 _ => {}
             }
         }
+    }
+}
+
+fn thread_summary(
+    thread_id: String,
+    thread_name: Option<String>,
+    thread_mode: ThreadMode,
+    thread_status: ThreadStatus,
+) -> Thread {
+    Thread {
+        id: thread_id,
+        forked_from_id: None,
+        preview: String::new(),
+        ephemeral: false,
+        model_provider: String::new(),
+        created_at: 0,
+        updated_at: 0,
+        status: thread_status,
+        mode: thread_mode,
+        resident: thread_mode == ThreadMode::ResidentAssistant,
+        path: None,
+        cwd: std::path::PathBuf::new(),
+        cli_version: String::new(),
+        source: codex_app_server_protocol::SessionSource::Cli,
+        agent_nickname: None,
+        agent_role: None,
+        git_info: None,
+        name: thread_name,
+        turns: Vec::new(),
+    }
+}
+
+fn known_thread_from_summary(thread: &Thread) -> KnownThread {
+    KnownThread {
+        thread_id: thread.id.clone(),
+        thread_name: thread.name.clone(),
+        thread_mode: thread.mode,
+        thread_status: thread.status.clone(),
     }
 }
 
@@ -593,9 +620,11 @@ mod tests {
     use super::build_thread_start_params;
     use super::default_user_input_answers;
     use super::denied_permissions_response;
+    use super::thread_summary;
     use crate::output::Output;
     use crate::state::KnownThread;
     use crate::state::State;
+    use codex_app_server_client::ThreadSummaryTracker;
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ThreadMode;
     use codex_app_server_protocol::ThreadStatus;
@@ -625,10 +654,21 @@ mod tests {
             stdin: Arc::new(Mutex::new(Some(stdin))),
             stdout: Some(std::io::BufReader::new(stdout)),
             next_request_id: Arc::new(AtomicI64::new(1)),
-            state: Arc::new(Mutex::new(State {
-                pending: Default::default(),
-                thread_id: None,
-                known_threads,
+            state: Arc::new(Mutex::new({
+                let mut state = State {
+                    pending: Default::default(),
+                    thread_id: None,
+                    thread_summaries: ThreadSummaryTracker::new(),
+                };
+                for known_thread in known_threads {
+                    state.thread_summaries.upsert_thread(thread_summary(
+                        known_thread.thread_id,
+                        known_thread.thread_name,
+                        known_thread.thread_mode,
+                        known_thread.thread_status,
+                    ));
+                }
+                state
             })),
             output: Output::new(),
             filtered_output: false,

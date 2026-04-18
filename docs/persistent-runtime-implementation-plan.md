@@ -30,6 +30,15 @@
 - SQLite repaired-summary 收口已经进入服务端与 typed client 的实现层
 - subagent 与 planning 已有基础事件和局部消费面
 
+而且有一条关键客户端契约已经开始进入实现层：
+
+- `thread/status/changed`、`thread/name/updated`、`thread/closed`、
+  `thread/archived`、`thread/unarchived` 继续只做增量或 lifecycle 边事件
+- 多个消费面已经开始把这些通知应用到“最近一次权威 `Thread` 摘要”上，而不再
+  在 close / archive 后把 resident thread 的摘要直接删掉
+- 这意味着 retained-summary / lifecycle-notification 这条心智已经不再只是设计稿
+  约束，而是已经开始成为真实实现边界
+
 但当前还不能说“persistent runtime 已经完成”。
 
 真正还没完成的是高层产品模式：
@@ -39,6 +48,14 @@
 - 更完整的多 agent 编排
 - 长时规划模式
 - 后台任务与异步结果体验
+
+更具体地说，当前还没完成的已经不再是“resident continuity 是否存在”这件事，
+而更偏：
+
+- 把 retained-summary / reconnect 契约补齐到所有主要产品面
+- 把这套契约稳定成用户可感知的正式产品语义
+- 在不打破当前读取面与通知边界的前提下，继续推进 bridge、observer、SQLite
+  的后续阶段
 
 ## 2. 当前阶段目标
 
@@ -71,6 +88,9 @@
   - `thread/name/updated` 继续只做 name 增量
   - 客户端与远端消费侧继续把这些通知应用到最近一次权威 `Thread` 摘要上，
     而不是把通知本身重新当成恢复摘要面
+- 把 retained-summary 语义固定下来：`thread/closed`、`thread/archived` 等
+  lifecycle 边事件继续保留最近一次权威 `Thread` 摘要的身份字段，只更新
+  `status` / lifecycle 事实，而不是把 resident 线程从本地摘要缓存里直接删除
 - 让客户端不再需要自行脑补 resident 语义
 
 不应混入：

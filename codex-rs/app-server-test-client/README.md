@@ -38,6 +38,50 @@ until interrupted:
 cargo run -p codex-app-server-test-client -- watch-summary --limit 20
 ```
 
+If you want that bridge-style bootstrap to walk every page up front instead of
+stopping at the first `next_cursor`, add `--all-pages`:
+
+```bash
+cargo run -p codex-app-server-test-client -- watch-summary --limit 20 --all-pages
+```
+
+If you already know the target thread id and want a more control-plane-like
+reconnect flow, point `watch-summary` at a shared websocket app-server and pass
+`--thread-id`. This skips the list bootstrap, performs `thread/resume`, prints
+the reconnect-aware summary, then continues streaming retained-summary bridge
+events plus default approval/request-user-input handling:
+
+```bash
+cargo run -p codex-app-server-test-client -- \
+  --url ws://127.0.0.1:4222 \
+  watch-summary --thread-id <THREAD_ID> --resident
+```
+
+When `watch-summary` is pointed at a websocket app-server (`--url`), it now
+uses the shared `codex-app-server-client` remote facade plus
+`ThreadSummaryBridgeClient` for retained-summary bootstrap, lifecycle updates,
+and the default bridge request policy, so
+this path stays aligned with the bridge-style consumer contract exercised by
+the reusable client crate. That remote bootstrap still uses the shared
+single-page summary fetch helpers for `thread/list` / `thread/loaded/read`, but
+the watch loop no longer has to hand-roll its own `request_handle()` +
+`ThreadSummaryTracker::track_event(...)` plumbing. The live notification path
+now just consumes `next_bridge_event()`, so the “apply lifecycle edge, refresh
+with `thread/read` if needed, then render, and answer default bridge requests”
+flow is shared with future bridge-style consumers instead of being re-derived
+inside this binary. That tracked event stream now also keeps approval /
+elicitation server requests attached to
+the retained thread summary when one is already known, so `watch-summary`
+prints approval prompts against the same reconnect-aware thread context instead
+of logging them as detached unexpected requests. The remote `watch-summary`
+path now also auto-resolves the current approval / request-user-input /
+elicitation request set through the shared bridge facade, so it behaves more like
+a minimal bridge consumer that can both observe remote runtime state and send
+the matching request resolution back to app-server. The same shared remote
+bridge path now also powers `watch-summary --thread-id ...`, so reconnecting a
+known resident thread and then following lifecycle / approval edges no longer
+falls back to a separate hand-rolled remote consumer path.
+
 ## Testing Thread Resume/Reconnect Behavior
 
 Build and start an app server using commands above. The app-server log is written to `/tmp/codex-app-server-test-client/app-server.log`
@@ -126,12 +170,14 @@ preserving cached `mode`/resident identity for the compact summary, and
 not briefly regress to a stale `NotLoaded` summary while reconnect semantics
 are being restored. That refresh also repopulates the local cache, so later
 notifications recover the restored `mode + status + action` snapshot without
-requiring a manual extra probe. `thread/closed`
-evicts any cached summary after printing the final compact unload line. That
-shared notification handling now covers both turn streaming and long-running
-observation modes such as `thread-resume` / `watch`, so the resident-aware
-summaries stay consistent even when you keep the client attached just to watch
-later runtime state changes.
+requiring a manual extra probe. `thread/closed` now follows that same retained-
+summary contract too: it preserves the cached `name + mode + resident`
+identity, updates the cached status to `NotLoaded`, and prints the final
+compact unload line against that retained summary instead of evicting the
+thread from the local cache. That shared notification handling now covers both
+turn streaming and long-running observation modes such as `thread-resume` /
+`watch`, so the resident-aware summaries stay consistent even when you keep the
+client attached just to watch later runtime state changes.
 
 When the test client receives server-side approval or elicitation requests, it
 now auto-responds across the full current app-server v2 set instead of only the

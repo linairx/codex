@@ -3355,7 +3355,25 @@ impl App {
             }
             Err(err) => {
                 if Self::is_terminal_thread_read_error(&err) && !has_replay_channel {
-                    self.agent_navigation.remove(thread_id);
+                    if let Some(entry) = existing_entry {
+                        self.upsert_agent_picker_thread(
+                            thread_id,
+                            entry.agent_nickname,
+                            entry.agent_role,
+                            /*is_closed*/ true,
+                            /*active_flags*/ Vec::new(),
+                            /*has_system_error*/ false,
+                        );
+                    } else {
+                        self.upsert_agent_picker_thread(
+                            thread_id,
+                            /*agent_nickname*/ None,
+                            /*agent_role*/ None,
+                            /*is_closed*/ true,
+                            /*active_flags*/ Vec::new(),
+                            /*has_system_error*/ false,
+                        );
+                    }
                     return false;
                 }
                 let is_closed = Self::closed_state_for_thread_read_error(
@@ -3403,10 +3421,10 @@ impl App {
     }
 
     async fn apply_authoritative_thread_summary(&mut self, thread_id: ThreadId, thread: &Thread) {
-        self.upsert_agent_picker_thread_from_summary(thread_id, &thread);
+        self.upsert_agent_picker_thread_from_summary(thread_id, thread);
 
         let is_displayed_thread = self.current_displayed_thread_id() == Some(thread_id);
-        let session = self.session_state_for_thread_read(thread_id, &thread).await;
+        let session = self.session_state_for_thread_read(thread_id, thread).await;
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             let turns = store.turns.clone();
@@ -8193,7 +8211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_agent_picker_prunes_terminal_metadata_only_threads() -> Result<()> {
+    async fn open_agent_picker_retains_closed_terminal_metadata_only_threads() -> Result<()> {
         let mut app = make_test_app().await;
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
@@ -8211,8 +8229,49 @@ mod tests {
 
         app.open_agent_picker(&mut app_server).await;
 
-        assert_eq!(app.agent_navigation.get(&thread_id), None);
-        assert!(app.agent_navigation.is_empty());
+        assert_eq!(
+            app.agent_navigation.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Ghost".to_string()),
+                agent_role: Some("worker".to_string()),
+                is_closed: true,
+                active_flags: Vec::new(),
+                has_system_error: false,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_agent_picker_creates_closed_placeholder_for_uncached_terminal_metadata_only_threads()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+        let thread_id = ThreadId::new();
+        app.agent_navigation.upsert(
+            thread_id,
+            /*agent_nickname*/ None,
+            /*agent_role*/ None,
+            /*is_closed*/ false,
+            /*active_flags*/ Vec::new(),
+            /*has_system_error*/ false,
+        );
+
+        app.open_agent_picker(&mut app_server).await;
+
+        assert_eq!(
+            app.agent_navigation.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: true,
+                active_flags: Vec::new(),
+                has_system_error: false,
+            })
+        );
         Ok(())
     }
 
@@ -8524,8 +8583,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_agent_picker_thread_liveness_prunes_closed_metadata_only_threads() -> Result<()>
-    {
+    async fn refresh_agent_picker_thread_liveness_retains_closed_metadata_only_threads()
+    -> Result<()> {
         let mut app = make_test_app().await;
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
@@ -8546,7 +8605,45 @@ mod tests {
             .await;
 
         assert!(!is_available);
-        assert_eq!(app.agent_navigation.get(&thread_id), None);
+        assert_eq!(
+            app.agent_navigation.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some("Ghost".to_string()),
+                agent_role: Some("worker".to_string()),
+                is_closed: true,
+                active_flags: Vec::new(),
+                has_system_error: false,
+            })
+        );
+        assert!(!app.thread_event_channels.contains_key(&thread_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_picker_thread_liveness_creates_closed_placeholder_for_uncached_terminal_metadata_only_threads()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+        let thread_id = ThreadId::new();
+
+        let is_available = app
+            .refresh_agent_picker_thread_liveness(&mut app_server, thread_id)
+            .await;
+
+        assert!(!is_available);
+        assert_eq!(
+            app.agent_navigation.get(&thread_id),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: true,
+                active_flags: Vec::new(),
+                has_system_error: false,
+            })
+        );
         assert!(!app.thread_event_channels.contains_key(&thread_id));
         Ok(())
     }
@@ -13503,13 +13600,21 @@ guardian_approval = true
         assert!(app.active_thread_workspace_changed);
         assert!(!app.thread_event_channels.contains_key(&thread_id));
 
-        let info = match app_event_rx.try_recv() {
-            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
-            other => panic!("expected info history cell, got {other:?}"),
-        };
-        assert_eq!(
-            lines_to_single_string(&info.display_lines(/*width*/ 120)),
-            "• Workspace changed on disk while this thread was active. Review local changes before continuing."
+        let mut saw_workspace_changed = false;
+        while let Ok(event) = app_event_rx.try_recv() {
+            let AppEvent::InsertHistoryCell(cell) = event else {
+                continue;
+            };
+            if lines_to_single_string(&cell.display_lines(/*width*/ 120))
+                == "• Workspace changed on disk while this thread was active. Review local changes before continuing."
+            {
+                saw_workspace_changed = true;
+                break;
+            }
+        }
+        assert!(
+            saw_workspace_changed,
+            "expected workspace-changed info history cell"
         );
     }
 
