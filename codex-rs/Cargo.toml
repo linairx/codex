@@ -13,6 +13,7 @@ members = [
     "arg0",
     "feedback",
     "features",
+    "gateway",
     "install-context",
     "codex-backend-openapi-models",
     "code-mode",
