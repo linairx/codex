@@ -16,6 +16,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const REQUEST_COUNT_METRIC: &str = "gateway_http_requests";
 const REQUEST_DURATION_METRIC: &str = "gateway_http_request_duration";
+const V2_REQUEST_COUNT_METRIC: &str = "gateway_v2_requests";
+const V2_REQUEST_DURATION_METRIC: &str = "gateway_v2_request_duration";
 
 type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
@@ -61,6 +63,20 @@ impl GatewayObservability {
         }
     }
 
+    pub(crate) fn record_v2_request(&self, method: &str, outcome: &str, duration: Duration) {
+        let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
+        let tags = [("method", method), ("outcome", outcome)];
+
+        if let Some(metrics) = &self.metrics {
+            if let Err(err) = metrics.counter(V2_REQUEST_COUNT_METRIC, 1, &tags) {
+                tracing::warn!("failed to record gateway v2 request count metric: {err}");
+            }
+            if let Err(err) = metrics.histogram(V2_REQUEST_DURATION_METRIC, duration_ms, &tags) {
+                tracing::warn!("failed to record gateway v2 request duration metric: {err}");
+            }
+        }
+    }
+
     fn emit_audit_log(
         &self,
         method: &str,
@@ -89,6 +105,33 @@ impl GatewayObservability {
             tenant_id,
             project_id,
             "gateway request completed"
+        );
+    }
+
+    pub(crate) fn emit_v2_audit_log(
+        &self,
+        method: &str,
+        outcome: &str,
+        duration: Duration,
+        context: &GatewayRequestContext,
+    ) {
+        if !self.audit_logs_enabled {
+            return;
+        }
+
+        let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        let tenant_id = context.tenant_id.as_str();
+        let project_id = context.project_id.as_deref();
+
+        tracing::event!(
+            target: "codex_gateway.audit",
+            Level::INFO,
+            method,
+            outcome,
+            duration_ms,
+            tenant_id,
+            project_id,
+            "gateway v2 request completed"
         );
     }
 }
@@ -151,6 +194,8 @@ mod tests {
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::V2_REQUEST_COUNT_METRIC;
+    use super::V2_REQUEST_DURATION_METRIC;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
@@ -210,6 +255,73 @@ mod tests {
                                     histogram.data_points().next().expect("histogram point");
                                 assert_eq!(point.count(), 1);
                                 assert_eq!(point.sum(), 12.0);
+                            }
+                            _ => panic!("unexpected duration aggregation"),
+                        },
+                        _ => panic!("unexpected duration type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(saw_count, true);
+        assert_eq!(saw_duration, true);
+    }
+
+    #[test]
+    fn records_v2_request_metrics_with_method_and_outcome_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_request("thread/start", "ok", Duration::from_millis(8));
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        let mut saw_duration = false;
+        for metric in metrics {
+            match metric.name() {
+                V2_REQUEST_COUNT_METRIC => {
+                    saw_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                            }
+                            _ => panic!("unexpected request count aggregation"),
+                        },
+                        _ => panic!("unexpected request count type"),
+                    }
+                }
+                V2_REQUEST_DURATION_METRIC => {
+                    saw_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 8.0);
                             }
                             _ => panic!("unexpected duration aggregation"),
                         },

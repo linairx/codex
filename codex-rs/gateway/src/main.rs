@@ -65,6 +65,15 @@ struct GatewayCli {
     #[arg(long = "turn-starts-per-minute", value_name = "COUNT")]
     turn_starts_per_minute: Option<u32>,
 
+    #[arg(long = "v2-initialize-timeout-seconds", value_name = "SECONDS")]
+    v2_initialize_timeout_seconds: Option<u64>,
+
+    #[arg(long = "v2-client-send-timeout-seconds", value_name = "SECONDS")]
+    v2_client_send_timeout_seconds: Option<u64>,
+
+    #[arg(long = "v2-max-pending-server-requests", value_name = "COUNT")]
+    v2_max_pending_server_requests: Option<usize>,
+
     #[arg(long = "remote-websocket-url", value_name = "URL")]
     remote_websocket_url: Vec<String>,
 
@@ -93,6 +102,7 @@ fn main() -> anyhow::Result<()> {
             codex_core::config::ConfigOverrides::default(),
         )
         .await?;
+        let default_gateway_config = GatewayConfig::default();
         let server = start_gateway_server(
             GatewayConfig {
                 bind_address: top_cli.inner.listen,
@@ -109,6 +119,20 @@ fn main() -> anyhow::Result<()> {
                 audit_logs_enabled: !top_cli.inner.no_audit_logs,
                 request_rate_limit_per_minute: top_cli.inner.requests_per_minute,
                 turn_start_quota_per_minute: top_cli.inner.turn_starts_per_minute,
+                v2_initialize_timeout: top_cli
+                    .inner
+                    .v2_initialize_timeout_seconds
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(default_gateway_config.v2_initialize_timeout),
+                v2_client_send_timeout: top_cli
+                    .inner
+                    .v2_client_send_timeout_seconds
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(default_gateway_config.v2_client_send_timeout),
+                v2_max_pending_server_requests: top_cli
+                    .inner
+                    .v2_max_pending_server_requests
+                    .unwrap_or(default_gateway_config.v2_max_pending_server_requests),
                 remote_runtime: (!top_cli.inner.remote_websocket_url.is_empty()).then_some(
                     GatewayRemoteRuntimeConfig {
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
@@ -123,7 +147,7 @@ fn main() -> anyhow::Result<()> {
                             .collect(),
                     },
                 ),
-                ..GatewayConfig::default()
+                ..default_gateway_config
             },
             arg0_paths,
             config,

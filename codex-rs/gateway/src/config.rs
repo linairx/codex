@@ -4,6 +4,7 @@ use codex_protocol::protocol::SessionSource;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
@@ -21,6 +22,9 @@ pub struct GatewayConfig {
     pub event_buffer_capacity: usize,
     pub request_rate_limit_per_minute: Option<u32>,
     pub turn_start_quota_per_minute: Option<u32>,
+    pub v2_initialize_timeout: Duration,
+    pub v2_client_send_timeout: Duration,
+    pub v2_max_pending_server_requests: usize,
     pub remote_runtime: Option<GatewayRemoteRuntimeConfig>,
 }
 
@@ -41,6 +45,9 @@ impl Default for GatewayConfig {
             event_buffer_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
             request_rate_limit_per_minute: None,
             turn_start_quota_per_minute: None,
+            v2_initialize_timeout: Duration::from_secs(30),
+            v2_client_send_timeout: Duration::from_secs(10),
+            v2_max_pending_server_requests: 64,
             remote_runtime: None,
         }
     }
@@ -82,6 +89,7 @@ mod tests {
     use codex_protocol::protocol::SessionSource;
     use pretty_assertions::assert_eq;
     use std::net::Ipv4Addr;
+    use std::time::Duration;
 
     #[test]
     fn default_config_targets_local_embedded_runtime() {
@@ -109,6 +117,9 @@ mod tests {
         );
         assert_eq!(config.request_rate_limit_per_minute, None);
         assert_eq!(config.turn_start_quota_per_minute, None);
+        assert_eq!(config.v2_initialize_timeout, Duration::from_secs(30));
+        assert_eq!(config.v2_client_send_timeout, Duration::from_secs(10));
+        assert_eq!(config.v2_max_pending_server_requests, 64);
         assert_eq!(config.remote_runtime, None);
     }
 

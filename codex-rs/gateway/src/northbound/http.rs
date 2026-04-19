@@ -14,10 +14,13 @@ use crate::auth::GatewayAuth;
 use crate::auth::require_auth;
 use crate::error::GatewayError;
 use crate::event::GatewayEvent;
+use crate::northbound::v2::GatewayV2Timeouts;
 use crate::observability::GatewayObservability;
 use crate::observability::observe_http_request;
 use crate::runtime::GatewayRuntime;
 use crate::scope::GatewayRequestContext;
+use crate::scope::GatewayScopeRegistry;
+use crate::v2::GatewayV2SessionFactory;
 use axum::Json;
 use axum::Router;
 use axum::extract::Path;
@@ -58,7 +61,15 @@ pub fn router(
     auth: GatewayAuth,
     admission: GatewayAdmissionController,
 ) -> Router {
-    router_with_observability(runtime, auth, admission, GatewayObservability::default())
+    router_with_observability(
+        runtime,
+        auth,
+        admission,
+        GatewayObservability::default(),
+        Arc::new(GatewayScopeRegistry::default()),
+        None,
+        GatewayV2Timeouts::default(),
+    )
 }
 
 pub fn router_with_observability(
@@ -66,6 +77,9 @@ pub fn router_with_observability(
     auth: GatewayAuth,
     admission: GatewayAdmissionController,
     observability: GatewayObservability,
+    scope_registry: Arc<GatewayScopeRegistry>,
+    v2_session_factory: Option<Arc<GatewayV2SessionFactory>>,
+    v2_timeouts: GatewayV2Timeouts,
 ) -> Router {
     let state = GatewayHttpState::new(runtime);
     let v1 = Router::new()
@@ -78,10 +92,26 @@ pub fn router_with_observability(
             "/threads/{thread_id}/turns/{turn_id}/interrupt",
             post(interrupt_turn),
         )
-        .route_layer(middleware::from_fn_with_state(admission, enforce_admission))
-        .route_layer(middleware::from_fn_with_state(auth, require_auth));
+        .route_layer(middleware::from_fn_with_state(
+            admission.clone(),
+            enforce_admission,
+        ))
+        .route_layer(middleware::from_fn_with_state(auth.clone(), require_auth));
 
     Router::new()
+        .route(
+            "/",
+            any(crate::northbound::v2::websocket_upgrade_handler).with_state(
+                crate::northbound::v2::GatewayV2State {
+                    auth,
+                    admission,
+                    observability: observability.clone(),
+                    scope_registry,
+                    session_factory: v2_session_factory,
+                    timeouts: v2_timeouts,
+                },
+            ),
+        )
         .route("/healthz", get(healthz))
         .nest("/v1", v1)
         .route("/v1", any(|| async { axum::http::StatusCode::NOT_FOUND }))
@@ -227,6 +257,8 @@ mod tests {
     use crate::api::GatewayThreadStatus;
     use crate::api::GatewayTurn;
     use crate::api::GatewayTurnStatus;
+    use crate::api::GatewayV2CompatibilityMode;
+    use crate::api::GatewayV2TransportConfig;
     use crate::api::InterruptTurnResponse;
     use crate::api::ListThreadsRequest;
     use crate::api::ListThreadsResponse;
@@ -238,9 +270,11 @@ mod tests {
     use crate::auth::GatewayAuth;
     use crate::error::GatewayError;
     use crate::event::GatewayEvent;
+    use crate::northbound::v2::GatewayV2Timeouts;
     use crate::observability::GatewayObservability;
     use crate::runtime::GatewayRuntime;
     use crate::scope::GatewayRequestContext;
+    use crate::scope::GatewayScopeRegistry;
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::body::to_bytes;
@@ -366,6 +400,12 @@ mod tests {
                 status: GatewayHealthStatus::Ok,
                 runtime_mode: "embedded".to_string(),
                 execution_mode: GatewayExecutionMode::InProcess,
+                v2_compatibility: GatewayV2CompatibilityMode::Embedded,
+                v2_transport: GatewayV2TransportConfig {
+                    initialize_timeout_seconds: 30,
+                    client_send_timeout_seconds: 10,
+                    max_pending_server_requests: 64,
+                },
                 remote_workers: None,
             }
         }
@@ -407,7 +447,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","remoteWorkers":null}"#
+            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"maxPendingServerRequests":64},"remoteWorkers":null}"#
         );
     }
 
@@ -706,6 +746,12 @@ mod tests {
                     status: GatewayHealthStatus::Ok,
                     runtime_mode: "embedded".to_string(),
                     execution_mode: GatewayExecutionMode::InProcess,
+                    v2_compatibility: GatewayV2CompatibilityMode::Embedded,
+                    v2_transport: GatewayV2TransportConfig {
+                        initialize_timeout_seconds: 30,
+                        client_send_timeout_seconds: 10,
+                        max_pending_server_requests: 64,
+                    },
                     remote_workers: None,
                 }
             }
@@ -871,6 +917,12 @@ mod tests {
                     status: GatewayHealthStatus::Unavailable,
                     runtime_mode: "remote".to_string(),
                     execution_mode: GatewayExecutionMode::WorkerManaged,
+                    v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorkerUnsupported,
+                    v2_transport: GatewayV2TransportConfig {
+                        initialize_timeout_seconds: 30,
+                        client_send_timeout_seconds: 10,
+                        max_pending_server_requests: 64,
+                    },
                     remote_workers: Some(Vec::new()),
                 }
             }
@@ -979,6 +1031,9 @@ mod tests {
             GatewayAuth::Disabled,
             GatewayAdmissionController::default(),
             GatewayObservability::new(Some(metrics), false),
+            Arc::new(GatewayScopeRegistry::default()),
+            None,
+            GatewayV2Timeouts::default(),
         );
 
         let response = app

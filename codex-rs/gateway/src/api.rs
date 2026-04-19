@@ -49,6 +49,14 @@ pub enum GatewayExecutionMode {
     WorkerManaged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GatewayV2CompatibilityMode {
+    Embedded,
+    RemoteSingleWorker,
+    RemoteMultiWorkerUnsupported,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayRemoteWorkerHealth {
@@ -58,12 +66,22 @@ pub struct GatewayRemoteWorkerHealth {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2TransportConfig {
+    pub initialize_timeout_seconds: u64,
+    pub client_send_timeout_seconds: u64,
+    pub max_pending_server_requests: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayHealthResponse {
     pub status: GatewayHealthStatus,
     pub runtime_mode: String,
     pub execution_mode: GatewayExecutionMode,
+    pub v2_compatibility: GatewayV2CompatibilityMode,
+    pub v2_transport: GatewayV2TransportConfig,
     pub remote_workers: Option<Vec<GatewayRemoteWorkerHealth>>,
 }
 

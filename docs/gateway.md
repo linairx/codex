@@ -166,9 +166,87 @@ Exit criteria:
 - the gateway can route requests to remote workers without changing the
   northbound API contract
 
+### Phase 6: App-Server v2 Compatibility
+
+Status: in progress
+
+Goal:
+
+- make `codex-gateway` speak the app-server v2 northbound protocol so existing
+  Codex clients can target the gateway directly
+
+Principles:
+
+- preserve the existing HTTP/SSE gateway surface; v2 compatibility is additive
+- reuse `codex-app-server-protocol` types and wire semantics instead of
+  inventing gateway-specific v2 DTOs
+- prefer a transport/proxy architecture over re-implementing app-server
+  business logic in the gateway
+- ship in stages: embedded and single-worker parity first, multi-worker fanout
+  second
+
+Planned milestones:
+
+- add a northbound WebSocket JSON-RPC transport that terminates v2 client
+  connections at the gateway
+- proxy `initialize`, requests, notifications, responses, and server requests to
+  downstream app-server sessions while enforcing auth and scope policy at the
+  gateway boundary
+- reach "drop-in Codex client" parity for embedded mode and single remote worker
+  mode first
+- add connection coordination and routing for multi-worker remote deployments
+  without breaking the v2 contract
+- keep HTTP/SSE as the operator- and platform-oriented API while v2 WebSocket
+  remains the compatibility API
+
+Exit criteria:
+
+- an unmodified Codex client can connect to `codex-gateway` over the app-server
+  v2 WebSocket protocol and complete a normal thread/turn workflow
+- gateway auth, scoping, audit, and rate-limit policies are still enforced for
+  v2 clients
+- remote-worker mode supports either a documented single-worker compatibility
+  profile or coordinated multi-worker routing with equivalent behavior
+
+Detailed plan:
+
+- see [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md)
+
+Recent progress:
+
+- the Stage A required-method matrix is now documented in
+  [docs/gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md)
+- dedicated gateway passthrough tests now cover the bootstrap-critical
+  `account/read` and `model/list` requests in addition to the previously added
+  thread, turn, server-request, and realtime compatibility coverage
+- embedded runtime now has a real drop-in v2 client harness using
+  `RemoteAppServerClient`, covering bootstrap plus thread read/list/update
+  workflow through the gateway's northbound WebSocket surface
+- single-worker remote runtime now also has a real northbound v2 client harness
+  using `RemoteAppServerClient`, covering bootstrap plus thread
+  read/list/update workflow through a gateway-backed remote worker session
+- northbound v2 connections now fail closed if the downstream app-server event
+  stream reports backpressure, instead of silently continuing after best-effort
+  event loss
+- gateway-owned v2 WebSocket close reasons are now clamped to protocol-safe
+  length, so downstream transport errors cannot produce oversized close frames
+- `docs/gateway-v2-compat.md` now includes operator guidance and rollout
+  profiles for embedded, single-worker remote, and multi-worker remote
+  deployments
+- multi-worker remote runtime now has explicit integration coverage for the
+  current Stage A boundary: `/healthz` reports
+  `RemoteMultiWorkerUnsupported` for v2 compatibility, and northbound v2
+  WebSocket upgrades return `501 Not Implemented`
+- single-worker remote runtime now has a northbound v2 reconnect regression
+  test, verifying that a later Codex client session can bootstrap and start a
+  thread after the gateway reconnects its downstream worker
+- that reconnect coverage now also asserts the worker has really returned to a
+  healthy single-worker v2 compatibility profile before the later client
+  session is admitted
+
 ## Current Work
 
-Phase 4 has started with:
+Phase 4 is complete with:
 
 - optional Bearer token middleware for `/v1/*`
 - anonymous `GET /healthz` for liveness checks outside the auth boundary
@@ -180,10 +258,6 @@ Phase 4 has started with:
   tenant/project context
 - request count and duration metrics for gateway HTTP routes via the existing
   OTEL provider when metrics export is enabled
-
-The remaining Phase 4 work is:
-
-- none
 
 Phase 4 now also includes:
 
@@ -246,3 +320,139 @@ Phase 5 evaluation result:
 - `/healthz` and startup logs now expose enough runtime and execution context
   for operators to distinguish embedded local execution, embedded `exec-server`
   delegation, and remote worker-managed execution
+
+Phase 6 is in progress with:
+
+- a northbound WebSocket JSON-RPC endpoint at `/` for app-server v2 traffic
+- embedded-runtime v2 passthrough for `initialize`, typed requests,
+  notifications, responses, and server requests
+- single-remote-worker v2 passthrough using the same proxy model
+- gateway-owned initialize response shaping plus downstream client identity and
+  capability propagation
+- transport guards for auth, Origin rejection, and explicit `501` behavior when
+  v2 compatibility is unavailable in the current runtime topology
+- health and startup signals that distinguish embedded compatibility, single
+  remote-worker compatibility, and unsupported multi-worker remote topology
+- `/healthz` now also exposes the effective v2 transport hardening config
+  (`initializeTimeoutSeconds`, `clientSendTimeoutSeconds`, and
+  `maxPendingServerRequests`) so rollout validation does not depend only on
+  startup logs
+- embedded and remote compatibility tests covering initialize, bootstrap
+  requests, thread notifications, thread queries, request passthrough, and
+  server-request round trips
+- expanded embedded compatibility coverage for additional thread control
+  requests used during normal client setup, including `thread/list`,
+  `thread/name/set`, `thread/memoryMode/set`, and `thread/loaded/list`
+- embedded compatibility coverage for app-server's current unmaterialized
+  thread semantics, verifying that `thread/resume` and `thread/fork` surface
+  the expected `no rollout found` errors before a thread has been materialized
+- expanded single-worker remote compatibility coverage for Stage A thread and
+  turn passthrough methods used by current clients, including thread
+  resume/fork/name/memory updates, loaded-thread discovery, review start, and
+  turn steer
+- expanded single-worker remote compatibility coverage for the remaining Stage A
+  bootstrap passthrough methods, additional thread control passthrough methods,
+  and the main approval / elicitation / token-refresh server-request round
+  trips
+- a real northbound `RemoteAppServerClient` harness now validates single-worker
+  remote drop-in parity across bootstrap plus thread read/list/update workflow,
+  not just per-method passthrough fixtures
+- that real single-worker remote harness now also covers the bootstrap/setup
+  methods current clients use beyond account/model discovery, including
+  `externalAgentConfig/detect`, `externalAgentConfig/import`, `skills/list`,
+  `config/batchWrite`, `memory/reset`, and `account/logout`
+- that real single-worker remote harness now also covers a bidirectional
+  server-request round trip over the gateway's northbound v2 transport,
+  validating that `item/tool/requestUserInput` reaches the client and its typed
+  response is proxied back to the owning worker
+- that real single-worker remote harness now also covers additional typed
+  server-request round trips for `item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval`,
+  `item/permissions/requestApproval`,
+  `mcpServer/elicitation/request`, and
+  `account/chatgptAuthTokens/refresh`, validating that the gateway preserves
+  those bidirectional payloads over the northbound v2 transport instead of only
+  the `requestUserInput` path
+- single-worker remote compatibility coverage now also verifies app-server's
+  current unmaterialized thread semantics, preserving the expected
+  `no rollout found for thread id ...` errors for `thread/resume` and
+  `thread/fork` over the gateway's northbound v2 transport
+- that real single-worker remote harness now also covers `turn/start` plus the
+  core turn-lifecycle notifications clients rely on during normal execution:
+  `thread/status/changed`, `turn/started`, `item/agentMessage/delta`, and
+  `turn/completed`
+- expanded single-worker remote compatibility coverage for `turn/start` and the
+  core turn-lifecycle notifications clients rely on during normal execution
+- dedicated v2 parity coverage for streamed item-delta notifications clients
+  consume during active turns, starting with `item/agentMessage/delta`
+- dedicated v2 parity coverage for experimental realtime request passthrough,
+  including `thread/realtime/start`, `thread/realtime/appendAudio`,
+  `thread/realtime/appendText`, and `thread/realtime/stop`
+- dedicated v2 parity coverage for experimental realtime notification
+  forwarding, starting with `thread/realtime/started`
+- v2 scope enforcement using the same tenant/project headers as HTTP, including
+  gateway-owned thread visibility checks, list filtering, and server-request
+  rejection for hidden threads
+- v2 admission enforcement using the same per-scope request rate limits and
+  turn-start quota policy as HTTP
+- per-request v2 metrics and audit logs for northbound JSON-RPC traffic,
+  including `initialize` and post-handshake client requests
+- a Stage A v2 method coverage matrix derived from current Codex client usage
+  in [docs/gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md)
+- explicit northbound WebSocket close signaling when the downstream app-server
+  session disconnects, so clients see a concrete close reason instead of a
+  silent drop
+- an explicit northbound initialize handshake timeout, so v2 connections that
+  never complete bootstrap are closed with a concrete gateway-owned reason
+- an explicit northbound client-send timeout, so stalled WebSocket writes fail
+  closed instead of leaving the gateway blocked on a slow or wedged client
+- explicit northbound close signaling for malformed client WebSocket payloads,
+  so invalid JSON-RPC text frames and invalid UTF-8 binary frames terminate
+  with a concrete gateway-owned close reason instead of only surfacing as
+  transport errors in logs
+- an explicit per-connection cap on unresolved northbound v2 server requests,
+  so a slow or non-responsive client cannot let server-request state grow
+  without bound inside one compatibility session
+- CLI/config wiring for that unresolved server-request cap via
+  `--v2-max-pending-server-requests`, so operators can tune the per-connection
+  slow-client bound during rollout instead of relying on a fixed compiled
+  default
+- dedicated northbound v2 regression tests for gateway-owned scope rejection of
+  `thread/resume` history/path bypasses and `thread/fork` path bypasses, so the
+  policy is enforced at the actual JSON-RPC boundary instead of only in unit
+  tests
+- dedicated northbound v2 regression tests for `thread/list` and
+  `thread/loaded/list` scope filtering, so hidden threads are removed from
+  real JSON-RPC responses instead of only from unit-test fixtures
+- dedicated northbound v2 passthrough tests for the remaining Stage A
+  thread/turn control requests that current clients issue less frequently,
+  including `thread/unsubscribe`, `thread/compact/start`,
+  `thread/shellCommand`, `thread/backgroundTerminals/clean`,
+  `thread/rollback`, `review/start`, `turn/interrupt`, and `turn/steer`
+- the real embedded `RemoteAppServerClient` compatibility harness now also
+  covers bootstrap/setup methods current clients use beyond account/model
+  discovery, including `externalAgentConfig/detect`,
+  `externalAgentConfig/import`, `skills/list`, `config/batchWrite`,
+  `memory/reset`, and `account/logout`
+- that real embedded harness now also covers a bidirectional server-request
+  round trip over the gateway's northbound v2 transport, validating that
+  `item/tool/requestUserInput` reaches the client, the typed response is
+  proxied back into the in-process app-server session, and
+  `serverRequest/resolved` is forwarded before turn completion
+- that real embedded harness now also covers
+  `item/permissions/requestApproval`, validating that the gateway preserves the
+  in-process approval round trip and `serverRequest/resolved` ordering for the
+  request-permissions flow too
+- that real embedded harness now also covers
+  `mcpServer/elicitation/request`, validating that the gateway preserves the
+  in-process MCP elicitation round trip and `serverRequest/resolved` ordering
+  for connector-driven tool flows too
+
+The remaining Phase 6 work is:
+
+- validate drop-in client parity more broadly in embedded and single-worker
+  remote mode
+- continue hardening around load, reconnect, and slow-client operational
+  behavior for the northbound v2 transport
+- design multi-worker connection coordination without breaking current v2
+  semantics

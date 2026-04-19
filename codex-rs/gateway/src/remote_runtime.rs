@@ -7,6 +7,8 @@ use crate::api::CreateThreadRequest;
 use crate::api::GatewayExecutionMode;
 use crate::api::GatewayHealthResponse;
 use crate::api::GatewayHealthStatus;
+use crate::api::GatewayV2CompatibilityMode;
+use crate::api::GatewayV2TransportConfig;
 use crate::api::InterruptTurnResponse;
 use crate::api::ListThreadsRequest;
 use crate::api::ListThreadsResponse;
@@ -47,6 +49,7 @@ pub struct RemoteWorkerGatewayRuntime {
     events: broadcast::Sender<GatewayEvent>,
     scope_registry: Arc<GatewayScopeRegistry>,
     worker_health: Arc<RemoteWorkerHealthRegistry>,
+    v2_transport: GatewayV2TransportConfig,
 }
 
 impl RemoteWorkerGatewayRuntime {
@@ -56,6 +59,7 @@ impl RemoteWorkerGatewayRuntime {
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
         worker_health: Arc<RemoteWorkerHealthRegistry>,
+        v2_transport: GatewayV2TransportConfig,
     ) -> Result<Self, GatewayError> {
         if workers.is_empty() {
             return Err(GatewayError::InvalidRequest(
@@ -71,6 +75,7 @@ impl RemoteWorkerGatewayRuntime {
             events,
             scope_registry,
             worker_health,
+            v2_transport,
         })
     }
 
@@ -429,6 +434,12 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
             status,
             runtime_mode: "remote".to_string(),
             execution_mode: GatewayExecutionMode::WorkerManaged,
+            v2_compatibility: if remote_workers.len() == 1 {
+                GatewayV2CompatibilityMode::RemoteSingleWorker
+            } else {
+                GatewayV2CompatibilityMode::RemoteMultiWorkerUnsupported
+            },
+            v2_transport: self.v2_transport,
             remote_workers: Some(remote_workers),
         }
     }
@@ -452,6 +463,8 @@ mod tests {
     use crate::api::GatewayThread;
     use crate::api::GatewayThreadSortKey;
     use crate::api::GatewayThreadStatus;
+    use crate::api::GatewayV2CompatibilityMode;
+    use crate::api::GatewayV2TransportConfig;
     use crate::api::ListThreadsRequest;
     use crate::config::GatewayRemoteSelectionPolicy;
     use crate::error::GatewayError;
@@ -488,6 +501,11 @@ mod tests {
             worker_health: Arc::new(crate::remote_health::RemoteWorkerHealthRegistry::new(
                 Vec::new(),
             )),
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                max_pending_server_requests: 64,
+            },
         };
         let mut threads = vec![
             test_thread("thread-1", 1, 10),
@@ -522,6 +540,11 @@ mod tests {
             worker_health: Arc::new(crate::remote_health::RemoteWorkerHealthRegistry::new(
                 Vec::new(),
             )),
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                max_pending_server_requests: 64,
+            },
         };
         let mut threads = vec![
             test_thread("thread-1", 1, 10),
@@ -598,6 +621,11 @@ mod tests {
             events: broadcast::channel(4).0,
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                max_pending_server_requests: 64,
+            },
         };
 
         assert_eq!(
@@ -606,6 +634,12 @@ mod tests {
                 status: GatewayHealthStatus::Degraded,
                 runtime_mode: "remote".to_string(),
                 execution_mode: GatewayExecutionMode::WorkerManaged,
+                v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorkerUnsupported,
+                v2_transport: GatewayV2TransportConfig {
+                    initialize_timeout_seconds: 30,
+                    client_send_timeout_seconds: 10,
+                    max_pending_server_requests: 64,
+                },
                 remote_workers: Some(vec![
                     crate::api::GatewayRemoteWorkerHealth {
                         worker_id: 0,

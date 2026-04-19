@@ -37,7 +37,7 @@ impl GatewayAdmissionController {
         &self.limits
     }
 
-    fn check_request(
+    pub(crate) fn check_request(
         &self,
         context: &GatewayRequestContext,
         route: &str,
@@ -139,7 +139,7 @@ struct AdmissionWindow {
 }
 
 fn is_turn_start_route(route: &str) -> bool {
-    route.ends_with("/threads/{thread_id}/turns")
+    route == "turn/start" || route.ends_with("/threads/{thread_id}/turns")
 }
 
 fn lock_windows(

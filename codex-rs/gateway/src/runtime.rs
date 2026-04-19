@@ -8,6 +8,8 @@ use crate::api::GatewayExecutionMode;
 use crate::api::GatewayHealthResponse;
 use crate::api::GatewayHealthStatus;
 use crate::api::GatewayServerRequest;
+use crate::api::GatewayV2CompatibilityMode;
+use crate::api::GatewayV2TransportConfig;
 use crate::api::InterruptTurnResponse;
 use crate::api::ListThreadsRequest;
 use crate::api::ListThreadsResponse;
@@ -87,6 +89,7 @@ pub struct AppServerGatewayRuntime {
     events: broadcast::Sender<GatewayEvent>,
     scope_registry: Arc<GatewayScopeRegistry>,
     remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
+    v2_transport: GatewayV2TransportConfig,
 }
 
 impl AppServerGatewayRuntime {
@@ -95,6 +98,7 @@ impl AppServerGatewayRuntime {
         execution_mode: GatewayExecutionMode,
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
+        v2_transport: GatewayV2TransportConfig,
     ) -> Self {
         Self::new_with_worker_id(
             app_server,
@@ -103,6 +107,7 @@ impl AppServerGatewayRuntime {
             events,
             scope_registry,
             None,
+            v2_transport,
         )
     }
 
@@ -113,6 +118,7 @@ impl AppServerGatewayRuntime {
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
         remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
+        v2_transport: GatewayV2TransportConfig,
     ) -> Self {
         Self {
             app_server,
@@ -122,6 +128,7 @@ impl AppServerGatewayRuntime {
             events,
             scope_registry,
             remote_worker_health,
+            v2_transport,
         }
     }
 
@@ -351,6 +358,8 @@ impl GatewayRuntime for AppServerGatewayRuntime {
             status: GatewayHealthStatus::Ok,
             runtime_mode: "embedded".to_string(),
             execution_mode: self.execution_mode,
+            v2_compatibility: GatewayV2CompatibilityMode::Embedded,
+            v2_transport: self.v2_transport,
             remote_workers: None,
         }
     }

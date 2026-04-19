@@ -13,3 +13,4 @@ pub mod remote_runtime;
 pub mod remote_worker;
 pub mod runtime;
 pub mod scope;
+pub mod v2;
