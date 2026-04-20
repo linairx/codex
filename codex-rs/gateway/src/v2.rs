@@ -1,3 +1,4 @@
+use crate::scope::GatewayRequestContext;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
@@ -5,8 +6,11 @@ use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
+use codex_app_server_protocol::RequestId;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone)]
 pub enum GatewayV2SessionFactory {
@@ -18,6 +22,16 @@ pub enum GatewayV2SessionFactory {
         connect_args: Box<RemoteAppServerConnectArgs>,
         initialize_response: Arc<InitializeResponse>,
     },
+    RemoteMulti {
+        connect_args: Vec<RemoteAppServerConnectArgs>,
+        initialize_response: Arc<InitializeResponse>,
+        next_server_request_id: Arc<AtomicU64>,
+    },
+}
+
+pub struct GatewayV2ConnectedSession {
+    pub worker_id: Option<usize>,
+    pub app_server: AppServerClient,
 }
 
 impl GatewayV2SessionFactory {
@@ -41,6 +55,17 @@ impl GatewayV2SessionFactory {
         }
     }
 
+    pub fn remote_multi(
+        connect_args: Vec<RemoteAppServerConnectArgs>,
+        initialize_response: InitializeResponse,
+    ) -> Self {
+        Self::RemoteMulti {
+            connect_args,
+            initialize_response: Arc::new(initialize_response),
+            next_server_request_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
     pub fn initialize_response(&self) -> InitializeResponse {
         match self {
             Self::Embedded {
@@ -50,11 +75,19 @@ impl GatewayV2SessionFactory {
             | Self::RemoteSingle {
                 initialize_response,
                 ..
+            }
+            | Self::RemoteMulti {
+                initialize_response,
+                ..
             } => initialize_response.as_ref().clone(),
         }
     }
 
-    pub async fn connect(&self, initialize: &InitializeParams) -> io::Result<AppServerClient> {
+    pub async fn connect(
+        &self,
+        initialize: &InitializeParams,
+        request_context: &GatewayRequestContext,
+    ) -> io::Result<Vec<GatewayV2ConnectedSession>> {
         match self {
             Self::Embedded { start_args, .. } => {
                 let mut start_args = start_args.as_ref().clone();
@@ -67,7 +100,12 @@ impl GatewayV2SessionFactory {
                 );
                 InProcessAppServerClient::start(start_args)
                     .await
-                    .map(AppServerClient::InProcess)
+                    .map(|app_server| {
+                        vec![GatewayV2ConnectedSession {
+                            worker_id: None,
+                            app_server: AppServerClient::InProcess(app_server),
+                        }]
+                    })
             }
             Self::RemoteSingle { connect_args, .. } => {
                 let mut connect_args = connect_args.as_ref().clone();
@@ -78,10 +116,54 @@ impl GatewayV2SessionFactory {
                     &mut connect_args.opt_out_notification_methods,
                     initialize,
                 );
-                RemoteAppServerClient::connect(connect_args)
-                    .await
-                    .map(AppServerClient::Remote)
+                RemoteAppServerClient::connect_with_headers(
+                    connect_args,
+                    request_context.forwarding_headers(),
+                )
+                .await
+                .map(|app_server| {
+                    vec![GatewayV2ConnectedSession {
+                        worker_id: Some(0),
+                        app_server: AppServerClient::Remote(app_server),
+                    }]
+                })
             }
+            Self::RemoteMulti { connect_args, .. } => {
+                let mut sessions = Vec::with_capacity(connect_args.len());
+                for (worker_id, connect_args) in connect_args.iter().enumerate() {
+                    let mut connect_args = connect_args.clone();
+                    apply_initialize_params(
+                        &mut connect_args.client_name,
+                        &mut connect_args.client_version,
+                        &mut connect_args.experimental_api,
+                        &mut connect_args.opt_out_notification_methods,
+                        initialize,
+                    );
+                    let app_server = RemoteAppServerClient::connect_with_headers(
+                        connect_args,
+                        request_context.forwarding_headers(),
+                    )
+                    .await?;
+                    sessions.push(GatewayV2ConnectedSession {
+                        worker_id: Some(worker_id),
+                        app_server: AppServerClient::Remote(app_server),
+                    });
+                }
+                Ok(sessions)
+            }
+        }
+    }
+
+    pub fn next_server_request_id(&self) -> RequestId {
+        match self {
+            Self::RemoteMulti {
+                next_server_request_id,
+                ..
+            } => RequestId::String(format!(
+                "gateway-srv-{}",
+                next_server_request_id.fetch_add(1, Ordering::Relaxed)
+            )),
+            _ => RequestId::String("gateway-srv-1".to_string()),
         }
     }
 }

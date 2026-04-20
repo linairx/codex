@@ -54,7 +54,7 @@ pub enum GatewayExecutionMode {
 pub enum GatewayV2CompatibilityMode {
     Embedded,
     RemoteSingleWorker,
-    RemoteMultiWorkerUnsupported,
+    RemoteMultiWorker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

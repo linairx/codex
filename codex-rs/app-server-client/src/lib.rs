@@ -835,6 +835,28 @@ impl InProcessAppServerRequestHandle {
             .map_err(|source| TypedRequestError::Deserialize { method, source })
     }
 
+    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::Notify {
+                notification,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server notify channel is closed",
+            )
+        })?
+    }
+
     pub async fn resolve_server_request(
         &self,
         request_id: RequestId,
@@ -905,6 +927,13 @@ impl AppServerRequestHandle {
         match self {
             Self::InProcess(handle) => handle.request_typed(request).await,
             Self::Remote(handle) => handle.request_typed(request).await,
+        }
+    }
+
+    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.notify(notification).await,
+            Self::Remote(handle) => handle.notify(notification).await,
         }
     }
 
@@ -1495,6 +1524,52 @@ mod tests {
             auth_token: Some(auth_token),
             ..test_remote_connect_args(websocket_url)
         })
+        .await
+        .expect("remote client should connect");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_connect_includes_custom_headers_when_configured() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = accept_hdr_async(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-codex-tenant-id")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("tenant-a")
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-codex-project-id")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("project-a")
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("websocket upgrade should succeed");
+            expect_remote_initialize(&mut websocket).await;
+            websocket.close(None).await.expect("close should succeed");
+        });
+        let client = RemoteAppServerClient::connect_with_headers(
+            test_remote_connect_args(format!("ws://{addr}")),
+            vec![
+                ("x-codex-tenant-id".to_string(), "tenant-a".to_string()),
+                ("x-codex-project-id".to_string(), "project-a".to_string()),
+            ],
+        )
         .await
         .expect("remote client should connect");
 

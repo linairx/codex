@@ -49,6 +49,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderName;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tracing::warn;
@@ -138,6 +139,13 @@ pub struct RemoteAppServerRequestHandle {
 
 impl RemoteAppServerClient {
     pub async fn connect(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
+        Self::connect_with_headers(args, Vec::new()).await
+    }
+
+    pub async fn connect_with_headers(
+        args: RemoteAppServerConnectArgs,
+        additional_headers: Vec<(String, String)>,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let websocket_url = args.websocket_url.clone();
         let url = Url::parse(&websocket_url).map_err(|err| {
@@ -160,6 +168,21 @@ impl RemoteAppServerClient {
                 format!("invalid websocket URL `{websocket_url}`: {err}"),
             )
         })?;
+        for (header_name, header_value) in additional_headers {
+            let name = HeaderName::from_bytes(header_name.as_bytes()).map_err(|err| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid remote header name `{header_name}`: {err}"),
+                )
+            })?;
+            let value = HeaderValue::from_str(&header_value).map_err(|err| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid remote header value for `{header_name}`: {err}"),
+                )
+            })?;
+            request.headers_mut().insert(name, value);
+        }
         if let Some(auth_token) = args.auth_token.as_deref() {
             let header_value =
                 HeaderValue::from_str(&format!("Bearer {auth_token}")).map_err(|err| {
@@ -671,6 +694,28 @@ impl RemoteAppServerRequestHandle {
         })?;
         serde_json::from_value(result)
             .map_err(|source| TypedRequestError::Deserialize { method, source })
+    }
+
+    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RemoteClientCommand::Notify {
+                notification,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "remote app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server notify channel is closed",
+            )
+        })?
     }
 
     pub async fn resolve_server_request(

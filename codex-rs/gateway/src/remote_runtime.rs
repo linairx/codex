@@ -437,7 +437,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
             v2_compatibility: if remote_workers.len() == 1 {
                 GatewayV2CompatibilityMode::RemoteSingleWorker
             } else {
-                GatewayV2CompatibilityMode::RemoteMultiWorkerUnsupported
+                GatewayV2CompatibilityMode::RemoteMultiWorker
             },
             v2_transport: self.v2_transport,
             remote_workers: Some(remote_workers),
@@ -634,7 +634,7 @@ mod tests {
                 status: GatewayHealthStatus::Degraded,
                 runtime_mode: "remote".to_string(),
                 execution_mode: GatewayExecutionMode::WorkerManaged,
-                v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorkerUnsupported,
+                v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorker,
                 v2_transport: GatewayV2TransportConfig {
                     initialize_timeout_seconds: 30,
                     client_send_timeout_seconds: 10,

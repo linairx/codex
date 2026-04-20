@@ -17,10 +17,16 @@ use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::ORIGIN;
 use axum::response::IntoResponse;
-use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
+use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_protocol::AppInfo;
+use codex_app_server_protocol::AppsListParams;
+use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
+use codex_app_server_protocol::GetAccountRateLimitsResponse;
+use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -28,13 +34,29 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ListMcpServerStatusParams;
+use codex_app_server_protocol::ListMcpServerStatusResponse;
+use codex_app_server_protocol::McpServerStatus;
+use codex_app_server_protocol::ModelListParams;
+use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::PluginListResponse;
+use codex_app_server_protocol::PluginMarketplaceEntry;
+use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ServerRequestResolvedNotification;
+use codex_app_server_protocol::SkillsListEntry;
+use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io;
@@ -42,6 +64,8 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 const INVALID_REQUEST_CODE: i64 = -32600;
@@ -56,6 +80,8 @@ const INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON: &str =
 const INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON: &str = "invalid gateway websocket UTF-8 payload";
 const TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE: &str =
     "too many pending server requests for websocket connection";
+const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
+    "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
 const MAX_CLOSE_REASON_BYTES: usize = 123;
 
@@ -93,6 +119,191 @@ struct GatewayV2ConnectionContext<'a> {
     request_context: &'a GatewayRequestContext,
     client_send_timeout: Duration,
     max_pending_server_requests: usize,
+}
+
+struct GatewayV2EventState {
+    pending_server_requests: HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+    skills_changed_pending_refresh: bool,
+    forwarded_connection_notifications: HashMap<String, Option<Value>>,
+}
+
+#[derive(Clone)]
+struct DownstreamWorkerHandle {
+    worker_id: Option<usize>,
+    request_handle: AppServerRequestHandle,
+}
+
+struct DownstreamWorkerEvent {
+    worker_id: Option<usize>,
+    event: Option<AppServerEvent>,
+}
+
+#[derive(Clone)]
+struct PendingServerRequestRoute {
+    worker_id: Option<usize>,
+    downstream_request_id: RequestId,
+    thread_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DownstreamServerRequestKey {
+    worker_id: Option<usize>,
+    request_id: RequestId,
+}
+
+#[derive(Clone)]
+struct ResolvedServerRequestRoute {
+    gateway_request_id: RequestId,
+    thread_id: Option<String>,
+}
+
+struct GatewayV2DownstreamRouter {
+    workers: Vec<DownstreamWorkerHandle>,
+    event_rx: mpsc::Receiver<DownstreamWorkerEvent>,
+    shutdown_txs: Vec<tokio::sync::oneshot::Sender<()>>,
+    event_tasks: Vec<JoinHandle<io::Result<()>>>,
+    next_worker: usize,
+}
+
+impl GatewayV2DownstreamRouter {
+    async fn connect(
+        session_factory: &GatewayV2SessionFactory,
+        initialize_params: &InitializeParams,
+        request_context: &GatewayRequestContext,
+    ) -> io::Result<Self> {
+        let sessions = session_factory
+            .connect(initialize_params, request_context)
+            .await?;
+        let (event_tx, event_rx) = mpsc::channel(sessions.len().max(1) * 4);
+        let mut workers = Vec::with_capacity(sessions.len());
+        let mut shutdown_txs = Vec::with_capacity(sessions.len());
+        let mut event_tasks = Vec::with_capacity(sessions.len());
+
+        for session in sessions {
+            let worker_id = session.worker_id;
+            let request_handle = session.app_server.request_handle();
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            let worker_event_tx = event_tx.clone();
+            let mut app_server = session.app_server;
+            event_tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            break;
+                        }
+                        event = app_server.next_event() => {
+                            let end_of_stream = event.is_none();
+                            if worker_event_tx
+                                .send(DownstreamWorkerEvent { worker_id, event })
+                                .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                            if end_of_stream {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                app_server.shutdown().await
+            }));
+            workers.push(DownstreamWorkerHandle {
+                worker_id,
+                request_handle,
+            });
+            shutdown_txs.push(shutdown_tx);
+        }
+        drop(event_tx);
+
+        Ok(Self {
+            workers,
+            event_rx,
+            shutdown_txs,
+            event_tasks,
+            next_worker: 0,
+        })
+    }
+
+    fn single_worker(&self) -> bool {
+        self.workers.len() == 1
+    }
+
+    fn primary_worker(&self) -> io::Result<&DownstreamWorkerHandle> {
+        self.workers.first().ok_or_else(|| {
+            io::Error::other("gateway v2 connection has no downstream app-server sessions")
+        })
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn has_worker(&self, worker_id: Option<usize>) -> bool {
+        self.workers
+            .iter()
+            .any(|worker| worker.worker_id == worker_id)
+    }
+
+    fn next_thread_start_worker(&mut self) -> io::Result<&DownstreamWorkerHandle> {
+        if self.workers.is_empty() {
+            return Err(io::Error::other(
+                "gateway v2 connection has no downstream app-server sessions",
+            ));
+        }
+        let index = self.next_worker % self.workers.len();
+        self.next_worker = self.next_worker.wrapping_add(1);
+        Ok(&self.workers[index])
+    }
+
+    fn worker_for_thread(
+        &self,
+        scope_registry: &GatewayScopeRegistry,
+        thread_id: &str,
+    ) -> io::Result<&DownstreamWorkerHandle> {
+        let worker_id = scope_registry.thread_worker_id(thread_id);
+        self.workers
+            .iter()
+            .find(|worker| worker.worker_id == worker_id)
+            .or_else(|| {
+                self.workers
+                    .iter()
+                    .find(|worker| worker.worker_id.is_none())
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::NotFound,
+                    format!("gateway has no downstream worker route for thread {thread_id}"),
+                )
+            })
+    }
+
+    async fn next_event(&mut self) -> Option<DownstreamWorkerEvent> {
+        self.event_rx.recv().await
+    }
+
+    async fn shutdown(self) -> io::Result<()> {
+        for shutdown_tx in self.shutdown_txs {
+            let _ = shutdown_tx.send(());
+        }
+        for event_task in self.event_tasks {
+            event_task.await.map_err(|err| {
+                io::Error::other(format!("gateway v2 event task failed: {err}"))
+            })??;
+        }
+        Ok(())
+    }
+
+    fn remove_worker(&mut self, worker_id: Option<usize>) -> bool {
+        let original_len = self.workers.len();
+        self.workers.retain(|worker| worker.worker_id != worker_id);
+        if self.next_worker >= self.workers.len() && !self.workers.is_empty() {
+            self.next_worker %= self.workers.len();
+        }
+        self.workers.len() != original_len
+    }
 }
 
 pub async fn websocket_upgrade_handler(
@@ -213,30 +424,33 @@ async fn run_websocket_connection(
             return Ok(());
         }
     };
-    let mut app_server = match session_factory.connect(&initialize_params).await {
-        Ok(app_server) => app_server,
-        Err(err) => {
-            send_jsonrpc_error(
-                &mut socket,
-                initialize_request_id,
-                JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("gateway failed to connect downstream app-server: {err}"),
-                    data: None,
-                },
-                timeouts.client_send,
-            )
-            .await?;
-            observe_v2_request(
-                &observability,
-                &context,
-                "initialize",
-                "internal_error",
-                initialize_started_at.elapsed(),
-            );
-            return Ok(());
-        }
-    };
+    let mut downstream =
+        match GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+            .await
+        {
+            Ok(downstream) => downstream,
+            Err(err) => {
+                send_jsonrpc_error(
+                    &mut socket,
+                    initialize_request_id,
+                    JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("gateway failed to connect downstream app-server: {err}"),
+                        data: None,
+                    },
+                    timeouts.client_send,
+                )
+                .await?;
+                observe_v2_request(
+                    &observability,
+                    &context,
+                    "initialize",
+                    "internal_error",
+                    initialize_started_at.elapsed(),
+                );
+                return Ok(());
+            }
+        };
     send_jsonrpc(
         &mut socket,
         JSONRPCMessage::Response(JSONRPCResponse {
@@ -255,7 +469,13 @@ async fn run_websocket_connection(
         initialize_started_at.elapsed(),
     );
 
-    let mut pending_server_requests = HashSet::<RequestId>::new();
+    let mut event_state = GatewayV2EventState {
+        pending_server_requests: HashMap::new(),
+        resolved_server_requests: HashMap::new(),
+        skills_changed_pending_refresh: false,
+        forwarded_connection_notifications: HashMap::new(),
+    };
+    let mut reject_pending_server_requests_on_exit = false;
     let connection = GatewayV2ConnectionContext {
         admission: &admission,
         observability: &observability,
@@ -264,11 +484,11 @@ async fn run_websocket_connection(
         client_send_timeout: timeouts.client_send,
         max_pending_server_requests: timeouts.max_pending_server_requests,
     };
-    loop {
+    let loop_result: io::Result<()> = loop {
         tokio::select! {
             frame = socket.recv() => {
                 let Some(frame) = frame else {
-                    break;
+                    break Ok(());
                 };
                 match frame {
                     Ok(WebSocketMessage::Text(text)) => {
@@ -281,14 +501,17 @@ async fn run_websocket_connection(
                                     timeouts.client_send,
                                 )
                                 .await?;
-                                break;
+                                reject_pending_server_requests_on_exit = true;
+                                break Ok(());
                             }
                         };
                         handle_client_message(
                             &mut socket,
-                            &app_server,
+                            &mut downstream,
                             &connection,
-                            &mut pending_server_requests,
+                            &mut event_state.pending_server_requests,
+                            &mut event_state.resolved_server_requests,
+                            &mut event_state.skills_changed_pending_refresh,
                             message,
                         )
                         .await?;
@@ -303,19 +526,25 @@ async fn run_websocket_connection(
                                     timeouts.client_send,
                                 )
                                 .await?;
-                                break;
+                                reject_pending_server_requests_on_exit = true;
+                                break Ok(());
                             }
                         };
                         handle_client_message(
                             &mut socket,
-                            &app_server,
+                            &mut downstream,
                             &connection,
-                            &mut pending_server_requests,
+                            &mut event_state.pending_server_requests,
+                            &mut event_state.resolved_server_requests,
+                            &mut event_state.skills_changed_pending_refresh,
                             message,
                         )
                         .await?;
                     }
-                    Ok(WebSocketMessage::Close(_)) => break,
+                    Ok(WebSocketMessage::Close(_)) => {
+                        reject_pending_server_requests_on_exit = true;
+                        break Ok(());
+                    }
                     Ok(WebSocketMessage::Ping(payload)) => {
                         send_websocket_message(
                             &mut socket,
@@ -325,10 +554,12 @@ async fn run_websocket_connection(
                         .await?;
                     }
                     Ok(WebSocketMessage::Pong(_)) => {}
-                    Err(err) => return Err(io::Error::other(format!("gateway websocket receive failed: {err}"))),
+                    Err(err) => {
+                        break Err(io::Error::other(format!("gateway websocket receive failed: {err}")));
+                    }
                 }
             }
-            event = app_server.next_event() => {
+            event = downstream.next_event() => {
                 let Some(event) = event else {
                     send_close_frame(
                         &mut socket,
@@ -337,24 +568,45 @@ async fn run_websocket_connection(
                         timeouts.client_send,
                     )
                     .await?;
-                    break;
+                    break Ok(());
                 };
                 let should_close = handle_app_server_event(
                     &mut socket,
-                    &app_server,
+                    &mut downstream,
+                    &session_factory,
                     &connection,
-                    &mut pending_server_requests,
+                    &mut event_state,
                     event,
                 )
                 .await?;
-                if should_close {
-                    break;
+                if let Some(should_reject_pending) = should_close {
+                    reject_pending_server_requests_on_exit = should_reject_pending;
+                    break Ok(());
                 }
             }
         }
+    };
+
+    if reject_pending_server_requests_on_exit
+        || loop_result
+            .as_ref()
+            .err()
+            .is_some_and(should_reject_pending_server_requests_after_connection_error)
+    {
+        reject_pending_server_requests(&downstream, &mut event_state.pending_server_requests)
+            .await?;
     }
 
-    app_server.shutdown().await
+    let shutdown_result = downstream.shutdown().await;
+    match loop_result {
+        Ok(()) => shutdown_result,
+        Err(err) => {
+            if let Err(shutdown_err) = shutdown_result {
+                warn!(%shutdown_err, "gateway v2 websocket downstream shutdown also failed after connection error");
+            }
+            Err(err)
+        }
+    }
 }
 
 async fn recv_initialize_request(
@@ -473,15 +725,20 @@ async fn handle_pre_initialize_message(
 
 async fn handle_client_message(
     socket: &mut WebSocket,
-    app_server: &AppServerClient,
+    downstream: &mut GatewayV2DownstreamRouter,
     connection: &GatewayV2ConnectionContext<'_>,
-    pending_server_requests: &mut HashSet<RequestId>,
+    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+    skills_changed_pending_refresh: &mut bool,
     message: JSONRPCMessage,
 ) -> io::Result<()> {
     match message {
         JSONRPCMessage::Request(request) => {
             let started_at = Instant::now();
             let method = request.method.clone();
+            if !downstream.single_worker() && request.method == "skills/list" {
+                *skills_changed_pending_refresh = false;
+            }
             if request.method == "initialize" {
                 send_jsonrpc_error(
                     socket,
@@ -550,15 +807,9 @@ async fn handle_client_message(
             }
 
             let request_id = request.id.clone();
-            let client_request = jsonrpc_request_to_client_request(request)?;
-            match app_server.request(client_request).await {
+            let method = request.method.clone();
+            match handle_client_request(downstream, connection, request).await {
                 Ok(Ok(result)) => {
-                    let result = apply_response_scope_policy(
-                        connection.scope_registry,
-                        connection.request_context,
-                        &method,
-                        result,
-                    )?;
                     send_jsonrpc(
                         socket,
                         JSONRPCMessage::Response(JSONRPCResponse {
@@ -611,23 +862,49 @@ async fn handle_client_message(
             }
         }
         JSONRPCMessage::Notification(notification) => {
-            if notification.method == "initialized" {
+            let is_initialized = notification.method == "initialized";
+            if is_initialized && !downstream.single_worker() {
+                fanout_connection_notification(downstream, ClientNotification::Initialized).await?;
                 return Ok(());
             }
+            let worker =
+                worker_for_notification(downstream, connection.scope_registry, &notification)?;
             let client_notification = jsonrpc_notification_to_client_notification(notification)?;
-            app_server.notify(client_notification).await?;
+            worker.request_handle.notify(client_notification).await?;
         }
         JSONRPCMessage::Response(response) => {
-            if pending_server_requests.remove(&response.id) {
-                app_server
-                    .resolve_server_request(response.id, response.result)
+            if let Some(route) = pending_server_requests.remove(&response.id) {
+                resolved_server_requests.insert(
+                    DownstreamServerRequestKey {
+                        worker_id: route.worker_id,
+                        request_id: route.downstream_request_id.clone(),
+                    },
+                    ResolvedServerRequestRoute {
+                        gateway_request_id: response.id.clone(),
+                        thread_id: route.thread_id.clone(),
+                    },
+                );
+                worker_for_server_request(downstream, route.worker_id)?
+                    .request_handle
+                    .resolve_server_request(route.downstream_request_id, response.result)
                     .await?;
             }
         }
         JSONRPCMessage::Error(error) => {
-            if pending_server_requests.remove(&error.id) {
-                app_server
-                    .reject_server_request(error.id, error.error)
+            if let Some(route) = pending_server_requests.remove(&error.id) {
+                resolved_server_requests.insert(
+                    DownstreamServerRequestKey {
+                        worker_id: route.worker_id,
+                        request_id: route.downstream_request_id.clone(),
+                    },
+                    ResolvedServerRequestRoute {
+                        gateway_request_id: error.id.clone(),
+                        thread_id: route.thread_id.clone(),
+                    },
+                );
+                worker_for_server_request(downstream, route.worker_id)?
+                    .request_handle
+                    .reject_server_request(route.downstream_request_id, error.error)
                     .await?;
             }
         }
@@ -638,11 +915,39 @@ async fn handle_client_message(
 
 async fn handle_app_server_event(
     socket: &mut WebSocket,
-    app_server: &AppServerClient,
+    downstream: &mut GatewayV2DownstreamRouter,
+    session_factory: &GatewayV2SessionFactory,
     connection: &GatewayV2ConnectionContext<'_>,
-    pending_server_requests: &mut HashSet<RequestId>,
-    event: AppServerEvent,
-) -> io::Result<bool> {
+    event_state: &mut GatewayV2EventState,
+    downstream_event: DownstreamWorkerEvent,
+) -> io::Result<Option<bool>> {
+    let worker_id = downstream_event.worker_id;
+    if worker_id.is_some() && !downstream.has_worker(worker_id) && downstream.worker_count() > 0 {
+        return Ok(None);
+    }
+    let Some(event) = downstream_event.event else {
+        if !downstream.single_worker() && downstream.remove_worker(worker_id) {
+            resolve_server_requests_for_worker(
+                socket,
+                connection.client_send_timeout,
+                &mut event_state.pending_server_requests,
+                &mut event_state.resolved_server_requests,
+                worker_id,
+            )
+            .await?;
+            if downstream.worker_count() > 0 {
+                return Ok(None);
+            }
+        }
+        send_close_frame(
+            socket,
+            close_code::ERROR,
+            DOWNSTREAM_SESSION_ENDED_CLOSE_REASON,
+            connection.client_send_timeout,
+        )
+        .await?;
+        return Ok(Some(false));
+    };
     match event {
         AppServerEvent::Lagged { skipped } => {
             send_close_frame(
@@ -652,15 +957,44 @@ async fn handle_app_server_event(
                 connection.client_send_timeout,
             )
             .await?;
-            return Ok(true);
+            return Ok(Some(true));
         }
         AppServerEvent::ServerNotification(notification) => {
-            let notification = server_notification_to_jsonrpc(notification)?;
+            let notification = server_notification_to_jsonrpc(
+                notification,
+                worker_id,
+                &mut event_state.resolved_server_requests,
+            )?;
+            if !downstream.single_worker()
+                && notification.method == "skills/changed"
+                && event_state.skills_changed_pending_refresh
+            {
+                return Ok(None);
+            }
+            if !downstream.single_worker()
+                && should_deduplicate_connection_notification(&notification)
+                && event_state
+                    .forwarded_connection_notifications
+                    .get(&notification.method)
+                    .is_some_and(|params| *params == notification.params)
+            {
+                return Ok(None);
+            }
             if notification_visible_to(
                 connection.scope_registry,
                 connection.request_context,
                 &notification,
             ) {
+                if !downstream.single_worker() && notification.method == "skills/changed" {
+                    event_state.skills_changed_pending_refresh = true;
+                }
+                if !downstream.single_worker()
+                    && should_deduplicate_connection_notification(&notification)
+                {
+                    event_state
+                        .forwarded_connection_notifications
+                        .insert(notification.method.clone(), notification.params.clone());
+                }
                 send_jsonrpc(
                     socket,
                     JSONRPCMessage::Notification(notification),
@@ -670,27 +1004,43 @@ async fn handle_app_server_event(
             }
         }
         AppServerEvent::ServerRequest(request) => {
-            let request = server_request_to_jsonrpc(request)?;
+            let gateway_request_id = if downstream.single_worker() {
+                request.id().clone()
+            } else {
+                session_factory.next_server_request_id()
+            };
+            let (request, downstream_request_id) =
+                server_request_to_jsonrpc(request, gateway_request_id)?;
             if request_visible_to(
                 connection.scope_registry,
                 connection.request_context,
                 &request,
             ) {
                 if let Some(error) = pending_server_request_limit_error(
-                    pending_server_requests.len(),
+                    event_state.pending_server_requests.len(),
                     connection.max_pending_server_requests,
                 ) {
                     warn!(
-                        pending_server_request_count = pending_server_requests.len(),
+                        pending_server_request_count = event_state.pending_server_requests.len(),
                         limit = connection.max_pending_server_requests,
                         request_id = ?request.id,
                         method = request.method,
                         "rejecting downstream server request because the gateway websocket connection is saturated"
                     );
-                    app_server.reject_server_request(request.id, error).await?;
-                    return Ok(false);
+                    worker_for_server_request(downstream, worker_id)?
+                        .request_handle
+                        .reject_server_request(downstream_request_id, error)
+                        .await?;
+                    return Ok(None);
                 }
-                pending_server_requests.insert(request.id.clone());
+                event_state.pending_server_requests.insert(
+                    request.id.clone(),
+                    PendingServerRequestRoute {
+                        worker_id,
+                        downstream_request_id,
+                        thread_id: request_thread_id(&request).map(str::to_string),
+                    },
+                );
                 send_jsonrpc(
                     socket,
                     JSONRPCMessage::Request(request),
@@ -699,9 +1049,10 @@ async fn handle_app_server_event(
                 .await?;
             } else {
                 let message = hidden_thread_error_message(&request).to_string();
-                app_server
+                worker_for_server_request(downstream, worker_id)?
+                    .request_handle
                     .reject_server_request(
-                        request.id,
+                        downstream_request_id,
                         JSONRPCErrorError {
                             code: INVALID_PARAMS_CODE,
                             message,
@@ -712,6 +1063,19 @@ async fn handle_app_server_event(
             }
         }
         AppServerEvent::Disconnected { message } => {
+            if !downstream.single_worker() && downstream.remove_worker(worker_id) {
+                resolve_server_requests_for_worker(
+                    socket,
+                    connection.client_send_timeout,
+                    &mut event_state.pending_server_requests,
+                    &mut event_state.resolved_server_requests,
+                    worker_id,
+                )
+                .await?;
+                if downstream.worker_count() > 0 {
+                    return Ok(None);
+                }
+            }
             send_close_frame(
                 socket,
                 close_code::ERROR,
@@ -719,11 +1083,869 @@ async fn handle_app_server_event(
                 connection.client_send_timeout,
             )
             .await?;
-            return Ok(true);
+            return Ok(Some(false));
         }
     }
 
-    Ok(false)
+    Ok(None)
+}
+
+async fn resolve_server_requests_for_worker(
+    socket: &mut WebSocket,
+    client_send_timeout: Duration,
+    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+    worker_id: Option<usize>,
+) -> io::Result<()> {
+    let mut request_resolved_notifications = Vec::new();
+
+    pending_server_requests.retain(|gateway_request_id, route| {
+        if route.worker_id != worker_id {
+            return true;
+        }
+        if let Some(thread_id) = route.thread_id.clone() {
+            request_resolved_notifications.push(ServerRequestResolvedNotification {
+                thread_id,
+                request_id: gateway_request_id.clone(),
+            });
+        }
+        false
+    });
+
+    resolved_server_requests.retain(|key, route| {
+        if key.worker_id != worker_id {
+            return true;
+        }
+        if let Some(thread_id) = route.thread_id.clone() {
+            request_resolved_notifications.push(ServerRequestResolvedNotification {
+                thread_id,
+                request_id: route.gateway_request_id.clone(),
+            });
+        }
+        false
+    });
+
+    for notification in request_resolved_notifications {
+        send_jsonrpc(
+            socket,
+            JSONRPCMessage::Notification(tagged_type_to_notification(
+                ServerNotification::ServerRequestResolved(notification),
+            )?),
+            client_send_timeout,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn reject_pending_server_requests(
+    downstream: &GatewayV2DownstreamRouter,
+    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
+) -> io::Result<()> {
+    for (_gateway_request_id, route) in pending_server_requests.drain() {
+        worker_for_server_request(downstream, route.worker_id)?
+            .request_handle
+            .reject_server_request(
+                route.downstream_request_id,
+                JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: PENDING_SERVER_REQUEST_ABORTED_MESSAGE.to_string(),
+                    data: None,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn handle_client_request(
+    downstream: &mut GatewayV2DownstreamRouter,
+    connection: &GatewayV2ConnectionContext<'_>,
+    request: JSONRPCRequest,
+) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    if !downstream.single_worker() {
+        match request.method.as_str() {
+            "app/list" if request_thread_id(&request).is_none() => {
+                return aggregate_apps_list_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "mcpServerStatus/list" => {
+                return aggregate_mcp_server_status_list_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "thread/list" => {
+                return aggregate_thread_list_response(
+                    downstream,
+                    connection.scope_registry,
+                    connection.request_context,
+                    &request,
+                )
+                .await
+                .map(Ok);
+            }
+            "thread/loaded/list" => {
+                return aggregate_loaded_thread_list_response(
+                    downstream,
+                    connection.scope_registry,
+                    connection.request_context,
+                    &request,
+                )
+                .await
+                .map(Ok);
+            }
+            "account/read" => {
+                return aggregate_account_read_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "account/rateLimits/read" => {
+                return aggregate_account_rate_limits_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "model/list" => {
+                return aggregate_model_list_response_if_supported(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "externalAgentConfig/detect" => {
+                return aggregate_external_agent_config_detect_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "skills/list" => {
+                return aggregate_skills_list_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "plugin/list" => {
+                return aggregate_plugin_list_response(downstream, &request)
+                    .await
+                    .map(Ok);
+            }
+            "plugin/read" | "plugin/install" | "plugin/uninstall" => {
+                return first_successful_connection_request(downstream, request).await;
+            }
+            "thread/read"
+                if request_thread_id(&request).is_some_and(|thread_id| {
+                    connection
+                        .scope_registry
+                        .thread_visible_to(connection.request_context, thread_id)
+                        && connection
+                            .scope_registry
+                            .thread_worker_id(thread_id)
+                            .is_none()
+                }) =>
+            {
+                return first_successful_visible_thread_read_request(
+                    downstream,
+                    connection.scope_registry,
+                    connection.request_context,
+                    request,
+                )
+                .await;
+            }
+            "externalAgentConfig/import"
+            | "config/value/write"
+            | "config/batchWrite"
+            | "memory/reset"
+            | "account/logout" => {
+                return fanout_mutating_connection_request(downstream, request).await;
+            }
+            _ => {}
+        }
+    }
+
+    let worker = worker_for_request(downstream, connection.scope_registry, &request)?;
+    let method = request.method.clone();
+    let client_request = jsonrpc_request_to_client_request(request)?;
+    let response = worker.request_handle.request(client_request).await?;
+    Ok(match response {
+        Ok(result) => Ok(apply_response_scope_policy(
+            connection.scope_registry,
+            connection.request_context,
+            &method,
+            worker.worker_id,
+            result,
+        )?),
+        Err(error) => Err(error),
+    })
+}
+
+async fn fanout_mutating_connection_request(
+    downstream: &GatewayV2DownstreamRouter,
+    request: JSONRPCRequest,
+) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    let mut primary_result = None;
+
+    for (index, worker) in downstream.workers.iter().enumerate() {
+        let response = worker
+            .request_handle
+            .request(jsonrpc_request_to_client_request(request.clone())?)
+            .await?;
+        match response {
+            Ok(result) => {
+                if index == 0 {
+                    primary_result = Some(result);
+                }
+            }
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+
+    primary_result.map(Ok).ok_or_else(|| {
+        io::Error::other("gateway v2 connection has no downstream app-server sessions")
+    })
+}
+
+async fn first_successful_connection_request(
+    downstream: &GatewayV2DownstreamRouter,
+    request: JSONRPCRequest,
+) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    let mut first_error = None;
+
+    for worker in &downstream.workers {
+        let response = worker
+            .request_handle
+            .request(jsonrpc_request_to_client_request(request.clone())?)
+            .await?;
+        match response {
+            Ok(result) => return Ok(Ok(result)),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Ok(Err(error)),
+        None => Err(io::Error::other(
+            "gateway v2 connection has no downstream app-server sessions",
+        )),
+    }
+}
+
+async fn fanout_connection_notification(
+    downstream: &GatewayV2DownstreamRouter,
+    notification: ClientNotification,
+) -> io::Result<()> {
+    for worker in &downstream.workers {
+        worker.request_handle.notify(notification.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn first_successful_visible_thread_read_request(
+    downstream: &GatewayV2DownstreamRouter,
+    scope_registry: &GatewayScopeRegistry,
+    context: &GatewayRequestContext,
+    request: JSONRPCRequest,
+) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    let mut first_error = None;
+
+    for worker in &downstream.workers {
+        let response = worker
+            .request_handle
+            .request(jsonrpc_request_to_client_request(request.clone())?)
+            .await?;
+        match response {
+            Ok(result) => {
+                return Ok(Ok(apply_response_scope_policy(
+                    scope_registry,
+                    context,
+                    &request.method,
+                    worker.worker_id,
+                    result,
+                )?));
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Ok(Err(error)),
+        None => Err(io::Error::other(
+            "gateway v2 connection has no downstream app-server sessions",
+        )),
+    }
+}
+
+fn worker_for_request<'a>(
+    downstream: &'a mut GatewayV2DownstreamRouter,
+    scope_registry: &GatewayScopeRegistry,
+    request: &JSONRPCRequest,
+) -> io::Result<&'a DownstreamWorkerHandle> {
+    if downstream.single_worker() {
+        return downstream.primary_worker();
+    }
+
+    if request.method == "thread/start" {
+        return downstream.next_thread_start_worker();
+    }
+
+    if let Some(thread_id) = request_thread_id(request) {
+        if let Ok(worker) = downstream.worker_for_thread(scope_registry, thread_id) {
+            return Ok(worker);
+        }
+        if scope_registry.thread_context(thread_id).is_some() {
+            return Err(io::Error::other(format!(
+                "thread {thread_id} is missing a downstream worker route"
+            )));
+        }
+    }
+
+    downstream.primary_worker()
+}
+
+fn worker_for_notification<'a>(
+    downstream: &'a mut GatewayV2DownstreamRouter,
+    scope_registry: &GatewayScopeRegistry,
+    notification: &JSONRPCNotification,
+) -> io::Result<&'a DownstreamWorkerHandle> {
+    if downstream.single_worker() {
+        return downstream.primary_worker();
+    }
+
+    if let Some(thread_id) = notification
+        .params
+        .as_ref()
+        .and_then(notification_thread_id)
+    {
+        if let Ok(worker) = downstream.worker_for_thread(scope_registry, thread_id) {
+            return Ok(worker);
+        }
+        if scope_registry.thread_context(thread_id).is_some() {
+            return Err(io::Error::other(format!(
+                "thread {thread_id} is missing a downstream worker route"
+            )));
+        }
+    }
+
+    downstream.primary_worker()
+}
+
+fn worker_for_server_request(
+    downstream: &GatewayV2DownstreamRouter,
+    worker_id: Option<usize>,
+) -> io::Result<&DownstreamWorkerHandle> {
+    downstream
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "gateway v2 connection has no downstream server-request route for worker {worker_id:?}"
+            ))
+        })
+}
+
+async fn aggregate_thread_list_response(
+    downstream: &GatewayV2DownstreamRouter,
+    scope_registry: &GatewayScopeRegistry,
+    context: &GatewayRequestContext,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let params = request_params::<ThreadListParams>(request)?;
+    let offset = decode_aggregated_offset_cursor(
+        params.cursor.as_deref(),
+        AGGREGATED_THREAD_CURSOR_PREFIX,
+        "thread",
+    )?;
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_AGGREGATED_THREAD_LIST_LIMIT as u32) as usize;
+    let mut threads = Vec::new();
+
+    for worker in &downstream.workers {
+        let response: ThreadListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        threads.extend(response.data.into_iter().filter_map(|thread| {
+            if !scope_registry.thread_visible_to(context, &thread.id) {
+                return None;
+            }
+            scope_registry.register_thread_worker_if_visible(&thread.id, context, worker.worker_id);
+            Some(thread)
+        }));
+    }
+
+    sort_threads_for_aggregation(&mut threads, params.sort_key, params.sort_direction);
+    let page: Vec<_> = threads.iter().skip(offset).take(limit).cloned().collect();
+    let next_cursor = (offset + page.len() < threads.len()).then(|| {
+        encode_aggregated_offset_cursor(AGGREGATED_THREAD_CURSOR_PREFIX, offset + page.len())
+    });
+    let backwards_cursor = (offset > 0).then(|| {
+        encode_aggregated_offset_cursor(
+            AGGREGATED_THREAD_CURSOR_PREFIX,
+            offset.saturating_sub(limit),
+        )
+    });
+
+    serde_json::to_value(ThreadListResponse {
+        data: page,
+        next_cursor,
+        backwards_cursor,
+    })
+    .map_err(io::Error::other)
+}
+
+async fn aggregate_loaded_thread_list_response(
+    downstream: &GatewayV2DownstreamRouter,
+    scope_registry: &GatewayScopeRegistry,
+    context: &GatewayRequestContext,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let mut thread_ids = Vec::new();
+    let mut seen = HashSet::new();
+
+    for worker in &downstream.workers {
+        let response: ThreadLoadedListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for thread_id in response.data {
+            if scope_registry.thread_visible_to(context, &thread_id) {
+                scope_registry.register_thread_worker_if_visible(
+                    &thread_id,
+                    context,
+                    worker.worker_id,
+                );
+            }
+            if scope_registry.thread_visible_to(context, &thread_id)
+                && seen.insert(thread_id.clone())
+            {
+                thread_ids.push(thread_id);
+            }
+        }
+    }
+
+    serde_json::to_value(ThreadLoadedListResponse {
+        data: thread_ids,
+        next_cursor: None,
+    })
+    .map_err(io::Error::other)
+}
+
+async fn aggregate_apps_list_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let params = request_params::<AppsListParams>(request)?;
+    let offset = decode_aggregated_offset_cursor(
+        params.cursor.as_deref(),
+        AGGREGATED_APPS_CURSOR_PREFIX,
+        "apps",
+    )?;
+    let fanout_request = JSONRPCRequest {
+        id: request.id.clone(),
+        method: request.method.clone(),
+        params: Some(
+            serde_json::to_value(AppsListParams {
+                cursor: None,
+                limit: None,
+                thread_id: None,
+                force_refetch: params.force_refetch,
+            })
+            .map_err(io::Error::other)?,
+        ),
+        trace: request.trace.clone(),
+    };
+
+    let mut apps = Vec::<AppInfo>::new();
+    let mut seen_ids = HashSet::new();
+
+    for worker in &downstream.workers {
+        let response: AppsListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(fanout_request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for app in response.data {
+            if seen_ids.insert(app.id.clone()) {
+                apps.push(app);
+            }
+        }
+    }
+
+    let limit = params.limit.unwrap_or(apps.len() as u32).max(1) as usize;
+    let (start, end, next_cursor) =
+        aggregated_page_bounds(apps.len(), offset, limit, AGGREGATED_APPS_CURSOR_PREFIX);
+
+    serde_json::to_value(AppsListResponse {
+        data: apps[start..end].to_vec(),
+        next_cursor,
+    })
+    .map_err(io::Error::other)
+}
+
+async fn aggregate_mcp_server_status_list_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let params = request_params::<ListMcpServerStatusParams>(request)?;
+    let offset = decode_aggregated_offset_cursor(
+        params.cursor.as_deref(),
+        AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX,
+        "mcp server status",
+    )?;
+    let fanout_request = JSONRPCRequest {
+        id: request.id.clone(),
+        method: request.method.clone(),
+        params: Some(
+            serde_json::to_value(ListMcpServerStatusParams {
+                cursor: None,
+                limit: None,
+                detail: params.detail,
+            })
+            .map_err(io::Error::other)?,
+        ),
+        trace: request.trace.clone(),
+    };
+
+    let mut statuses = Vec::<McpServerStatus>::new();
+    let mut seen_names = HashSet::new();
+
+    for worker in &downstream.workers {
+        let response: ListMcpServerStatusResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(fanout_request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for status in response.data {
+            if seen_names.insert(status.name.clone()) {
+                statuses.push(status);
+            }
+        }
+    }
+
+    let limit = params.limit.unwrap_or(statuses.len() as u32).max(1) as usize;
+    let (start, end, next_cursor) = aggregated_page_bounds(
+        statuses.len(),
+        offset,
+        limit,
+        AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX,
+    );
+
+    serde_json::to_value(ListMcpServerStatusResponse {
+        data: statuses[start..end].to_vec(),
+        next_cursor,
+    })
+    .map_err(io::Error::other)
+}
+
+async fn aggregate_external_agent_config_detect_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let mut items = Vec::new();
+
+    for worker in &downstream.workers {
+        let response: ExternalAgentConfigDetectResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for item in response.items {
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+    }
+
+    serde_json::to_value(ExternalAgentConfigDetectResponse { items }).map_err(io::Error::other)
+}
+
+async fn aggregate_account_read_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let mut primary_response = None;
+    let mut requires_openai_auth = false;
+
+    for (index, worker) in downstream.workers.iter().enumerate() {
+        let response: GetAccountResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        requires_openai_auth |= response.requires_openai_auth;
+        if index == 0 {
+            primary_response = Some(response);
+        }
+    }
+
+    let mut response = primary_response.ok_or_else(|| {
+        io::Error::other("gateway v2 connection has no downstream app-server sessions")
+    })?;
+    response.requires_openai_auth = requires_openai_auth;
+    serde_json::to_value(response).map_err(io::Error::other)
+}
+
+async fn aggregate_account_rate_limits_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let mut primary_response = None;
+    let mut aggregated_rate_limits_by_limit_id = HashMap::new();
+
+    for (index, worker) in downstream.workers.iter().enumerate() {
+        let response: GetAccountRateLimitsResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        if let Some(rate_limits_by_limit_id) = &response.rate_limits_by_limit_id {
+            for (limit_id, snapshot) in rate_limits_by_limit_id {
+                aggregated_rate_limits_by_limit_id
+                    .entry(limit_id.clone())
+                    .or_insert_with(|| snapshot.clone());
+            }
+        }
+        if index == 0 {
+            primary_response = Some(response);
+        }
+    }
+
+    let mut response = primary_response.ok_or_else(|| {
+        io::Error::other("gateway v2 connection has no downstream app-server sessions")
+    })?;
+    response.rate_limits_by_limit_id = (!aggregated_rate_limits_by_limit_id.is_empty())
+        .then_some(aggregated_rate_limits_by_limit_id);
+    serde_json::to_value(response).map_err(io::Error::other)
+}
+
+async fn aggregate_model_list_response_if_supported(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let params = request_params::<ModelListParams>(request)?;
+    if params.cursor.is_some() || params.limit.is_some() {
+        let worker = downstream.primary_worker()?;
+        let response: ModelListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        return serde_json::to_value(response).map_err(io::Error::other);
+    }
+
+    let mut models = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for worker in &downstream.workers {
+        let response: ModelListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for model in response.data {
+            if seen_ids.insert(model.id.clone()) {
+                models.push(model);
+            }
+        }
+    }
+
+    serde_json::to_value(ModelListResponse {
+        data: models,
+        next_cursor: None,
+    })
+    .map_err(io::Error::other)
+}
+
+async fn aggregate_skills_list_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let mut entries = Vec::<SkillsListEntry>::new();
+
+    for worker in &downstream.workers {
+        let response: SkillsListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for mut incoming in response.data {
+            if let Some(existing) = entries.iter_mut().find(|entry| entry.cwd == incoming.cwd) {
+                for skill in incoming.skills.drain(..) {
+                    if !existing.skills.contains(&skill) {
+                        existing.skills.push(skill);
+                    }
+                }
+                for error in incoming.errors.drain(..) {
+                    if !existing.errors.contains(&error) {
+                        existing.errors.push(error);
+                    }
+                }
+            } else {
+                entries.push(incoming);
+            }
+        }
+    }
+
+    serde_json::to_value(SkillsListResponse { data: entries }).map_err(io::Error::other)
+}
+
+async fn aggregate_plugin_list_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    let mut marketplaces = Vec::<PluginMarketplaceEntry>::new();
+    let mut featured_plugin_ids = Vec::<String>::new();
+    let mut marketplace_load_errors = Vec::new();
+
+    for worker in &downstream.workers {
+        let response: PluginListResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for marketplace in response.marketplaces {
+            merge_plugin_marketplace(&mut marketplaces, marketplace);
+        }
+        for plugin_id in response.featured_plugin_ids {
+            if !featured_plugin_ids.contains(&plugin_id) {
+                featured_plugin_ids.push(plugin_id);
+            }
+        }
+        for load_error in response.marketplace_load_errors {
+            if !marketplace_load_errors.contains(&load_error) {
+                marketplace_load_errors.push(load_error);
+            }
+        }
+    }
+
+    serde_json::to_value(PluginListResponse {
+        marketplaces,
+        marketplace_load_errors,
+        featured_plugin_ids,
+    })
+    .map_err(io::Error::other)
+}
+
+fn merge_plugin_marketplace(
+    marketplaces: &mut Vec<PluginMarketplaceEntry>,
+    mut incoming: PluginMarketplaceEntry,
+) {
+    if let Some(existing) = marketplaces
+        .iter_mut()
+        .find(|entry| entry.name == incoming.name && entry.path == incoming.path)
+    {
+        for plugin in incoming.plugins.drain(..) {
+            merge_plugin_summary(&mut existing.plugins, plugin);
+        }
+    } else {
+        marketplaces.push(incoming);
+    }
+}
+
+fn merge_plugin_summary(plugins: &mut Vec<PluginSummary>, incoming: PluginSummary) {
+    if let Some(existing) = plugins.iter_mut().find(|entry| entry.id == incoming.id) {
+        let was_installed = existing.installed;
+        if incoming.installed && !was_installed {
+            *existing = incoming;
+        } else {
+            existing.installed |= incoming.installed;
+            existing.enabled |= incoming.enabled;
+        }
+    } else {
+        plugins.push(incoming);
+    }
+}
+
+const DEFAULT_AGGREGATED_THREAD_LIST_LIMIT: usize = 20;
+const AGGREGATED_THREAD_CURSOR_PREFIX: &str = "offset:";
+const AGGREGATED_APPS_CURSOR_PREFIX: &str = "apps-offset:";
+const AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX: &str = "mcp-status-offset:";
+
+fn decode_aggregated_offset_cursor(
+    cursor: Option<&str>,
+    prefix: &str,
+    cursor_type: &str,
+) -> io::Result<usize> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let Some(offset) = cursor.strip_prefix(prefix) else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid aggregated {cursor_type} cursor: {cursor}"),
+        ));
+    };
+    offset.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid aggregated {cursor_type} cursor: {cursor}"),
+        )
+    })
+}
+
+fn encode_aggregated_offset_cursor(prefix: &str, offset: usize) -> String {
+    format!("{prefix}{offset}")
+}
+
+fn aggregated_page_bounds(
+    total_len: usize,
+    offset: usize,
+    limit: usize,
+    cursor_prefix: &str,
+) -> (usize, usize, Option<String>) {
+    let start = offset.min(total_len);
+    let end = start.saturating_add(limit).min(total_len);
+    let next_cursor =
+        (end < total_len).then(|| encode_aggregated_offset_cursor(cursor_prefix, end));
+    (start, end, next_cursor)
+}
+
+fn sort_threads_for_aggregation(
+    threads: &mut [codex_app_server_protocol::Thread],
+    sort_key: Option<codex_app_server_protocol::ThreadSortKey>,
+    sort_direction: Option<codex_app_server_protocol::SortDirection>,
+) {
+    match sort_key.unwrap_or(codex_app_server_protocol::ThreadSortKey::CreatedAt) {
+        codex_app_server_protocol::ThreadSortKey::CreatedAt => {
+            if sort_direction.unwrap_or(codex_app_server_protocol::SortDirection::Desc)
+                == codex_app_server_protocol::SortDirection::Asc
+            {
+                threads.sort_by_key(|thread| (thread.created_at, thread.id.clone()));
+            } else {
+                threads.sort_by_key(|thread| Reverse((thread.created_at, thread.id.clone())));
+            }
+        }
+        codex_app_server_protocol::ThreadSortKey::UpdatedAt => {
+            if sort_direction.unwrap_or(codex_app_server_protocol::SortDirection::Desc)
+                == codex_app_server_protocol::SortDirection::Asc
+            {
+                threads.sort_by_key(|thread| (thread.updated_at, thread.id.clone()));
+            } else {
+                threads.sort_by_key(|thread| Reverse((thread.updated_at, thread.id.clone())));
+            }
+        }
+    }
+}
+
+fn should_reject_pending_server_requests_after_connection_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::TimedOut
+            | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::WriteZero
+            | ErrorKind::NotConnected
+    )
 }
 
 fn enforce_request_scope(
@@ -768,17 +1990,26 @@ fn apply_response_scope_policy(
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
     method: &str,
+    worker_id: Option<usize>,
     mut result: Value,
 ) -> io::Result<Value> {
     match method {
-        "thread/start" | "thread/resume" | "thread/fork" => {
+        "thread/start" | "thread/resume" | "thread/fork" | "thread/read" => {
             if let Some(thread_id) = response_thread_id(&result) {
-                scope_registry.register_thread(thread_id.to_string(), context.clone());
+                scope_registry.register_thread_with_worker(
+                    thread_id.to_string(),
+                    context.clone(),
+                    worker_id,
+                );
             }
         }
         "review/start" => {
             if let Some(review_thread_id) = result.get("reviewThreadId").and_then(Value::as_str) {
-                scope_registry.register_thread(review_thread_id.to_string(), context.clone());
+                scope_registry.register_thread_with_worker(
+                    review_thread_id.to_string(),
+                    context.clone(),
+                    worker_id,
+                );
             }
         }
         "thread/list" => {
@@ -795,7 +2026,17 @@ fn apply_response_scope_policy(
                 thread
                     .get("id")
                     .and_then(Value::as_str)
-                    .is_some_and(|thread_id| scope_registry.thread_visible_to(context, thread_id))
+                    .is_some_and(|thread_id| {
+                        let visible = scope_registry.thread_visible_to(context, thread_id);
+                        if visible && let Some(worker_id) = worker_id {
+                            scope_registry.register_thread_worker_if_visible(
+                                thread_id,
+                                context,
+                                Some(worker_id),
+                            );
+                        }
+                        visible
+                    })
             });
         }
         "thread/loaded/list" => {
@@ -809,9 +2050,17 @@ fn apply_response_scope_policy(
                     )
                 })?;
             data.retain(|thread_id| {
-                thread_id
-                    .as_str()
-                    .is_some_and(|thread_id| scope_registry.thread_visible_to(context, thread_id))
+                thread_id.as_str().is_some_and(|thread_id| {
+                    let visible = scope_registry.thread_visible_to(context, thread_id);
+                    if visible && let Some(worker_id) = worker_id {
+                        scope_registry.register_thread_worker_if_visible(
+                            thread_id,
+                            context,
+                            Some(worker_id),
+                        );
+                    }
+                    visible
+                })
             });
         }
         _ => {}
@@ -845,6 +2094,13 @@ fn notification_visible_to(
         .as_ref()
         .and_then(notification_thread_id)
         .is_none_or(|thread_id| scope_registry.thread_visible_to(context, thread_id))
+}
+
+fn should_deduplicate_connection_notification(notification: &JSONRPCNotification) -> bool {
+    matches!(
+        notification.method.as_str(),
+        "account/updated" | "account/rateLimits/updated" | "app/list/updated"
+    )
 }
 
 fn request_visible_to(
@@ -983,30 +2239,53 @@ fn jsonrpc_notification_to_client_notification(
 
 fn server_notification_to_jsonrpc(
     notification: ServerNotification,
+    worker_id: Option<usize>,
+    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) -> io::Result<JSONRPCNotification> {
-    tagged_type_to_notification(notification)
+    let mut notification = tagged_type_to_notification(notification)?;
+    if notification.method == "serverRequest/resolved"
+        && let Some(params) = notification.params.as_mut()
+        && let Some(request_id_value) = params.get("requestId").cloned()
+    {
+        let downstream_request_id =
+            serde_json::from_value::<RequestId>(request_id_value).map_err(io::Error::other)?;
+        if let Some(route) = resolved_server_requests.remove(&DownstreamServerRequestKey {
+            worker_id,
+            request_id: downstream_request_id,
+        }) {
+            params["requestId"] =
+                serde_json::to_value(route.gateway_request_id).map_err(io::Error::other)?;
+        }
+    }
+    Ok(notification)
 }
 
-fn server_request_to_jsonrpc(request: ServerRequest) -> io::Result<JSONRPCRequest> {
+fn server_request_to_jsonrpc(
+    request: ServerRequest,
+    gateway_request_id: RequestId,
+) -> io::Result<(JSONRPCRequest, RequestId)> {
     let value = serde_json::to_value(request).map_err(io::Error::other)?;
     let method = value
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "server request is missing method"))?
         .to_string();
-    let id =
+    let downstream_request_id =
         serde_json::from_value::<RequestId>(value.get("id").cloned().ok_or_else(|| {
             io::Error::new(ErrorKind::InvalidData, "server request is missing id")
         })?)
         .map_err(io::Error::other)?;
     let params = value.get("params").cloned();
 
-    Ok(JSONRPCRequest {
-        id,
-        method,
-        params,
-        trace: None,
-    })
+    Ok((
+        JSONRPCRequest {
+            id: gateway_request_id,
+            method,
+            params,
+            trace: None,
+        },
+        downstream_request_id,
+    ))
 }
 
 fn request_params<T: DeserializeOwned>(request: &JSONRPCRequest) -> io::Result<T> {
@@ -1133,9 +2412,14 @@ async fn send_invalid_payload_close(
 
 #[cfg(test)]
 mod tests {
+    use super::DownstreamWorkerEvent;
+    use super::GatewayV2ConnectionContext;
+    use super::GatewayV2DownstreamRouter;
+    use super::GatewayV2EventState;
     use super::GatewayV2State;
     use super::GatewayV2Timeouts;
     use super::await_io_with_timeout;
+    use super::handle_app_server_event;
     use super::websocket_upgrade_handler;
     use crate::admission::GatewayAdmissionConfig;
     use crate::admission::GatewayAdmissionController;
@@ -1146,13 +2430,17 @@ mod tests {
     use crate::v2::GatewayV2SessionFactory;
     use crate::v2::gateway_initialize_response;
     use axum::Router;
+    use axum::extract::WebSocketUpgrade;
     use axum::http::StatusCode;
     use axum::routing::any;
+    use codex_app_server_client::AppServerEvent;
     use codex_app_server_client::RemoteAppServerConnectArgs;
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::InitializeCapabilities;
     use codex_app_server_protocol::InitializeParams;
     use codex_app_server_protocol::InitializeResponse;
+    use codex_app_server_protocol::JSONRPCError;
+    use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::JSONRPCRequest;
@@ -1164,16 +2452,22 @@ mod tests {
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
     use tokio::time::Duration;
     use tokio::time::sleep;
     use tokio::time::timeout;
+    use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Error as WebSocketError;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
+    use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
 
     #[tokio::test]
     async fn await_io_with_timeout_returns_result_before_timeout() {
@@ -1228,7 +2522,18 @@ mod tests {
             timeouts: GatewayV2Timeouts::default(),
         })
         .await;
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-visible".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-visible".parse().expect("project header"),
+        );
+        let (mut websocket, _response) = connect_async(request)
             .await
             .expect("websocket should connect");
 
@@ -1312,6 +2617,72 @@ mod tests {
             ))
             .await
             .expect("binary request should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected pre-initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("model-list".to_string()));
+        assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
+        assert_eq!(error.error.message, "initialize must be the first request");
+
+        send_initialize_with_capabilities(
+            &mut websocket,
+            Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: None,
+            }),
+        )
+        .await;
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn initialize_must_be_the_first_request_for_text_frames_too() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts {
+                initialize: Duration::from_secs(30),
+                client_send: Duration::from_secs(10),
+                max_pending_server_requests: 1,
+            },
+        })
+        .await;
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("model-list".to_string()),
+                    method: "model/list".to_string(),
+                    params: Some(serde_json::json!({})),
+                    trace: None,
+                }))
+                .expect("request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("text request should send");
 
         let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
             panic!("expected pre-initialize error response");
@@ -1618,6 +2989,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_closes_when_post_initialize_text_is_not_jsonrpc() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text("not json".to_string().into()))
+            .await
+            .expect("invalid payload should send");
+
+        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::PROTOCOL
+        );
+        assert!(
+            close_frame
+                .reason
+                .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_closes_when_pre_initialize_binary_is_not_utf8() {
+        let initialize_response = test_initialize_response().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://127.0.0.1:1".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Binary(vec![0xff, 0xfe, 0xfd].into()))
+            .await
+            .expect("invalid payload should send");
+
+        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::INVALID
+        );
+        assert!(
+            close_frame
+                .reason
+                .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_closes_when_post_initialize_binary_is_not_utf8() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
@@ -1669,6 +3142,422 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[tokio::test]
+    async fn websocket_upgrade_ignores_non_request_jsonrpc_messages_before_initialize() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Notification(JSONRPCNotification {
+                    method: "initialized".to_string(),
+                    params: None,
+                }))
+                .expect("notification should serialize")
+                .into(),
+            ))
+            .await
+            .expect("pre-initialize notification should send");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: RequestId::String("unexpected-response".to_string()),
+                    result: serde_json::json!({}),
+                }))
+                .expect("response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("pre-initialize response should send");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                    id: RequestId::String("unexpected-error".to_string()),
+                    error: JSONRPCErrorError {
+                        code: super::INVALID_REQUEST_CODE,
+                        message: "unexpected error".to_string(),
+                        data: None,
+                    },
+                }))
+                .expect("error should serialize")
+                .into(),
+            ))
+            .await
+            .expect("pre-initialize error should send");
+
+        assert!(
+            timeout(Duration::from_millis(200), websocket.next())
+                .await
+                .is_err(),
+            "gateway should ignore pre-initialize notification/response/error frames"
+        );
+
+        send_initialize(&mut websocket).await;
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_ignores_non_request_jsonrpc_binary_messages_before_initialize() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Binary(
+                serde_json::to_vec(&JSONRPCMessage::Notification(JSONRPCNotification {
+                    method: "initialized".to_string(),
+                    params: None,
+                }))
+                .expect("notification should serialize")
+                .into(),
+            ))
+            .await
+            .expect("pre-initialize notification should send");
+
+        websocket
+            .send(Message::Binary(
+                serde_json::to_vec(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: RequestId::String("unexpected-response".to_string()),
+                    result: serde_json::json!({}),
+                }))
+                .expect("response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("pre-initialize response should send");
+
+        websocket
+            .send(Message::Binary(
+                serde_json::to_vec(&JSONRPCMessage::Error(JSONRPCError {
+                    id: RequestId::String("unexpected-error".to_string()),
+                    error: JSONRPCErrorError {
+                        code: super::INVALID_REQUEST_CODE,
+                        message: "unexpected error".to_string(),
+                        data: None,
+                    },
+                }))
+                .expect("error should serialize")
+                .into(),
+            ))
+            .await
+            .expect("pre-initialize error should send");
+
+        assert!(
+            timeout(Duration::from_millis(200), websocket.next())
+                .await
+                .is_err(),
+            "gateway should ignore pre-initialize notification/response/error binary frames"
+        );
+
+        send_initialize(&mut websocket).await;
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_fanouts_initialized_notification_to_multi_worker_sessions() {
+        let worker_a = start_mock_remote_server_expecting_forwarded_initialized().await;
+        let worker_b = start_mock_remote_server_expecting_forwarded_initialized().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Notification(JSONRPCNotification {
+                    method: "initialized".to_string(),
+                    params: None,
+                }))
+                .expect("initialized notification should serialize")
+                .into(),
+            ))
+            .await
+            .expect("initialized notification should send");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_responds_to_ping_before_and_after_initialize() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Ping(vec![1, 2, 3].into()))
+            .await
+            .expect("pre-initialize ping should send");
+        let Message::Pong(payload) = timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("pre-initialize pong should arrive")
+            .expect("pre-initialize pong frame should exist")
+            .expect("pre-initialize pong should decode")
+        else {
+            panic!("expected pre-initialize pong frame");
+        };
+        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Ping(vec![4, 5, 6].into()))
+            .await
+            .expect("post-initialize ping should send");
+        let Message::Pong(payload) = timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("post-initialize pong should arrive")
+            .expect("post-initialize pong frame should exist")
+            .expect("post-initialize pong should decode")
+        else {
+            panic!("expected post-initialize pong frame");
+        };
+        assert_eq!(payload.as_ref(), &[4, 5, 6]);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_repeated_initialize_after_handshake() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("initialize-again".to_string()),
+                    method: "initialize".to_string(),
+                    params: Some(
+                        serde_json::to_value(InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        })
+                        .expect("initialize params should serialize"),
+                    ),
+                    trace: None,
+                }))
+                .expect("initialize request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("repeated initialize should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected repeated initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
+        assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
+        assert_eq!(error.error.message, "connection is already initialized");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_repeated_initialize_binary_after_handshake() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Binary(
+                serde_json::to_vec(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("initialize-again".to_string()),
+                    method: "initialize".to_string(),
+                    params: Some(
+                        serde_json::to_value(InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        })
+                        .expect("initialize params should serialize"),
+                    ),
+                    trace: None,
+                }))
+                .expect("initialize request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("repeated initialize should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected repeated initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
+        assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
+        assert_eq!(error.error.message, "connection is already initialized");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
     #[test]
     fn pending_server_request_limit_error_allows_counts_below_limit() {
         assert_eq!(super::pending_server_request_limit_error(0, 1), None);
@@ -1690,6 +3579,306 @@ mod tests {
             error.message,
             super::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE
         );
+    }
+
+    #[test]
+    fn aggregated_page_bounds_returns_requested_window_when_offset_is_in_range() {
+        assert_eq!(
+            super::aggregated_page_bounds(5, 1, 2, "apps-offset:"),
+            (1, 3, Some("apps-offset:3".to_string()))
+        );
+    }
+
+    #[test]
+    fn aggregated_page_bounds_returns_empty_page_when_offset_is_past_end() {
+        assert_eq!(
+            super::aggregated_page_bounds(2, 5, 3, "apps-offset:"),
+            (2, 2, None)
+        );
+    }
+
+    #[test]
+    fn connection_errors_that_end_the_northbound_socket_reject_pending_server_requests() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::WriteZero,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            let err = std::io::Error::new(kind, "test");
+            assert_eq!(
+                super::should_reject_pending_server_requests_after_connection_error(&err),
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn non_terminal_connection_errors_do_not_reject_pending_server_requests() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let err = std::io::Error::new(kind, "test");
+            assert_eq!(
+                super::should_reject_pending_server_requests_after_connection_error(&err),
+                false
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_server_requests_above_pending_limit_without_closing() {
+        let (rejection_observed_tx, rejection_observed_rx) = oneshot::channel();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let downstream_addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let rejection_observed_tx = rejection_observed_tx;
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("server-request-1".to_string()),
+                        method: "item/commandExecution/requestApproval".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-visible",
+                            "turnId": "turn-visible",
+                            "itemId": "item-visible-1",
+                            "reason": "Need approval 1",
+                            "command": "pwd",
+                        })),
+                        trace: None,
+                    }))
+                    .expect("first server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("first server request should send");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("server-request-2".to_string()),
+                        method: "item/commandExecution/requestApproval".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-visible",
+                            "turnId": "turn-visible",
+                            "itemId": "item-visible-2",
+                            "reason": "Need approval 2",
+                            "command": "ls",
+                        })),
+                        trace: None,
+                    }))
+                    .expect("second server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("second server request should send");
+
+            let rejected_request_id = loop {
+                let Message::Text(text) = websocket
+                    .next()
+                    .await
+                    .expect("server request follow-up should exist")
+                    .expect("server request follow-up should decode")
+                else {
+                    panic!("expected server request follow-up text frame");
+                };
+                match serde_json::from_str::<JSONRPCMessage>(&text)
+                    .expect("server request follow-up should decode")
+                {
+                    JSONRPCMessage::Error(error) => {
+                        assert_eq!(error.error.code, super::RATE_LIMITED_ERROR_CODE);
+                        assert_eq!(
+                            error.error.message,
+                            super::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE
+                        );
+                        break error.id;
+                    }
+                    JSONRPCMessage::Response(response) => {
+                        assert_eq!(response.result, serde_json::json!({ "approved": true }));
+                    }
+                    message => panic!("unexpected server request follow-up: {message:?}"),
+                }
+            };
+            assert_eq!(
+                rejected_request_id == RequestId::String("server-request-1".to_string())
+                    || rejected_request_id == RequestId::String("server-request-2".to_string()),
+                true
+            );
+            rejection_observed_tx
+                .send(())
+                .expect("rejection observation should send");
+
+            let request = loop {
+                let Message::Text(text) = websocket
+                    .next()
+                    .await
+                    .expect("follow-up message should exist")
+                    .expect("follow-up message should decode")
+                else {
+                    panic!("expected follow-up message text frame");
+                };
+                match serde_json::from_str::<JSONRPCMessage>(&text)
+                    .expect("follow-up message should decode")
+                {
+                    JSONRPCMessage::Request(request) => break request,
+                    JSONRPCMessage::Response(response) => {
+                        assert_eq!(response.result, serde_json::json!({ "approved": true }));
+                    }
+                    message => panic!("unexpected follow-up message: {message:?}"),
+                }
+            };
+            assert_eq!(request.method, "model/list");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({
+                            "data": [],
+                            "nextCursor": null,
+                        }),
+                    }))
+                    .expect("follow-up response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("follow-up response should send");
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let initialize_response = test_initialize_response().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext {
+                tenant_id: "default".to_string(),
+                project_id: None,
+            },
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url: format!("ws://{downstream_addr}"),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts {
+                initialize: Duration::from_secs(30),
+                client_send: Duration::from_secs(10),
+                max_pending_server_requests: 1,
+            },
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        send_initialize(&mut websocket).await;
+
+        let JSONRPCMessage::Request(first_request) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected first forwarded server request");
+        };
+        assert_eq!(
+            first_request.id,
+            RequestId::String("server-request-1".to_string())
+        );
+        assert_eq!(
+            first_request.method,
+            "item/commandExecution/requestApproval"
+        );
+
+        rejection_observed_rx
+            .await
+            .expect("downstream should observe pending-limit rejection");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: first_request.id.clone(),
+                    result: serde_json::json!({
+                        "approved": true,
+                    }),
+                }))
+                .expect("first server request response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("first server request response should send");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("model-list".to_string()),
+                    method: "model/list".to_string(),
+                    params: Some(serde_json::json!({
+                        "cursor": null,
+                        "limit": null,
+                        "includeHidden": true,
+                    })),
+                    trace: None,
+                }))
+                .expect("follow-up request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("follow-up request should send");
+
+        let response = loop {
+            match read_websocket_message(&mut websocket).await {
+                JSONRPCMessage::Response(response)
+                    if response.id == RequestId::String("model-list".to_string()) =>
+                {
+                    break response;
+                }
+                JSONRPCMessage::Notification(_) => continue,
+                JSONRPCMessage::Response(response) => {
+                    panic!("unexpected follow-up response id: {:?}", response.id);
+                }
+                JSONRPCMessage::Error(error) => {
+                    panic!("unexpected follow-up error: {error:?}");
+                }
+                JSONRPCMessage::Request(request) => {
+                    panic!("unexpected follow-up request: {request:?}");
+                }
+            }
+        };
+        assert_eq!(response.id, RequestId::String("model-list".to_string()));
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "data": [],
+                "nextCursor": null,
+            })
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -1796,6 +3985,56 @@ mod tests {
             .and_then(serde_json::Value::as_u64)
             .expect("retryAfterSeconds should be present");
         assert_eq!((59..=60).contains(&retry_after_seconds), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_scope_headers_to_remote_worker_session() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_initialize_with_expected_headers(
+            "tenant-visible",
+            Some("project-visible"),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-visible".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-visible".parse().expect("project header"),
+        );
+        let (mut websocket, _response) = connect_async(request)
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
 
         server_task.abort();
         let _ = server_task.await;
@@ -2125,6 +4364,448 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_truncates_close_reason_when_downstream_disconnect_reason_is_long() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_that_disconnects_after_initialize_with_reason("x".repeat(200))
+                .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::ERROR
+        );
+        assert_eq!(
+            close_frame
+                .reason
+                .starts_with("downstream app-server disconnected:"),
+            true
+        );
+        assert_eq!(close_frame.reason.len() <= 123, true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_close_reason_is_truncated_to_protocol_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let app = Router::new().route(
+            "/",
+            any(|websocket: WebSocketUpgrade| async move {
+                websocket.on_upgrade(|mut socket| async move {
+                    super::send_invalid_payload_close(
+                        &mut socket,
+                        &std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "{}: {}",
+                                super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON,
+                                "x".repeat(200)
+                            ),
+                        ),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("invalid payload close should send");
+                })
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::PROTOCOL
+        );
+        assert_eq!(close_frame.reason.len() <= 123, true);
+        assert!(
+            close_frame
+                .reason
+                .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn handle_app_server_event_closes_with_policy_reason_when_downstream_lags() {
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let websocket_url = websocket_url.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::default();
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext {
+                            tenant_id: "tenant-a".to_string(),
+                            project_id: Some("project-a".to_string()),
+                        };
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_secs(10),
+                            max_pending_server_requests: 4,
+                        };
+                        let mut router = GatewayV2DownstreamRouter {
+                            workers: Vec::new(),
+                            event_rx: mpsc::channel(1).1,
+                            shutdown_txs: Vec::new(),
+                            event_tasks: Vec::new(),
+                            next_worker: 0,
+                        };
+                        let session_factory = GatewayV2SessionFactory::remote_single(
+                            RemoteAppServerConnectArgs {
+                                websocket_url,
+                                auth_token: None,
+                                client_name: "codex-gateway".to_string(),
+                                client_version: "0.0.0-test".to_string(),
+                                experimental_api: false,
+                                opt_out_notification_methods: Vec::new(),
+                                channel_capacity: 4,
+                            },
+                            test_initialize_response().await,
+                        );
+                        let mut event_state = GatewayV2EventState {
+                            pending_server_requests: HashMap::new(),
+                            resolved_server_requests: HashMap::new(),
+                            skills_changed_pending_refresh: false,
+                            forwarded_connection_notifications: HashMap::new(),
+                        };
+                        let should_close = handle_app_server_event(
+                            &mut socket,
+                            &mut router,
+                            &session_factory,
+                            &connection,
+                            &mut event_state,
+                            DownstreamWorkerEvent {
+                                worker_id: None,
+                                event: Some(AppServerEvent::Lagged { skipped: 3 }),
+                            },
+                        )
+                        .await
+                        .expect("lagged event should be handled");
+                        assert_eq!(should_close, Some(true));
+                    })
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::POLICY
+        );
+        assert_eq!(
+            close_frame.reason,
+            "downstream app-server event stream lagged: skipped 3 events"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_pending_server_requests_when_client_disconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let downstream_addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("server-request-1".to_string()),
+                        method: "item/commandExecution/requestApproval".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-visible",
+                            "turnId": "turn-visible",
+                            "itemId": "item-visible-1",
+                            "reason": "Need approval 1",
+                            "command": "pwd",
+                        })),
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+
+            let Message::Text(text) = websocket
+                .next()
+                .await
+                .expect("server request rejection should exist")
+                .expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection text frame");
+            };
+            let JSONRPCMessage::Error(error) =
+                serde_json::from_str(&text).expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection");
+            };
+            assert_eq!(error.id, RequestId::String("server-request-1".to_string()));
+            assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+            assert_eq!(
+                error.error.message,
+                super::PENDING_SERVER_REQUEST_ABORTED_MESSAGE
+            );
+        });
+
+        let initialize_response = test_initialize_response().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext {
+                tenant_id: "default".to_string(),
+                project_id: None,
+            },
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url: format!("ws://{downstream_addr}"),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let JSONRPCMessage::Request(first_request) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected forwarded server request");
+        };
+        assert_eq!(
+            first_request.id,
+            RequestId::String("server-request-1".to_string())
+        );
+        assert_eq!(
+            first_request.method,
+            "item/commandExecution/requestApproval"
+        );
+
+        websocket
+            .close(None)
+            .await
+            .expect("client close should send");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_pending_server_requests_when_client_sends_invalid_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let downstream_addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("server-request-1".to_string()),
+                        method: "item/commandExecution/requestApproval".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-visible",
+                            "turnId": "turn-visible",
+                            "itemId": "item-visible-1",
+                            "reason": "Need approval 1",
+                            "command": "pwd",
+                        })),
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+
+            let Message::Text(text) = websocket
+                .next()
+                .await
+                .expect("server request rejection should exist")
+                .expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection text frame");
+            };
+            let JSONRPCMessage::Error(error) =
+                serde_json::from_str(&text).expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection");
+            };
+            assert_eq!(error.id, RequestId::String("server-request-1".to_string()));
+            assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+            assert_eq!(
+                error.error.message,
+                super::PENDING_SERVER_REQUEST_ABORTED_MESSAGE
+            );
+        });
+
+        let initialize_response = test_initialize_response().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext {
+                tenant_id: "default".to_string(),
+                project_id: None,
+            },
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url: format!("ws://{downstream_addr}"),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let JSONRPCMessage::Request(first_request) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected forwarded server request");
+        };
+        assert_eq!(
+            first_request.id,
+            RequestId::String("server-request-1".to_string())
+        );
+        assert_eq!(
+            first_request.method,
+            "item/commandExecution/requestApproval"
+        );
+
+        websocket
+            .send(Message::Text("not json".to_string().into()))
+            .await
+            .expect("invalid payload should send");
+
+        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::PROTOCOL
+        );
+        assert!(
+            close_frame
+                .reason
+                .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_forwards_account_read_requests() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_passthrough_request_with_result(
@@ -2199,6 +4880,225 @@ mod tests {
                     "planType": "plus",
                 },
                 "requiresOpenaiAuth": false,
+            })
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_account_rate_limits_read_requests() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_for_passthrough_request_with_optional_params_and_result(
+                "account/rateLimits/read",
+                None,
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "codex",
+                        "limitName": "Codex",
+                        "primary": {
+                            "usedPercent": 42,
+                            "windowMinutes": 300,
+                            "resetsAt": 1_700_000_000,
+                        },
+                        "secondary": null,
+                        "credits": null,
+                        "planType": "plus",
+                        "rateLimitReachedType": null,
+                    },
+                    "rateLimitsByLimitId": {
+                        "codex": {
+                            "limitId": "codex",
+                            "limitName": "Codex",
+                            "primary": {
+                                "usedPercent": 42,
+                                "windowMinutes": 300,
+                                "resetsAt": 1_700_000_000,
+                            },
+                            "secondary": null,
+                            "credits": null,
+                            "planType": "plus",
+                            "rateLimitReachedType": null,
+                        }
+                    },
+                }),
+            )
+            .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("account-rate-limits-read".to_string()),
+                    method: "account/rateLimits/read".to_string(),
+                    params: None,
+                    trace: None,
+                }))
+                .expect("account rate limits read request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("account rate limits read request should send");
+
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected account rate limits read response");
+        };
+        assert_eq!(
+            response.id,
+            RequestId::String("account-rate-limits-read".to_string())
+        );
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": "Codex",
+                    "primary": {
+                        "usedPercent": 42,
+                        "windowMinutes": 300,
+                        "resetsAt": 1_700_000_000,
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "planType": "plus",
+                    "rateLimitReachedType": null,
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "limitName": "Codex",
+                        "primary": {
+                            "usedPercent": 42,
+                            "windowMinutes": 300,
+                            "resetsAt": 1_700_000_000,
+                        },
+                        "secondary": null,
+                        "credits": null,
+                        "planType": "plus",
+                        "rateLimitReachedType": null,
+                    }
+                },
+            })
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_config_value_write_requests() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_passthrough_request_with_result(
+            "config/value/write",
+            serde_json::json!({
+                "keyPath": "plugins.demo-plugin",
+                "value": {
+                    "enabled": true,
+                },
+                "mergeStrategy": "upsert",
+                "filePath": null,
+                "expectedVersion": null,
+            }),
+            serde_json::json!({
+                "status": "ok",
+                "version": "remote-version-1",
+                "filePath": "/tmp/remote-project/config.toml",
+                "overriddenMetadata": null,
+            }),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("config-value-write".to_string()),
+                    method: "config/value/write".to_string(),
+                    params: Some(serde_json::json!({
+                        "keyPath": "plugins.demo-plugin",
+                        "value": {
+                            "enabled": true,
+                        },
+                        "mergeStrategy": "upsert",
+                        "filePath": null,
+                        "expectedVersion": null,
+                    })),
+                    trace: None,
+                }))
+                .expect("config value write request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("config value write request should send");
+
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected config value write response");
+        };
+        assert_eq!(
+            response.id,
+            RequestId::String("config-value-write".to_string())
+        );
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "status": "ok",
+                "version": "remote-version-1",
+                "filePath": "/tmp/remote-project/config.toml",
+                "overriddenMetadata": null,
             })
         );
 
@@ -2350,6 +5250,99 @@ mod tests {
                         "isDefault": true,
                     }
                 ],
+                "nextCursor": null,
+            })
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_mcp_server_status_list_requests() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_for_passthrough_request_with_result(
+            "mcpServerStatus/list",
+            serde_json::json!({
+                "cursor": null,
+                "limit": 100,
+                "detail": "toolsAndAuthOnly",
+            }),
+            serde_json::json!({
+                "data": [{
+                    "name": "calendar",
+                    "tools": {},
+                    "resources": [],
+                    "resourceTemplates": [],
+                    "authStatus": "bearerToken"
+                }],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("mcp-status-list".to_string()),
+                    method: "mcpServerStatus/list".to_string(),
+                    params: Some(serde_json::json!({
+                        "cursor": null,
+                        "limit": 100,
+                        "detail": "toolsAndAuthOnly",
+                    })),
+                    trace: None,
+                }))
+                .expect("mcp status list request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("mcp status list request should send");
+
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected mcp status list response");
+        };
+        assert_eq!(
+            response.id,
+            RequestId::String("mcp-status-list".to_string())
+        );
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "data": [{
+                    "name": "calendar",
+                    "tools": {},
+                    "resources": [],
+                    "resourceTemplates": [],
+                    "authStatus": "bearerToken"
+                }],
                 "nextCursor": null,
             })
         );
@@ -2738,6 +5731,504 @@ mod tests {
                 "backwardsCursor": null,
             })
         );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn aggregate_thread_list_response_backfills_multi_worker_routes_for_visible_threads() {
+        let worker_a = start_mock_remote_server_for_thread_list_and_read(
+            "thread-worker-a",
+            "Worker A thread",
+            "/tmp/worker-a",
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_thread_list_and_read(
+            "thread-worker-b",
+            "Worker B thread",
+            "/tmp/worker-b",
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-a".to_string(), context.clone());
+        scope_registry.register_thread("thread-worker-b".to_string(), context);
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let router = GatewayV2DownstreamRouter::connect(
+            &session_factory,
+            &initialize_params,
+            &GatewayRequestContext::default(),
+        )
+        .await
+        .expect("downstream router should connect");
+        let list_response = super::aggregate_thread_list_response(
+            &router,
+            &scope_registry,
+            &GatewayRequestContext::default(),
+            &JSONRPCRequest {
+                id: RequestId::String("thread-list".to_string()),
+                method: "thread/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 10,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread list aggregation should succeed");
+        let listed: codex_app_server_protocol::ThreadListResponse =
+            serde_json::from_value(list_response).expect("thread list response should decode");
+        assert_eq!(listed.next_cursor, None);
+        assert_eq!(listed.backwards_cursor, None);
+        assert_eq!(
+            listed
+                .data
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-worker-b", "thread-worker-a"]
+        );
+        assert_eq!(
+            listed.data[0].cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-b"
+        );
+        assert_eq!(
+            listed.data[1].cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), Some(0));
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn aggregate_loaded_thread_list_response_backfills_multi_worker_routes_for_visible_threads()
+     {
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/loaded/list",
+            serde_json::json!({
+                "cursor": null,
+                "limit": 10,
+            }),
+            serde_json::json!({
+                "data": ["thread-worker-a"],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/loaded/list",
+            serde_json::json!({
+                "cursor": null,
+                "limit": 10,
+            }),
+            serde_json::json!({
+                "data": ["thread-worker-b"],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-a".to_string(), context.clone());
+        scope_registry.register_thread("thread-worker-b".to_string(), context);
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let router = GatewayV2DownstreamRouter::connect(
+            &session_factory,
+            &initialize_params,
+            &GatewayRequestContext::default(),
+        )
+        .await
+        .expect("downstream router should connect");
+        let loaded = super::aggregate_loaded_thread_list_response(
+            &router,
+            &scope_registry,
+            &GatewayRequestContext::default(),
+            &JSONRPCRequest {
+                id: RequestId::String("thread-loaded-list".to_string()),
+                method: "thread/loaded/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 10,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("loaded thread list aggregation should succeed");
+        let loaded: codex_app_server_protocol::ThreadLoadedListResponse =
+            serde_json::from_value(loaded).expect("loaded thread list response should decode");
+        assert_eq!(loaded.next_cursor, None);
+        assert_eq!(loaded.data, vec!["thread-worker-a", "thread-worker-b"]);
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), Some(0));
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_probes_visible_thread_read_across_workers_when_route_missing() {
+        let thread_read_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "includeTurns": false,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+            "thread/read",
+            thread_read_params.clone(),
+            JSONRPCErrorError {
+                code: super::INVALID_PARAMS_CODE,
+                message: "thread not found: thread-worker-b".to_string(),
+                data: None,
+            },
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_thread_list_and_read(
+            "thread-worker-b",
+            "Worker B thread",
+            "/tmp/worker-b",
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-b".to_string(), context.clone());
+
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-read".to_string()),
+                method: "thread/read".to_string(),
+                params: Some(thread_read_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/read should reach downstream workers")
+        .expect("thread/read should succeed through probed worker");
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-b",
+                    "name": "Worker B thread",
+                    "cwd": "/tmp/worker-b",
+                },
+            })
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_connection_notifications()
+    {
+        let notification_params = serde_json::json!({
+            "authMode": null,
+            "planType": null,
+        });
+        let worker_a = start_mock_remote_server_for_connection_notification(
+            "account/updated",
+            notification_params.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "account/updated",
+            notification_params.clone(),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "account/updated",
+            notification_params,
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_multi_worker_skills_changed_until_refresh() {
+        let worker_a =
+            start_mock_remote_server_for_skills_changed_and_list("/tmp/worker-a", vec!["skill-a"])
+                .await;
+        let worker_b =
+            start_mock_remote_server_for_skills_changed_and_list("/tmp/worker-b", vec!["skill-b"])
+                .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "skills/changed",
+            serde_json::json!({}),
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("skills-list".to_string()),
+                    method: "skills/list".to_string(),
+                    params: Some(serde_json::json!({
+                        "cwds": ["/tmp/worker-a", "/tmp/worker-b"],
+                        "forceReload": false,
+                        "perCwdExtraUserRoots": null,
+                    })),
+                    trace: None,
+                }))
+                .expect("skills/list request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("skills/list request should send");
+
+        let mut skills_changed_notifications = 0;
+        let mut skills_list_response = None;
+        for _ in 0..4 {
+            let message = timeout(Duration::from_secs(1), websocket.next())
+                .await
+                .expect("expected skills/list response or refreshed notification")
+                .expect("websocket message should exist")
+                .expect("websocket message should decode");
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let parsed = serde_json::from_str::<JSONRPCMessage>(&text)
+                .expect("json-rpc message should decode");
+            match parsed {
+                JSONRPCMessage::Notification(notification) => {
+                    assert_eq!(notification.method, "skills/changed");
+                    assert_eq!(notification.params, Some(serde_json::json!({})));
+                    skills_changed_notifications += 1;
+                }
+                JSONRPCMessage::Response(response) => {
+                    if response.id == RequestId::String("skills-list".to_string()) {
+                        skills_list_response = Some(response.result);
+                    }
+                }
+                other => panic!("unexpected message after skills/list refresh: {other:?}"),
+            }
+            if skills_list_response.is_some() && skills_changed_notifications == 1 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            skills_list_response,
+            Some(serde_json::json!({
+                "data": [
+                    {
+                        "cwd": "/tmp/worker-a",
+                        "skills": [{
+                            "name": "skill-a",
+                            "description": "skill-a description",
+                            "path": "/tmp/worker-a/skill-a",
+                            "scope": "repo",
+                            "enabled": true,
+                        }],
+                        "errors": [],
+                    },
+                    {
+                        "cwd": "/tmp/worker-b",
+                        "skills": [{
+                            "name": "skill-b",
+                            "description": "skill-b description",
+                            "path": "/tmp/worker-b/skill-b",
+                            "scope": "repo",
+                            "enabled": true,
+                        }],
+                        "errors": [],
+                    }
+                ]
+            }))
+        );
+        assert_eq!(skills_changed_notifications, 1);
+
+        let post_refresh_duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(post_refresh_duplicate.is_err(), true);
 
         server_task.abort();
         let _ = server_task.await;
@@ -3267,6 +6758,319 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_additional_realtime_notifications_for_visible_threads() {
+        let cases = vec![
+            (
+                "thread/realtime/itemAdded",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [],
+                    },
+                }),
+            ),
+            (
+                "thread/realtime/outputAudio/delta",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "audio": {
+                        "data": "AQID",
+                        "sampleRate": 24000,
+                        "numChannels": 1,
+                        "samplesPerChannel": 3,
+                        "itemId": "item-visible",
+                    },
+                }),
+            ),
+            (
+                "thread/realtime/transcript/delta",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "role": "assistant",
+                    "delta": "hello from realtime transcript",
+                }),
+            ),
+            (
+                "thread/realtime/transcript/done",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "role": "assistant",
+                    "text": "hello from realtime transcript",
+                }),
+            ),
+            (
+                "thread/realtime/sdp",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Codex\r\n",
+                }),
+            ),
+            (
+                "thread/realtime/error",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "message": "realtime transport failed",
+                }),
+            ),
+            (
+                "thread/realtime/closed",
+                serde_json::json!({
+                    "threadId": "thread-visible",
+                    "reason": "client-requested",
+                }),
+            ),
+        ];
+
+        for (method, params) in cases {
+            let initialize_response = test_initialize_response().await;
+            let websocket_url =
+                start_mock_remote_server_for_realtime_notification(method, params.clone()).await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            scope_registry.register_thread(
+                "thread-visible".to_string(),
+                GatewayRequestContext::default(),
+            );
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::default(),
+                scope_registry,
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize_with_capabilities(
+                &mut websocket,
+                Some(InitializeCapabilities {
+                    experimental_api: true,
+                    opt_out_notification_methods: None,
+                }),
+            )
+            .await;
+
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                params,
+            );
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_fans_in_multi_worker_realtime_notifications_for_visible_threads() {
+        let worker_a = start_mock_remote_server_for_realtime_notification(
+            "thread/realtime/transcript/delta",
+            serde_json::json!({
+                "threadId": "thread-worker-a",
+                "role": "assistant",
+                "delta": "worker a transcript",
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notification(
+            "thread/realtime/outputAudio/delta",
+            serde_json::json!({
+                "threadId": "thread-worker-b",
+                "audio": {
+                    "data": "AQID",
+                    "sampleRate": 24000,
+                    "numChannels": 1,
+                    "samplesPerChannel": 3,
+                    "itemId": "item-worker-b",
+                },
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-a".to_string(), context.clone());
+        scope_registry.register_thread("thread-worker-b".to_string(), context);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize_with_capabilities(
+            &mut websocket,
+            Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: None,
+            }),
+        )
+        .await;
+
+        let mut forwarded = Vec::new();
+        for _ in 0..2 {
+            let JSONRPCMessage::Notification(notification) =
+                read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected realtime notification");
+            };
+            forwarded.push((notification.method, notification.params));
+        }
+        forwarded.sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(
+            forwarded,
+            vec![
+                (
+                    "thread/realtime/outputAudio/delta".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-b",
+                        "audio": {
+                            "data": "AQID",
+                            "sampleRate": 24000,
+                            "numChannels": 1,
+                            "samplesPerChannel": 3,
+                            "itemId": "item-worker-b",
+                        },
+                    })),
+                ),
+                (
+                    "thread/realtime/transcript/delta".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-a",
+                        "role": "assistant",
+                        "delta": "worker a transcript",
+                    })),
+                ),
+            ]
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_user_visible_notifications() {
+        let cases = vec![
+            (
+                "warning",
+                serde_json::json!({
+                    "threadId": null,
+                    "message": "Gateway warning test message",
+                }),
+            ),
+            (
+                "configWarning",
+                serde_json::json!({
+                    "summary": "Gateway config warning summary",
+                    "details": null,
+                }),
+            ),
+            (
+                "deprecationNotice",
+                serde_json::json!({
+                    "summary": "Deprecated gateway behavior",
+                    "details": "Use the new gateway flow instead.",
+                }),
+            ),
+            (
+                "mcpServer/startupStatus/updated",
+                serde_json::json!({
+                    "name": "gateway-mcp",
+                    "status": "failed",
+                    "error": "handshake failed",
+                }),
+            ),
+        ];
+
+        for (method, params) in cases {
+            let initialize_response = test_initialize_response().await;
+            let websocket_url =
+                start_mock_remote_server_for_connection_notification(method, params.clone()).await;
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::default(),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                params,
+            );
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
     #[test]
     fn enforce_request_scope_rejects_thread_resume_history_and_path_bypass() {
         let scope_registry = GatewayScopeRegistry::default();
@@ -3362,6 +7166,7 @@ mod tests {
             &scope_registry,
             &context,
             "thread/resume",
+            Some(7),
             serde_json::json!({
                 "thread": {
                     "id": "thread-resumed",
@@ -3379,6 +7184,7 @@ mod tests {
             &scope_registry,
             &context,
             "thread/fork",
+            Some(8),
             serde_json::json!({
                 "thread": {
                     "id": "thread-forked",
@@ -3396,6 +7202,7 @@ mod tests {
             &scope_registry,
             &context,
             "thread/loaded/list",
+            None,
             serde_json::json!({
                 "data": ["thread-visible", "thread-hidden", "thread-forked"],
             }),
@@ -3407,6 +7214,25 @@ mod tests {
                 "data": ["thread-visible", "thread-forked"],
             })
         );
+
+        let thread_read_result = super::apply_response_scope_policy(
+            &scope_registry,
+            &context,
+            "thread/read",
+            Some(9),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-read",
+                }
+            }),
+        )
+        .expect("thread/read response should be accepted");
+        assert_eq!(thread_read_result["thread"]["id"], "thread-read");
+        assert_eq!(
+            scope_registry.thread_visible_to(&context, "thread-read"),
+            true
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-read"), Some(9));
     }
 
     #[test]
@@ -3563,6 +7389,76 @@ mod tests {
                     | Message::Frame(_) => {}
                 }
             }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_expecting_forwarded_initialized() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("forwarded initialized frame should exist")
+                .expect("forwarded initialized frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected forwarded initialized text frame");
+            };
+            let JSONRPCMessage::Notification(notification) =
+                serde_json::from_str(&text).expect("forwarded initialized should decode")
+            else {
+                panic!("expected forwarded initialized notification");
+            };
+            assert_eq!(notification.method, "initialized");
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_initialize_with_expected_headers(
+        expected_tenant_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let expected_tenant_id = expected_tenant_id.to_string();
+        let expected_project_id = expected_project_id.map(str::to_string);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = accept_hdr_async(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-codex-tenant-id")
+                            .and_then(|value| value.to_str().ok()),
+                        Some(expected_tenant_id.as_str())
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-codex-project-id")
+                            .and_then(|value| value.to_str().ok()),
+                        expected_project_id.as_deref()
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("websocket should accept");
+            expect_remote_initialize(&mut websocket).await;
         });
         format!("ws://{addr}")
     }
@@ -3823,13 +7719,36 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_server_for_realtime_notification(
+        method: &str,
+        params: serde_json::Value,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let method = method.to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            send_remote_notification(&mut websocket, &method, params).await;
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        format!("ws://{addr}")
+    }
+
     async fn start_mock_remote_server_for_passthrough_request(
         expected_method: &'static str,
         expected_params: serde_json::Value,
     ) -> String {
-        start_mock_remote_server_for_passthrough_request_with_result(
+        start_mock_remote_server_for_passthrough_request_with_optional_params_and_result(
             expected_method,
-            expected_params,
+            Some(expected_params),
             serde_json::json!({}),
         )
         .await
@@ -3838,6 +7757,66 @@ mod tests {
     async fn start_mock_remote_server_for_passthrough_request_with_result(
         expected_method: &'static str,
         expected_params: serde_json::Value,
+        response_result: serde_json::Value,
+    ) -> String {
+        start_mock_remote_server_for_passthrough_request_with_optional_params_and_result(
+            expected_method,
+            Some(expected_params),
+            response_result,
+        )
+        .await
+    }
+
+    async fn start_mock_remote_server_for_passthrough_request_with_error(
+        expected_method: &'static str,
+        expected_params: serde_json::Value,
+        response_error: JSONRPCErrorError,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            let Some(frame) = websocket.next().await else {
+                panic!("request should exist");
+            };
+            let frame = frame.expect("frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected request text frame");
+            };
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&text).expect("request should decode")
+            else {
+                panic!("expected request");
+            };
+            assert_eq!(request.method, expected_method);
+            assert_eq!(request.params, Some(expected_params));
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                        id: request.id,
+                        error: response_error,
+                    }))
+                    .expect("error response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("error response should send");
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_passthrough_request_with_optional_params_and_result(
+        expected_method: &'static str,
+        expected_params: Option<serde_json::Value>,
         response_result: serde_json::Value,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -3866,7 +7845,7 @@ mod tests {
                 panic!("expected request");
             };
             assert_eq!(request.method, expected_method);
-            assert_eq!(request.params, Some(expected_params));
+            assert_eq!(request.params, expected_params);
 
             websocket
                 .send(Message::Text(
@@ -3989,6 +7968,180 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_server_for_thread_list_and_read(
+        thread_id: &str,
+        thread_name: &str,
+        cwd: &str,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let thread_id = thread_id.to_string();
+        let thread_name = thread_name.to_string();
+        let cwd = cwd.to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            loop {
+                let Some(frame) = websocket.next().await else {
+                    break;
+                };
+                let frame = frame.expect("frame should decode");
+                let Message::Text(text) = frame else {
+                    continue;
+                };
+                let JSONRPCMessage::Request(request) =
+                    serde_json::from_str(&text).expect("request should decode")
+                else {
+                    continue;
+                };
+
+                let result = match request.method.as_str() {
+                    "thread/list" => serde_json::json!({
+                        "data": [{
+                            "id": thread_id,
+                            "forkedFromId": null,
+                            "preview": "",
+                            "ephemeral": true,
+                            "modelProvider": "openai",
+                            "createdAt": if thread_id == "thread-worker-a" { 1 } else { 2 },
+                            "updatedAt": if thread_id == "thread-worker-a" { 1 } else { 2 },
+                            "status": { "type": "idle" },
+                            "path": null,
+                            "cwd": cwd,
+                            "cliVersion": "0.0.0-test",
+                            "source": "cli",
+                            "agentNickname": null,
+                            "agentRole": null,
+                            "gitInfo": null,
+                            "name": thread_name,
+                            "turns": [],
+                        }],
+                        "nextCursor": null,
+                        "backwardsCursor": null,
+                    }),
+                    "thread/read" => serde_json::json!({
+                        "thread": {
+                            "id": thread_id,
+                            "name": thread_name,
+                            "cwd": cwd,
+                        },
+                    }),
+                    other => panic!("unexpected request method: {other}"),
+                };
+
+                websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request.id,
+                            result,
+                        }))
+                        .expect("response should serialize")
+                        .into(),
+                    ))
+                    .await
+                    .expect("response should send");
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_connection_notification(
+        method: &str,
+        params: serde_json::Value,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let method = method.to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            send_remote_notification(&mut websocket, &method, params).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_skills_changed_and_list(
+        cwd: &str,
+        skills: Vec<&str>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let cwd = cwd.to_string();
+        let skills = skills
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "description": format!("{name} description"),
+                    "path": format!("{cwd}/{name}"),
+                    "scope": "repo",
+                    "enabled": true,
+                })
+            })
+            .collect::<Vec<serde_json::Value>>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({})).await;
+
+            loop {
+                let Some(frame) = websocket.next().await else {
+                    break;
+                };
+                let frame = frame.expect("frame should decode");
+                let Message::Text(text) = frame else {
+                    continue;
+                };
+                let JSONRPCMessage::Request(request) =
+                    serde_json::from_str(&text).expect("request should decode")
+                else {
+                    continue;
+                };
+                assert_eq!(request.method, "skills/list");
+                websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request.id,
+                            result: serde_json::json!({
+                                "data": [{
+                                    "cwd": cwd.clone(),
+                                    "skills": skills.clone(),
+                                    "errors": [],
+                                }]
+                            }),
+                        }))
+                        .expect("skills/list response should serialize")
+                        .into(),
+                    ))
+                    .await
+                    .expect("skills/list response should send");
+                send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({}))
+                    .await;
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     async fn spawn_remote_gateway_v2_test_server(
         websocket_url: String,
         scope_registry: Arc<GatewayScopeRegistry>,
@@ -4017,6 +8170,12 @@ mod tests {
     }
 
     async fn start_mock_remote_server_that_disconnects_after_initialize() -> String {
+        start_mock_remote_server_that_disconnects_after_initialize_with_reason(String::new()).await
+    }
+
+    async fn start_mock_remote_server_that_disconnects_after_initialize_with_reason(
+        reason: String,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -4030,7 +8189,12 @@ mod tests {
             expect_remote_initialize(&mut websocket).await;
 
             websocket
-                .close(None)
+                .close((!reason.is_empty()).then_some(
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
+                        reason: reason.into(),
+                    },
+                ))
                 .await
                 .expect("close frame should send");
         });

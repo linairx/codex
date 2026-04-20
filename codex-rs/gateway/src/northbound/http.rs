@@ -917,7 +917,7 @@ mod tests {
                     status: GatewayHealthStatus::Unavailable,
                     runtime_mode: "remote".to_string(),
                     execution_mode: GatewayExecutionMode::WorkerManaged,
-                    v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorkerUnsupported,
+                    v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorker,
                     v2_transport: GatewayV2TransportConfig {
                         initialize_timeout_seconds: 30,
                         client_send_timeout_seconds: 10,

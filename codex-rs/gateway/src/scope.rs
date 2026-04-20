@@ -43,6 +43,14 @@ impl GatewayRequestContext {
             project_id,
         })
     }
+
+    pub fn forwarding_headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![(TENANT_HEADER.to_string(), self.tenant_id.clone())];
+        if let Some(project_id) = &self.project_id {
+            headers.push((PROJECT_HEADER.to_string(), project_id.clone()));
+        }
+        headers
+    }
 }
 
 impl<S> FromRequestParts<S> for GatewayRequestContext
@@ -102,6 +110,25 @@ impl GatewayScopeRegistry {
         read_guard(&self.thread_contexts)
             .get(thread_id)
             .and_then(|scope| scope.worker_id)
+    }
+
+    pub fn register_thread_worker_if_visible(
+        &self,
+        thread_id: &str,
+        context: &GatewayRequestContext,
+        worker_id: Option<usize>,
+    ) -> bool {
+        let mut thread_contexts = write_guard(&self.thread_contexts);
+        let Some(scope) = thread_contexts.get_mut(thread_id) else {
+            return false;
+        };
+        if &scope.context != context {
+            return false;
+        }
+        if worker_id.is_some() {
+            scope.worker_id = worker_id;
+        }
+        true
     }
 
     pub fn thread_visible_to(&self, context: &GatewayRequestContext, thread_id: &str) -> bool {
@@ -323,5 +350,34 @@ mod tests {
                 .is_some(),
             true
         );
+    }
+
+    #[test]
+    fn register_thread_worker_if_visible_only_updates_matching_scope() {
+        let registry = GatewayScopeRegistry::default();
+        let visible_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let other_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+        registry.register_thread("thread-a".to_string(), visible_context.clone());
+
+        assert_eq!(
+            registry.register_thread_worker_if_visible("thread-a", &visible_context, Some(7)),
+            true
+        );
+        assert_eq!(registry.thread_worker_id("thread-a"), Some(7));
+        assert_eq!(
+            registry.register_thread_worker_if_visible("thread-a", &other_context, Some(8)),
+            false
+        );
+        assert_eq!(
+            registry.register_thread_worker_if_visible("thread-missing", &visible_context, Some(9)),
+            false
+        );
+        assert_eq!(registry.thread_worker_id("thread-a"), Some(7));
     }
 }
