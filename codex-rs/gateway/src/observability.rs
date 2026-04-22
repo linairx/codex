@@ -18,6 +18,8 @@ const REQUEST_COUNT_METRIC: &str = "gateway_http_requests";
 const REQUEST_DURATION_METRIC: &str = "gateway_http_request_duration";
 const V2_REQUEST_COUNT_METRIC: &str = "gateway_v2_requests";
 const V2_REQUEST_DURATION_METRIC: &str = "gateway_v2_request_duration";
+const V2_CONNECTION_COUNT_METRIC: &str = "gateway_v2_connections";
+const V2_CONNECTION_DURATION_METRIC: &str = "gateway_v2_connection_duration";
 
 type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
@@ -77,6 +79,20 @@ impl GatewayObservability {
         }
     }
 
+    pub(crate) fn record_v2_connection(&self, outcome: &str, duration: Duration) {
+        let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
+        let tags = [("outcome", outcome)];
+
+        if let Some(metrics) = &self.metrics {
+            if let Err(err) = metrics.counter(V2_CONNECTION_COUNT_METRIC, 1, &tags) {
+                tracing::warn!("failed to record gateway v2 connection count metric: {err}");
+            }
+            if let Err(err) = metrics.histogram(V2_CONNECTION_DURATION_METRIC, duration_ms, &tags) {
+                tracing::warn!("failed to record gateway v2 connection duration metric: {err}");
+            }
+        }
+    }
+
     fn emit_audit_log(
         &self,
         method: &str,
@@ -132,6 +148,31 @@ impl GatewayObservability {
             tenant_id,
             project_id,
             "gateway v2 request completed"
+        );
+    }
+
+    pub(crate) fn emit_v2_connection_audit_log(
+        &self,
+        outcome: &str,
+        duration: Duration,
+        context: &GatewayRequestContext,
+    ) {
+        if !self.audit_logs_enabled {
+            return;
+        }
+
+        let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        let tenant_id = context.tenant_id.as_str();
+        let project_id = context.project_id.as_deref();
+
+        tracing::event!(
+            target: "codex_gateway.audit",
+            Level::INFO,
+            outcome,
+            duration_ms,
+            tenant_id,
+            project_id,
+            "gateway v2 connection completed"
         );
     }
 }
@@ -194,12 +235,15 @@ mod tests {
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::V2_CONNECTION_COUNT_METRIC;
+    use super::V2_CONNECTION_DURATION_METRIC;
     use super::V2_REQUEST_COUNT_METRIC;
     use super::V2_REQUEST_DURATION_METRIC;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     #[test]
@@ -240,6 +284,24 @@ mod tests {
                             MetricData::Sum(sum) => {
                                 let point = sum.data_points().next().expect("count point");
                                 assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("method".to_string(), "POST".to_string()),
+                                        ("route".to_string(), "/v1/threads".to_string()),
+                                        ("status".to_string(), "200".to_string()),
+                                        ("status_class".to_string(), "2xx".to_string()),
+                                    ])
+                                );
                             }
                             _ => panic!("unexpected request count aggregation"),
                         },
@@ -255,6 +317,24 @@ mod tests {
                                     histogram.data_points().next().expect("histogram point");
                                 assert_eq!(point.count(), 1);
                                 assert_eq!(point.sum(), 12.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("method".to_string(), "POST".to_string()),
+                                        ("route".to_string(), "/v1/threads".to_string()),
+                                        ("status".to_string(), "200".to_string()),
+                                        ("status_class".to_string(), "2xx".to_string()),
+                                    ])
+                                );
                             }
                             _ => panic!("unexpected duration aggregation"),
                         },
@@ -307,6 +387,22 @@ mod tests {
                             MetricData::Sum(sum) => {
                                 let point = sum.data_points().next().expect("count point");
                                 assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("method".to_string(), "thread/start".to_string()),
+                                        ("outcome".to_string(), "ok".to_string()),
+                                    ])
+                                );
                             }
                             _ => panic!("unexpected request count aggregation"),
                         },
@@ -322,10 +418,125 @@ mod tests {
                                     histogram.data_points().next().expect("histogram point");
                                 assert_eq!(point.count(), 1);
                                 assert_eq!(point.sum(), 8.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("method".to_string(), "thread/start".to_string()),
+                                        ("outcome".to_string(), "ok".to_string()),
+                                    ])
+                                );
                             }
                             _ => panic!("unexpected duration aggregation"),
                         },
                         _ => panic!("unexpected duration type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(saw_count, true);
+        assert_eq!(saw_duration, true);
+    }
+
+    #[test]
+    fn records_v2_connection_metrics_with_outcome_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_connection("downstream_session_ended", Duration::from_millis(14));
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        let mut saw_duration = false;
+        for metric in metrics {
+            match metric.name() {
+                V2_CONNECTION_COUNT_METRIC => {
+                    saw_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected connection count aggregation"),
+                        },
+                        _ => panic!("unexpected connection count type"),
+                    }
+                }
+                V2_CONNECTION_DURATION_METRIC => {
+                    saw_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 14.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected connection duration aggregation"),
+                        },
+                        _ => panic!("unexpected connection duration type"),
                     }
                 }
                 _ => {}

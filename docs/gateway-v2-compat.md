@@ -328,6 +328,29 @@ Recent progress:
   notifications the current TUI consumes during active runs:
   `item/reasoning/summaryTextDelta`, `item/reasoning/textDelta`,
   `item/commandExecution/outputDelta`, and `item/fileChange/outputDelta`
+- dedicated northbound gateway coverage now also exercises item lifecycle
+  notifications the TUI uses for longer-running turn state, covering
+  `item/started` and `item/completed`
+- dedicated northbound gateway coverage now also exercises hook lifecycle
+  notifications the TUI renders for hook progress and completion, covering
+  `hookStarted` and `hookCompleted`
+- dedicated northbound gateway coverage now also exercises guardian review
+  lifecycle notifications for approval auto-review UX, covering
+  `item/guardianApprovalReviewStarted` and
+  `item/guardianApprovalReviewCompleted`
+- dedicated northbound gateway coverage now also exercises richer turn
+  notifications that the TUI consumes opportunistically, including
+  `plan/delta`, `reasoning/summaryPartAdded`, `terminalInteraction`,
+  `turn/diffUpdated`, `turn/planUpdated`, `thread/tokenUsage/updated`,
+  `mcpToolCall/progress`, `contextCompacted`, and `model/rerouted`
+- that same dedicated northbound connection-notification coverage now also
+  includes `account/login/completed` for onboarding auth completion flows
+- the real single-worker remote compatibility harness now also exercises
+  `account/login/completed` during an end-to-end onboarding auth flow
+- dedicated northbound v2 passthrough coverage now also verifies the
+  unsupported-but-transparent `item/tool/call` server-request round trip, so
+  gateway transport behavior is covered even though the current TUI still does
+  not handle that request family
 
 ### Milestone 4: Coverage Audit and Method Gaps
 
@@ -354,6 +377,9 @@ Recent progress:
 
 - the gateway now emits per-request v2 metrics and audit logs for northbound
   JSON-RPC traffic, including `initialize`
+- the gateway now also emits per-connection v2 metrics and audit logs for
+  northbound WebSocket session outcomes, including initialize timeouts,
+  downstream disconnects, protocol violations, and normal client closes
 - the v2 transport now applies thread scope enforcement to downstream
   server-request forwarding, rejecting hidden-thread requests at the gateway
   boundary instead of leaking them to the northbound client
@@ -372,8 +398,13 @@ Recent progress:
 - the real single-worker remote `RemoteAppServerClient` harness now also covers
   the bootstrap/setup methods current clients use beyond account/model
   discovery, including `externalAgentConfig/detect`,
-  `externalAgentConfig/import`, `app/list`, `skills/list`, `plugin/list`,
-  `plugin/read`, `config/batchWrite`, `memory/reset`, and `account/logout`
+  `externalAgentConfig/import`, `app/list`, `skills/list`,
+  `mcpServerStatus/list`, `plugin/list`, `plugin/read`,
+  `config/batchWrite`, `memory/reset`, and `account/logout`
+- that same real single-worker remote harness now also covers the
+  supporting/configuration methods that some clients and test tools use
+  outside the main TUI flow: `config/read`, `configRequirements/read`,
+  `experimentalFeature/list`, and `collaborationMode/list`
 - that same real single-worker remote harness now also covers plugin
   management flows current clients use after bootstrap, including
   `plugin/install` and `plugin/uninstall`, and verifies the resulting
@@ -390,6 +421,37 @@ Recent progress:
   `account/chatgptAuthTokens/refresh`, so the real northbound client path now
   exercises multiple server-request payload families instead of only
   `requestUserInput`
+- that same real single-worker remote harness now also covers the
+  connection-scoped client notifications `account/updated`,
+  `account/rateLimits/updated`, `app/list/updated`, and `skills/changed`, so
+  ordinary refresh and invalidation flows are exercised through the same real
+  northbound client path
+- single-worker remote compatibility coverage now also verifies same-scope
+  thread re-entry from a later northbound v2 client session, verifying that a
+  second client can still `thread/read` a previously created thread after the
+  original client disconnects
+- that same real single-worker remote harness now also covers onboarding auth
+  and feedback flows for `account/login/start`, `account/login/cancel`,
+  `account/login/completed`, and `feedback/upload`, so those TUI-owned session
+  setup paths are exercised through the drop-in client transport too
+- dedicated northbound gateway passthrough coverage now also includes the
+  current TUI's onboarding auth and feedback methods:
+  `account/login/start`, `account/login/cancel`, and `feedback/upload`
+- that same dedicated northbound passthrough coverage now also includes
+  lower-frequency app-server methods outside the current TUI hot path:
+  `thread/archive`, `thread/unarchive`, `thread/metadata/update`,
+  `thread/turns/list`, `thread/realtime/listVoices`,
+  `thread/increment_elicitation`, `thread/decrement_elicitation`, and
+  `thread/inject_items`
+- dedicated northbound v2 passthrough coverage now also includes
+  supporting/configuration methods that some clients and test tools use outside
+  the main TUI flow: `config/read`, `configRequirements/read`,
+  `experimentalFeature/list`, and `collaborationMode/list`
+- the real embedded `RemoteAppServerClient` harness now also covers those same
+  supporting/configuration methods, validating `config/read`,
+  `configRequirements/read`, `experimentalFeature/list`, and
+  `collaborationMode/list` through the in-process gateway transport instead of
+  only through targeted passthrough fixtures
 - the real embedded `RemoteAppServerClient` harness now also covers the same
   `item/tool/requestUserInput` server-request round trip, validating that the
   gateway proxies the typed response back into the in-process app-server
@@ -409,6 +471,17 @@ Recent progress:
   `mcpServer/elicitation/request`, validating that the gateway preserves the
   in-process MCP elicitation round trip and `serverRequest/resolved` ordering
   for connector-driven tool flows too
+- the real embedded `RemoteAppServerClient` harness now also covers
+  lower-frequency thread-control flows, including `thread/unsubscribe`,
+  `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, and `thread/rollback`
+- that same real embedded compatibility harness now also covers the
+  threadless experimental realtime discovery request
+  `thread/realtime/listVoices`
+- that same real embedded compatibility harness now also covers turn-control
+  parity for `turn/steer` and `turn/interrupt`, verifying the active turn is
+  steered successfully and later completes as `interrupted` through the
+  gateway transport
 - multi-worker remote runtime now also aggregates the current threadless
   `app/list` request path across workers, including gateway-owned pagination
   over the merged result set instead of exposing only the primary worker's app
@@ -512,8 +585,25 @@ Recent progress:
   `thread/rollback`, `review/start`, `turn/interrupt`, and `turn/steer`
 - the embedded compatibility harness now also covers additional bootstrap/setup
   requests that current clients use during startup and settings flows:
-  `externalAgentConfig/detect`, `externalAgentConfig/import`, `skills/list`,
-  `config/batchWrite`, `memory/reset`, and `account/logout`
+  `externalAgentConfig/detect`, `externalAgentConfig/import`, `app/list`,
+  `skills/list`, `mcpServerStatus/list`, `config/batchWrite`,
+  `memory/reset`, and `account/logout`
+- dedicated northbound passthrough coverage now also exercises those current
+  TUI bootstrap/setup discovery requests directly at the gateway boundary:
+  `externalAgentConfig/detect`, `app/list`, `skills/list`, and `plugin/list`
+- dedicated northbound passthrough coverage now also exercises current TUI
+  setup-mutation and plugin-management requests directly at the gateway
+  boundary: `externalAgentConfig/import`, `plugin/read`, `plugin/install`,
+  `plugin/uninstall`, `config/batchWrite`, `memory/reset`, and
+  `account/logout`
+- dedicated northbound passthrough coverage now also exercises the core
+  thread/turn transport requests current TUI sessions rely on directly at the
+  gateway boundary: `thread/start`, `thread/resume`, `thread/fork`,
+  `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`,
+  `thread/memoryMode/set`, and `turn/start`
+- the real single-worker remote compatibility harness now also covers the
+  threadless experimental realtime discovery request
+  `thread/realtime/listVoices`
 - northbound v2 connections now fail closed when the downstream app-server
   event stream reports backpressure via `Lagged`, closing the WebSocket with an
   explicit gateway-owned reason instead of silently continuing after best-effort
@@ -561,6 +651,49 @@ Recent progress:
   `item/reasoning/summaryTextDelta`, `item/reasoning/textDelta`,
   `item/commandExecution/outputDelta`, and `item/fileChange/outputDelta`
 - multi-worker remote runtime now also has a real northbound v2 client
+  regression for sticky realtime request routing and notification fan-in
+  across two workers on one gateway session, verifying
+  `thread/realtime/start`, `thread/realtime/appendText`, and
+  `thread/realtime/stop` stay on the owning worker while
+  `thread/realtime/started`, `thread/realtime/itemAdded`,
+  `thread/realtime/transcript/delta`,
+  `thread/realtime/transcript/done`, and `thread/realtime/closed` all fan
+  back into the shared northbound connection
+- that same multi-worker realtime regression now also covers
+  `thread/realtime/appendAudio` plus shared-session delivery for the
+  lower-frequency notifications `thread/realtime/outputAudio/delta`,
+  `thread/realtime/sdp`, and `thread/realtime/error`
+- multi-worker remote runtime now also has a real northbound v2 client
+  regression for turn-control parity across two workers on one shared gateway
+  session, verifying sticky `turn/steer` and `turn/interrupt` routing plus
+  shared-session fan-in for the resulting `item/agentMessage/delta`,
+  `turn/completed`, and `thread/status/changed` notifications
+- multi-worker remote runtime now also has a broader real northbound
+  `RemoteAppServerClient` bootstrap/setup regression that exercises one shared
+  session through aggregated `account/read`, `account/rateLimits/read`,
+  `model/list`, `externalAgentConfig/detect`, `app/list`, `skills/list`, and
+  `mcpServerStatus/list`, instead of validating those setup paths only through
+  separate targeted aggregation regressions
+- multi-worker remote runtime now also has a real northbound
+  `RemoteAppServerClient` regression for primary-worker onboarding and
+  feedback flows, covering `account/login/start`, `account/login/cancel`,
+  `account/login/completed`, and `feedback/upload`
+- multi-worker remote runtime now also has a real northbound
+  `RemoteAppServerClient` setup-mutation regression that exercises one shared
+  session through `externalAgentConfig/import`, `config/batchWrite`,
+  `config/value/write`, `memory/reset`, and `account/logout`, verifying that
+  each mutation still fans out to both worker sessions under the same client
+  connection
+- multi-worker remote runtime now also has a real northbound
+  `RemoteAppServerClient` regression for lower-frequency thread-control and
+  review routing across two workers on one shared gateway session, covering
+  sticky `thread/unsubscribe`, `thread/archive`, `thread/unarchive`,
+  `thread/metadata/update`, `thread/turns/list`,
+  `thread/increment_elicitation`, `thread/decrement_elicitation`,
+  `thread/inject_items`, `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, `thread/rollback`, and detached
+  `review/start` followed by `thread/read` on the returned review thread
+- multi-worker remote runtime now also has a real northbound v2 client
   regression for thread mutation routing across two workers, verifying that
   `thread/name/set` stays sticky to the owning worker and the aggregated
   `thread/read` / `thread/list` results reflect the per-worker renamed state on
@@ -593,10 +726,11 @@ Recent progress:
   change
 - the multi-worker v2 router now also suppresses exact-duplicate
   connection-state notifications across worker sessions for
-  `account/updated`, `account/rateLimits/updated`, and `app/list/updated`, so
-  one shared northbound connection does not receive repeated identical account,
-  rate-limit, or connector-state updates when multiple workers emit the same
-  current-state payload
+  `account/updated`, `account/rateLimits/updated`,
+  `app/list/updated`, and `mcpServer/startupStatus/updated`, so one shared
+  northbound connection does not receive repeated identical account,
+  rate-limit, connector-state, or MCP-startup updates when multiple workers
+  emit the same current-state payload
 - the multi-worker v2 router now also aggregates threadless `plugin/list`
   discovery across worker sessions and routes `plugin/read`,
   `plugin/install`, and `plugin/uninstall` to the worker that can satisfy the
@@ -606,12 +740,46 @@ Recent progress:
 - single-worker remote runtime now also has a northbound reconnect regression
   test, verifying that after the gateway reconnects its downstream worker, a
   later v2 client session can still bootstrap and complete `thread/start`
+- single-worker remote runtime now also has a real northbound v2 client
+  regression for realtime workflow parity, covering
+  `thread/realtime/start`, `thread/realtime/appendText`,
+  `thread/realtime/appendAudio`, and `thread/realtime/stop`, plus delivery for
+  `thread/realtime/started`, `thread/realtime/itemAdded`,
+  `thread/realtime/outputAudio/delta`,
+  `thread/realtime/transcript/delta`,
+  `thread/realtime/transcript/done`, `thread/realtime/sdp`,
+  `thread/realtime/error`, and `thread/realtime/closed`
+- single-worker remote runtime now also has a real northbound v2 client
+  regression for turn-control parity, covering `turn/steer` and
+  `turn/interrupt` plus the resulting `item/agentMessage/delta`,
+  `turn/completed`, and `thread/status/changed` notifications
+- single-worker remote runtime now also has a broader real northbound v2
+  client regression for lower-frequency thread-control and review flows,
+  covering `thread/unsubscribe`, `thread/archive`, `thread/unarchive`,
+  `thread/metadata/update`, `thread/turns/list`,
+  `thread/increment_elicitation`, `thread/decrement_elicitation`,
+  `thread/inject_items`, `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, `thread/rollback`, and detached
+  `review/start` followed by `thread/read` on the returned review thread
+- the real embedded compatibility harness now also covers that same
+  lower-frequency thread-control set for `thread/unsubscribe`,
+  `thread/archive`, `thread/unarchive`, `thread/metadata/update`,
+  `thread/turns/list`, `thread/increment_elicitation`,
+  `thread/decrement_elicitation`, `thread/inject_items`,
+  `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, and `thread/rollback`
+- that same single-worker remote real bootstrap/setup harness now also covers
+  `app/list` and `mcpServerStatus/list`, keeping connection-scoped discovery
+  closer to the embedded parity harness
 - that reconnect regression now waits for `/healthz` to report a recovered
   single-worker compatibility profile, so it covers both worker recovery and
   subsequent northbound v2 admission
 - that reconnect regression now also verifies the recovered v2 session can
   still complete a bidirectional `item/tool/requestUserInput` server-request
   round trip, not just bootstrap and `thread/start`
+- that same single-worker reconnect regression now also verifies the recovered
+  v2 session still delivers `account/updated`,
+  `account/rateLimits/updated`, `app/list/updated`, and `skills/changed`
 - multi-worker remote runtime now also has a northbound v2 reconnect
   regression, verifying that after one worker disconnects and recovers, a
   later client session can again route `thread/start` to the recovered worker
@@ -623,8 +791,8 @@ Recent progress:
   thread routing
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses exact-duplicate connection-state notifications
-  across workers for `account/updated`, `account/rateLimits/updated`, and
-  `app/list/updated`
+  across workers for `account/updated`, `account/rateLimits/updated`,
+  `app/list/updated`, and `mcpServer/startupStatus/updated`
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses duplicate `skills/changed` invalidations across
   workers until the client refreshes with `skills/list`, and still emits one
@@ -634,6 +802,34 @@ Recent progress:
   synthesizing `serverRequest/resolved` for that worker's thread-scoped
   in-flight prompts, and continuing to serve `thread/start` plus aggregated
   `thread/list` through the remaining workers
+- northbound multi-worker v2 transport now also drops duplicate downstream
+  `serverRequest/resolved` replays after the first worker-local request-id
+  translation is consumed, preventing stale worker ids from surfacing on the
+  shared northbound session
+- northbound v2 transport now also fails closed if a client sends a
+  `JSONRPCResponse` or `JSONRPCError` for a server request that is no longer
+  pending, instead of silently accepting that out-of-order protocol traffic
+- that same protocol-violation path now also rejects any other still-pending
+  downstream server requests before the northbound connection closes, so
+  partially completed approval / elicitation flows do not remain stranded
+- dedicated northbound multi-worker v2 regression coverage now also verifies
+  those duplicate downstream `serverRequest/resolved` replays are dropped while
+  the shared northbound session remains usable for follow-up requests
+- multi-worker v2 `thread/list` aggregation now also deduplicates repeated
+  thread ids across workers, selecting the newest visible thread metadata for
+  the shared northbound response instead of surfacing duplicate logical
+  threads
+- that same aggregation path now also backfills sticky worker ownership from
+  the deduplicated winner, so follow-up thread-scoped requests route to the
+  worker that supplied the visible thread snapshot
+- multi-worker v2 routing now also probes downstream ownership to recover a
+  missing worker route for already-visible threads before forwarding later
+  thread-scoped requests, instead of only recovering that route on
+  `thread/read`
+- multi-worker remote runtime now also has a real northbound
+  `RemoteAppServerClient` regression for `thread/resume` and `thread/fork`,
+  verifying sticky routing on worker-owned threads and follow-up `thread/read`
+  on the returned forked thread
 
 ## Operator Guidance
 
