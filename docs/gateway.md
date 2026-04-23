@@ -221,6 +221,10 @@ Recent progress:
 - embedded runtime now has a real drop-in v2 client harness using
   `RemoteAppServerClient`, covering bootstrap plus thread read/list/update
   workflow through the gateway's northbound WebSocket surface
+- that same real embedded harness now also verifies thread re-entry from a
+  later northbound v2 client session, so a second client can still
+  `thread/resume` and then `thread/read` a previously materialized thread
+  after the original client disconnects
 - single-worker remote runtime now also has a real northbound v2 client harness
   using `RemoteAppServerClient`, covering bootstrap plus thread
   read/list/update workflow through a gateway-backed remote worker session
@@ -248,6 +252,17 @@ Recent progress:
 - northbound v2 transport now establishes one downstream app-server session per
   configured remote worker in multi-worker mode, with gateway-owned routing for
   aggregated thread-list requests and translated server-request IDs
+- northbound v2 transport now also fans out `account/login/start` for the
+  external-auth `chatgptAuthTokens` path across multi-worker downstream
+  sessions, so gateway-scoped auth state does not drift behind the primary
+  worker
+- northbound v2 transport now also fails closed if a downstream app-server
+  session reuses a still-pending server-request id, preventing silent
+  overwrite of the original pending route
+- northbound v2 transport now also fails closed if a downstream worker
+  disconnects while a connection-scoped server request is still pending or
+  awaiting downstream `serverRequest/resolved` on a shared multi-worker
+  session, preventing the unresolved prompt from being silently dropped
 - multi-worker remote runtime now also has a real northbound v2 client
   regression covering per-worker server-request round trips with identical
   downstream request IDs, including `item/tool/requestUserInput`,
@@ -285,7 +300,8 @@ Recent progress:
   reads
 - multi-worker remote runtime now also fans out connection-scoped state
   mutation requests that current clients use during setup, including
-  `externalAgentConfig/import`, `config/value/write`,
+  `account/login/start` for external-auth `apiKey` and
+  `chatgptAuthTokens`, `externalAgentConfig/import`, `config/value/write`,
   `config/batchWrite`, `memory/reset`, and `account/logout`, so
   worker-local session/config state does not silently drift behind one shared
   northbound v2 connection
@@ -319,6 +335,10 @@ Recent progress:
   selected plugin request, so one shared northbound v2 connection can manage
   worker-local plugin state instead of exposing only the primary worker's
   marketplace view
+- dedicated multi-worker northbound regression coverage now also verifies that
+  aggregated `plugin/list` preserves merged marketplace state across workers
+  and that `plugin/read`, `plugin/install`, and `plugin/uninstall` fall back
+  to the first worker that can satisfy the selected plugin request
 - single-worker remote runtime now has a northbound v2 reconnect regression
   test, verifying that a later Codex client session can bootstrap and start a
   thread after the gateway reconnects its downstream worker
@@ -328,6 +348,20 @@ Recent progress:
 - that reconnect coverage now also verifies the recovered v2 session can still
   complete a bidirectional `item/tool/requestUserInput` server-request round
   trip, not just bootstrap and `thread/start`
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still satisfy `account/read` and `account/rateLimits/read`,
+  so bootstrap account state and background rate-limit refresh survive worker
+  recovery too
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still complete a realtime workflow for
+  `thread/realtime/listVoices`, `thread/realtime/start`,
+  `thread/realtime/appendText`, `thread/realtime/appendAudio`, and
+  `thread/realtime/stop`, plus the resulting
+  `thread/realtime/started`, `thread/realtime/itemAdded`,
+  `thread/realtime/transcript/delta`,
+  `thread/realtime/transcript/done`,
+  `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`,
+  `thread/realtime/error`, and `thread/realtime/closed`
 - that same single-worker reconnect coverage now also verifies the recovered
   v2 session still delivers `account/updated`,
   `account/rateLimits/updated`, `app/list/updated`, and `skills/changed`
@@ -340,6 +374,26 @@ Recent progress:
   session can still complete a bidirectional `item/tool/requestUserInput`
   server-request round trip with the recovered worker, not just bootstrap and
   thread routing
+- dedicated northbound v2 regression coverage now also verifies that if one
+  downstream worker disconnects after a thread-scoped server request has
+  already been answered but before downstream `serverRequest/resolved`, the
+  gateway still synthesizes `serverRequest/resolved` northbound instead of
+  leaving the shared session stranded
+- the real multi-worker remote `RemoteAppServerClient` harness now also covers
+  that same answered-but-unresolved thread-scoped server-request disconnect
+  path, validating that one shared northbound client session still sees
+  `serverRequest/resolved` and can continue onto later worker-owned threads
+- that same reconnect regression now also verifies the recovered multi-worker
+  v2 session can still route one shared realtime workflow across the recovered
+  worker and a second healthy worker, covering aggregated
+  `thread/realtime/listVoices`, sticky `thread/realtime/start`,
+  `thread/realtime/appendText`, `thread/realtime/appendAudio`, and
+  `thread/realtime/stop` plus fan-in for
+  `thread/realtime/started`, `thread/realtime/itemAdded`,
+  `thread/realtime/transcript/delta`,
+  `thread/realtime/transcript/done`,
+  `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`,
+  `thread/realtime/error`, and `thread/realtime/closed`
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses exact-duplicate connection-state notifications
   across workers for `account/updated`, `account/rateLimits/updated`,
@@ -353,6 +407,10 @@ Recent progress:
   synthesizing `serverRequest/resolved` for that worker's thread-scoped
   in-flight prompts, and continuing to serve `thread/start` plus aggregated
   `thread/list` through the remaining workers
+- those same shared multi-worker v2 sessions now also re-add a recovered
+  downstream worker lazily on later client requests, so one northbound client
+  can resume round-robin `thread/start` and aggregated `thread/list` / sticky
+  `thread/read` coverage for the recovered worker without reconnecting
 - dedicated northbound multi-worker v2 regression coverage now verifies exact
   duplicate connection-state notifications such as `account/updated` are
   emitted only once on the shared northbound session
@@ -544,6 +602,8 @@ Phase 6 is in progress with:
 - dedicated northbound v2 passthrough coverage now also includes the current
   TUI's onboarding auth and feedback methods: `account/login/start`,
   `account/login/cancel`, and `feedback/upload`
+- dedicated northbound v2 server-request round-trip coverage now also includes
+  `account/chatgptAuthTokens/refresh`
 - that same dedicated northbound passthrough coverage now also includes
   lower-frequency app-server methods outside the current TUI hot path:
   `thread/archive`, `thread/unarchive`, `thread/metadata/update`,
@@ -660,8 +720,11 @@ Phase 6 is in progress with:
   `model/list`, `externalAgentConfig/detect`, `app/list`, `skills/list`, and
   `mcpServerStatus/list`, instead of validating those setup paths only through
   separate targeted passthrough-style regressions
+- that same real multi-worker bootstrap/setup coverage now also verifies that
+  thread-scoped `app/list` stays sticky to the owning worker instead of
+  accidentally reusing the threadless aggregation path
 - that same real multi-worker bootstrap/setup coverage now also exercises the
-  primary-worker threadless configuration reads `config/read` and
+  cwd-aware threadless `config/read`, primary-worker
   `configRequirements/read`, plus aggregated capability discovery for
   `experimentalFeature/list` and `collaborationMode/list`, verifying they
   remain usable through one shared v2 client session without needing
@@ -782,6 +845,45 @@ Phase 6 is in progress with:
 - that same real embedded compatibility harness now also covers
   `config/read`, `configRequirements/read`, `experimentalFeature/list`, and
   `collaborationMode/list`
+- that same real embedded compatibility harness now also covers
+  `account/rateLimits/read`, so the client's background rate-limit refresh
+  path is exercised through the in-process gateway transport instead of only
+  through targeted passthrough fixtures
+- that same real embedded compatibility harness now also covers the
+  external-auth onboarding flow for `account/login/start`,
+  `account/login/cancel`, and `account/login/completed`, validating the
+  client-supplied `chatgptAuthTokens` path plus the resulting
+  `account/updated` notification
+- that same real embedded compatibility harness now also covers
+  `feedback/upload`, so operator-facing feedback submission is exercised
+  through the in-process gateway transport instead of only through dedicated
+  passthrough fixtures
+- that same real embedded compatibility harness now also validates that the
+  client-supplied `chatgptAuthTokens` are carried through to the downstream
+  model request path after onboarding, instead of stopping at account-state
+  notifications alone
+- that same real single-worker remote compatibility harness now also covers
+  the external-auth onboarding flow for `account/login/start`,
+  `account/login/cancel`, and `account/login/completed`, validating the
+  client-supplied `chatgptAuthTokens` path plus the resulting
+  `account/updated` notification through the remote transport
+- that same real single-worker remote compatibility harness now also covers
+  `account/rateLimits/read`, so the client's background rate-limit refresh
+  path is exercised through the gateway-backed remote worker session instead of
+  only through targeted passthrough fixtures or aggregated multi-worker tests
+- that same real multi-worker remote compatibility harness now also covers
+  `account/rateLimits/read`, preserving the primary worker's historical
+  top-level snapshot while merging the per-limit map across workers for the
+  current Stage B transport
+- that same real multi-worker remote compatibility harness now also covers
+  the primary-worker external-auth onboarding flow for `account/login/start`,
+  `account/login/cancel`, and `account/login/completed`, validating the
+  client-supplied `chatgptAuthTokens` path plus the resulting
+  `account/updated` notification through the current Stage B transport
+- that same real multi-worker remote compatibility harness now also covers
+  connection-scoped realtime voice discovery for `thread/realtime/listVoices`,
+  aggregating distinct voice inventory across workers while keeping the
+  primary-worker defaults stable
 - that same embedded compatibility harness now also covers post-bootstrap
   plugin management flows current clients use in the TUI, including
   `plugin/install` and `plugin/uninstall`, and verifies the resulting
@@ -800,9 +902,12 @@ Phase 6 is in progress with:
   `item/fileChange/requestApproval`, validating that the gateway preserves the
   in-process approval round trips and `serverRequest/resolved` ordering for
   shell and patch approval flows too
-- that same real embedded compatibility harness now also covers the
-  threadless experimental realtime discovery request
-  `thread/realtime/listVoices`
+- that same real embedded compatibility harness now also covers realtime
+  request workflow for `thread/realtime/start`,
+  `thread/realtime/appendText`, `thread/realtime/appendAudio`,
+  `thread/realtime/stop`, and `thread/realtime/listVoices`, validating that
+  the in-process gateway reaches the realtime sideband transport for start and
+  append requests
 - that real embedded harness now also covers
   `mcpServer/elicitation/request`, validating that the gateway preserves the
   in-process MCP elicitation round trip and `serverRequest/resolved` ordering

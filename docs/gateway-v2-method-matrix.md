@@ -48,22 +48,22 @@ session setup.
 | Method | Client use | Gateway status | Notes |
 | --- | --- | --- | --- |
 | `account/read` | Bootstrap auth/account state | `transparent passthrough` | Required for drop-in startup parity and covered by dedicated gateway passthrough tests. |
-| `account/rateLimits/read` | Background rate-limit refresh for status surfaces | `transparent passthrough` | Covered by dedicated gateway passthrough tests; multi-worker remote mode now also aggregates the per-limit map across workers while preserving the primary historical view from the first worker. |
+| `account/rateLimits/read` | Background rate-limit refresh for status surfaces | `transparent passthrough` | Covered by dedicated gateway passthrough tests, by the real embedded and single-worker remote compatibility harnesses, and by multi-worker remote aggregation coverage that preserves the primary historical view from the first worker while merging the per-limit map across workers. |
 | `model/list` | Bootstrap model picker/default model discovery | `transparent passthrough` | Required for drop-in startup parity and covered by dedicated gateway passthrough tests. |
 | `externalAgentConfig/detect` | Import existing external agent config | `transparent passthrough` | Covered by single-worker remote compatibility tests. |
 | `externalAgentConfig/import` | Import external agent config | `transparent passthrough` | Covered by single-worker remote compatibility tests. |
-| `app/list` | Connector/app discovery and refresh | `transparent passthrough` | Multi-worker remote mode now aggregates the current threadless `app/list` path across workers, including gateway-owned pagination over the merged result set. |
+| `app/list` | Connector/app discovery and refresh | `transparent passthrough` | Multi-worker remote mode now aggregates the current threadless `app/list` path across workers, including gateway-owned pagination over the merged result set, while thread-scoped `app/list` stays sticky to the owning worker and is covered by the real multi-worker compatibility harness. |
 | `mcpServerStatus/list` | MCP inventory/bootstrap refresh | `transparent passthrough` | Covered by dedicated gateway passthrough tests; multi-worker remote mode now also aggregates connection-scoped MCP server inventory across workers with gateway-owned pagination. |
 | `skills/list` | Skills picker / refresh | `transparent passthrough` | Covered by single-worker remote compatibility tests. |
-| `plugin/list` | Plugin catalog discovery | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests using the real northbound v2 client harness. |
-| `plugin/read` | Plugin detail view | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests using the real northbound v2 client harness. |
+| `plugin/list` | Plugin catalog discovery | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests using the real northbound v2 client harness; multi-worker remote mode now also has dedicated aggregation coverage for merged marketplace inventory, featured plugins, and installed-state selection across workers. |
+| `plugin/read` | Plugin detail view | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests using the real northbound v2 client harness; dedicated multi-worker northbound regression coverage now also verifies fallback routing to the first worker that can satisfy the selected plugin request. |
 | `config/value/write` | Plugin enablement and other targeted config updates | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests; multi-worker remote mode now fans this connection-scoped mutation out across workers so plugin/config state does not drift. |
 | `config/batchWrite` | Reload user config | `transparent passthrough` | Covered by single-worker remote compatibility tests. |
-| `account/login/start` | Onboarding sign-in start flow | `transparent passthrough` | Covered by dedicated gateway passthrough tests and by the real single-worker remote compatibility harness. |
-| `account/login/cancel` | Cancel a pending onboarding sign-in flow | `transparent passthrough` | Covered by dedicated gateway passthrough tests and by the real single-worker remote compatibility harness. |
+| `account/login/start` | Onboarding sign-in start flow | `transparent passthrough` | Covered by dedicated gateway passthrough tests, by the real embedded compatibility harness for the external-auth `chatgptAuthTokens` path, by the real single-worker remote compatibility harness for both managed-auth and external-auth onboarding flows, by the real multi-worker remote compatibility harness for the current external-auth onboarding path, and by dedicated multi-worker northbound regression coverage that verifies `apiKey` and `chatgptAuthTokens` login fanout to every downstream worker session while managed ChatGPT login flows remain on the primary worker because they return worker-local `loginId` state. |
+| `account/login/cancel` | Cancel a pending onboarding sign-in flow | `transparent passthrough` | Covered by dedicated gateway passthrough tests, by the real embedded compatibility harness for post-login cancellation semantics, by the real single-worker remote compatibility harness for both managed-auth and external-auth onboarding flows, and by the real multi-worker remote compatibility harness for the current primary-worker external-auth path. |
 | `account/logout` | Sign-out flow | `transparent passthrough` | Covered by single-worker remote compatibility tests. |
 | `memory/reset` | Reset memory mode state | `transparent passthrough` | Covered by single-worker remote compatibility tests. |
-| `feedback/upload` | Submit in-product feedback from an active session | `transparent passthrough` | Covered by dedicated gateway passthrough tests and by the real single-worker remote compatibility harness. |
+| `feedback/upload` | Submit in-product feedback from an active session | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus the real embedded, single-worker remote, and multi-worker remote compatibility harnesses. |
 
 ## Supporting Configuration Requests
 
@@ -72,7 +72,7 @@ bootstrap hot path, but they still need stable v2 compatibility behavior.
 
 | Method | Client use | Gateway status | Notes |
 | --- | --- | --- | --- |
-| `config/read` | Read effective config and optional layer metadata | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus real embedded, single-worker remote, and primary-worker multi-worker compatibility coverage. |
+| `config/read` | Read effective config and optional layer metadata | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus real embedded, single-worker remote, and cwd-aware multi-worker compatibility coverage. |
 | `configRequirements/read` | Read config requirements and validation metadata | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus real embedded, single-worker remote, and primary-worker multi-worker compatibility coverage. |
 | `experimentalFeature/list` | Discover experimental capability flags | `transparent passthrough` | Covered by dedicated gateway passthrough tests; multi-worker remote mode now also aggregates capability discovery across workers. |
 | `collaborationMode/list` | Discover supported collaboration modes | `transparent passthrough` | Covered by dedicated gateway passthrough tests; multi-worker remote mode now also deduplicates and sorts the aggregated capability set across workers. |
@@ -83,8 +83,8 @@ These are the plugin-management requests the current TUI issues after bootstrap.
 
 | Method | Client use | Gateway status | Notes |
 | --- | --- | --- | --- |
-| `plugin/install` | Install a selected plugin | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests, including follow-up `plugin/list` state changes. |
-| `plugin/uninstall` | Remove an installed plugin | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests, including follow-up `plugin/list` state changes. |
+| `plugin/install` | Install a selected plugin | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests, including follow-up `plugin/list` state changes; dedicated multi-worker northbound regression coverage now also verifies fallback routing to the first worker that can satisfy the install request. |
+| `plugin/uninstall` | Remove an installed plugin | `transparent passthrough` | Covered by embedded and single-worker remote compatibility tests, including follow-up `plugin/list` state changes; dedicated multi-worker northbound regression coverage now also verifies fallback routing to the first worker that can satisfy the uninstall request. |
 
 ## Thread and Turn Requests
 
@@ -132,11 +132,11 @@ These methods are used by the TUI realtime conversation path.
 
 | Method | Client use | Gateway status | Notes |
 | --- | --- | --- | --- |
-| `thread/realtime/listVoices` | Discover available realtime voices before a session starts | `transparent passthrough` | Covered by dedicated northbound passthrough tests plus real embedded and single-worker remote compatibility harnesses. |
-| `thread/realtime/start` | Start realtime session | `transparent passthrough` | Covered by dedicated gateway passthrough tests. |
-| `thread/realtime/appendAudio` | Stream microphone audio | `transparent passthrough` | Covered by dedicated gateway passthrough tests. |
-| `thread/realtime/appendText` | Stream text into realtime session | `transparent passthrough` | Covered by dedicated gateway passthrough tests. |
-| `thread/realtime/stop` | Stop realtime session | `transparent passthrough` | Covered by dedicated gateway passthrough tests. |
+| `thread/realtime/listVoices` | Discover available realtime voices before a session starts | `transparent passthrough` | Covered by dedicated northbound passthrough tests plus real embedded, single-worker remote, and multi-worker remote compatibility harnesses. |
+| `thread/realtime/start` | Start realtime session | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus the real embedded and single-worker remote compatibility harnesses. |
+| `thread/realtime/appendAudio` | Stream microphone audio | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus the real embedded and single-worker remote compatibility harnesses. |
+| `thread/realtime/appendText` | Stream text into realtime session | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus the real embedded and single-worker remote compatibility harnesses. |
+| `thread/realtime/stop` | Stop realtime session | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus the real embedded and single-worker remote compatibility harnesses. |
 
 ## Server Notifications
 
@@ -191,9 +191,15 @@ Current status:
   `deprecationNotice`, and `mcpServer/startupStatus/updated`
 - dedicated gateway connection-notification coverage now also includes
   `account/login/completed` for onboarding auth completion flows
+- the real embedded compatibility harness now also covers
+  `account/login/completed` during the external-auth onboarding flow
+- the real single-worker remote compatibility harness now also covers
+  `account/login/completed` during the external-auth onboarding flow
 - the real single-worker remote compatibility harness now also covers
   `account/login/completed` notification delivery during the onboarding auth
   flow
+- the real multi-worker remote compatibility harness now also covers
+  `account/login/completed` during the external-auth onboarding flow
 - broader notification coverage is still deferred to parity validation and
   hardening work, especially less common realtime notifications
 
@@ -203,13 +209,13 @@ These are the server-initiated requests the current TUI explicitly handles.
 
 | Method | Client handling status | Gateway status | Notes |
 | --- | --- | --- | --- |
-| `item/commandExecution/requestApproval` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests. |
-| `item/fileChange/requestApproval` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests. |
-| `item/permissions/requestApproval` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests, including the real `RemoteAppServerClient` northbound harness. |
-| `item/tool/requestUserInput` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests. |
-| `mcpServer/elicitation/request` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests, including the real `RemoteAppServerClient` northbound harness. |
+| `item/commandExecution/requestApproval` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests and by the real multi-worker remote `RemoteAppServerClient` harness, which verifies per-worker request-id translation on one shared northbound session. |
+| `item/fileChange/requestApproval` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests and by the real multi-worker remote `RemoteAppServerClient` harness, which verifies per-worker request-id translation on one shared northbound session. |
+| `item/permissions/requestApproval` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests, including the real `RemoteAppServerClient` northbound harness, plus the real multi-worker remote harness for translated per-worker request IDs. |
+| `item/tool/requestUserInput` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests and by the real multi-worker remote `RemoteAppServerClient` harness, which verifies per-worker request-id translation on one shared northbound session. |
+| `mcpServer/elicitation/request` | Supported by current TUI | `transparent passthrough` | Covered by single-worker remote round-trip tests, including the real `RemoteAppServerClient` northbound harness, plus the real multi-worker remote harness for translated per-worker request IDs. |
 | `item/tool/call` | TUI marks unsupported today | `transparent passthrough` | This is a client capability gap, not a gateway transport gap; dedicated northbound passthrough coverage now verifies the request/response round trip. |
-| `account/chatgptAuthTokens/refresh` | TUI accepts | `transparent passthrough` | Covered by single-worker remote round-trip tests. |
+| `account/chatgptAuthTokens/refresh` | TUI accepts | `transparent passthrough` | Covered by dedicated northbound server-request round-trip tests plus single-worker and multi-worker remote round-trip tests, including translated per-worker request IDs on one shared northbound session. Embedded mode currently relies on targeted northbound coverage for this path because the in-process downstream app-server client rejects ChatGPT token-refresh prompts before they can surface through the real embedded compatibility harness. |
 | legacy `apply_patch` / `exec_command` approvals | TUI marks unsupported today | `transparent passthrough` | These are not part of the primary Stage A drop-in target. |
 
 Additional transport behavior:
@@ -226,11 +232,24 @@ Additional transport behavior:
   protocol violation, closes the northbound WebSocket, and rejects any other
   still-pending downstream server requests instead of silently ignoring the
   out-of-order reply
+- if a downstream app-server session reuses a still-pending server-request id,
+  the gateway now closes the northbound WebSocket with a gateway-owned error
+  close and rejects the older pending request instead of silently overwriting
+  the original route
 - if one downstream worker disconnects during a multi-worker session while a
   thread-scoped server request from that worker is still pending or waiting on
   downstream `serverRequest/resolved`, the gateway now synthesizes
   `serverRequest/resolved` northbound so the client can dismiss that prompt
   instead of leaving it stranded on the shared session
+- if one downstream worker disconnects during a multi-worker session while a
+  connection-scoped server request from that worker is still pending or
+  awaiting downstream `serverRequest/resolved`, the gateway now fails closed
+  and ends the northbound WebSocket instead of silently dropping the
+  unresolved prompt
+- dedicated northbound regression coverage now also exercises the thread-scoped
+  answered-but-unresolved variant of that worker-disconnect path, verifying
+  that `serverRequest/resolved` is still synthesized after the client has
+  already replied but before the worker can confirm resolution
 
 ## Topology and Policy Gaps
 
@@ -238,7 +257,7 @@ These are the known gaps that remain after the current Stage A coverage work.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| remote runtime with more than one worker | `partial` | Northbound v2 WebSocket upgrades are now admitted in multi-worker remote mode, with one downstream session per worker plus aggregated `thread/list` / `thread/loaded/list`, deduplicated multi-worker `thread/list` results that keep the newest visible snapshot per thread id, aggregated bootstrap/setup discovery for `account/read`, `model/list`, `externalAgentConfig/detect`, `app/list`, `skills/list`, and threadless `plugin/list`, translated server-request IDs across workers for `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `mcpServer/elicitation/request`, and `account/chatgptAuthTokens/refresh`, sticky thread routing, worker-discovery routing for `plugin/read` / `plugin/install` / `plugin/uninstall`, fanout for connection-scoped setup mutations such as `externalAgentConfig/import`, `config/batchWrite`, `memory/reset`, and `account/logout`, deduplicated `skills/changed` invalidation notifications until the client refreshes with `skills/list`, exact-duplicate suppression for connection-state notifications such as `account/updated`, `account/rateLimits/updated`, `app/list/updated`, and `mcpServer/startupStatus/updated`, synthesized `serverRequest/resolved` for thread-scoped prompts stranded by a worker disconnect, route backfill for already visible threads discovered through aggregated `thread/list` / `thread/loaded/list` plus lazy route recovery for later thread-scoped requests when that worker mapping is missing, and in-session survival when one downstream worker disconnects and the remaining workers can still serve the shared northbound connection. Broader parity and hardening work are still pending before this matches embedded or single-worker remote support. |
+| remote runtime with more than one worker | `partial` | Northbound v2 WebSocket upgrades are now admitted in multi-worker remote mode, with one downstream session per worker plus aggregated `thread/list` / `thread/loaded/list`, deduplicated multi-worker `thread/list` results that keep the newest visible snapshot per thread id, aggregated bootstrap/setup discovery for `account/read`, `model/list`, `externalAgentConfig/detect`, `app/list`, `skills/list`, and threadless `plugin/list`, translated server-request IDs across workers for `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `mcpServer/elicitation/request`, and `account/chatgptAuthTokens/refresh`, sticky thread routing, worker-discovery routing for `plugin/read` / `plugin/install` / `plugin/uninstall`, fanout for connection-scoped setup mutations such as `account/login/start` for external-auth `apiKey` and `chatgptAuthTokens`, `externalAgentConfig/import`, `config/batchWrite`, `memory/reset`, and `account/logout`, deduplicated `skills/changed` invalidation notifications until the client refreshes with `skills/list`, exact-duplicate suppression for connection-state notifications such as `account/updated`, `account/rateLimits/updated`, `app/list/updated`, and `mcpServer/startupStatus/updated`, synthesized `serverRequest/resolved` for thread-scoped prompts stranded by a worker disconnect, route backfill for already visible threads discovered through aggregated `thread/list` / `thread/loaded/list` plus lazy route recovery for later thread-scoped requests when that worker mapping is missing, in-session survival when one downstream worker disconnects and the remaining workers can still serve the shared northbound connection, and lazy re-add of a recovered worker on later client requests so the same northbound session can resume routing work back onto that worker. Broader parity and hardening work are still pending before this matches embedded or single-worker remote support. |
 | v2 scope enforcement | `partial` | Embedded, single-worker remote, and multi-worker remote v2 connections now derive tenant/project scope from the WebSocket upgrade headers, enforce thread visibility on thread-scoped requests, filter `thread/list` plus `thread/loaded/list`, reject downstream server requests for hidden threads, backfill worker ownership for already visible threads discovered through aggregated list responses, and register resumed/forked thread IDs back into scope ownership. Multi-worker remote runtime now also has a real northbound `RemoteAppServerClient` regression covering same-scope re-entry plus cross-scope filtering for aggregated `thread/list` / `thread/loaded/list` / `thread/read`. Resume/fork flows that bypass `threadId` are rejected for now, and those resume/fork plus list-filtering behaviors are covered by dedicated northbound JSON-RPC regression tests. |
 | v2 admission/rate limiting | `complete` | The gateway now applies the same per-scope request rate limit and turn-start quota policy to v2 JSON-RPC requests that it already applies to HTTP routes. |
 | v2 per-message audit/metrics | `complete` | The gateway now emits per-request v2 metrics and audit logs for `initialize` and subsequent client JSON-RPC requests, tagged by method and outcome. |
@@ -281,6 +300,7 @@ The current gateway compatibility tests cover this required subset:
 - `thread/backgroundTerminals/clean`
 - `thread/rollback`
 - `review/start`
+- `thread/realtime/listVoices`
 - `thread/realtime/start`
 - `thread/realtime/appendAudio`
 - `thread/realtime/appendText`
@@ -304,7 +324,11 @@ The current gateway compatibility tests cover this required subset:
 - `item/commandExecution/outputDelta` notification forwarding
 - `item/fileChange/outputDelta` notification forwarding
 - `thread/realtime/started` notification forwarding
+- `account/updated` notification forwarding
+- `account/rateLimits/updated` notification forwarding
+- `app/list/updated` notification forwarding
 - `account/login/completed` notification forwarding
+- `skills/changed` notification forwarding
 - `item/commandExecution/requestApproval` server-request round trip
 - `item/fileChange/requestApproval` server-request round trip
 - `item/permissions/requestApproval` server-request round trip
@@ -312,9 +336,9 @@ The current gateway compatibility tests cover this required subset:
 - `mcpServer/elicitation/request` server-request round trip
 - `account/chatgptAuthTokens/refresh` server-request round trip
 
-This is still narrower than the full TUI request surface because some realtime
-flows and a few less common passthrough methods still lack dedicated gateway
-parity tests.
+This is still narrower than exhaustive TUI parity because some lower-frequency
+notifications, reconnect paths, and operational edge cases still rely more on
+targeted gateway regressions than on one broad end-to-end client harness.
 
 Separate from the current TUI-focused matrix, dedicated northbound passthrough
 coverage now also exercises several lower-frequency app-server methods outside
@@ -346,10 +370,15 @@ thread/turn transport requests current TUI sessions rely on:
 
 Real northbound `RemoteAppServerClient` coverage now also exercises those same
 supporting/configuration methods in embedded and single-worker remote mode, and
-multi-worker remote mode now also covers the primary-worker threadless path for
-`config/read` and `configRequirements/read`, plus aggregated capability
-discovery for `experimentalFeature/list` and `collaborationMode/list`, so they
-are no longer validated only through targeted passthrough fixtures.
+multi-worker remote mode now also routes threadless `config/read` by matching
+`cwd` while keeping `configRequirements/read` on the primary worker, plus
+aggregated capability discovery for `experimentalFeature/list` and
+`collaborationMode/list`, so they are no longer validated only through
+targeted passthrough fixtures.
+That same real embedded coverage now also includes `account/rateLimits/read`,
+so the client's background rate-limit refresh path is exercised through the
+in-process gateway transport instead of only through targeted passthrough
+fixtures.
 
 Real northbound multi-worker coverage now also exercises the primary-worker
 onboarding and feedback flows `account/login/start`,
@@ -394,6 +423,9 @@ Embedded-mode coverage notes:
   `mcpServer/elicitation/request` server-request round trip, including the
   forwarded `serverRequest/resolved` notification ordering before
   `turn/completed`
+- that same embedded harness now also covers `feedback/upload`, validating
+  operator-facing feedback submission through the real northbound client
+  transport instead of only through targeted passthrough fixtures
 - that embedded harness now also covers lower-frequency thread-control flows
   for `thread/unsubscribe`, `thread/archive`, `thread/unarchive`,
   `thread/metadata/update`, `thread/turns/list`,
@@ -418,9 +450,10 @@ Single-worker remote coverage notes:
   `thread/memoryMode/set`, `turn/start`, and `thread/started` notification
   delivery
 - that single-worker remote harness now also covers
-  `externalAgentConfig/detect`, `externalAgentConfig/import`, `app/list`,
-  `skills/list`, `mcpServerStatus/list`, `config/batchWrite`,
-  `memory/reset`, and `account/logout`
+  `externalAgentConfig/detect`, `externalAgentConfig/import`,
+  `account/rateLimits/read`, `app/list`, `skills/list`,
+  `mcpServerStatus/list`, `config/batchWrite`, `memory/reset`, and
+  `account/logout`
 - that same single-worker remote harness now also covers onboarding auth and
   feedback flows for `account/login/start`, `account/login/cancel`,
   `account/login/completed`, and `feedback/upload`
@@ -438,6 +471,14 @@ Single-worker remote coverage notes:
 - that same single-worker remote harness now also verifies thread re-entry
   from a later northbound v2 client session, covering `thread/read` after the
   original client disconnects
+- that same real embedded harness now also verifies thread re-entry from a
+  later northbound v2 client session, covering `thread/resume` plus
+  follow-up `thread/read` after the original client disconnects
+- that real embedded compatibility harness now also covers realtime workflow
+  parity for `thread/realtime/start`, `thread/realtime/appendText`,
+  `thread/realtime/appendAudio`, `thread/realtime/stop`, and
+  `thread/realtime/listVoices`, validating that the in-process gateway reaches
+  the realtime sideband transport for start and append requests
 - that single-worker remote harness also covers the core turn-lifecycle
   notifications `thread/status/changed`, `turn/started`,
   `item/agentMessage/delta`, and `turn/completed`
@@ -450,6 +491,9 @@ Single-worker remote coverage notes:
   `thread/realtime/transcript/delta`,
   `thread/realtime/transcript/done`, `thread/realtime/sdp`,
   `thread/realtime/error`, and `thread/realtime/closed`
+- that same single-worker reconnect harness now also verifies the recovered v2
+  session can still complete that realtime workflow after the downstream worker
+  disconnects and the gateway restores the remote session
 - that single-worker remote harness now also covers turn-control parity for
   `turn/steer` and `turn/interrupt`, plus the resulting
   `item/agentMessage/delta`, `turn/completed`, and
@@ -479,10 +523,10 @@ Multi-worker remote coverage notes:
   `externalAgentConfig/detect`, `app/list`, `skills/list`, and
   `mcpServerStatus/list`, instead of validating those setup paths only through
   separate targeted aggregation regressions
-- that same multi-worker harness now also covers the primary-worker
-  threadless configuration reads `config/read` and
-  `configRequirements/read`, plus aggregated capability discovery for
-  `experimentalFeature/list` and `collaborationMode/list`
+- that same multi-worker harness now also covers cwd-aware threadless
+  `config/read`, primary-worker `configRequirements/read`, plus aggregated
+  capability discovery for `experimentalFeature/list` and
+  `collaborationMode/list`
 - that same multi-worker harness now also covers the primary-worker
   onboarding and feedback flows for `account/login/start`,
   `account/login/cancel`, `account/login/completed`, and `feedback/upload`
@@ -510,6 +554,13 @@ Multi-worker remote coverage notes:
 - that same multi-worker harness now also covers `thread/realtime/appendAudio`
   plus shared-session fan-in for `thread/realtime/outputAudio/delta`,
   `thread/realtime/sdp`, and `thread/realtime/error`
+- that same multi-worker harness now also covers connection-scoped realtime
+  voice discovery for `thread/realtime/listVoices`, aggregating distinct voice
+  inventory across workers while keeping the primary worker defaults stable
+- that same multi-worker reconnect harness now also verifies that realtime
+  routing and fan-in still work after one worker disconnects and recovers,
+  including aggregated `thread/realtime/listVoices` plus the recovered worker
+  and a second healthy worker on one shared v2 client session
 - that multi-worker harness now also covers sticky `turn/steer` and
   `turn/interrupt` routing on worker-owned threads, plus shared-session fan-in
   for the resulting `item/agentMessage/delta`, `turn/completed`, and

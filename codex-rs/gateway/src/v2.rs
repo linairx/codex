@@ -107,50 +107,49 @@ impl GatewayV2SessionFactory {
                         }]
                     })
             }
-            Self::RemoteSingle { connect_args, .. } => {
-                let mut connect_args = connect_args.as_ref().clone();
-                apply_initialize_params(
-                    &mut connect_args.client_name,
-                    &mut connect_args.client_version,
-                    &mut connect_args.experimental_api,
-                    &mut connect_args.opt_out_notification_methods,
-                    initialize,
-                );
-                RemoteAppServerClient::connect_with_headers(
-                    connect_args,
-                    request_context.forwarding_headers(),
-                )
+            Self::RemoteSingle { .. } => self
+                .connect_worker(0, initialize, request_context)
                 .await
-                .map(|app_server| {
-                    vec![GatewayV2ConnectedSession {
-                        worker_id: Some(0),
-                        app_server: AppServerClient::Remote(app_server),
-                    }]
-                })
-            }
+                .map(|app_server| vec![app_server]),
             Self::RemoteMulti { connect_args, .. } => {
                 let mut sessions = Vec::with_capacity(connect_args.len());
-                for (worker_id, connect_args) in connect_args.iter().enumerate() {
-                    let mut connect_args = connect_args.clone();
-                    apply_initialize_params(
-                        &mut connect_args.client_name,
-                        &mut connect_args.client_version,
-                        &mut connect_args.experimental_api,
-                        &mut connect_args.opt_out_notification_methods,
-                        initialize,
+                for worker_id in 0..connect_args.len() {
+                    sessions.push(
+                        self.connect_worker(worker_id, initialize, request_context)
+                            .await?,
                     );
-                    let app_server = RemoteAppServerClient::connect_with_headers(
-                        connect_args,
-                        request_context.forwarding_headers(),
-                    )
-                    .await?;
-                    sessions.push(GatewayV2ConnectedSession {
-                        worker_id: Some(worker_id),
-                        app_server: AppServerClient::Remote(app_server),
-                    });
                 }
                 Ok(sessions)
             }
+        }
+    }
+
+    pub async fn connect_worker(
+        &self,
+        worker_id: usize,
+        initialize: &InitializeParams,
+        request_context: &GatewayRequestContext,
+    ) -> io::Result<GatewayV2ConnectedSession> {
+        match self {
+            Self::RemoteSingle { connect_args, .. } if worker_id == 0 => {
+                connect_remote_worker(
+                    connect_args.as_ref().clone(),
+                    worker_id,
+                    initialize,
+                    request_context,
+                )
+                .await
+            }
+            Self::RemoteMulti { connect_args, .. } => {
+                let connect_args = connect_args.get(worker_id).ok_or_else(|| {
+                    io::Error::other(format!("gateway v2 worker {worker_id} is not configured"))
+                })?;
+                connect_remote_worker(connect_args.clone(), worker_id, initialize, request_context)
+                    .await
+            }
+            _ => Err(io::Error::other(format!(
+                "gateway v2 worker {worker_id} cannot be connected for this runtime"
+            ))),
         }
     }
 
@@ -166,6 +165,30 @@ impl GatewayV2SessionFactory {
             _ => RequestId::String("gateway-srv-1".to_string()),
         }
     }
+}
+
+async fn connect_remote_worker(
+    mut connect_args: RemoteAppServerConnectArgs,
+    worker_id: usize,
+    initialize: &InitializeParams,
+    request_context: &GatewayRequestContext,
+) -> io::Result<GatewayV2ConnectedSession> {
+    apply_initialize_params(
+        &mut connect_args.client_name,
+        &mut connect_args.client_version,
+        &mut connect_args.experimental_api,
+        &mut connect_args.opt_out_notification_methods,
+        initialize,
+    );
+    let app_server = RemoteAppServerClient::connect_with_headers(
+        connect_args,
+        request_context.forwarding_headers(),
+    )
+    .await?;
+    Ok(GatewayV2ConnectedSession {
+        worker_id: Some(worker_id),
+        app_server: AppServerClient::Remote(app_server),
+    })
 }
 
 fn apply_initialize_params(
