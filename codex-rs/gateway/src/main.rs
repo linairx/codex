@@ -71,6 +71,9 @@ struct GatewayCli {
     #[arg(long = "v2-client-send-timeout-seconds", value_name = "SECONDS")]
     v2_client_send_timeout_seconds: Option<u64>,
 
+    #[arg(long = "v2-reconnect-retry-backoff-seconds", value_name = "SECONDS")]
+    v2_reconnect_retry_backoff_seconds: Option<u64>,
+
     #[arg(long = "v2-max-pending-server-requests", value_name = "COUNT")]
     v2_max_pending_server_requests: Option<usize>,
 
@@ -129,6 +132,11 @@ fn main() -> anyhow::Result<()> {
                     .v2_client_send_timeout_seconds
                     .map(std::time::Duration::from_secs)
                     .unwrap_or(default_gateway_config.v2_client_send_timeout),
+                v2_reconnect_retry_backoff: top_cli
+                    .inner
+                    .v2_reconnect_retry_backoff_seconds
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(default_gateway_config.v2_reconnect_retry_backoff),
                 v2_max_pending_server_requests: top_cli
                     .inner
                     .v2_max_pending_server_requests
