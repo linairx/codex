@@ -404,6 +404,7 @@ mod tests {
                 v2_transport: GatewayV2TransportConfig {
                     initialize_timeout_seconds: 30,
                     client_send_timeout_seconds: 10,
+                    reconnect_retry_backoff_seconds: 1,
                     max_pending_server_requests: 64,
                 },
                 remote_workers: None,
@@ -750,6 +751,7 @@ mod tests {
                     v2_transport: GatewayV2TransportConfig {
                         initialize_timeout_seconds: 30,
                         client_send_timeout_seconds: 10,
+                        reconnect_retry_backoff_seconds: 1,
                         max_pending_server_requests: 64,
                     },
                     remote_workers: None,
@@ -921,6 +923,7 @@ mod tests {
                     v2_transport: GatewayV2TransportConfig {
                         initialize_timeout_seconds: 30,
                         client_send_timeout_seconds: 10,
+                        reconnect_retry_backoff_seconds: 1,
                         max_pending_server_requests: 64,
                     },
                     remote_workers: Some(Vec::new()),

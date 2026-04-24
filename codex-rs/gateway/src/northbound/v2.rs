@@ -32,6 +32,9 @@ use codex_app_server_protocol::ExperimentalFeature;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
 use codex_app_server_protocol::ExperimentalFeatureListResponse;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
+use codex_app_server_protocol::FsUnwatchParams;
+use codex_app_server_protocol::FsWatchParams;
+use codex_app_server_protocol::FsWatchResponse;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::InitializeParams;
@@ -102,11 +105,11 @@ const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
     "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
 const MAX_CLOSE_REASON_BYTES: usize = 123;
-
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayV2Timeouts {
     pub initialize: Duration,
     pub client_send: Duration,
+    pub reconnect_retry_backoff: Duration,
     pub max_pending_server_requests: usize,
 }
 
@@ -115,6 +118,7 @@ impl Default for GatewayV2Timeouts {
         Self {
             initialize: Duration::from_secs(30),
             client_send: Duration::from_secs(10),
+            reconnect_retry_backoff: Duration::from_secs(1),
             max_pending_server_requests: MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
         }
     }
@@ -158,6 +162,7 @@ struct GatewayV2ReconnectState {
     session_factory: GatewayV2SessionFactory,
     initialize_params: InitializeParams,
     request_context: GatewayRequestContext,
+    retry_backoff: Duration,
 }
 
 #[derive(Clone)]
@@ -197,14 +202,33 @@ struct GatewayV2DownstreamRouter {
     shutdown_txs: Vec<tokio::sync::oneshot::Sender<()>>,
     event_tasks: Vec<JoinHandle<io::Result<()>>>,
     next_worker: usize,
+    initialized_notification_sent: bool,
+    active_fs_watches: HashMap<String, FsWatchParams>,
+    reconnect_retry_after: HashMap<usize, Instant>,
     reconnect_state: Option<GatewayV2ReconnectState>,
 }
 
 impl GatewayV2DownstreamRouter {
+    #[cfg(test)]
     async fn connect(
         session_factory: &GatewayV2SessionFactory,
         initialize_params: &InitializeParams,
         request_context: &GatewayRequestContext,
+    ) -> io::Result<Self> {
+        Self::connect_with_timeouts(
+            session_factory,
+            initialize_params,
+            request_context,
+            &GatewayV2Timeouts::default(),
+        )
+        .await
+    }
+
+    async fn connect_with_timeouts(
+        session_factory: &GatewayV2SessionFactory,
+        initialize_params: &InitializeParams,
+        request_context: &GatewayRequestContext,
+        timeouts: &GatewayV2Timeouts,
     ) -> io::Result<Self> {
         let sessions = session_factory
             .connect(initialize_params, request_context)
@@ -217,6 +241,7 @@ impl GatewayV2DownstreamRouter {
                     session_factory: session_factory.clone(),
                     initialize_params: initialize_params.clone(),
                     request_context: request_context.clone(),
+                    retry_backoff: timeouts.reconnect_retry_backoff,
                 })
             }
             _ => None,
@@ -228,6 +253,9 @@ impl GatewayV2DownstreamRouter {
             shutdown_txs: Vec::with_capacity(sessions.len()),
             event_tasks: Vec::with_capacity(sessions.len()),
             next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
             reconnect_state,
         };
 
@@ -317,6 +345,10 @@ impl GatewayV2DownstreamRouter {
     }
 
     async fn reconnect_missing_workers(&mut self) {
+        self.reconnect_missing_workers_at(Instant::now()).await;
+    }
+
+    async fn reconnect_missing_workers_at(&mut self, now: Instant) {
         let Some(reconnect_state) = self.reconnect_state.clone() else {
             return;
         };
@@ -326,6 +358,9 @@ impl GatewayV2DownstreamRouter {
 
         for worker_id in reconnect_state.configured_worker_ids {
             if self.has_worker(Some(worker_id)) {
+                continue;
+            }
+            if !self.should_attempt_worker_reconnect(worker_id, now) {
                 continue;
             }
             match reconnect_state
@@ -338,9 +373,28 @@ impl GatewayV2DownstreamRouter {
                 .await
             {
                 Ok(session) => {
+                    if let Err(err) = self.replay_connection_state(&session).await {
+                        self.record_worker_reconnect_failure(
+                            worker_id,
+                            now,
+                            reconnect_state.retry_backoff,
+                        );
+                        warn!(
+                            worker_id,
+                            %err,
+                            "failed to replay connection state to reconnected downstream worker session"
+                        );
+                        continue;
+                    }
+                    self.clear_worker_reconnect_failure(worker_id);
                     self.add_session(session);
                 }
                 Err(err) => {
+                    self.record_worker_reconnect_failure(
+                        worker_id,
+                        now,
+                        reconnect_state.retry_backoff,
+                    );
                     warn!(
                         worker_id,
                         %err,
@@ -359,6 +413,81 @@ impl GatewayV2DownstreamRouter {
             .sort_by_key(|worker| worker.worker_id.unwrap_or(usize::MAX));
         self.shutdown_txs.push(shutdown_tx);
         self.event_tasks.push(event_task);
+    }
+
+    fn mark_initialized(&mut self) {
+        self.initialized_notification_sent = true;
+    }
+
+    fn record_fs_watch(&mut self, params: FsWatchParams) {
+        self.active_fs_watches
+            .insert(params.watch_id.clone(), params);
+    }
+
+    fn clear_fs_watch(&mut self, watch_id: &str) {
+        self.active_fs_watches.remove(watch_id);
+    }
+
+    fn should_attempt_worker_reconnect(&self, worker_id: usize, now: Instant) -> bool {
+        self.reconnect_retry_after
+            .get(&worker_id)
+            .is_none_or(|retry_after| *retry_after <= now)
+    }
+
+    fn record_worker_reconnect_failure(
+        &mut self,
+        worker_id: usize,
+        now: Instant,
+        retry_backoff: Duration,
+    ) {
+        self.reconnect_retry_after
+            .insert(worker_id, now + retry_backoff);
+    }
+
+    fn clear_worker_reconnect_failure(&mut self, worker_id: usize) {
+        self.reconnect_retry_after.remove(&worker_id);
+    }
+
+    fn ensure_all_configured_workers_present_for(&self, label: &str) -> io::Result<()> {
+        let Some(reconnect_state) = &self.reconnect_state else {
+            return Ok(());
+        };
+
+        let missing_worker_ids = reconnect_state
+            .configured_worker_ids
+            .iter()
+            .copied()
+            .filter(|worker_id| !self.has_worker(Some(*worker_id)))
+            .collect::<Vec<_>>();
+        if missing_worker_ids.is_empty() {
+            return Ok(());
+        }
+
+        Err(io::Error::other(format!(
+            "required worker routes are unavailable for {label}: {missing_worker_ids:?}"
+        )))
+    }
+
+    async fn replay_connection_state(&self, session: &GatewayV2ConnectedSession) -> io::Result<()> {
+        let request_handle = session.app_server.request_handle();
+        if self.initialized_notification_sent {
+            request_handle
+                .notify(ClientNotification::Initialized)
+                .await?;
+        }
+        for params in self.active_fs_watches.values() {
+            request_handle
+                .request_typed::<FsWatchResponse>(ClientRequest::FsWatch {
+                    request_id: RequestId::String(format!(
+                        "gateway-replay-fs-watch:{watch_id}",
+                        watch_id = params.watch_id
+                    )),
+                    params: params.clone(),
+                })
+                .await
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
     }
 }
 
@@ -553,39 +682,43 @@ async fn run_websocket_connection(
             return Ok(());
         }
     };
-    let mut downstream =
-        match GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
-            .await
-        {
-            Ok(downstream) => downstream,
-            Err(err) => {
-                send_jsonrpc_error(
-                    &mut socket,
-                    initialize_request_id,
-                    JSONRPCErrorError {
-                        code: INTERNAL_ERROR_CODE,
-                        message: format!("gateway failed to connect downstream app-server: {err}"),
-                        data: None,
-                    },
-                    timeouts.client_send,
-                )
-                .await?;
-                observe_v2_request(
-                    &observability,
-                    &context,
-                    "initialize",
-                    "internal_error",
-                    initialize_started_at.elapsed(),
-                );
-                observe_v2_connection(
-                    &observability,
-                    &context,
-                    "downstream_connect_error",
-                    connection_started_at.elapsed(),
-                );
-                return Ok(());
-            }
-        };
+    let mut downstream = match GatewayV2DownstreamRouter::connect_with_timeouts(
+        &session_factory,
+        &initialize_params,
+        &context,
+        &timeouts,
+    )
+    .await
+    {
+        Ok(downstream) => downstream,
+        Err(err) => {
+            send_jsonrpc_error(
+                &mut socket,
+                initialize_request_id,
+                JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("gateway failed to connect downstream app-server: {err}"),
+                    data: None,
+                },
+                timeouts.client_send,
+            )
+            .await?;
+            observe_v2_request(
+                &observability,
+                &context,
+                "initialize",
+                "internal_error",
+                initialize_started_at.elapsed(),
+            );
+            observe_v2_connection(
+                &observability,
+                &context,
+                "downstream_connect_error",
+                connection_started_at.elapsed(),
+            );
+            return Ok(());
+        }
+    };
     send_jsonrpc(
         &mut socket,
         JSONRPCMessage::Response(JSONRPCResponse {
@@ -1028,6 +1161,9 @@ async fn handle_client_message(
         }
         JSONRPCMessage::Notification(notification) => {
             let is_initialized = notification.method == "initialized";
+            if is_initialized {
+                downstream.mark_initialized();
+            }
             if is_initialized && !downstream.single_worker() {
                 fanout_connection_notification(downstream, ClientNotification::Initialized).await?;
                 return Ok(());
@@ -1435,6 +1571,8 @@ async fn handle_client_request(
         }
 
         match request.method.as_str() {
+            "fs/watch" => return fanout_fs_watch_request(downstream, request).await,
+            "fs/unwatch" => return fanout_fs_unwatch_request(downstream, request).await,
             "app/list" if request_thread_id(&request).is_none() => {
                 return aggregate_apps_list_response(downstream, &request)
                     .await
@@ -1608,6 +1746,7 @@ async fn fanout_mutating_connection_request(
     downstream: &GatewayV2DownstreamRouter,
     request: JSONRPCRequest,
 ) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
     let mut primary_result = None;
 
     for (index, worker) in downstream.workers.iter().enumerate() {
@@ -1630,6 +1769,82 @@ async fn fanout_mutating_connection_request(
     })
 }
 
+async fn fanout_fs_watch_request(
+    downstream: &mut GatewayV2DownstreamRouter,
+    request: JSONRPCRequest,
+) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+    let params = request_params::<FsWatchParams>(&request)?;
+    let mut primary_result = None;
+    let mut watched_workers = Vec::new();
+
+    for (index, worker) in downstream.workers.iter().enumerate() {
+        let response = worker
+            .request_handle
+            .request(jsonrpc_request_to_client_request(request.clone())?)
+            .await?;
+        match response {
+            Ok(result) => {
+                watched_workers.push(worker.worker_id);
+                if index == 0 {
+                    primary_result = Some(result);
+                }
+            }
+            Err(error) => {
+                rollback_fs_watch_registrations(downstream, &params.watch_id, &watched_workers)
+                    .await;
+                return Ok(Err(error));
+            }
+        }
+    }
+
+    let Some(primary_result) = primary_result else {
+        return Err(io::Error::other(
+            "gateway v2 connection has no downstream app-server sessions",
+        ));
+    };
+
+    downstream.record_fs_watch(params);
+    Ok(Ok(primary_result))
+}
+
+async fn fanout_fs_unwatch_request(
+    downstream: &mut GatewayV2DownstreamRouter,
+    request: JSONRPCRequest,
+) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    let params = request_params::<FsUnwatchParams>(&request)?;
+    let result = fanout_mutating_connection_request(downstream, request).await?;
+    if result.is_ok() {
+        downstream.clear_fs_watch(&params.watch_id);
+    }
+    Ok(result)
+}
+
+async fn rollback_fs_watch_registrations(
+    downstream: &GatewayV2DownstreamRouter,
+    watch_id: &str,
+    worker_ids: &[Option<usize>],
+) {
+    for worker_id in worker_ids {
+        let Some(worker) = downstream
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == *worker_id)
+        else {
+            continue;
+        };
+        let _ = worker
+            .request_handle
+            .request(ClientRequest::FsUnwatch {
+                request_id: RequestId::String(format!("gateway-rollback-fs-watch:{watch_id}")),
+                params: FsUnwatchParams {
+                    watch_id: watch_id.to_string(),
+                },
+            })
+            .await;
+    }
+}
+
 async fn route_config_read_request_if_supported(
     downstream: &GatewayV2DownstreamRouter,
     request: JSONRPCRequest,
@@ -1642,6 +1857,7 @@ async fn route_config_read_request_if_supported(
             .request(jsonrpc_request_to_client_request(request)?)
             .await;
     };
+    downstream.ensure_all_configured_workers_present_for("config/read")?;
     let request_cwd = Path::new(cwd);
     let mut primary_result = None;
     let mut first_result = None;
@@ -1688,6 +1904,7 @@ async fn first_successful_connection_request(
     downstream: &GatewayV2DownstreamRouter,
     request: JSONRPCRequest,
 ) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
     let mut first_error = None;
 
     for worker in &downstream.workers {
@@ -1786,6 +2003,13 @@ fn worker_for_request<'a>(
         }
     }
 
+    if requires_primary_worker_route(request) && !downstream.has_worker(Some(0)) {
+        return Err(io::Error::other(format!(
+            "primary worker route is unavailable for {}",
+            request.method
+        )));
+    }
+
     downstream.primary_worker()
 }
 
@@ -1829,6 +2053,19 @@ fn worker_for_server_request(
                 "gateway v2 connection has no downstream server-request route for worker {worker_id:?}"
             ))
         })
+}
+
+fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
+    matches!(
+        request.method.as_str(),
+        "configRequirements/read"
+            | "account/login/cancel"
+            | "feedback/upload"
+            | "command/exec"
+            | "command/exec/write"
+            | "command/exec/resize"
+            | "command/exec/terminate"
+    ) || (request.method == "account/login/start" && !is_multi_worker_fanout_login_request(request))
 }
 
 fn config_read_response_matches_cwd(result: &Value, cwd: &Path) -> bool {
@@ -2656,6 +2893,7 @@ fn should_deduplicate_connection_notification(notification: &JSONRPCNotification
             | "account/rateLimits/updated"
             | "app/list/updated"
             | "mcpServer/startupStatus/updated"
+            | "externalAgentConfig/import/completed"
     )
 }
 
@@ -3020,10 +3258,16 @@ mod tests {
     use axum::routing::any;
     use codex_app_server_client::AppServerEvent;
     use codex_app_server_client::RemoteAppServerConnectArgs;
+    use codex_app_server_protocol::AppsListResponse;
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::CollaborationModeListResponse;
+    use codex_app_server_protocol::CommandExecOutputDeltaNotification;
+    use codex_app_server_protocol::CommandExecOutputStream;
     use codex_app_server_protocol::ContextCompactedNotification;
     use codex_app_server_protocol::ExperimentalFeatureListResponse;
+    use codex_app_server_protocol::FsUnwatchResponse;
+    use codex_app_server_protocol::FsWatchParams;
+    use codex_app_server_protocol::FsWatchResponse;
     use codex_app_server_protocol::GetAccountRateLimitsResponse;
     use codex_app_server_protocol::HookCompletedNotification;
     use codex_app_server_protocol::HookStartedNotification;
@@ -3040,6 +3284,7 @@ mod tests {
     use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
+    use codex_app_server_protocol::ListMcpServerStatusResponse;
     use codex_app_server_protocol::McpToolCallProgressNotification;
     use codex_app_server_protocol::ModelRerouteReason;
     use codex_app_server_protocol::ModelReroutedNotification;
@@ -3050,8 +3295,11 @@ mod tests {
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::ServerRequestResolvedNotification;
+    use codex_app_server_protocol::SkillsListResponse;
     use codex_app_server_protocol::TerminalInteractionNotification;
     use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadListResponse;
+    use codex_app_server_protocol::ThreadLoadedListResponse;
     use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
     use codex_app_server_protocol::ThreadTokenUsage;
     use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -3072,11 +3320,14 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Instant;
     use tempfile::tempdir;
     use tokio::io::AsyncRead;
     use tokio::io::AsyncWrite;
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
     use tokio::time::Duration;
@@ -3217,6 +3468,7 @@ mod tests {
             timeouts: GatewayV2Timeouts {
                 initialize: Duration::from_secs(30),
                 client_send: Duration::from_secs(10),
+                reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: 1,
             },
         })
@@ -3283,6 +3535,7 @@ mod tests {
             timeouts: GatewayV2Timeouts {
                 initialize: Duration::from_secs(30),
                 client_send: Duration::from_secs(10),
+                reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: 1,
             },
         })
@@ -3533,6 +3786,7 @@ mod tests {
             timeouts: GatewayV2Timeouts {
                 initialize: Duration::from_millis(50),
                 client_send: Duration::from_secs(10),
+                reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
             },
         })
@@ -4529,6 +4783,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observe_v2_connection_records_client_send_timeout_outcome() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let context = GatewayRequestContext::default();
+
+        super::observe_v2_connection(
+            &observability,
+            &context,
+            super::classify_v2_connection_error(&std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "gateway websocket send timed out",
+            )),
+            Duration::from_millis(9),
+        );
+
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        let mut saw_duration = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_connections" => {
+                    saw_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection count type"),
+                    }
+                }
+                "gateway_v2_connection_duration" => {
+                    saw_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 9.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection duration type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(saw_count, true);
+        assert_eq!(saw_duration, true);
+    }
+
     #[tokio::test]
     async fn websocket_upgrade_rejects_server_requests_above_pending_limit_without_closing() {
         let (rejection_observed_tx, rejection_observed_rx) = oneshot::channel();
@@ -4687,6 +5043,7 @@ mod tests {
             timeouts: GatewayV2Timeouts {
                 initialize: Duration::from_secs(30),
                 client_send: Duration::from_secs(10),
+                reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: 1,
             },
         })
@@ -5726,6 +6083,9 @@ mod tests {
                             shutdown_txs: Vec::new(),
                             event_tasks: Vec::new(),
                             next_worker: 0,
+                            initialized_notification_sent: false,
+                            active_fs_watches: HashMap::new(),
+                            reconnect_retry_after: HashMap::new(),
                             reconnect_state: None,
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -7745,6 +8105,64 @@ mod tests {
     async fn websocket_upgrade_forwards_additional_low_frequency_passthrough_requests() {
         let cases = vec![
             (
+                "command/exec",
+                "command-exec",
+                None,
+                Some(serde_json::json!({
+                    "command": ["sh", "-lc", "printf gateway-command-exec"],
+                    "processId": "proc-visible",
+                    "tty": true,
+                    "streamStdin": true,
+                    "streamStdoutStderr": true,
+                    "outputBytesCap": null,
+                    "timeoutMs": null,
+                    "cwd": null,
+                    "env": null,
+                    "size": {
+                        "rows": 24,
+                        "cols": 80,
+                    },
+                    "sandboxPolicy": null,
+                })),
+                serde_json::json!({
+                    "exitCode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }),
+            ),
+            (
+                "command/exec/write",
+                "command-exec-write",
+                None,
+                Some(serde_json::json!({
+                    "processId": "proc-visible",
+                    "deltaBase64": "AQID",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "command/exec/resize",
+                "command-exec-resize",
+                None,
+                Some(serde_json::json!({
+                    "processId": "proc-visible",
+                    "size": {
+                        "rows": 40,
+                        "cols": 120,
+                    },
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "command/exec/terminate",
+                "command-exec-terminate",
+                None,
+                Some(serde_json::json!({
+                    "processId": "proc-visible",
+                })),
+                serde_json::json!({}),
+            ),
+            (
                 "thread/archive",
                 "thread-archive",
                 Some("thread-visible"),
@@ -7976,6 +8394,47 @@ mod tests {
             server_task.abort();
             let _ = server_task.await;
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_command_exec_output_notifications() {
+        let notification =
+            ServerNotification::CommandExecOutputDelta(CommandExecOutputDeltaNotification {
+                process_id: "proc-visible".to_string(),
+                stream: CommandExecOutputStream::Stdout,
+                delta_base64: "AQID".to_string(),
+                cap_reached: false,
+            });
+        let expected =
+            tagged_type_to_notification(&notification).expect("notification should serialize");
+        let websocket_url = start_mock_remote_server_for_notification(notification).await;
+        let (addr, server_task) = spawn_remote_gateway_v2_test_server(
+            websocket_url,
+            Arc::new(GatewayScopeRegistry::default()),
+        )
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize_with_capabilities(
+            &mut websocket,
+            Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: None,
+            }),
+        )
+        .await;
+
+        let JSONRPCMessage::Notification(actual) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected command/exec/outputDelta notification");
+        };
+        assert_eq!(actual, expected);
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -9504,6 +9963,1337 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_skills_list() {
+        let worker_a = start_mock_remote_server_for_reconnectable_skills_list(
+            "/tmp/worker-a",
+            vec!["skill-a"],
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_skills_list(
+            "/tmp/worker-b",
+            vec!["skill-b"],
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router = timeout(
+            Duration::from_secs(2),
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context),
+        )
+        .await
+        .expect("downstream router connect should finish in time")
+        .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("skills-list".to_string()),
+                method: "skills/list".to_string(),
+                params: Some(serde_json::json!({})),
+                trace: None,
+            },
+        )
+        .await
+        .expect("skills/list should reach downstream workers")
+        .expect("skills/list should succeed after reconnecting the missing worker");
+
+        let mut response: SkillsListResponse =
+            serde_json::from_value(result).expect("skills/list response should decode");
+        response.data.sort_by(|a, b| a.cwd.cmp(&b.cwd));
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].cwd, PathBuf::from("/tmp/worker-a"));
+        assert_eq!(response.data[0].skills.len(), 1);
+        assert_eq!(response.data[0].skills[0].name, "skill-a");
+        assert_eq!(response.data[1].cwd, PathBuf::from("/tmp/worker-b"));
+        assert_eq!(response.data[1].skills.len(), 1);
+        assert_eq!(response.data[1].skills[0].name, "skill-b");
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_app_list() {
+        let worker_a = start_mock_remote_server_for_reconnectable_app_list(vec![(
+            "worker-a-app",
+            "Worker A App",
+        )])
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_app_list(vec![(
+            "worker-b-app",
+            "Worker B App",
+        )])
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("app-list".to_string()),
+                method: "app/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 25,
+                    "threadId": null,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("app/list should reach downstream workers")
+        .expect("app/list should succeed after reconnecting the missing worker");
+
+        let mut response: AppsListResponse =
+            serde_json::from_value(result).expect("app/list response should decode");
+        response.data.sort_by(|a, b| a.id.cmp(&b.id));
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(response.next_cursor, None);
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].id, "worker-a-app");
+        assert_eq!(response.data[0].name, "Worker A App");
+        assert_eq!(response.data[1].id, "worker-b-app");
+        assert_eq!(response.data[1].name, "Worker B App");
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_mcp_server_status_list()
+     {
+        let worker_a =
+            start_mock_remote_server_for_reconnectable_mcp_server_status_list(vec!["worker-a-mcp"])
+                .await;
+        let worker_b =
+            start_mock_remote_server_for_reconnectable_mcp_server_status_list(vec!["worker-b-mcp"])
+                .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("mcp-server-status-list".to_string()),
+                method: "mcpServerStatus/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 25,
+                    "detail": "toolsAndAuthOnly",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("mcpServerStatus/list should reach downstream workers")
+        .expect("mcpServerStatus/list should succeed after reconnecting the missing worker");
+
+        let mut response: ListMcpServerStatusResponse =
+            serde_json::from_value(result).expect("mcpServerStatus/list response should decode");
+        response.data.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(response.next_cursor, None);
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].name, "worker-a-mcp");
+        assert_eq!(response.data[1].name, "worker-b-mcp");
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_plugin_list() {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "plugin/list",
+            serde_json::json!({
+                "marketplaces": [{
+                    "name": "worker-a-marketplace",
+                    "path": "/tmp/worker-a/plugins/marketplace.json",
+                    "interface": {
+                        "displayName": "Worker A Marketplace",
+                    },
+                    "plugins": [{
+                        "id": "worker-a-plugin@local",
+                        "name": "worker-a-plugin",
+                        "source": {
+                            "type": "local",
+                            "path": "/tmp/worker-a/plugins/worker-a-plugin",
+                        },
+                        "installed": false,
+                        "enabled": false,
+                        "installPolicy": "AVAILABLE",
+                        "authPolicy": "ON_USE",
+                        "interface": {
+                            "displayName": "Worker A Plugin",
+                            "shortDescription": "Worker A plugin",
+                            "longDescription": null,
+                            "developerName": null,
+                            "category": null,
+                            "capabilities": [],
+                            "websiteUrl": null,
+                            "privacyPolicyUrl": null,
+                            "termsOfServiceUrl": null,
+                            "defaultPrompt": null,
+                            "brandColor": null,
+                            "composerIcon": null,
+                            "composerIconUrl": null,
+                            "logo": null,
+                            "logoUrl": null,
+                            "screenshots": [],
+                            "screenshotUrls": [],
+                        },
+                    }],
+                }],
+                "marketplaceLoadErrors": [],
+                "featuredPluginIds": ["worker-a-plugin@local"],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "plugin/list",
+            serde_json::json!({
+                "marketplaces": [{
+                    "name": "worker-b-marketplace",
+                    "path": "/tmp/worker-b/plugins/marketplace.json",
+                    "interface": {
+                        "displayName": "Worker B Marketplace",
+                    },
+                    "plugins": [{
+                        "id": "worker-b-plugin@local",
+                        "name": "worker-b-plugin",
+                        "source": {
+                            "type": "local",
+                            "path": "/tmp/worker-b/plugins/worker-b-plugin",
+                        },
+                        "installed": true,
+                        "enabled": true,
+                        "installPolicy": "AVAILABLE",
+                        "authPolicy": "ON_USE",
+                        "interface": {
+                            "displayName": "Worker B Plugin",
+                            "shortDescription": "Worker B plugin",
+                            "longDescription": null,
+                            "developerName": null,
+                            "category": null,
+                            "capabilities": [],
+                            "websiteUrl": null,
+                            "privacyPolicyUrl": null,
+                            "termsOfServiceUrl": null,
+                            "defaultPrompt": null,
+                            "brandColor": null,
+                            "composerIcon": null,
+                            "composerIconUrl": null,
+                            "logo": null,
+                            "logoUrl": null,
+                            "screenshots": [],
+                            "screenshotUrls": [],
+                        },
+                    }],
+                }],
+                "marketplaceLoadErrors": [],
+                "featuredPluginIds": ["worker-b-plugin@local"],
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("plugin-list".to_string()),
+                method: "plugin/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cwds": ["/tmp/project"],
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("plugin/list should reach downstream workers")
+        .expect("plugin/list should succeed after reconnecting the missing worker");
+
+        let response: PluginListResponse =
+            serde_json::from_value(result).expect("plugin/list response should decode");
+        let mut plugin_ids = response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| marketplace.plugins.iter().map(|plugin| plugin.id.clone()))
+            .collect::<Vec<_>>();
+        plugin_ids.sort();
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(response.marketplaces.len(), 2);
+        assert_eq!(
+            plugin_ids,
+            vec![
+                "worker-a-plugin@local".to_string(),
+                "worker-b-plugin@local".to_string(),
+            ]
+        );
+        assert_eq!(
+            response.featured_plugin_ids,
+            vec![
+                "worker-a-plugin@local".to_string(),
+                "worker-b-plugin@local".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_account_read() {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "account/read",
+            serde_json::json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "worker-a@example.com",
+                    "planType": "plus",
+                },
+                "requiresOpenaiAuth": false,
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "account/read",
+            serde_json::json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "worker-b@example.com",
+                    "planType": "enterprise",
+                },
+                "requiresOpenaiAuth": true,
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("account-read".to_string()),
+                method: "account/read".to_string(),
+                params: Some(serde_json::json!({
+                    "refreshToken": false,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("account/read should reach downstream workers")
+        .expect("account/read should succeed after reconnecting the missing worker");
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "worker-a@example.com",
+                    "planType": "plus",
+                },
+                "requiresOpenaiAuth": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_account_rate_limits_read()
+     {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "account/rateLimits/read",
+            serde_json::json!({
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": "Codex",
+                    "primary": {
+                        "usedPercent": 20,
+                        "windowMinutes": 300,
+                        "resetsAt": 1_700_000_000,
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "planType": null,
+                    "rateLimitReachedType": null,
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "limitName": "Codex",
+                        "primary": {
+                            "usedPercent": 20,
+                            "windowMinutes": 300,
+                            "resetsAt": 1_700_000_000,
+                        },
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    }
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "account/rateLimits/read",
+            serde_json::json!({
+                "rateLimits": {
+                    "limitId": "worker-b",
+                    "limitName": "Worker B",
+                    "primary": {
+                        "usedPercent": 35,
+                        "windowMinutes": 300,
+                        "resetsAt": 1_700_000_500,
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "planType": null,
+                    "rateLimitReachedType": null,
+                },
+                "rateLimitsByLimitId": {
+                    "worker-b": {
+                        "limitId": "worker-b",
+                        "limitName": "Worker B",
+                        "primary": {
+                            "usedPercent": 35,
+                            "windowMinutes": 300,
+                            "resetsAt": 1_700_000_500,
+                        },
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    }
+                },
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("account-rate-limits-read".to_string()),
+                method: "account/rateLimits/read".to_string(),
+                params: Some(serde_json::json!({})),
+                trace: None,
+            },
+        )
+        .await
+        .expect("account/rateLimits/read should reach downstream workers")
+        .expect("account/rateLimits/read should succeed after reconnecting the missing worker");
+
+        let response: GetAccountRateLimitsResponse =
+            serde_json::from_value(result).expect("rate limits should decode");
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(response.rate_limits.limit_id.as_deref(), Some("codex"));
+        assert_eq!(response.rate_limits.limit_name.as_deref(), Some("Codex"));
+        assert_eq!(
+            response.rate_limits_by_limit_id.as_ref().map(HashMap::len),
+            Some(2)
+        );
+        assert_eq!(
+            response
+                .rate_limits_by_limit_id
+                .as_ref()
+                .and_then(|limits| limits.get("worker-b"))
+                .and_then(|limits| limits.limit_name.as_deref()),
+            Some("Worker B")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_model_list() {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "model/list",
+            serde_json::json!({
+                "data": [reconnectable_model_json("worker-a-model", "Worker A Model", true)],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "model/list",
+            serde_json::json!({
+                "data": [reconnectable_model_json("worker-b-model", "Worker B Model", false)],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("model-list".to_string()),
+                method: "model/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": null,
+                    "includeHidden": true,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("model/list should reach downstream workers")
+        .expect("model/list should succeed after reconnecting the missing worker");
+
+        let mut model_ids = result["data"]
+            .as_array()
+            .expect("model/list response should include data array")
+            .iter()
+            .map(|model| {
+                model["model"]
+                    .as_str()
+                    .expect("model/list response should include model id")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        model_ids.sort();
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(result["nextCursor"], Value::Null);
+        assert_eq!(
+            model_ids,
+            vec!["worker-a-model".to_string(), "worker-b-model".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_external_agent_config_detect()
+     {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "externalAgentConfig/detect",
+            serde_json::json!({
+                "items": [{
+                    "itemType": "AGENTS_MD",
+                    "description": "Import AGENTS.md from /tmp/worker-a",
+                    "cwd": "/tmp/worker-a",
+                    "details": null,
+                }],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "externalAgentConfig/detect",
+            serde_json::json!({
+                "items": [{
+                    "itemType": "CONFIG",
+                    "description": "Import config from /tmp/worker-b",
+                    "cwd": "/tmp/worker-b",
+                    "details": null,
+                }],
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("external-agent-config-detect".to_string()),
+                method: "externalAgentConfig/detect".to_string(),
+                params: Some(serde_json::json!({
+                    "includeHome": true,
+                    "cwds": ["/tmp/project"],
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("externalAgentConfig/detect should reach downstream workers")
+        .expect("externalAgentConfig/detect should succeed after reconnecting the missing worker");
+
+        let mut descriptions = result["items"]
+            .as_array()
+            .expect("externalAgentConfig/detect response should include items")
+            .iter()
+            .map(|item| {
+                item["description"]
+                    .as_str()
+                    .expect("externalAgentConfig/detect item should include description")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        descriptions.sort();
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            descriptions,
+            vec![
+                "Import AGENTS.md from /tmp/worker-a".to_string(),
+                "Import config from /tmp/worker-b".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_experimental_feature_list()
+     {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "experimentalFeature/list",
+            serde_json::json!({
+                "data": [{
+                    "name": "worker-a-feature",
+                    "stage": "beta",
+                    "displayName": "Worker A Feature",
+                    "description": "From worker A",
+                    "announcement": null,
+                    "enabled": false,
+                    "defaultEnabled": false,
+                }],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "experimentalFeature/list",
+            serde_json::json!({
+                "data": [{
+                    "name": "worker-b-feature",
+                    "stage": "beta",
+                    "displayName": "Worker B Feature",
+                    "description": "From worker B",
+                    "announcement": null,
+                    "enabled": true,
+                    "defaultEnabled": false,
+                }],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("experimental-feature-list".to_string()),
+                method: "experimentalFeature/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 20,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("experimentalFeature/list should reach downstream workers")
+        .expect("experimentalFeature/list should succeed after reconnecting the missing worker");
+
+        let response: ExperimentalFeatureListResponse =
+            serde_json::from_value(result).expect("experimental features should decode");
+        let feature_names = response
+            .data
+            .iter()
+            .map(|feature| feature.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(feature_names, vec!["worker-a-feature", "worker-b-feature"]);
+        assert_eq!(response.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_collaboration_mode_list()
+     {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "collaborationMode/list",
+            serde_json::json!({
+                "data": [{
+                    "name": "worker-a-default",
+                    "mode": "default",
+                    "model": "gpt-5-worker-a",
+                    "reasoningEffort": null,
+                }],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "collaborationMode/list",
+            serde_json::json!({
+                "data": [{
+                    "name": "worker-b-default",
+                    "mode": "plan",
+                    "model": "gpt-5-worker-b",
+                    "reasoningEffort": null,
+                }],
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("collaboration-mode-list".to_string()),
+                method: "collaborationMode/list".to_string(),
+                params: Some(serde_json::json!({})),
+                trace: None,
+            },
+        )
+        .await
+        .expect("collaborationMode/list should reach downstream workers")
+        .expect("collaborationMode/list should succeed after reconnecting the missing worker");
+
+        let response: CollaborationModeListResponse =
+            serde_json::from_value(result).expect("collaboration modes should decode");
+        let mode_names = response
+            .data
+            .iter()
+            .map(|mode| mode.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(mode_names, vec!["worker-a-default", "worker-b-default"]);
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_realtime_list_voices()
+     {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "thread/realtime/listVoices",
+            serde_json::json!({
+                "voices": {
+                    "v1": ["juniper", "maple"],
+                    "v2": ["alloy"],
+                    "defaultV1": "juniper",
+                    "defaultV2": "alloy",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "thread/realtime/listVoices",
+            serde_json::json!({
+                "voices": {
+                    "v1": ["maple", "cove"],
+                    "v2": ["alloy", "marin"],
+                    "defaultV1": "cove",
+                    "defaultV2": "marin",
+                },
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("realtime-list-voices".to_string()),
+                method: "thread/realtime/listVoices".to_string(),
+                params: Some(serde_json::json!({})),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/realtime/listVoices should reach downstream workers")
+        .expect("thread/realtime/listVoices should succeed after reconnecting the missing worker");
+
+        let response: ThreadRealtimeListVoicesResponse = serde_json::from_value(result)
+            .expect("thread/realtime/listVoices response should decode");
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            response,
+            ThreadRealtimeListVoicesResponse {
+                voices: RealtimeVoicesList {
+                    v1: vec![
+                        RealtimeVoice::Juniper,
+                        RealtimeVoice::Maple,
+                        RealtimeVoice::Cove,
+                    ],
+                    v2: vec![RealtimeVoice::Alloy, RealtimeVoice::Marin],
+                    default_v1: RealtimeVoice::Juniper,
+                    default_v2: RealtimeVoice::Alloy,
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn handle_client_request_routes_multi_worker_config_read_by_matching_cwd() {
         let (worker_a_tx, worker_a_rx) = oneshot::channel();
         let worker_a = start_mock_remote_server_for_single_request(
@@ -9643,6 +11433,1609 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_config_read_by_matching_cwd() {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "config/read",
+            serde_json::json!({
+                "config": {
+                    "model": "gpt-5-worker-a",
+                },
+                "origins": {},
+                "layers": [{
+                    "name": {
+                        "type": "user",
+                        "file": "/tmp/worker-a/config.toml",
+                    },
+                    "version": "worker-a-config-version",
+                    "config": {
+                        "model": "gpt-5-worker-a",
+                    },
+                    "disabledReason": null,
+                }],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "config/read",
+            serde_json::json!({
+                "config": {
+                    "model": "gpt-5-worker-b",
+                },
+                "origins": {},
+                "layers": [{
+                    "name": {
+                        "type": "project",
+                        "dotCodexFolder": "/tmp/worker-b",
+                    },
+                    "version": "worker-b-config-version",
+                    "config": {
+                        "model": "gpt-5-worker-b",
+                    },
+                    "disabledReason": null,
+                }],
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("config-read".to_string()),
+                method: "config/read".to_string(),
+                params: Some(serde_json::json!({
+                    "includeLayers": true,
+                    "cwd": "/tmp/worker-b/subdir",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("config/read should reach downstream workers")
+        .expect("config/read should succeed after reconnecting the missing worker");
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "config": {
+                    "model": "gpt-5-worker-b",
+                },
+                "origins": {},
+                "layers": [{
+                    "name": {
+                        "type": "project",
+                        "dotCodexFolder": "/tmp/worker-b",
+                    },
+                    "version": "worker-b-config-version",
+                    "config": {
+                        "model": "gpt-5-worker-b",
+                    },
+                    "disabledReason": null,
+                }],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_thread_list() {
+        let worker_a = start_mock_remote_server_for_thread_list_and_read(
+            "thread-worker-a",
+            "Worker A thread",
+            "/tmp/worker-a",
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_thread_list_and_read(
+            "thread-worker-b",
+            "Worker B thread",
+            "/tmp/worker-b",
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-a".to_string(), context.clone());
+        scope_registry.register_thread("thread-worker-b".to_string(), context.clone());
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-list".to_string()),
+                method: "thread/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 10,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/list should reach downstream workers")
+        .expect("thread/list should succeed after reconnecting the missing worker");
+
+        let listed: ThreadListResponse =
+            serde_json::from_value(result).expect("thread list response should decode");
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(listed.next_cursor, None);
+        assert_eq!(listed.backwards_cursor, None);
+        assert_eq!(
+            listed
+                .data
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-worker-b", "thread-worker-a"]
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), Some(0));
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_loaded_thread_list()
+    {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "thread/loaded/list",
+            serde_json::json!({
+                "data": ["thread-worker-a"],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "thread/loaded/list",
+            serde_json::json!({
+                "data": ["thread-worker-b"],
+                "nextCursor": null,
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-a".to_string(), context.clone());
+        scope_registry.register_thread("thread-worker-b".to_string(), context.clone());
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-loaded-list".to_string()),
+                method: "thread/loaded/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 10,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/loaded/list should reach downstream workers")
+        .expect("thread/loaded/list should succeed after reconnecting the missing worker");
+
+        let loaded: ThreadLoadedListResponse =
+            serde_json::from_value(result).expect("loaded thread list response should decode");
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(loaded.next_cursor, None);
+        assert_eq!(loaded.data, vec!["thread-worker-a", "thread-worker-b"]);
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), Some(0));
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_plugin_management_fallback_requests()
+     {
+        let cases = vec![
+            (
+                "plugin/read",
+                serde_json::json!({
+                    "marketplacePath": "/tmp/project/plugins/demo-marketplace.json",
+                    "remoteMarketplaceName": null,
+                    "pluginName": "demo-plugin",
+                }),
+                serde_json::json!({
+                    "plugin": {
+                        "marketplaceName": "demo-marketplace",
+                        "marketplacePath": "/tmp/project/plugins/demo-marketplace.json",
+                        "summary": {
+                            "id": "demo-plugin@local",
+                            "name": "demo-plugin",
+                            "source": {
+                                "type": "local",
+                                "path": "/tmp/project/plugins/demo-plugin",
+                            },
+                            "installed": false,
+                            "enabled": false,
+                            "installPolicy": "AVAILABLE",
+                            "authPolicy": "ON_USE",
+                            "interface": {
+                                "displayName": "Demo Plugin",
+                                "shortDescription": "Gateway passthrough plugin",
+                                "longDescription": null,
+                                "developerName": null,
+                                "category": null,
+                                "capabilities": [],
+                                "websiteUrl": null,
+                                "privacyPolicyUrl": null,
+                                "termsOfServiceUrl": null,
+                                "defaultPrompt": null,
+                                "brandColor": null,
+                                "composerIcon": null,
+                                "composerIconUrl": null,
+                                "logo": null,
+                                "logoUrl": null,
+                                "screenshots": [],
+                                "screenshotUrls": [],
+                            },
+                        },
+                        "description": "Gateway passthrough plugin description",
+                        "skills": [],
+                        "apps": [],
+                        "mcpServers": [],
+                    },
+                }),
+            ),
+            (
+                "plugin/install",
+                serde_json::json!({
+                    "marketplacePath": "/tmp/project/plugins/demo-marketplace.json",
+                    "remoteMarketplaceName": null,
+                    "pluginName": "demo-plugin",
+                }),
+                serde_json::json!({
+                    "authPolicy": "ON_USE",
+                    "appsNeedingAuth": [],
+                }),
+            ),
+            (
+                "plugin/uninstall",
+                serde_json::json!({
+                    "pluginId": "demo-plugin@local",
+                }),
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+                method,
+                params.clone(),
+                JSONRPCErrorError {
+                    code: super::INVALID_PARAMS_CODE,
+                    message: format!("{method} missing on worker-a"),
+                    data: None,
+                },
+            )
+            .await;
+            let worker_b =
+                start_mock_remote_server_for_reconnectable_request(method, expected_result.clone())
+                    .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert_eq!(router.worker_count(), 2);
+            assert!(
+                router.remove_worker(Some(1)),
+                "test should drop the second worker before reconnect"
+            );
+            assert_eq!(router.worker_count(), 1);
+
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::default();
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let result = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                },
+            )
+            .await
+            .expect("plugin management request should reach downstream workers")
+            .expect(
+                "plugin management request should succeed after reconnecting the missing worker",
+            );
+
+            assert_eq!(router.worker_count(), 2);
+            assert_eq!(result, expected_result);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_fanout_setup_mutations() {
+        let cases = vec![
+            (
+                "externalAgentConfig/import",
+                serde_json::json!({
+                    "migrationItems": [],
+                }),
+                serde_json::json!({}),
+            ),
+            (
+                "config/batchWrite",
+                serde_json::json!({
+                    "edits": [],
+                    "filePath": "/tmp/shared/config.toml",
+                    "expectedVersion": null,
+                    "reloadUserConfig": true,
+                }),
+                serde_json::json!({
+                    "status": "ok",
+                    "version": "worker-a",
+                    "filePath": "/tmp/shared/config.toml",
+                    "overriddenMetadata": null,
+                }),
+            ),
+            (
+                "config/value/write",
+                serde_json::json!({
+                    "keyPath": "plugins.shared-plugin",
+                    "value": {
+                        "enabled": true,
+                    },
+                    "mergeStrategy": "upsert",
+                    "filePath": null,
+                    "expectedVersion": null,
+                }),
+                serde_json::json!({
+                    "status": "ok",
+                    "version": "worker-a",
+                    "filePath": "/tmp/shared/config.toml",
+                    "overriddenMetadata": null,
+                }),
+            ),
+            (
+                "memory/reset",
+                serde_json::Value::Null,
+                serde_json::json!({}),
+            ),
+            (
+                "account/logout",
+                serde_json::Value::Null,
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert_eq!(router.worker_count(), 2);
+            assert!(
+                router.remove_worker(Some(1)),
+                "test should drop the second worker before reconnect"
+            );
+            assert_eq!(router.worker_count(), 1);
+
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::default();
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let result = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params: (params != serde_json::Value::Null).then_some(params),
+                    trace: None,
+                },
+            )
+            .await
+            .expect("setup mutation request should reach downstream workers")
+            .expect("setup mutation request should succeed after reconnecting the missing worker");
+
+            assert_eq!(router.worker_count(), 2);
+            assert_eq!(result, expected_result);
+            assert_eq!(*worker_a_requests.lock().await, vec![method.to_string()]);
+            assert_eq!(*worker_b_requests.lock().await, vec![method.to_string()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_fs_watch_and_unwatch() {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_server_for_reconnectable_fs_watch_and_unwatch().await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_server_for_reconnectable_fs_watch_and_unwatch().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let watch_result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("fs-watch".to_string()),
+                method: "fs/watch".to_string(),
+                params: Some(serde_json::json!({
+                    "watchId": "watch-shared",
+                    "path": "/tmp/shared/project/.git/HEAD",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("fs/watch should reach downstream workers")
+        .expect("fs/watch should succeed after reconnecting the missing worker");
+        let watch_response: FsWatchResponse =
+            serde_json::from_value(watch_result).expect("fs/watch response should decode");
+        assert_eq!(
+            watch_response.path.as_ref().to_string_lossy(),
+            "/tmp/shared/project/.git/HEAD"
+        );
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            *worker_a_requests.lock().await,
+            vec!["fs/watch".to_string()]
+        );
+        assert_eq!(
+            *worker_b_requests.lock().await,
+            vec!["fs/watch".to_string()]
+        );
+
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker again before reconnecting unwatch"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let unwatch_result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("fs-unwatch".to_string()),
+                method: "fs/unwatch".to_string(),
+                params: Some(serde_json::json!({
+                    "watchId": "watch-shared",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("fs/unwatch should reach downstream workers")
+        .expect("fs/unwatch should succeed after reconnecting the missing worker");
+        let _: FsUnwatchResponse =
+            serde_json::from_value(unwatch_result).expect("fs/unwatch response should decode");
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            *worker_a_requests.lock().await,
+            vec!["fs/watch".to_string(), "fs/unwatch".to_string()]
+        );
+        assert_eq!(
+            *worker_b_requests.lock().await,
+            vec!["fs/watch".to_string(), "fs/unwatch".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_primary_worker_before_primary_worker_requests()
+     {
+        let cases = vec![
+            (
+                "configRequirements/read",
+                None,
+                serde_json::json!({
+                    "requirements": [],
+                    "validationErrors": [],
+                }),
+            ),
+            (
+                "account/login/start",
+                Some(serde_json::json!({
+                    "type": "chatgpt",
+                })),
+                serde_json::json!({
+                    "type": "chatgpt",
+                    "loginId": "login-reconnected",
+                    "authUrl": "https://example.com/login",
+                }),
+            ),
+            (
+                "account/login/cancel",
+                Some(serde_json::json!({
+                    "loginId": "login-reconnected",
+                })),
+                serde_json::json!({
+                    "status": "canceled",
+                }),
+            ),
+            (
+                "command/exec",
+                Some(serde_json::json!({
+                    "command": ["sh", "-lc", "printf gateway-reconnected-command"],
+                    "processId": "proc-reconnected",
+                    "tty": true,
+                    "streamStdin": true,
+                    "streamStdoutStderr": true,
+                    "outputBytesCap": null,
+                    "timeoutMs": null,
+                    "cwd": null,
+                    "env": null,
+                    "size": {
+                        "rows": 24,
+                        "cols": 80,
+                    },
+                    "sandboxPolicy": null,
+                })),
+                serde_json::json!({
+                    "exitCode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }),
+            ),
+            (
+                "command/exec/write",
+                Some(serde_json::json!({
+                    "processId": "proc-reconnected",
+                    "deltaBase64": "AQID",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "command/exec/resize",
+                Some(serde_json::json!({
+                    "processId": "proc-reconnected",
+                    "size": {
+                        "rows": 40,
+                        "cols": 120,
+                    },
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "command/exec/terminate",
+                Some(serde_json::json!({
+                    "processId": "proc-reconnected",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "feedback/upload",
+                Some(serde_json::json!({
+                    "classification": "bug",
+                    "reason": "gateway reconnect regression",
+                    "threadId": "thread-visible",
+                    "includeLogs": false,
+                    "extraLogFiles": [],
+                    "tags": {},
+                })),
+                serde_json::json!({
+                    "threadId": "feedback-thread-reconnected",
+                }),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            if method == "feedback/upload" {
+                scope_registry.register_thread("thread-visible".to_string(), context.clone());
+            }
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert_eq!(router.worker_count(), 2);
+            assert!(
+                router.remove_worker(Some(0)),
+                "test should drop the primary worker before reconnect"
+            );
+            assert_eq!(router.worker_count(), 1);
+
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::default();
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let result = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params: params.clone(),
+                    trace: None,
+                },
+            )
+            .await
+            .expect("primary-worker request should reach downstream workers")
+            .expect("primary-worker request should succeed after reconnecting the primary worker");
+
+            assert_eq!(router.worker_count(), 2);
+            assert_eq!(result, expected_result);
+            assert_eq!(*worker_a_requests.lock().await, vec![method.to_string()]);
+            assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_fallback_primary_worker_requests_during_reconnect_backoff()
+     {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_server_for_reconnectable_request_with_recording(
+                "command/exec",
+                serde_json::json!({
+                    "exitCode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }),
+            )
+            .await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_server_for_reconnectable_request_with_recording(
+                "command/exec",
+                serde_json::json!({
+                    "exitCode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }),
+            )
+            .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert!(
+            router.remove_worker(Some(0)),
+            "test should drop the primary worker before applying reconnect backoff"
+        );
+        router.record_worker_reconnect_failure(0, Instant::now(), Duration::from_secs(60));
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let err = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("command-exec-request".to_string()),
+                method: "command/exec".to_string(),
+                params: Some(serde_json::json!({
+                    "command": ["sh", "-lc", "printf gateway-reconnected-command"],
+                    "processId": "proc-reconnected",
+                    "tty": true,
+                    "streamStdin": true,
+                    "streamStdoutStderr": true,
+                    "outputBytesCap": null,
+                    "timeoutMs": null,
+                    "cwd": null,
+                    "env": null,
+                    "size": {
+                        "rows": 24,
+                        "cols": 80,
+                    },
+                    "sandboxPolicy": null,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("primary-worker request should not fall back during reconnect backoff");
+
+        assert_eq!(
+            err.to_string(),
+            "primary worker route is unavailable for command/exec"
+        );
+        assert_eq!(router.worker_count(), 1);
+        assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+        assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_apply_fanout_setup_mutations_during_reconnect_backoff()
+    {
+        let cases = vec![
+            (
+                "externalAgentConfig/import",
+                Some(serde_json::json!({
+                    "migrationItems": [],
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "config/batchWrite",
+                Some(serde_json::json!({
+                    "edits": [],
+                    "filePath": "/tmp/shared/config.toml",
+                    "expectedVersion": null,
+                    "reloadUserConfig": true,
+                })),
+                serde_json::json!({
+                    "status": "ok",
+                    "version": "worker-a",
+                    "filePath": "/tmp/shared/config.toml",
+                    "overriddenMetadata": null,
+                }),
+            ),
+            (
+                "config/value/write",
+                Some(serde_json::json!({
+                    "keyPath": "plugins.shared-plugin",
+                    "value": {
+                        "enabled": true,
+                    },
+                    "mergeStrategy": "upsert",
+                    "filePath": null,
+                    "expectedVersion": null,
+                })),
+                serde_json::json!({
+                    "status": "ok",
+                    "version": "worker-a",
+                    "filePath": "/tmp/shared/config.toml",
+                    "overriddenMetadata": null,
+                }),
+            ),
+            ("memory/reset", None, serde_json::json!({})),
+            ("account/logout", None, serde_json::json!({})),
+            (
+                "account/login/start",
+                Some(serde_json::json!({
+                    "type": "apiKey",
+                    "apiKey": "sk-test",
+                })),
+                serde_json::json!({
+                    "type": "apiKey",
+                    "accountId": "acct-worker-a",
+                }),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert!(
+                router.remove_worker(Some(1)),
+                "test should drop the second worker before applying reconnect backoff"
+            );
+            router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::default();
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let err = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params: params.clone(),
+                    trace: None,
+                },
+            )
+            .await
+            .expect_err("fanout setup mutation should fail closed during reconnect backoff");
+
+            assert_eq!(
+                err.to_string(),
+                format!("required worker routes are unavailable for {method}: [1]")
+            );
+            assert_eq!(router.worker_count(), 1);
+            assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+            assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_apply_fs_watch_during_reconnect_backoff() {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_server_for_reconnectable_fs_watch_and_unwatch().await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_server_for_reconnectable_fs_watch_and_unwatch().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before applying reconnect backoff"
+        );
+        router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let err = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("fs-watch".to_string()),
+                method: "fs/watch".to_string(),
+                params: Some(serde_json::json!({
+                    "watchId": "watch-shared",
+                    "path": "/tmp/shared/project/.git/HEAD",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("fs/watch should fail closed during reconnect backoff");
+
+        assert_eq!(
+            err.to_string(),
+            "required worker routes are unavailable for fs/watch: [1]"
+        );
+        assert_eq!(router.worker_count(), 1);
+        assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+        assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_fallback_config_read_by_cwd_during_reconnect_backoff() {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "config/read",
+            serde_json::json!({
+                "config": {
+                    "model": "gpt-5-worker-a",
+                },
+                "origins": {},
+                "layers": [{
+                    "name": {
+                        "type": "user",
+                        "file": "/tmp/worker-a/config.toml",
+                    },
+                    "version": "worker-a-config-version",
+                    "config": {
+                        "model": "gpt-5-worker-a",
+                    },
+                    "disabledReason": null,
+                }],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "config/read",
+            serde_json::json!({
+                "config": {
+                    "model": "gpt-5-worker-b",
+                },
+                "origins": {},
+                "layers": [{
+                    "name": {
+                        "type": "project",
+                        "dotCodexFolder": "/tmp/worker-b",
+                    },
+                    "version": "worker-b-config-version",
+                    "config": {
+                        "model": "gpt-5-worker-b",
+                    },
+                    "disabledReason": null,
+                }],
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the matching worker before applying reconnect backoff"
+        );
+        router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let err = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("config-read".to_string()),
+                method: "config/read".to_string(),
+                params: Some(serde_json::json!({
+                    "includeLayers": true,
+                    "cwd": "/tmp/worker-b/subdir",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("cwd-aware config/read should fail closed during reconnect backoff");
+
+        assert_eq!(
+            err.to_string(),
+            "required worker routes are unavailable for config/read: [1]"
+        );
+        assert_eq!(router.worker_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_fallback_plugin_management_during_reconnect_backoff() {
+        let cases = vec![
+            (
+                "plugin/read",
+                serde_json::json!({
+                    "marketplacePath": "/tmp/project/plugins/demo-marketplace.json",
+                    "remoteMarketplaceName": null,
+                    "pluginName": "demo-plugin",
+                }),
+                serde_json::json!({
+                    "plugin": {
+                        "marketplaceName": "demo-marketplace",
+                        "marketplacePath": "/tmp/project/plugins/demo-marketplace.json",
+                        "summary": {
+                            "id": "demo-plugin@local",
+                            "name": "demo-plugin",
+                            "source": {
+                                "type": "local",
+                                "path": "/tmp/project/plugins/demo-plugin",
+                            },
+                            "installed": false,
+                            "enabled": false,
+                            "installPolicy": "AVAILABLE",
+                            "authPolicy": "ON_USE",
+                            "interface": {
+                                "displayName": "Demo Plugin",
+                                "shortDescription": "Gateway passthrough plugin",
+                                "longDescription": null,
+                                "developerName": null,
+                                "category": null,
+                                "capabilities": [],
+                                "websiteUrl": null,
+                                "privacyPolicyUrl": null,
+                                "termsOfServiceUrl": null,
+                                "defaultPrompt": null,
+                                "brandColor": null,
+                                "composerIcon": null,
+                                "composerIconUrl": null,
+                                "logo": null,
+                                "logoUrl": null,
+                                "screenshots": [],
+                                "screenshotUrls": [],
+                            },
+                        },
+                        "description": "Gateway passthrough plugin description",
+                        "skills": [],
+                        "apps": [],
+                        "mcpServers": [],
+                    },
+                }),
+            ),
+            (
+                "plugin/install",
+                serde_json::json!({
+                    "marketplacePath": "/tmp/project/plugins/demo-marketplace.json",
+                    "remoteMarketplaceName": null,
+                    "pluginName": "demo-plugin",
+                }),
+                serde_json::json!({
+                    "authPolicy": "ON_USE",
+                    "appsNeedingAuth": [],
+                }),
+            ),
+            (
+                "plugin/uninstall",
+                serde_json::json!({
+                    "pluginId": "demo-plugin@local",
+                }),
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert!(
+                router.remove_worker(Some(1)),
+                "test should drop the fallback worker before applying reconnect backoff"
+            );
+            router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::default();
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let err = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                },
+            )
+            .await
+            .expect_err("plugin management fallback should fail closed during reconnect backoff");
+
+            assert_eq!(
+                err.to_string(),
+                format!("required worker routes are unavailable for {method}: [1]")
+            );
+            assert_eq!(router.worker_count(), 1);
+            assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+            assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_connection_notifications()
     {
         let notification_params = serde_json::json!({
@@ -9769,6 +13162,71 @@ mod tests {
         assert_jsonrpc_notification(
             read_websocket_message(&mut websocket).await,
             "mcpServer/startupStatus/updated",
+            notification_params,
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_external_agent_import_completed_notifications()
+     {
+        let notification_params = serde_json::json!({});
+        let worker_a = start_mock_remote_server_for_connection_notification(
+            "externalAgentConfig/import/completed",
+            notification_params.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "externalAgentConfig/import/completed",
+            notification_params.clone(),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "externalAgentConfig/import/completed",
             notification_params,
         );
 
@@ -10210,6 +13668,410 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_reconnects_missing_worker_before_forwarding_server_requests() {
+        let worker_a =
+            start_mock_remote_server_for_reconnectable_thread_start_then_server_requests().await;
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        send_initialized(&mut websocket).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("thread-start".to_string()),
+                    method: "thread/start".to_string(),
+                    params: Some(serde_json::json!({
+                        "model": null,
+                        "modelProvider": null,
+                        "serviceTier": null,
+                        "cwd": "/tmp/recovered-worker",
+                        "approvalPolicy": null,
+                        "approvalsReviewer": null,
+                        "sandbox": null,
+                        "config": null,
+                        "serviceName": null,
+                        "baseInstructions": null,
+                        "developerInstructions": null,
+                        "personality": null,
+                        "ephemeral": true,
+                        "sessionStartSource": null,
+                        "dynamicTools": null,
+                        "experimentalRawEvents": false,
+                        "persistExtendedHistory": false,
+                    })),
+                    trace: None,
+                }))
+                .expect("thread/start request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("thread/start request should send");
+
+        let JSONRPCMessage::Response(response) = timeout(
+            Duration::from_secs(2),
+            read_websocket_message(&mut websocket),
+        )
+        .await
+        .expect("thread/start response should arrive") else {
+            panic!("expected thread/start response");
+        };
+        assert_eq!(response.id, RequestId::String("thread-start".to_string()));
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-recovered",
+                    "forkedFromId": null,
+                    "preview": "",
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": {
+                        "type": "idle",
+                    },
+                    "path": null,
+                    "cwd": "/tmp/recovered-worker",
+                    "cliVersion": "0.0.0-test",
+                    "source": "cli",
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "gitInfo": null,
+                    "name": null,
+                    "turns": [],
+                },
+                "model": "gpt-5",
+                "modelProvider": "openai",
+                "serviceTier": null,
+                "cwd": "/tmp/recovered-worker",
+                "instructionSources": [],
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandbox": {
+                    "type": "dangerFullAccess",
+                },
+                "reasoningEffort": null,
+            })
+        );
+
+        let JSONRPCMessage::Request(user_input_request) = timeout(
+            Duration::from_secs(2),
+            read_websocket_message(&mut websocket),
+        )
+        .await
+        .expect("forwarded user-input request should arrive") else {
+            panic!("expected forwarded user-input request");
+        };
+        assert_eq!(user_input_request.method, "item/tool/requestUserInput");
+        assert_eq!(
+            user_input_request.params,
+            Some(serde_json::json!({
+                "threadId": "thread-recovered",
+                "turnId": "turn-recovered",
+                "itemId": "tool-call-recovered",
+                "questions": [{
+                    "id": "mode",
+                    "header": "Mode",
+                    "question": "Pick execution mode",
+                    "isOther": false,
+                    "isSecret": false,
+                    "options": [],
+                }],
+            }))
+        );
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: user_input_request.id,
+                    result: serde_json::json!({
+                        "answers": {
+                            "mode": {
+                                "answers": ["safe"],
+                            },
+                        },
+                    }),
+                }))
+                .expect("user-input response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("user-input response should send");
+
+        let JSONRPCMessage::Request(refresh_request) = timeout(
+            Duration::from_secs(2),
+            read_websocket_message(&mut websocket),
+        )
+        .await
+        .expect("forwarded chatgpt refresh request should arrive") else {
+            panic!("expected forwarded chatgpt refresh request");
+        };
+        assert_eq!(refresh_request.method, "account/chatgptAuthTokens/refresh");
+        assert_eq!(
+            refresh_request.params,
+            Some(serde_json::json!({
+                "reason": "unauthorized",
+                "previousAccountId": "acct-recovered",
+            }))
+        );
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: refresh_request.id,
+                    result: serde_json::json!({
+                        "accessToken": "access-token-recovered",
+                        "chatgptAccountId": "acct-recovered",
+                        "chatgptPlanType": "pro",
+                    }),
+                }))
+                .expect("refresh response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("refresh response should send");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_reconnects_missing_primary_worker_before_forwarding_login_completed()
+    {
+        let worker_a = start_mock_remote_server_for_reconnectable_primary_login_completed().await;
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("account-login-start".to_string()),
+                    method: "account/login/start".to_string(),
+                    params: Some(serde_json::json!({
+                        "type": "chatgpt",
+                    })),
+                    trace: None,
+                }))
+                .expect("account/login/start request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("account/login/start request should send");
+
+        let JSONRPCMessage::Response(response) = timeout(
+            Duration::from_secs(2),
+            read_websocket_message(&mut websocket),
+        )
+        .await
+        .expect("account/login/start response should arrive") else {
+            panic!("expected account/login/start response");
+        };
+        assert_eq!(
+            response.id,
+            RequestId::String("account-login-start".to_string())
+        );
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "type": "chatgpt",
+                "loginId": "login-reconnected",
+                "authUrl": "https://example.com/login",
+            })
+        );
+
+        assert_jsonrpc_notification(
+            timeout(
+                Duration::from_secs(2),
+                read_websocket_message(&mut websocket),
+            )
+            .await
+            .expect("account/login/completed notification should arrive"),
+            "account/login/completed",
+            serde_json::json!({
+                "loginId": "login-reconnected",
+                "success": true,
+                "error": null,
+            }),
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_replays_initialized_and_active_fs_watches() {
+        let worker_a =
+            start_mock_remote_server_for_reconnectable_initialized_and_fs_watch_replay().await;
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+
+        router.mark_initialized();
+        router.record_fs_watch(FsWatchParams {
+            watch_id: "watch-shared".to_string(),
+            path: PathBuf::from("/tmp/shared/project/.git/HEAD")
+                .try_into()
+                .expect("fs watch path should be absolute"),
+        });
+
+        assert!(
+            router.remove_worker(Some(0)),
+            "test should drop the primary worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        timeout(Duration::from_secs(2), router.reconnect_missing_workers())
+            .await
+            .expect("worker reconnect should finish in time");
+        assert_eq!(router.worker_count(), 2);
+
+        timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("router shutdown should finish in time")
+            .expect("router should shut down");
+    }
+
+    #[test]
+    fn worker_reconnect_backoff_suppresses_immediate_retry_attempts() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let now = Instant::now();
+        let retry_backoff = Duration::from_secs(3);
+        let mut router = GatewayV2DownstreamRouter {
+            workers: Vec::new(),
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: None,
+        };
+
+        assert!(router.should_attempt_worker_reconnect(0, now));
+        assert!(router.should_attempt_worker_reconnect(1, now));
+
+        router.record_worker_reconnect_failure(0, now, retry_backoff);
+        assert!(!router.should_attempt_worker_reconnect(0, now));
+        assert!(!router.should_attempt_worker_reconnect(0, now + Duration::from_secs(2)));
+        assert!(router.should_attempt_worker_reconnect(0, now + retry_backoff));
+        assert!(router.should_attempt_worker_reconnect(1, now));
+
+        router.clear_worker_reconnect_failure(0);
+        assert!(router.should_attempt_worker_reconnect(0, now + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_closes_when_downstream_reuses_pending_server_request_id() {
         let websocket_url = start_mock_remote_server_for_initialize().await;
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -10242,6 +14104,9 @@ mod tests {
                             shutdown_txs: Vec::new(),
                             event_tasks: Vec::new(),
                             next_worker: 0,
+                            initialized_notification_sent: false,
+                            active_fs_watches: HashMap::new(),
+                            reconnect_retry_after: HashMap::new(),
                             reconnect_state: None,
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -11821,28 +15686,81 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_fans_in_multi_worker_realtime_notifications_for_visible_threads() {
-        let worker_a = start_mock_remote_server_for_realtime_notification(
-            "thread/realtime/transcript/delta",
-            serde_json::json!({
-                "threadId": "thread-worker-a",
-                "role": "assistant",
-                "delta": "worker a transcript",
-            }),
-        )
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            (
+                "thread/realtime/started",
+                serde_json::json!({
+                    "threadId": "thread-worker-a",
+                    "sessionId": "session-worker-a",
+                    "version": "v1",
+                }),
+            ),
+            (
+                "thread/realtime/itemAdded",
+                serde_json::json!({
+                    "threadId": "thread-worker-a",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [],
+                    },
+                }),
+            ),
+            (
+                "thread/realtime/transcript/delta",
+                serde_json::json!({
+                    "threadId": "thread-worker-a",
+                    "role": "assistant",
+                    "delta": "worker a transcript",
+                }),
+            ),
+            (
+                "thread/realtime/transcript/done",
+                serde_json::json!({
+                    "threadId": "thread-worker-a",
+                    "role": "assistant",
+                    "text": "worker a transcript complete",
+                }),
+            ),
+        ])
         .await;
-        let worker_b = start_mock_remote_server_for_realtime_notification(
-            "thread/realtime/outputAudio/delta",
-            serde_json::json!({
-                "threadId": "thread-worker-b",
-                "audio": {
-                    "data": "AQID",
-                    "sampleRate": 24000,
-                    "numChannels": 1,
-                    "samplesPerChannel": 3,
-                    "itemId": "item-worker-b",
-                },
-            }),
-        )
+        let worker_b = start_mock_remote_server_for_realtime_notifications(vec![
+            (
+                "thread/realtime/outputAudio/delta",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "audio": {
+                        "data": "AQID",
+                        "sampleRate": 24000,
+                        "numChannels": 1,
+                        "samplesPerChannel": 3,
+                        "itemId": "item-worker-b",
+                    },
+                }),
+            ),
+            (
+                "thread/realtime/sdp",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Worker B\r\n",
+                }),
+            ),
+            (
+                "thread/realtime/error",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "message": "worker b realtime warning",
+                }),
+            ),
+            (
+                "thread/realtime/closed",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "reason": "worker-b-closed",
+                }),
+            ),
+        ])
         .await;
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         let context = GatewayRequestContext::default();
@@ -11894,7 +15812,7 @@ mod tests {
         .await;
 
         let mut forwarded = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..8 {
             let JSONRPCMessage::Notification(notification) =
                 read_websocket_message(&mut websocket).await
             else {
@@ -11907,6 +15825,32 @@ mod tests {
         assert_eq!(
             forwarded,
             vec![
+                (
+                    "thread/realtime/closed".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-b",
+                        "reason": "worker-b-closed",
+                    })),
+                ),
+                (
+                    "thread/realtime/error".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-b",
+                        "message": "worker b realtime warning",
+                    })),
+                ),
+                (
+                    "thread/realtime/itemAdded".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-a",
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [],
+                        },
+                    })),
+                ),
                 (
                     "thread/realtime/outputAudio/delta".to_string(),
                     Some(serde_json::json!({
@@ -11921,11 +15865,34 @@ mod tests {
                     })),
                 ),
                 (
+                    "thread/realtime/sdp".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-b",
+                        "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Worker B\r\n",
+                    })),
+                ),
+                (
+                    "thread/realtime/started".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-a",
+                        "sessionId": "session-worker-a",
+                        "version": "v1",
+                    })),
+                ),
+                (
                     "thread/realtime/transcript/delta".to_string(),
                     Some(serde_json::json!({
                         "threadId": "thread-worker-a",
                         "role": "assistant",
                         "delta": "worker a transcript",
+                    })),
+                ),
+                (
+                    "thread/realtime/transcript/done".to_string(),
+                    Some(serde_json::json!({
+                        "threadId": "thread-worker-a",
+                        "role": "assistant",
+                        "text": "worker a transcript complete",
                     })),
                 ),
             ]
@@ -12214,11 +16181,12 @@ mod tests {
         (addr, server_task)
     }
 
-    async fn read_websocket_message(
-        websocket: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> JSONRPCMessage {
+    async fn read_websocket_message<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> JSONRPCMessage
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         loop {
             let frame = websocket
                 .next()
@@ -12542,6 +16510,311 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_server_for_reconnectable_thread_start_then_server_requests() -> String
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket should accept");
+
+                expect_remote_initialize(&mut websocket).await;
+
+                match connection_index {
+                    0 => {
+                        websocket
+                            .close(None)
+                            .await
+                            .expect("close frame should send");
+                    }
+                    1 => {
+                        let frame = websocket
+                            .next()
+                            .await
+                            .expect("initialized frame should exist")
+                            .expect("initialized frame should decode");
+                        let Message::Text(text) = frame else {
+                            panic!("expected initialized text frame");
+                        };
+                        let JSONRPCMessage::Notification(notification) =
+                            serde_json::from_str(&text).expect("initialized should decode")
+                        else {
+                            panic!("expected initialized notification");
+                        };
+                        assert_eq!(notification.method, "initialized");
+
+                        let request = read_websocket_request(&mut websocket).await;
+                        assert_eq!(request.method, "thread/start");
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result: serde_json::json!({
+                                        "thread": {
+                                            "id": "thread-recovered",
+                                            "forkedFromId": null,
+                                            "preview": "",
+                                            "ephemeral": true,
+                                            "modelProvider": "openai",
+                                            "createdAt": 1,
+                                            "updatedAt": 1,
+                                            "status": {
+                                                "type": "idle",
+                                            },
+                                            "path": null,
+                                            "cwd": "/tmp/recovered-worker",
+                                            "cliVersion": "0.0.0-test",
+                                            "source": "cli",
+                                            "agentNickname": null,
+                                            "agentRole": null,
+                                            "gitInfo": null,
+                                            "name": null,
+                                            "turns": [],
+                                        },
+                                        "model": "gpt-5",
+                                        "modelProvider": "openai",
+                                        "serviceTier": null,
+                                        "cwd": "/tmp/recovered-worker",
+                                        "instructionSources": [],
+                                        "approvalPolicy": "never",
+                                        "approvalsReviewer": "user",
+                                        "sandbox": {
+                                            "type": "dangerFullAccess",
+                                        },
+                                        "reasoningEffort": null,
+                                    }),
+                                }))
+                                .expect("thread/start response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("thread/start response should send");
+
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                                    id: RequestId::String("downstream-user-input".to_string()),
+                                    method: "item/tool/requestUserInput".to_string(),
+                                    params: Some(serde_json::json!({
+                                        "threadId": "thread-recovered",
+                                        "turnId": "turn-recovered",
+                                        "itemId": "tool-call-recovered",
+                                        "questions": [{
+                                            "id": "mode",
+                                            "header": "Mode",
+                                            "question": "Pick execution mode",
+                                            "isOther": false,
+                                            "isSecret": false,
+                                            "options": [],
+                                        }],
+                                    })),
+                                    trace: None,
+                                }))
+                                .expect("user-input request should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("user-input request should send");
+
+                        let JSONRPCMessage::Response(user_input_response) =
+                            read_websocket_message(&mut websocket).await
+                        else {
+                            panic!("expected user-input response");
+                        };
+                        assert_eq!(
+                            user_input_response.id,
+                            RequestId::String("downstream-user-input".to_string())
+                        );
+                        assert_eq!(
+                            user_input_response.result,
+                            serde_json::json!({
+                                "answers": {
+                                    "mode": {
+                                        "answers": ["safe"],
+                                    },
+                                },
+                            })
+                        );
+
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                                    id: RequestId::String("downstream-refresh".to_string()),
+                                    method: "account/chatgptAuthTokens/refresh".to_string(),
+                                    params: Some(serde_json::json!({
+                                        "reason": "unauthorized",
+                                        "previousAccountId": "acct-recovered",
+                                    })),
+                                    trace: None,
+                                }))
+                                .expect("refresh request should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("refresh request should send");
+
+                        let JSONRPCMessage::Response(refresh_response) =
+                            read_websocket_message(&mut websocket).await
+                        else {
+                            panic!("expected refresh response");
+                        };
+                        assert_eq!(
+                            refresh_response.id,
+                            RequestId::String("downstream-refresh".to_string())
+                        );
+                        assert_eq!(
+                            refresh_response.result,
+                            serde_json::json!({
+                                "accessToken": "access-token-recovered",
+                                "chatgptAccountId": "acct-recovered",
+                                "chatgptPlanType": "pro",
+                            })
+                        );
+
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    _ => unreachable!("unexpected connection index"),
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_primary_login_completed() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket should accept");
+
+                expect_remote_initialize(&mut websocket).await;
+
+                match connection_index {
+                    0 => {
+                        websocket
+                            .close(None)
+                            .await
+                            .expect("close frame should send");
+                    }
+                    1 => {
+                        let request = read_websocket_request(&mut websocket).await;
+                        assert_eq!(request.method, "account/login/start");
+                        assert_eq!(
+                            request.params,
+                            Some(serde_json::json!({
+                                "type": "chatgpt",
+                            }))
+                        );
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result: serde_json::json!({
+                                        "type": "chatgpt",
+                                        "loginId": "login-reconnected",
+                                        "authUrl": "https://example.com/login",
+                                    }),
+                                }))
+                                .expect("login response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("login response should send");
+                        send_remote_notification(
+                            &mut websocket,
+                            "account/login/completed",
+                            serde_json::json!({
+                                "loginId": "login-reconnected",
+                                "success": true,
+                                "error": null,
+                            }),
+                        )
+                        .await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    _ => unreachable!("unexpected connection index"),
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_initialized_and_fs_watch_replay() -> String
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket should accept");
+
+                expect_remote_initialize(&mut websocket).await;
+
+                match connection_index {
+                    0 => {
+                        websocket
+                            .close(None)
+                            .await
+                            .expect("close frame should send");
+                    }
+                    1 => {
+                        let JSONRPCMessage::Notification(initialized) =
+                            read_websocket_message(&mut websocket).await
+                        else {
+                            panic!("expected initialized notification");
+                        };
+                        assert_eq!(initialized.method, "initialized");
+                        assert_eq!(initialized.params, None);
+
+                        let replay_watch_request = read_websocket_request(&mut websocket).await;
+                        assert_eq!(replay_watch_request.method, "fs/watch");
+                        assert_eq!(
+                            replay_watch_request.id,
+                            RequestId::String("gateway-replay-fs-watch:watch-shared".to_string())
+                        );
+                        assert_eq!(
+                            replay_watch_request.params,
+                            Some(serde_json::json!({
+                                "watchId": "watch-shared",
+                                "path": "/tmp/shared/project/.git/HEAD",
+                            }))
+                        );
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: replay_watch_request.id,
+                                    result: serde_json::json!({
+                                        "path": "/tmp/shared/project/.git/HEAD",
+                                    }),
+                                }))
+                                .expect("replayed fs/watch response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("replayed fs/watch response should send");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    _ => unreachable!("unexpected connection index"),
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     async fn start_mock_remote_server_for_item_delta_notification() -> String {
         start_mock_remote_server_for_notification(ServerNotification::AgentMessageDelta(
             codex_app_server_protocol::AgentMessageDeltaNotification {
@@ -12711,11 +16984,20 @@ mod tests {
         method: &str,
         params: serde_json::Value,
     ) -> String {
+        start_mock_remote_server_for_realtime_notifications(vec![(method, params)]).await
+    }
+
+    async fn start_mock_remote_server_for_realtime_notifications(
+        notifications: Vec<(&str, serde_json::Value)>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
-        let method = method.to_string();
+        let notifications = notifications
+            .into_iter()
+            .map(|(method, params)| (method.to_string(), params))
+            .collect::<Vec<_>>();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
             let mut websocket = tokio_tungstenite::accept_async(stream)
@@ -12723,7 +17005,9 @@ mod tests {
                 .expect("websocket should accept");
 
             expect_remote_initialize(&mut websocket).await;
-            send_remote_notification(&mut websocket, &method, params).await;
+            for (method, params) in notifications {
+                send_remote_notification(&mut websocket, &method, params).await;
+            }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
@@ -13152,6 +17436,281 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_server_for_reconnectable_skills_list(
+        cwd: &str,
+        skills: Vec<&str>,
+    ) -> String {
+        let cwd = cwd.to_string();
+        let skills = skills
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "description": format!("{name} description"),
+                    "path": format!("{cwd}/{name}"),
+                    "scope": "repo",
+                    "enabled": true,
+                })
+            })
+            .collect::<Vec<serde_json::Value>>();
+        start_mock_remote_server_for_reconnectable_request(
+            "skills/list",
+            serde_json::json!({
+                "data": [{
+                    "cwd": cwd,
+                    "skills": skills,
+                    "errors": [],
+                }]
+            }),
+        )
+        .await
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_request(
+        method: &'static str,
+        result: serde_json::Value,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let result = result.clone();
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket should accept");
+
+                    expect_remote_initialize(&mut websocket).await;
+
+                    loop {
+                        let Some(frame) = websocket.next().await else {
+                            break;
+                        };
+                        let frame = frame.expect("frame should decode");
+                        let Message::Text(text) = frame else {
+                            continue;
+                        };
+                        let JSONRPCMessage::Request(request) =
+                            serde_json::from_str(&text).expect("request should decode")
+                        else {
+                            continue;
+                        };
+                        assert_eq!(request.method, method);
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result: result.clone(),
+                                }))
+                                .expect("reconnectable response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("reconnectable response should send");
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_request_with_recording(
+        method: &'static str,
+        result: serde_json::Value,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_task = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let result = result.clone();
+                let requests = Arc::clone(&requests_for_task);
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket should accept");
+
+                    expect_remote_initialize(&mut websocket).await;
+
+                    loop {
+                        let Some(frame) = websocket.next().await else {
+                            break;
+                        };
+                        let frame = frame.expect("frame should decode");
+                        let Message::Text(text) = frame else {
+                            continue;
+                        };
+                        let JSONRPCMessage::Request(request) =
+                            serde_json::from_str(&text).expect("request should decode")
+                        else {
+                            continue;
+                        };
+                        assert_eq!(request.method, method);
+                        requests.lock().await.push(request.method.clone());
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result: result.clone(),
+                                }))
+                                .expect("reconnectable response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("reconnectable response should send");
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), requests)
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_fs_watch_and_unwatch()
+    -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_task = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let requests = Arc::clone(&requests_for_task);
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket should accept");
+
+                    expect_remote_initialize(&mut websocket).await;
+
+                    loop {
+                        let Some(frame) = websocket.next().await else {
+                            break;
+                        };
+                        let frame = frame.expect("frame should decode");
+                        let Message::Text(text) = frame else {
+                            continue;
+                        };
+                        let JSONRPCMessage::Request(request) =
+                            serde_json::from_str(&text).expect("request should decode")
+                        else {
+                            continue;
+                        };
+                        requests.lock().await.push(request.method.clone());
+                        let result = match request.method.as_str() {
+                            "fs/watch" => serde_json::json!({
+                                "path": request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("path"))
+                                    .cloned()
+                                    .expect("fs/watch should include path"),
+                            }),
+                            "fs/unwatch" => serde_json::json!({}),
+                            method => panic!("unexpected reconnectable fs method: {method}"),
+                        };
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result,
+                                }))
+                                .expect("reconnectable fs response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("reconnectable fs response should send");
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), requests)
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_app_list(
+        apps: Vec<(&str, &str)>,
+    ) -> String {
+        let apps = apps
+            .into_iter()
+            .map(|(id, name)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "description": format!("{name} description"),
+                    "installUrl": null,
+                    "needsAuth": false,
+                })
+            })
+            .collect::<Vec<serde_json::Value>>();
+        start_mock_remote_server_for_reconnectable_request(
+            "app/list",
+            serde_json::json!({
+                "data": apps,
+                "nextCursor": null,
+            }),
+        )
+        .await
+    }
+
+    fn reconnectable_model_json(
+        id: &str,
+        display_name: &str,
+        is_default: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "model": id,
+            "upgrade": null,
+            "upgradeInfo": null,
+            "availabilityNux": null,
+            "displayName": display_name,
+            "description": format!("{display_name} description"),
+            "hidden": false,
+            "supportedReasoningEfforts": [{
+                "reasoningEffort": "medium",
+                "description": "Balanced",
+            }],
+            "defaultReasoningEffort": "medium",
+            "inputModalities": ["text"],
+            "supportsPersonality": false,
+            "additionalSpeedTiers": [],
+            "isDefault": is_default,
+        })
+    }
+
+    async fn start_mock_remote_server_for_reconnectable_mcp_server_status_list(
+        names: Vec<&str>,
+    ) -> String {
+        let statuses = names
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "tools": {},
+                    "resources": [],
+                    "resourceTemplates": [],
+                    "authStatus": "bearerToken",
+                })
+            })
+            .collect::<Vec<serde_json::Value>>();
+        start_mock_remote_server_for_reconnectable_request(
+            "mcpServerStatus/list",
+            serde_json::json!({
+                "data": statuses,
+                "nextCursor": null,
+            }),
+        )
+        .await
+    }
+
     async fn spawn_remote_gateway_v2_test_server(
         websocket_url: String,
         scope_registry: Arc<GatewayScopeRegistry>,
@@ -13292,6 +17851,24 @@ mod tests {
         >,
     ) {
         send_initialize_with_capabilities(websocket, None).await;
+    }
+
+    async fn send_initialized(
+        websocket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Notification(JSONRPCNotification {
+                    method: "initialized".to_string(),
+                    params: None,
+                }))
+                .expect("initialized notification should serialize")
+                .into(),
+            ))
+            .await
+            .expect("initialized notification should send");
     }
 
     async fn send_initialize_with_capabilities(
