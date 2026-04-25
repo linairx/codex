@@ -457,7 +457,6 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
 mod tests {
     use super::RemoteWorkerGatewayRuntime;
     use crate::api::GatewayExecutionMode;
-    use crate::api::GatewayHealthResponse;
     use crate::api::GatewayHealthStatus;
     use crate::api::GatewaySortDirection;
     use crate::api::GatewayThread;
@@ -468,6 +467,7 @@ mod tests {
     use crate::api::ListThreadsRequest;
     use crate::config::GatewayRemoteSelectionPolicy;
     use crate::error::GatewayError;
+    use crate::remote_health::RemoteWorkerHealthRegistry;
     use crate::runtime::GatewayRuntime;
     use crate::scope::GatewayRequestContext;
     use crate::scope::GatewayScopeRegistry;
@@ -475,6 +475,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::sync::broadcast;
 
     fn test_thread(id: &str, created_at: i64, updated_at: i64) -> GatewayThread {
@@ -610,7 +611,7 @@ mod tests {
 
     #[test]
     fn reports_degraded_remote_health_when_some_workers_are_unhealthy() {
-        let worker_health = Arc::new(crate::remote_health::RemoteWorkerHealthRegistry::new(vec![
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new(vec![
             "ws://127.0.0.1:8081".to_string(),
             "ws://127.0.0.1:8082".to_string(),
         ]));
@@ -631,34 +632,96 @@ mod tests {
             },
         };
 
+        assert_eq!(runtime.health().status, GatewayHealthStatus::Degraded);
+        let health = runtime.health();
+        assert_eq!(health.runtime_mode, "remote".to_string());
+        assert_eq!(health.execution_mode, GatewayExecutionMode::WorkerManaged);
         assert_eq!(
-            runtime.health(),
-            GatewayHealthResponse {
-                status: GatewayHealthStatus::Degraded,
-                runtime_mode: "remote".to_string(),
-                execution_mode: GatewayExecutionMode::WorkerManaged,
-                v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorker,
-                v2_transport: GatewayV2TransportConfig {
-                    initialize_timeout_seconds: 30,
-                    client_send_timeout_seconds: 10,
-                    reconnect_retry_backoff_seconds: 1,
-                    max_pending_server_requests: 64,
-                },
-                remote_workers: Some(vec![
-                    crate::api::GatewayRemoteWorkerHealth {
-                        worker_id: 0,
-                        websocket_url: "ws://127.0.0.1:8081".to_string(),
-                        healthy: true,
-                        last_error: None,
-                    },
-                    crate::api::GatewayRemoteWorkerHealth {
-                        worker_id: 1,
-                        websocket_url: "ws://127.0.0.1:8082".to_string(),
-                        healthy: false,
-                        last_error: Some("socket closed".to_string()),
-                    },
-                ]),
+            health.v2_compatibility,
+            GatewayV2CompatibilityMode::RemoteMultiWorker
+        );
+        assert_eq!(
+            health.v2_transport,
+            GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
             }
         );
+        let remote_workers = health.remote_workers.expect("remote workers");
+        assert_eq!(remote_workers.len(), 2);
+        assert_eq!(
+            remote_workers[0],
+            crate::api::GatewayRemoteWorkerHealth {
+                worker_id: 0,
+                websocket_url: "ws://127.0.0.1:8081".to_string(),
+                healthy: true,
+                reconnecting: false,
+                last_error: None,
+                last_state_change_at: None,
+                last_error_at: None,
+                next_reconnect_at: None,
+            }
+        );
+        assert_eq!(remote_workers[1].worker_id, 1);
+        assert_eq!(remote_workers[1].websocket_url, "ws://127.0.0.1:8082");
+        assert_eq!(remote_workers[1].healthy, false);
+        assert_eq!(remote_workers[1].reconnecting, false);
+        assert_eq!(
+            remote_workers[1].last_error.as_deref(),
+            Some("socket closed")
+        );
+        assert_eq!(remote_workers[1].last_state_change_at.is_some(), true);
+        assert_eq!(remote_workers[1].last_error_at.is_some(), true);
+        assert_eq!(remote_workers[1].next_reconnect_at, None);
+    }
+
+    #[test]
+    fn reports_reconnecting_remote_health_with_retry_metadata() {
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new(vec![
+            "ws://127.0.0.1:8081".to_string(),
+        ]));
+        worker_health.mark_reconnecting(
+            0,
+            Some("remote app server event stream ended".to_string()),
+            Duration::from_millis(250),
+        );
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events: broadcast::channel(4).0,
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+            },
+        };
+
+        let health = runtime.health();
+
+        assert_eq!(health.status, GatewayHealthStatus::Unavailable);
+        assert_eq!(
+            health.v2_compatibility,
+            GatewayV2CompatibilityMode::RemoteSingleWorker
+        );
+        let remote_workers = health.remote_workers.expect("remote workers");
+        assert_eq!(remote_workers.len(), 1);
+        assert_eq!(remote_workers[0].worker_id, 0);
+        assert_eq!(remote_workers[0].websocket_url, "ws://127.0.0.1:8081");
+        assert_eq!(remote_workers[0].healthy, false);
+        assert_eq!(remote_workers[0].reconnecting, true);
+        assert_eq!(
+            remote_workers[0].last_error.as_deref(),
+            Some("remote app server event stream ended")
+        );
+        assert_eq!(remote_workers[0].last_state_change_at.is_some(), true);
+        assert_eq!(remote_workers[0].last_error_at.is_some(), true);
+        assert_eq!(remote_workers[0].next_reconnect_at.is_some(), true);
     }
 }

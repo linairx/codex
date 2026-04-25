@@ -502,10 +502,10 @@ async fn start_remote_runtime_gateway_http_server(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteWorkerLoopExit {
     Shutdown,
-    Disconnected,
+    Disconnected { message: String },
 }
 
 async fn run_remote_worker_loop(
@@ -518,7 +518,13 @@ async fn run_remote_worker_loop(
     loop {
         match run_remote_worker_session(app_server, &runtime, &mut shutdown_rx).await? {
             RemoteWorkerLoopExit::Shutdown => break,
-            RemoteWorkerLoopExit::Disconnected => {
+            RemoteWorkerLoopExit::Disconnected { message } => {
+                runtime.publish_event(GatewayEvent::reconnecting(
+                    worker.id(),
+                    worker.websocket_url().to_string(),
+                    message,
+                    REMOTE_WORKER_RECONNECT_DELAY.as_secs(),
+                ));
                 let mut reconnected_client = None;
                 loop {
                     tokio::select! {
@@ -526,6 +532,11 @@ async fn run_remote_worker_loop(
                         _ = sleep(REMOTE_WORKER_RECONNECT_DELAY) => {
                             match worker.reconnect().await {
                                 Ok(client) => {
+                                    tracing::info!(
+                                        worker_id = worker.id(),
+                                        websocket_url = worker.websocket_url(),
+                                        "gateway remote worker reconnected"
+                                    );
                                     runtime.mark_worker_healthy();
                                     runtime.publish_event(GatewayEvent::reconnected(
                                         worker.id(),
@@ -535,11 +546,21 @@ async fn run_remote_worker_loop(
                                     break;
                                 }
                                 Err(err) => {
-                                    runtime.mark_worker_unhealthy(Some(format!(
-                                        "failed to reconnect remote worker {} at `{}`: {err}",
-                                        worker.id(),
-                                        worker.websocket_url(),
-                                    )));
+                                    tracing::warn!(
+                                        worker_id = worker.id(),
+                                        websocket_url = worker.websocket_url(),
+                                        retry_delay_seconds = REMOTE_WORKER_RECONNECT_DELAY.as_secs(),
+                                        %err,
+                                        "gateway remote worker reconnect attempt failed"
+                                    );
+                                    runtime.mark_worker_reconnecting(
+                                        Some(format!(
+                                            "failed to reconnect remote worker {} at `{}`: {err}",
+                                            worker.id(),
+                                            worker.websocket_url(),
+                                        )),
+                                        REMOTE_WORKER_RECONNECT_DELAY,
+                                    );
                                 }
                             }
                         }
@@ -572,19 +593,39 @@ async fn run_remote_worker_session(
             }
             event = app_server.next_event() => {
                 let Some(event) = event else {
-                    runtime.mark_worker_unhealthy(Some(
-                        "remote app server event stream ended".to_string(),
-                    ));
+                    tracing::warn!(
+                        worker_id = runtime.worker_id(),
+                        retry_delay_seconds = REMOTE_WORKER_RECONNECT_DELAY.as_secs(),
+                        "gateway remote worker event stream ended; entering reconnect loop"
+                    );
+                    let message = "remote app server event stream ended".to_string();
+                    runtime.mark_worker_reconnecting(
+                        Some(message.clone()),
+                        REMOTE_WORKER_RECONNECT_DELAY,
+                    );
                     runtime.clear_owned_pending_server_requests();
                     app_server.shutdown().await?;
-                    return Ok(RemoteWorkerLoopExit::Disconnected);
+                    return Ok(RemoteWorkerLoopExit::Disconnected { message });
                 };
-                let disconnected = matches!(event, AppServerEvent::Disconnected { .. });
+                let disconnected_message = match &event {
+                    AppServerEvent::Disconnected { message } => Some(message.clone()),
+                    _ => None,
+                };
                 handle_app_server_event(event, &app_server, runtime).await?;
-                if disconnected {
+                if let Some(message) = disconnected_message {
+                    tracing::warn!(
+                        worker_id = runtime.worker_id(),
+                        retry_delay_seconds = REMOTE_WORKER_RECONNECT_DELAY.as_secs(),
+                        disconnect_message = %message,
+                        "gateway remote worker disconnected; entering reconnect loop"
+                    );
+                    runtime.mark_worker_reconnecting(
+                        Some(message.clone()),
+                        REMOTE_WORKER_RECONNECT_DELAY,
+                    );
                     runtime.clear_owned_pending_server_requests();
                     app_server.shutdown().await?;
-                    return Ok(RemoteWorkerLoopExit::Disconnected);
+                    return Ok(RemoteWorkerLoopExit::Disconnected { message });
                 }
             }
         }
@@ -759,6 +800,10 @@ mod tests {
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::ConfigValueWriteParams;
     use codex_app_server_protocol::ConfigWriteResponse;
+    use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+    use codex_app_server_protocol::DynamicToolCallResponse;
+    use codex_app_server_protocol::DynamicToolCallStatus;
+    use codex_app_server_protocol::DynamicToolSpec;
     use codex_app_server_protocol::ExperimentalFeatureListParams;
     use codex_app_server_protocol::ExperimentalFeatureListResponse;
     use codex_app_server_protocol::ExternalAgentConfigDetectParams;
@@ -776,6 +821,8 @@ mod tests {
     use codex_app_server_protocol::GetAccountParams;
     use codex_app_server_protocol::GetAccountRateLimitsResponse;
     use codex_app_server_protocol::GetAccountResponse;
+    use codex_app_server_protocol::ItemCompletedNotification;
+    use codex_app_server_protocol::ItemStartedNotification;
     use codex_app_server_protocol::JSONRPCError;
     use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::JSONRPCMessage;
@@ -833,6 +880,7 @@ mod tests {
     use codex_app_server_protocol::ThreadIncrementElicitationResponse;
     use codex_app_server_protocol::ThreadInjectItemsParams;
     use codex_app_server_protocol::ThreadInjectItemsResponse;
+    use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ThreadListParams;
     use codex_app_server_protocol::ThreadListResponse as AppServerThreadListResponse;
     use codex_app_server_protocol::ThreadLoadedListParams;
@@ -854,6 +902,7 @@ mod tests {
     use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
     use codex_app_server_protocol::ThreadRealtimeStartParams;
     use codex_app_server_protocol::ThreadRealtimeStartResponse;
+    use codex_app_server_protocol::ThreadRealtimeStartTransport;
     use codex_app_server_protocol::ThreadRealtimeStopParams;
     use codex_app_server_protocol::ThreadRealtimeStopResponse;
     use codex_app_server_protocol::ThreadResumeParams;
@@ -901,7 +950,9 @@ mod tests {
     use codex_protocol::protocol::RealtimeOutputModality;
     use codex_protocol::protocol::RealtimeVoice;
     use codex_protocol::protocol::RealtimeVoicesList;
+    use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
+    use core_test_support::responses;
     use core_test_support::responses::start_websocket_server;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -962,11 +1013,15 @@ mod tests {
     struct TurnStreamingCoverage {
         saw_thread_active: bool,
         saw_turn_started: bool,
+        saw_hook_started: bool,
+        saw_item_started: bool,
         saw_agent_delta: bool,
         saw_reasoning_summary_delta: bool,
         saw_reasoning_text_delta: bool,
         saw_command_output_delta: bool,
         saw_file_change_delta: bool,
+        saw_hook_completed: bool,
+        saw_item_completed: bool,
         saw_turn_completed: bool,
     }
 
@@ -2096,39 +2151,33 @@ mod tests {
             .expect("feedback/upload should succeed through embedded gateway");
         assert!(!feedback.thread_id.is_empty());
 
-        let command_exec: CommandExecResponse = client
-            .request_typed(ClientRequest::OneOffCommandExec {
-                request_id: RequestId::Integer(19),
-                params: CommandExecParams {
-                    command: vec![
-                        "sh".to_string(),
-                        "-lc".to_string(),
-                        "printf embedded-command".to_string(),
-                    ],
-                    process_id: Some("proc-embedded".to_string()),
-                    tty: false,
-                    stream_stdin: false,
-                    stream_stdout_stderr: true,
-                    output_bytes_cap: None,
-                    disable_output_cap: false,
-                    disable_timeout: false,
-                    timeout_ms: None,
-                    cwd: None,
-                    env: None,
-                    size: None,
-                    sandbox_policy: None,
-                },
-            })
-            .await
-            .expect("command/exec should succeed through embedded gateway");
-        assert_eq!(
-            command_exec,
-            CommandExecResponse {
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            }
-        );
+        let request_handle = client.request_handle();
+        let command_exec_task = tokio::spawn(async move {
+            request_handle
+                .request_typed::<CommandExecResponse>(ClientRequest::OneOffCommandExec {
+                    request_id: RequestId::Integer(19),
+                    params: CommandExecParams {
+                        command: vec![
+                            "sh".to_string(),
+                            "-lc".to_string(),
+                            "printf embedded-command".to_string(),
+                        ],
+                        process_id: Some("proc-embedded".to_string()),
+                        tty: false,
+                        stream_stdin: false,
+                        stream_stdout_stderr: true,
+                        output_bytes_cap: None,
+                        disable_output_cap: false,
+                        disable_timeout: false,
+                        timeout_ms: None,
+                        cwd: None,
+                        env: None,
+                        size: None,
+                        sandbox_policy: Some(SandboxPolicy::DangerFullAccess.into()),
+                    },
+                })
+                .await
+        });
 
         let command_output = timeout(Duration::from_secs(5), async {
             loop {
@@ -2150,6 +2199,20 @@ mod tests {
         assert_eq!(command_output.stream, CommandExecOutputStream::Stdout);
         assert_eq!(command_output.delta_base64, "ZW1iZWRkZWQtY29tbWFuZA==");
         assert_eq!(command_output.cap_reached, false);
+
+        let command_exec = timeout(Duration::from_secs(5), command_exec_task)
+            .await
+            .expect("command/exec should finish in time")
+            .expect("command/exec task should join")
+            .expect("command/exec should succeed through embedded gateway");
+        assert_eq!(
+            command_exec,
+            CommandExecResponse {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        );
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -2593,7 +2656,7 @@ requires_openai_auth = true
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -2823,7 +2886,7 @@ request_permissions_tool = true
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -3044,7 +3107,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -3309,7 +3372,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -3481,8 +3544,235 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn embedded_server_supports_dynamic_tool_call_server_request_roundtrip_over_v2() {
+        let codex_home = tempdir().expect("tempdir");
+        let tool_name = "demo_tool";
+        let call_id = "dyn-call-embedded";
+        let tool_arguments = serde_json::json!({
+            "city": "Paris",
+        });
+        let tool_call_arguments =
+            serde_json::to_string(&tool_arguments).expect("tool arguments should serialize");
+        let model_server = start_mock_responses_server_sequence(vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_function_call(call_id, tool_name, &tool_call_arguments),
+                responses::ev_completed("resp-1"),
+            ]),
+            mock_responses_sse_body("Done"),
+        ])
+        .await;
+        write_mock_responses_config_toml(codex_home.path(), &model_server.uri)
+            .expect("config.toml should be written");
+        let config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .expect("config");
+        let server = start_embedded_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                enable_codex_api_key_env: false,
+                session_source: SessionSource::Cli,
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 64,
+        })
+        .await
+        .expect("remote client should connect to embedded gateway");
+
+        let started: AppServerThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: Some("mock-model".to_string()),
+                    dynamic_tools: Some(vec![DynamicToolSpec {
+                        name: tool_name.to_string(),
+                        description: "Demo dynamic tool".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "city": { "type": "string" },
+                            },
+                            "required": ["city"],
+                            "additionalProperties": false,
+                        }),
+                        defer_loading: false,
+                    }]),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("thread/start should succeed through embedded gateway");
+
+        let turn_started_response: TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(2),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "Run the dynamic tool".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    model: Some("mock-model".to_string()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("turn/start should succeed through embedded gateway");
+        let turn_id = turn_started_response.turn.id.clone();
+
+        let mut saw_item_started = false;
+        let mut saw_item_completed = false;
+        let mut saw_turn_completed = false;
+        let mut resolved_request_id: Option<RequestId> = None;
+        let dynamic_tool_result = timeout(Duration::from_secs(10), async {
+            while !(saw_item_started && saw_item_completed && saw_turn_completed) {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerRequest(ServerRequest::DynamicToolCall {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(params.thread_id, started.thread.id);
+                        assert_eq!(params.turn_id, turn_id);
+                        assert_eq!(params.call_id, call_id);
+                        assert_eq!(params.tool, tool_name);
+                        assert_eq!(params.arguments, tool_arguments);
+                        resolved_request_id = Some(request_id.clone());
+                        client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(DynamicToolCallResponse {
+                                    content_items: vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: "dynamic-ok".to_string(),
+                                        },
+                                    ],
+                                    success: true,
+                                })
+                                .expect("dynamic tool call response should serialize"),
+                            )
+                            .await
+                            .expect("dynamic tool call should resolve");
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::DynamicToolCall {
+                                    id: item_call_id,
+                                    tool: item_tool_name,
+                                    status,
+                                    ..
+                                } if item_call_id == call_id
+                                    && item_tool_name == tool_name
+                                    && *status == DynamicToolCallStatus::InProgress
+                            )
+                        {
+                            saw_item_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::DynamicToolCall {
+                                    id: item_call_id,
+                                    tool: item_tool_name,
+                                    status,
+                                    ..
+                                } if item_call_id == call_id
+                                    && item_tool_name == tool_name
+                                    && *status == DynamicToolCallStatus::Completed
+                            )
+                        {
+                            saw_item_completed = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ServerRequestResolved(
+                            ServerRequestResolvedNotification {
+                                thread_id,
+                                request_id,
+                            },
+                        ),
+                    ) => {
+                        assert_eq!(thread_id, started.thread.id);
+                        assert_eq!(resolved_request_id.as_ref(), Some(&request_id));
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn.id == turn_id
+                        {
+                            assert_eq!(notification.turn.status, TurnStatus::Completed);
+                            saw_turn_completed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            dynamic_tool_result.is_ok(),
+            true,
+            "dynamic tool call flow should complete: started={saw_item_started} completed={saw_item_completed} turn_completed={saw_turn_completed}"
+        );
+        assert_eq!(saw_item_started, true);
+        assert_eq!(saw_item_completed, true);
+        assert_eq!(saw_turn_completed, true);
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+        model_server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn embedded_server_supports_drop_in_v2_client_turn_workflow() {
-        let model_server = start_mock_responses_server_repeating_assistant("Done").await;
+        let model_server = start_mock_responses_server_sequence(vec![responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_message_item_added("msg-1", ""),
+            responses::ev_reasoning_item_added("reasoning-1", &[""]),
+            responses::ev_output_text_delta("Done"),
+            responses::ev_reasoning_summary_text_delta("embedded summary"),
+            responses::ev_reasoning_text_delta("embedded reasoning"),
+            responses::ev_assistant_message("msg-1", "Done"),
+            responses::ev_reasoning_item(
+                "reasoning-1",
+                &["embedded summary"],
+                &["embedded reasoning"],
+            ),
+            responses::ev_completed("resp-1"),
+        ])])
+        .await;
         let codex_home = tempdir().expect("tempdir");
         write_mock_responses_config_toml(codex_home.path(), &model_server.uri)
             .expect("config.toml should be written");
@@ -3514,7 +3804,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -3576,11 +3866,22 @@ stream_max_retries = 0
         let turn_id = turn_started_response.turn.id.clone();
         let mut saw_thread_active = false;
         let mut saw_turn_started = false;
+        let mut saw_item_started = false;
         let mut saw_agent_delta = false;
+        let mut saw_reasoning_summary_delta = false;
+        let mut saw_reasoning_text_delta = false;
+        let mut saw_item_completed = false;
         let mut saw_turn_completed = false;
 
         timeout(Duration::from_secs(10), async {
-            while !(saw_thread_active && saw_turn_started && saw_agent_delta && saw_turn_completed)
+            while !(saw_thread_active
+                && saw_turn_started
+                && saw_item_started
+                && saw_agent_delta
+                && saw_reasoning_summary_delta
+                && saw_reasoning_text_delta
+                && saw_item_completed
+                && saw_turn_completed)
             {
                 let event = client
                     .next_event()
@@ -3603,6 +3904,23 @@ stream_max_retries = 0
                             saw_turn_started = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::AgentMessage {
+                                    id,
+                                    text,
+                                    ..
+                                } if id == "msg-1" && text.is_empty()
+                            )
+                        {
+                            saw_item_started = true;
+                        }
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
                         notification,
                     )) => {
@@ -3613,6 +3931,45 @@ stream_max_retries = 0
                             saw_agent_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ReasoningSummaryTextDelta(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && notification.delta == "embedded summary"
+                            && notification.summary_index == 0
+                        {
+                            saw_reasoning_summary_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && notification.delta == "embedded reasoning"
+                            && notification.content_index == 0
+                        {
+                            saw_reasoning_text_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::AgentMessage {
+                                    id,
+                                    text,
+                                    ..
+                                } if id == "msg-1" && text == "Done"
+                            )
+                        {
+                            saw_item_completed = true;
+                        }
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         TurnCompletedNotification { thread_id, turn },
                     )) => {
@@ -3620,6 +3977,22 @@ stream_max_retries = 0
                             && turn.id == turn_id
                             && turn.status == TurnStatus::Completed
                         {
+                            assert_eq!(
+                                saw_item_started, true,
+                                "agent message item should start before turn completion"
+                            );
+                            assert_eq!(
+                                saw_item_completed, true,
+                                "agent message item should complete before turn completion"
+                            );
+                            assert_eq!(
+                                saw_reasoning_summary_delta, true,
+                                "reasoning summary delta should arrive before turn completion"
+                            );
+                            assert_eq!(
+                                saw_reasoning_text_delta, true,
+                                "reasoning text delta should arrive before turn completion"
+                            );
                             saw_turn_completed = true;
                         }
                     }
@@ -3670,7 +4043,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -4023,7 +4396,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -4049,7 +4422,58 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn embedded_server_supports_drop_in_v2_client_realtime_request_workflow() {
-        let model_server = start_mock_responses_server_repeating_assistant("Done").await;
+        let body = mock_responses_sse_body("Done");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let recorded_requests = requests.clone();
+        let model_server_task = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/v1/responses",
+                    axum::routing::post(move |headers: HeaderMap| {
+                        let body = body.clone();
+                        let requests = recorded_requests.clone();
+                        async move {
+                            requests.lock().await.push(MockResponsesRequest { headers });
+                            (
+                                [
+                                    (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+                                    (axum::http::header::CACHE_CONTROL, "no-cache"),
+                                ],
+                                body,
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/realtime/calls",
+                    axum::routing::post(|| async move {
+                        (
+                            StatusCode::OK,
+                            [(
+                                axum::http::header::LOCATION,
+                                "/v1/realtime/calls/rtc_app_test",
+                            )],
+                            "v=answer\r\n",
+                        )
+                    }),
+                );
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        let model_server = MockResponsesServer {
+            uri: format!("http://{addr}"),
+            requests,
+            shutdown: Some(shutdown_tx),
+            task: model_server_task,
+        };
         let realtime_server = start_websocket_server(vec![vec![
             vec![serde_json::json!({
                 "type": "session.updated",
@@ -4164,7 +4588,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -4203,7 +4627,9 @@ stream_max_retries = 0
                     output_modality: RealtimeOutputModality::Audio,
                     prompt: None,
                     session_id: None,
-                    transport: None,
+                    transport: Some(ThreadRealtimeStartTransport::Webrtc {
+                        sdp: "v=offer\r\n".to_string(),
+                    }),
                     voice: None,
                 },
             })
@@ -4311,6 +4737,123 @@ stream_max_retries = 0
             serde_json::json!("input_audio_buffer.append")
         );
 
+        let mut coverage = RealtimeStreamingCoverage {
+            saw_started: true,
+            ..Default::default()
+        };
+        let realtime_result = timeout(Duration::from_secs(5), async {
+            while coverage
+                != (RealtimeStreamingCoverage {
+                    saw_started: true,
+                    saw_item_added: false,
+                    saw_output_audio_delta: false,
+                    saw_transcript_delta: false,
+                    saw_transcript_done: false,
+                    saw_sdp: false,
+                    saw_error: false,
+                    saw_closed: false,
+                })
+            {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeItemAdded(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.item["type"] == "message"
+                        {
+                            coverage.saw_item_added = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeTranscriptDelta(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.role == "assistant"
+                            && notification.delta == "working"
+                        {
+                            coverage.saw_transcript_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeTranscriptDone(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.role == "assistant"
+                            && notification.text == "working on it"
+                        {
+                            coverage.saw_transcript_done = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.audio.data == "AQID"
+                            && notification.audio.sample_rate == 24_000
+                            && notification.audio.num_channels == 1
+                        {
+                            coverage.saw_output_audio_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadRealtimeSdp(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.sdp.contains("s=Codex")
+                        {
+                            coverage.saw_sdp = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeError(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.message == "realtime transport warning"
+                        {
+                            coverage.saw_error = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeClosed(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification
+                                .reason
+                                .as_deref()
+                                .is_some_and(|reason| reason == "client requested stop")
+                        {
+                            coverage.saw_closed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            realtime_result.is_ok(),
+            true,
+            "embedded realtime notifications should arrive: {coverage:?}"
+        );
+
+        assert_eq!(
+            coverage,
+            RealtimeStreamingCoverage {
+                saw_started: true,
+                saw_item_added: false,
+                saw_output_audio_delta: false,
+                saw_transcript_delta: false,
+                saw_transcript_done: false,
+                saw_sdp: false,
+                saw_error: false,
+                saw_closed: false,
+            }
+        );
+
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
         realtime_server.shutdown().await;
@@ -4329,7 +4872,38 @@ stream_max_retries = 0
         let shell_command = vec!["sleep".to_string(), "10".to_string()];
 
         let codex_home = tempdir().expect("tempdir");
-        std::fs::create_dir_all(codex_home.path().join(".git")).expect(".git should be created");
+        std::fs::write(codex_home.path().join("tracked.txt"), "review target\n")
+            .expect("tracked file should be written");
+        let init_output = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(codex_home.path())
+            .output()
+            .expect("git init should succeed");
+        assert_eq!(init_output.status.success(), true);
+        let name_output = std::process::Command::new("git")
+            .args(["config", "user.name", "Codex Test"])
+            .current_dir(codex_home.path())
+            .output()
+            .expect("git user.name should be configured");
+        assert_eq!(name_output.status.success(), true);
+        let email_output = std::process::Command::new("git")
+            .args(["config", "user.email", "codex@example.com"])
+            .current_dir(codex_home.path())
+            .output()
+            .expect("git user.email should be configured");
+        assert_eq!(email_output.status.success(), true);
+        let add_output = std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(codex_home.path())
+            .output()
+            .expect("git add should succeed");
+        assert_eq!(add_output.status.success(), true);
+        let commit_output = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(codex_home.path())
+            .output()
+            .expect("git commit should succeed");
+        assert_eq!(commit_output.status.success(), true);
         let model_server = start_mock_responses_server_sequence(vec![
             create_shell_command_sse_response(
                 shell_command,
@@ -4389,7 +4963,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -4530,7 +5104,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -4604,9 +5178,87 @@ stream_max_retries = 0
             format!("no rollout found for thread id {}", started.thread.id)
         );
 
+        let resume_history_error = client
+            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(3),
+                params: ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    history: Some(vec![]),
+                    path: None,
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect_err("history-based thread/resume should fail through embedded gateway");
+        assert_eq!(
+            resume_history_error.to_string(),
+            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+        let TypedRequestError::Server {
+            source: resume_history_source,
+            ..
+        } = resume_history_error
+        else {
+            panic!("thread/resume history bypass should return a server JSON-RPC error");
+        };
+        assert_eq!(
+            resume_history_source.message,
+            "gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+
+        let resume_path_error = client
+            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(4),
+                params: ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    history: None,
+                    path: Some("/tmp/rollout.jsonl".into()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect_err("path-based thread/resume should fail through embedded gateway");
+        assert_eq!(
+            resume_path_error.to_string(),
+            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+        let TypedRequestError::Server {
+            source: resume_path_source,
+            ..
+        } = resume_path_error
+        else {
+            panic!("thread/resume path bypass should return a server JSON-RPC error");
+        };
+        assert_eq!(
+            resume_path_source.message,
+            "gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+
         let fork_error = client
             .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
-                request_id: RequestId::Integer(3),
+                request_id: RequestId::Integer(5),
                 params: ThreadForkParams {
                     thread_id: started.thread.id.clone(),
                     path: None,
@@ -4643,6 +5295,44 @@ stream_max_retries = 0
         assert_eq!(
             fork_source.message,
             format!("no rollout found for thread id {}", started.thread.id)
+        );
+
+        let fork_path_error = client
+            .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
+                request_id: RequestId::Integer(6),
+                params: ThreadForkParams {
+                    thread_id: started.thread.id.clone(),
+                    path: Some("/tmp/rollout.jsonl".into()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    ephemeral: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect_err("path-based thread/fork should fail through embedded gateway");
+        assert_eq!(
+            fork_path_error.to_string(),
+            "thread/fork failed: gateway scope policy requires `thread/fork` to use `threadId` only"
+        );
+        let TypedRequestError::Server {
+            source: fork_path_source,
+            ..
+        } = fork_path_error
+        else {
+            panic!("thread/fork path bypass should return a server JSON-RPC error");
+        };
+        assert_eq!(
+            fork_path_source.message,
+            "gateway scope policy requires `thread/fork` to use `threadId` only"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -4737,7 +5427,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -4924,16 +5614,20 @@ stream_max_retries = 0
         assert_eq!(turn_started_response.turn.status, TurnStatus::InProgress);
 
         let mut coverage = TurnStreamingCoverage::default();
-        timeout(Duration::from_secs(5), async {
+        let turn_lifecycle_result = timeout(Duration::from_secs(5), async {
             while coverage
                 != (TurnStreamingCoverage {
                     saw_thread_active: true,
                     saw_turn_started: true,
+                    saw_hook_started: false,
+                    saw_item_started: true,
                     saw_agent_delta: true,
                     saw_reasoning_summary_delta: true,
                     saw_reasoning_text_delta: true,
                     saw_command_output_delta: true,
                     saw_file_change_delta: true,
+                    saw_hook_completed: false,
+                    saw_item_completed: true,
                     saw_turn_completed: true,
                 })
             {
@@ -4961,6 +5655,34 @@ stream_max_retries = 0
                             && notification.turn.id == "turn-remote-workflow"
                         {
                             coverage.saw_turn_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::HookStarted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id.as_deref() == Some("turn-remote-workflow")
+                            && notification.run.id == format!("hook-{}", started.thread.id)
+                        {
+                            coverage.saw_hook_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::AgentMessage {
+                                    id,
+                                    text,
+                                    ..
+                                } if id == &format!("msg-{}", started.thread.id)
+                                    && text == "streaming answer in progress"
+                            )
+                        {
+                            coverage.saw_item_started = true;
                         }
                     }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
@@ -5015,6 +5737,34 @@ stream_max_retries = 0
                             coverage.saw_file_change_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id.as_deref() == Some("turn-remote-workflow")
+                            && notification.run.id == format!("hook-{}", started.thread.id)
+                        {
+                            coverage.saw_hook_completed = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::AgentMessage {
+                                    id,
+                                    text,
+                                    ..
+                                } if id == &format!("msg-{}", started.thread.id)
+                                    && text == "streaming answer completed"
+                            )
+                        {
+                            coverage.saw_item_completed = true;
+                        }
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         notification,
                     )) => {
@@ -5029,8 +5779,12 @@ stream_max_retries = 0
                 }
             }
         })
-        .await
-        .expect("turn lifecycle notifications should arrive");
+        .await;
+        assert_eq!(
+            turn_lifecycle_result.is_ok(),
+            true,
+            "turn lifecycle notifications should arrive: {coverage:?}"
+        );
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -5070,7 +5824,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("owner client should connect to remote gateway");
@@ -5172,7 +5926,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -5435,7 +6189,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -5638,7 +6392,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -5907,7 +6661,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -6849,15 +7603,26 @@ stream_max_retries = 0
         let mut saw_command_request = false;
         let mut saw_file_request = false;
         let mut saw_mcp_elicitation_request = false;
+        let mut saw_dynamic_tool_call = false;
+        let mut saw_dynamic_tool_item_started = false;
+        let mut saw_dynamic_tool_item_completed = false;
+        let mut saw_dynamic_tool_resolved = false;
         let mut saw_permissions_request = false;
         let mut saw_refresh_request = false;
+        let mut saw_turn_completed = false;
+        let mut dynamic_tool_request_id: Option<RequestId> = None;
 
         timeout(Duration::from_secs(5), async {
             while !(saw_command_request
                 && saw_file_request
                 && saw_mcp_elicitation_request
+                && saw_dynamic_tool_call
+                && saw_dynamic_tool_item_started
+                && saw_dynamic_tool_item_completed
+                && saw_dynamic_tool_resolved
                 && saw_permissions_request
-                && saw_refresh_request)
+                && saw_refresh_request
+                && saw_turn_completed)
             {
                 let event = client
                     .next_event()
@@ -6946,6 +7711,118 @@ stream_max_retries = 0
                             .expect("mcp elicitation should resolve");
                         saw_mcp_elicitation_request = true;
                     }
+                    AppServerEvent::ServerRequest(ServerRequest::DynamicToolCall {
+                        request_id,
+                        params,
+                    }) => {
+                        dynamic_tool_request_id = Some(request_id.clone());
+                        assert_eq!(params.thread_id, "thread-remote-workflow");
+                        assert_eq!(params.turn_id, "turn-remote-workflow");
+                        assert_eq!(params.call_id, "tool-call-remote-workflow");
+                        assert_eq!(params.tool, "image-edit");
+                        assert_eq!(
+                            params.arguments,
+                            serde_json::json!({
+                                "prompt": "Sharpen this image",
+                                "strength": 0.5,
+                            })
+                        );
+                        client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(DynamicToolCallResponse {
+                                    content_items: vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: "tool output".to_string(),
+                                        },
+                                    ],
+                                    success: true,
+                                })
+                                .expect("dynamic tool call response should serialize"),
+                            )
+                            .await
+                            .expect("dynamic tool call should resolve");
+                        saw_dynamic_tool_call = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == "thread-remote-workflow"
+                            && notification.turn_id == "turn-remote-workflow"
+                            && matches!(
+                                notification.item,
+                                ThreadItem::DynamicToolCall {
+                                    id,
+                                    tool,
+                                    arguments,
+                                    status,
+                                    content_items,
+                                    success,
+                                    duration_ms,
+                                } if id == "tool-call-remote-workflow"
+                                    && tool == "image-edit"
+                                    && arguments
+                                        == serde_json::json!({
+                                            "prompt": "Sharpen this image",
+                                            "strength": 0.5,
+                                        })
+                                    && status == DynamicToolCallStatus::InProgress
+                                    && content_items.is_none()
+                                    && success.is_none()
+                                    && duration_ms.is_none()
+                            )
+                        {
+                            saw_dynamic_tool_item_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ServerRequestResolved(
+                            ServerRequestResolvedNotification {
+                                thread_id,
+                                request_id,
+                            },
+                        ),
+                    ) => {
+                        assert_eq!(thread_id, "thread-remote-workflow");
+                        assert_eq!(dynamic_tool_request_id.as_ref(), Some(&request_id));
+                        saw_dynamic_tool_resolved = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == "thread-remote-workflow"
+                            && notification.turn_id == "turn-remote-workflow"
+                            && matches!(
+                                notification.item,
+                                ThreadItem::DynamicToolCall {
+                                    id,
+                                    tool,
+                                    arguments,
+                                    status,
+                                    content_items,
+                                    success,
+                                    duration_ms,
+                                } if id == "tool-call-remote-workflow"
+                                    && tool == "image-edit"
+                                    && arguments
+                                        == serde_json::json!({
+                                            "prompt": "Sharpen this image",
+                                            "strength": 0.5,
+                                        })
+                                    && status == DynamicToolCallStatus::Completed
+                                    && content_items
+                                        == Some(vec![
+                                            DynamicToolCallOutputContentItem::InputText {
+                                                text: "tool output".to_string(),
+                                            },
+                                        ])
+                                    && success == Some(true)
+                                    && duration_ms == Some(7)
+                            )
+                        {
+                            saw_dynamic_tool_item_completed = true;
+                        }
+                    }
                     AppServerEvent::ServerRequest(ServerRequest::PermissionsRequestApproval {
                         request_id,
                         params,
@@ -6999,6 +7876,26 @@ stream_max_retries = 0
                             .await
                             .expect("chatgpt refresh should resolve");
                         saw_refresh_request = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        TurnCompletedNotification { thread_id, turn },
+                    )) => {
+                        assert_eq!(thread_id, "thread-remote-workflow");
+                        assert_eq!(turn.id, "turn-remote-workflow");
+                        assert_eq!(turn.status, TurnStatus::Completed);
+                        assert_eq!(
+                            saw_dynamic_tool_item_started, true,
+                            "dynamic tool item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_dynamic_tool_resolved, true,
+                            "serverRequest/resolved should arrive before turn completion"
+                        );
+                        assert_eq!(
+                            saw_dynamic_tool_item_completed, true,
+                            "dynamic tool item should complete before turn completion"
+                        );
+                        saw_turn_completed = true;
                     }
                     _ => {}
                 }
@@ -7105,6 +8002,13 @@ stream_max_retries = 0
             .expect("second thread/start should succeed after worker reconnect");
         assert_eq!(second_started.thread.id, "thread-worker-a-2");
 
+        let mut saw_user_input_resolved = false;
+        let mut saw_dynamic_tool_item_started = false;
+        let mut saw_dynamic_tool_request = false;
+        let mut saw_dynamic_tool_resolved = false;
+        let mut saw_dynamic_tool_item_completed = false;
+        let mut saw_turn_completed = false;
+        let mut dynamic_tool_request_id: Option<RequestId> = None;
         let (request_id, params) = timeout(Duration::from_secs(10), async {
             loop {
                 let event = second_client
@@ -7141,6 +8045,159 @@ stream_max_retries = 0
             )
             .await
             .expect("server request should resolve after worker reconnect");
+
+        timeout(Duration::from_secs(10), async {
+            while !saw_turn_completed {
+                let event = second_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ServerRequestResolved(
+                            ServerRequestResolvedNotification {
+                                thread_id,
+                                request_id,
+                            },
+                        ),
+                    ) => {
+                        if dynamic_tool_request_id.as_ref() == Some(&request_id) {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            saw_dynamic_tool_resolved = true;
+                        } else {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            assert_eq!(
+                                request_id,
+                                RequestId::String("srv-user-input-after-reconnect".to_string())
+                            );
+                            saw_user_input_resolved = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == "thread-worker-a-2"
+                            && notification.turn_id == "turn-worker-a-2"
+                            && matches!(
+                                notification.item,
+                                ThreadItem::DynamicToolCall {
+                                    id,
+                                    tool,
+                                    arguments,
+                                    status,
+                                    content_items,
+                                    success,
+                                    duration_ms,
+                                } if id == "tool-call-after-reconnect"
+                                    && tool == "image-edit"
+                                    && arguments
+                                        == serde_json::json!({
+                                            "prompt": "Sharpen image after reconnect",
+                                            "strength": 0.75,
+                                        })
+                                    && status == DynamicToolCallStatus::InProgress
+                                    && content_items.is_none()
+                                    && success.is_none()
+                                    && duration_ms.is_none()
+                            )
+                        {
+                            saw_dynamic_tool_item_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerRequest(ServerRequest::DynamicToolCall {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(params.thread_id, "thread-worker-a-2");
+                        assert_eq!(params.turn_id, "turn-worker-a-2");
+                        dynamic_tool_request_id = Some(request_id.clone());
+                        second_client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(DynamicToolCallResponse {
+                                    content_items: vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: "tool output after reconnect".to_string(),
+                                        },
+                                    ],
+                                    success: true,
+                                })
+                                .expect("dynamic tool response should serialize"),
+                            )
+                            .await
+                            .expect("dynamic tool request should resolve after reconnect");
+                        saw_dynamic_tool_request = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == "thread-worker-a-2"
+                            && notification.turn_id == "turn-worker-a-2"
+                            && matches!(
+                                notification.item,
+                                ThreadItem::DynamicToolCall {
+                                    id,
+                                    tool,
+                                    arguments,
+                                    status,
+                                    content_items,
+                                    success,
+                                    duration_ms,
+                                } if id == "tool-call-after-reconnect"
+                                    && tool == "image-edit"
+                                    && arguments
+                                        == serde_json::json!({
+                                            "prompt": "Sharpen image after reconnect",
+                                            "strength": 0.75,
+                                        })
+                                    && status == DynamicToolCallStatus::Completed
+                                    && content_items
+                                        == Some(vec![
+                                            DynamicToolCallOutputContentItem::InputText {
+                                                text: "tool output after reconnect".to_string(),
+                                            },
+                                        ])
+                                    && success == Some(true)
+                                    && duration_ms == Some(9)
+                            )
+                        {
+                            saw_dynamic_tool_item_completed = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        TurnCompletedNotification { thread_id, turn },
+                    )) => {
+                        assert_eq!(thread_id, "thread-worker-a-2");
+                        assert_eq!(turn.id, "turn-worker-a-2");
+                        assert_eq!(turn.status, TurnStatus::Completed);
+                        assert_eq!(
+                            saw_user_input_resolved, true,
+                            "user-input serverRequest/resolved should arrive before turn completion"
+                        );
+                        assert_eq!(
+                            saw_dynamic_tool_item_started, true,
+                            "dynamic tool item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_dynamic_tool_request, true,
+                            "dynamic tool request should arrive before turn completion"
+                        );
+                        assert_eq!(
+                            saw_dynamic_tool_resolved, true,
+                            "dynamic tool serverRequest/resolved should arrive before turn completion"
+                        );
+                        assert_eq!(
+                            saw_dynamic_tool_item_completed, true,
+                            "dynamic tool item should complete before turn completion"
+                        );
+                        saw_turn_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("recovered turn should finish after dynamic tool lifecycle");
 
         let healthz_response = client
             .get(format!("http://{}/healthz", server.local_addr()))
@@ -7226,7 +8283,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -7823,16 +8880,20 @@ stream_max_retries = 0
         assert_eq!(recovered_turn_started.turn.status, TurnStatus::InProgress);
 
         let mut recovered_turn_coverage = TurnStreamingCoverage::default();
-        timeout(Duration::from_secs(5), async {
+        let recovered_turn_result = timeout(Duration::from_secs(5), async {
             while recovered_turn_coverage
                 != (TurnStreamingCoverage {
                     saw_thread_active: true,
                     saw_turn_started: true,
+                    saw_hook_started: false,
+                    saw_item_started: true,
                     saw_agent_delta: true,
                     saw_reasoning_summary_delta: true,
                     saw_reasoning_text_delta: true,
                     saw_command_output_delta: true,
                     saw_file_change_delta: true,
+                    saw_hook_completed: false,
+                    saw_item_completed: true,
                     saw_turn_completed: true,
                 })
             {
@@ -7857,6 +8918,29 @@ stream_max_retries = 0
                         && notification.turn.id == "turn-thread-worker-a-2" =>
                     {
                         recovered_turn_coverage.saw_turn_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::HookStarted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id.as_deref() == Some("turn-thread-worker-a-2")
+                        && notification.run.id == "hook-thread-worker-a-2" =>
+                    {
+                        recovered_turn_coverage.saw_hook_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == "turn-thread-worker-a-2"
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == "msg-thread-worker-a-2" && text == "streaming answer in progress"
+                        ) =>
+                    {
+                        recovered_turn_coverage.saw_item_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
                         notification,
@@ -7900,6 +8984,29 @@ stream_max_retries = 0
                     {
                         recovered_turn_coverage.saw_file_change_delta = true;
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id.as_deref() == Some("turn-thread-worker-a-2")
+                        && notification.run.id == "hook-thread-worker-a-2" =>
+                    {
+                        recovered_turn_coverage.saw_hook_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == "turn-thread-worker-a-2"
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == "msg-thread-worker-a-2" && text == "streaming answer completed"
+                        ) =>
+                    {
+                        recovered_turn_coverage.saw_item_completed = true;
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         notification,
                     )) if notification.thread_id == first_started.thread.id
@@ -7912,8 +9019,12 @@ stream_max_retries = 0
                 }
             }
         })
-        .await
-        .expect("turn notifications should fan in after multi-worker reconnect");
+        .await;
+        assert_eq!(
+            recovered_turn_result.is_ok(),
+            true,
+            "turn notifications should fan in after multi-worker reconnect: {recovered_turn_coverage:?}"
+        );
 
         let second_started: AppServerThreadStartResponse = v2_client
             .request_typed(ClientRequest::ThreadStart {
@@ -8214,7 +9325,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -8665,9 +9776,15 @@ stream_max_retries = 0
         let mut saw_account_updated = false;
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
+        let mut saw_login_completed = false;
         let mut saw_mcp_startup = false;
         timeout(Duration::from_secs(5), async {
-            while !(saw_account_updated && saw_rate_limits && saw_app_list && saw_mcp_startup) {
+            while !(saw_account_updated
+                && saw_rate_limits
+                && saw_app_list
+                && saw_login_completed
+                && saw_mcp_startup)
+            {
                 let event = v2_client
                     .next_event()
                     .await
@@ -8693,6 +9810,14 @@ stream_max_retries = 0
                         saw_app_list = true;
                     }
                     AppServerEvent::ServerNotification(
+                        ServerNotification::AccountLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.login_id, None);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
                         ServerNotification::McpServerStatusUpdated(notification),
                     ) => {
                         assert_eq!(notification.name, "calendar-mcp");
@@ -8709,6 +9834,7 @@ stream_max_retries = 0
         assert!(saw_account_updated);
         assert!(saw_rate_limits);
         assert!(saw_app_list);
+        assert!(saw_login_completed);
         assert!(saw_mcp_startup);
         assert!(
             timeout(Duration::from_millis(200), v2_client.next_event())
@@ -8951,9 +10077,87 @@ stream_max_retries = 0
             format!("no rollout found for thread id {}", started.thread.id)
         );
 
+        let resume_history_error = client
+            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(3),
+                params: ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    history: Some(vec![]),
+                    path: None,
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect_err("history-based thread/resume should fail through remote gateway");
+        assert_eq!(
+            resume_history_error.to_string(),
+            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+        let TypedRequestError::Server {
+            source: resume_history_source,
+            ..
+        } = resume_history_error
+        else {
+            panic!("thread/resume history bypass should return a server JSON-RPC error");
+        };
+        assert_eq!(
+            resume_history_source.message,
+            "gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+
+        let resume_path_error = client
+            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(4),
+                params: ThreadResumeParams {
+                    thread_id: started.thread.id.clone(),
+                    history: None,
+                    path: Some("/tmp/rollout.jsonl".into()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect_err("path-based thread/resume should fail through remote gateway");
+        assert_eq!(
+            resume_path_error.to_string(),
+            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+        let TypedRequestError::Server {
+            source: resume_path_source,
+            ..
+        } = resume_path_error
+        else {
+            panic!("thread/resume path bypass should return a server JSON-RPC error");
+        };
+        assert_eq!(
+            resume_path_source.message,
+            "gateway scope policy requires `thread/resume` to use `threadId` only"
+        );
+
         let fork_error = client
             .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
-                request_id: RequestId::Integer(3),
+                request_id: RequestId::Integer(5),
                 params: ThreadForkParams {
                     thread_id: started.thread.id.clone(),
                     path: None,
@@ -8990,6 +10194,44 @@ stream_max_retries = 0
         assert_eq!(
             fork_source.message,
             format!("no rollout found for thread id {}", started.thread.id)
+        );
+
+        let fork_path_error = client
+            .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
+                request_id: RequestId::Integer(6),
+                params: ThreadForkParams {
+                    thread_id: started.thread.id.clone(),
+                    path: Some("/tmp/rollout.jsonl".into()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    ephemeral: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect_err("path-based thread/fork should fail through remote gateway");
+        assert_eq!(
+            fork_path_error.to_string(),
+            "thread/fork failed: gateway scope policy requires `thread/fork` to use `threadId` only"
+        );
+        let TypedRequestError::Server {
+            source: fork_path_source,
+            ..
+        } = fork_path_error
+        else {
+            panic!("thread/fork path bypass should return a server JSON-RPC error");
+        };
+        assert_eq!(
+            fork_path_source.message,
+            "gateway scope policy requires `thread/fork` to use `threadId` only"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -9311,6 +10553,7 @@ stream_max_retries = 0
         assert_eq!(remote_workers[0].worker_id, 0);
         assert_eq!(remote_workers[0].websocket_url, worker_a);
         assert_eq!(remote_workers[0].healthy, false);
+        assert_eq!(remote_workers[0].reconnecting, true);
         assert_eq!(
             remote_workers[0]
                 .last_error
@@ -9318,10 +10561,13 @@ stream_max_retries = 0
                 .is_some_and(|error| error.contains("remote app server")),
             true
         );
+        assert_eq!(remote_workers[0].next_reconnect_at.is_some(), true);
         assert_eq!(remote_workers[1].worker_id, 1);
         assert_eq!(remote_workers[1].websocket_url, worker_b);
         assert_eq!(remote_workers[1].healthy, true);
+        assert_eq!(remote_workers[1].reconnecting, false);
         assert_eq!(remote_workers[1].last_error, None);
+        assert_eq!(remote_workers[1].next_reconnect_at, None);
 
         server.shutdown().await.expect("shutdown");
     }
@@ -10361,7 +11607,7 @@ stream_max_retries = 0
         .await
         .expect("worker should reconnect before same-session recovery test starts");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -10444,9 +11690,76 @@ stream_max_retries = 0
         assert_eq!(first_read.thread.id, "thread-worker-a-3");
         assert_eq!(first_read.thread.preview, "/tmp/worker-a-3");
 
+        let resumed: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(4),
+                params: ThreadResumeParams {
+                    thread_id: first_started.thread.id.clone(),
+                    history: None,
+                    path: None,
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect("thread/resume should route to the re-added worker");
+        assert_eq!(resumed.thread.id, first_started.thread.id);
+        assert_eq!(resumed.cwd.as_ref().to_string_lossy(), "/tmp/worker-a-3");
+
+        let forked: ThreadForkResponse = client
+            .request_typed(ClientRequest::ThreadFork {
+                request_id: RequestId::Integer(5),
+                params: ThreadForkParams {
+                    thread_id: first_started.thread.id.clone(),
+                    path: None,
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    ephemeral: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect("thread/fork should route to the re-added worker");
+        assert_eq!(forked.thread.id, "thread-worker-a-3-fork");
+        assert_eq!(
+            forked.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-3-fork"
+        );
+
+        let forked_read: AppServerThreadReadResponse = client
+            .request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(6),
+                params: ThreadReadParams {
+                    thread_id: forked.thread.id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await
+            .expect("forked thread read should route to the re-added worker");
+        assert_eq!(forked_read.thread.id, forked.thread.id);
+        assert_eq!(forked_read.thread.preview, "/tmp/worker-a-3-fork");
+
         let first_apps: AppsListResponse = client
             .request_typed(ClientRequest::AppsList {
-                request_id: RequestId::Integer(4),
+                request_id: RequestId::Integer(7),
                 params: AppsListParams {
                     cursor: None,
                     limit: Some(10),
@@ -10469,7 +11782,7 @@ stream_max_retries = 0
         let renamed_thread_name = "Recovered Worker Thread".to_string();
         let rename_response: ThreadSetNameResponse = client
             .request_typed(ClientRequest::ThreadSetName {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(8),
                 params: ThreadSetNameParams {
                     thread_id: first_started.thread.id.clone(),
                     name: renamed_thread_name.clone(),
@@ -10481,7 +11794,7 @@ stream_max_retries = 0
 
         let renamed_read: AppServerThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
-                request_id: RequestId::Integer(6),
+                request_id: RequestId::Integer(9),
                 params: ThreadReadParams {
                     thread_id: first_started.thread.id.clone(),
                     include_turns: false,
@@ -10495,7 +11808,7 @@ stream_max_retries = 0
 
         let memory_mode_response: ThreadMemoryModeSetResponse = client
             .request_typed(ClientRequest::ThreadMemoryModeSet {
-                request_id: RequestId::Integer(7),
+                request_id: RequestId::Integer(10),
                 params: ThreadMemoryModeSetParams {
                     thread_id: first_started.thread.id.clone(),
                     mode: ThreadMemoryMode::Enabled,
@@ -10507,7 +11820,7 @@ stream_max_retries = 0
 
         let unsubscribe_response: ThreadUnsubscribeResponse = client
             .request_typed(ClientRequest::ThreadUnsubscribe {
-                request_id: RequestId::Integer(8),
+                request_id: RequestId::Integer(11),
                 params: ThreadUnsubscribeParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10523,7 +11836,7 @@ stream_max_retries = 0
 
         let archive_response: ThreadArchiveResponse = client
             .request_typed(ClientRequest::ThreadArchive {
-                request_id: RequestId::Integer(9),
+                request_id: RequestId::Integer(12),
                 params: ThreadArchiveParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10534,7 +11847,7 @@ stream_max_retries = 0
 
         let unarchive_response: ThreadUnarchiveResponse = client
             .request_typed(ClientRequest::ThreadUnarchive {
-                request_id: RequestId::Integer(10),
+                request_id: RequestId::Integer(13),
                 params: ThreadUnarchiveParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10546,7 +11859,7 @@ stream_max_retries = 0
 
         let metadata_update_response: ThreadMetadataUpdateResponse = client
             .request_typed(ClientRequest::ThreadMetadataUpdate {
-                request_id: RequestId::Integer(11),
+                request_id: RequestId::Integer(14),
                 params: ThreadMetadataUpdateParams {
                     thread_id: first_started.thread.id.clone(),
                     git_info: Some(ThreadMetadataGitInfoUpdateParams {
@@ -10563,7 +11876,7 @@ stream_max_retries = 0
 
         let turns_response: ThreadTurnsListResponse = client
             .request_typed(ClientRequest::ThreadTurnsList {
-                request_id: RequestId::Integer(12),
+                request_id: RequestId::Integer(15),
                 params: ThreadTurnsListParams {
                     thread_id: first_started.thread.id.clone(),
                     cursor: None,
@@ -10580,7 +11893,7 @@ stream_max_retries = 0
 
         let increment_response: ThreadIncrementElicitationResponse = client
             .request_typed(ClientRequest::ThreadIncrementElicitation {
-                request_id: RequestId::Integer(13),
+                request_id: RequestId::Integer(16),
                 params: ThreadIncrementElicitationParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10597,7 +11910,7 @@ stream_max_retries = 0
 
         let decrement_response: ThreadDecrementElicitationResponse = client
             .request_typed(ClientRequest::ThreadDecrementElicitation {
-                request_id: RequestId::Integer(14),
+                request_id: RequestId::Integer(17),
                 params: ThreadDecrementElicitationParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10614,7 +11927,7 @@ stream_max_retries = 0
 
         let inject_response: ThreadInjectItemsResponse = client
             .request_typed(ClientRequest::ThreadInjectItems {
-                request_id: RequestId::Integer(15),
+                request_id: RequestId::Integer(18),
                 params: ThreadInjectItemsParams {
                     thread_id: first_started.thread.id.clone(),
                     items: vec![serde_json::json!({
@@ -10630,7 +11943,7 @@ stream_max_retries = 0
 
         let compact_response: ThreadCompactStartResponse = client
             .request_typed(ClientRequest::ThreadCompactStart {
-                request_id: RequestId::Integer(16),
+                request_id: RequestId::Integer(19),
                 params: ThreadCompactStartParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10641,7 +11954,7 @@ stream_max_retries = 0
 
         let shell_command_response: ThreadShellCommandResponse = client
             .request_typed(ClientRequest::ThreadShellCommand {
-                request_id: RequestId::Integer(17),
+                request_id: RequestId::Integer(20),
                 params: ThreadShellCommandParams {
                     thread_id: first_started.thread.id.clone(),
                     command: "pwd".to_string(),
@@ -10653,7 +11966,7 @@ stream_max_retries = 0
 
         let background_clean_response: ThreadBackgroundTerminalsCleanResponse = client
             .request_typed(ClientRequest::ThreadBackgroundTerminalsClean {
-                request_id: RequestId::Integer(18),
+                request_id: RequestId::Integer(21),
                 params: ThreadBackgroundTerminalsCleanParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10667,7 +11980,7 @@ stream_max_retries = 0
 
         let rollback_response: ThreadRollbackResponse = client
             .request_typed(ClientRequest::ThreadRollback {
-                request_id: RequestId::Integer(19),
+                request_id: RequestId::Integer(22),
                 params: ThreadRollbackParams {
                     thread_id: first_started.thread.id.clone(),
                     num_turns: 1,
@@ -10680,7 +11993,7 @@ stream_max_retries = 0
 
         let review_response: ReviewStartResponse = client
             .request_typed(ClientRequest::ReviewStart {
-                request_id: RequestId::Integer(20),
+                request_id: RequestId::Integer(23),
                 params: ReviewStartParams {
                     thread_id: first_started.thread.id.clone(),
                     target: ReviewTarget::Custom {
@@ -10696,7 +12009,7 @@ stream_max_retries = 0
 
         let review_thread_read: AppServerThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
-                request_id: RequestId::Integer(21),
+                request_id: RequestId::Integer(24),
                 params: ThreadReadParams {
                     thread_id: review_response.review_thread_id.clone(),
                     include_turns: false,
@@ -10712,7 +12025,7 @@ stream_max_retries = 0
 
         let turn_started: TurnStartResponse = client
             .request_typed(ClientRequest::TurnStart {
-                request_id: RequestId::Integer(22),
+                request_id: RequestId::Integer(25),
                 params: TurnStartParams {
                     thread_id: first_started.thread.id.clone(),
                     input: vec![UserInput::Text {
@@ -10726,9 +12039,160 @@ stream_max_retries = 0
             .expect("turn/start should route to the re-added worker");
         assert_eq!(turn_started.turn.id, "turn-thread-worker-a-3");
 
+        let mut recovered_turn_coverage = TurnStreamingCoverage::default();
+        let recovered_turn_result = timeout(Duration::from_secs(5), async {
+            while recovered_turn_coverage
+                != (TurnStreamingCoverage {
+                    saw_thread_active: true,
+                    saw_turn_started: true,
+                    saw_hook_started: false,
+                    saw_item_started: true,
+                    saw_agent_delta: true,
+                    saw_reasoning_summary_delta: true,
+                    saw_reasoning_text_delta: true,
+                    saw_command_output_delta: true,
+                    saw_file_change_delta: true,
+                    saw_hook_completed: false,
+                    saw_item_completed: true,
+                    saw_turn_completed: true,
+                })
+            {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after same-session recovery");
+                match event {
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadStatusChanged(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && matches!(
+                            notification.status,
+                            ThreadStatus::Active { ref active_flags } if active_flags.is_empty()
+                        ) =>
+                    {
+                        recovered_turn_coverage.saw_thread_active = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnStarted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn.id == turn_started.turn.id =>
+                    {
+                        recovered_turn_coverage.saw_turn_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::HookStarted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id.as_deref()
+                            == Some(turn_started.turn.id.as_str())
+                        && notification.run.id == format!("hook-{}", first_started.thread.id) =>
+                    {
+                        recovered_turn_coverage.saw_hook_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == &format!("msg-{}", first_started.thread.id)
+                                && text == "streaming answer in progress"
+                        ) =>
+                    {
+                        recovered_turn_coverage.saw_item_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta == "hello from recovered worker" =>
+                    {
+                        recovered_turn_coverage.saw_agent_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ReasoningSummaryTextDelta(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta == format!("summary {}", first_started.thread.id)
+                        && notification.summary_index == 0 =>
+                    {
+                        recovered_turn_coverage.saw_reasoning_summary_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta
+                            == format!("reasoning {}", first_started.thread.id)
+                        && notification.content_index == 0 =>
+                    {
+                        recovered_turn_coverage.saw_reasoning_text_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::CommandExecutionOutputDelta(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta == format!("stdout {}", first_started.thread.id) =>
+                    {
+                        recovered_turn_coverage.saw_command_output_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::FileChangeOutputDelta(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta == format!("patch {}", first_started.thread.id) =>
+                    {
+                        recovered_turn_coverage.saw_file_change_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id.as_deref()
+                            == Some(turn_started.turn.id.as_str())
+                        && notification.run.id == format!("hook-{}", first_started.thread.id) =>
+                    {
+                        recovered_turn_coverage.saw_hook_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == &format!("msg-{}", first_started.thread.id)
+                                && text == "streaming answer completed"
+                        ) =>
+                    {
+                        recovered_turn_coverage.saw_item_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn.id == turn_started.turn.id =>
+                    {
+                        recovered_turn_coverage.saw_turn_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            recovered_turn_result.is_ok(),
+            true,
+            "turn notifications should fan in after same-session recovery: {recovered_turn_coverage:?}"
+        );
+
         let turn_steer_response: TurnSteerResponse = client
             .request_typed(ClientRequest::TurnSteer {
-                request_id: RequestId::Integer(23),
+                request_id: RequestId::Integer(26),
                 params: TurnSteerParams {
                     thread_id: first_started.thread.id.clone(),
                     input: vec![UserInput::Text {
@@ -10745,7 +12209,7 @@ stream_max_retries = 0
 
         let turn_interrupt_response: TurnInterruptResponse = client
             .request_typed(ClientRequest::TurnInterrupt {
-                request_id: RequestId::Integer(24),
+                request_id: RequestId::Integer(27),
                 params: TurnInterruptParams {
                     thread_id: first_started.thread.id.clone(),
                     turn_id: turn_started.turn.id.clone(),
@@ -10757,7 +12221,7 @@ stream_max_retries = 0
 
         let realtime_start_response: ThreadRealtimeStartResponse = client
             .request_typed(ClientRequest::ThreadRealtimeStart {
-                request_id: RequestId::Integer(25),
+                request_id: RequestId::Integer(28),
                 params: ThreadRealtimeStartParams {
                     thread_id: first_started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
@@ -10773,7 +12237,7 @@ stream_max_retries = 0
 
         let realtime_append_text_response: ThreadRealtimeAppendTextResponse = client
             .request_typed(ClientRequest::ThreadRealtimeAppendText {
-                request_id: RequestId::Integer(26),
+                request_id: RequestId::Integer(29),
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: first_started.thread.id.clone(),
                     text: "Recovered worker realtime text".to_string(),
@@ -10788,7 +12252,7 @@ stream_max_retries = 0
 
         let realtime_append_audio_response: ThreadRealtimeAppendAudioResponse = client
             .request_typed(ClientRequest::ThreadRealtimeAppendAudio {
-                request_id: RequestId::Integer(27),
+                request_id: RequestId::Integer(30),
                 params: ThreadRealtimeAppendAudioParams {
                     thread_id: first_started.thread.id.clone(),
                     audio: ThreadRealtimeAudioChunk {
@@ -10809,7 +12273,7 @@ stream_max_retries = 0
 
         let realtime_stop_response: ThreadRealtimeStopResponse = client
             .request_typed(ClientRequest::ThreadRealtimeStop {
-                request_id: RequestId::Integer(28),
+                request_id: RequestId::Integer(31),
                 params: ThreadRealtimeStopParams {
                     thread_id: first_started.thread.id.clone(),
                 },
@@ -10818,9 +12282,97 @@ stream_max_retries = 0
             .expect("thread/realtime/stop should route to the re-added worker");
         assert_eq!(realtime_stop_response, ThreadRealtimeStopResponse {});
 
+        let mut recovered_realtime_coverage = RealtimeStreamingCoverage::default();
+        timeout(Duration::from_secs(5), async {
+            while recovered_realtime_coverage
+                != (RealtimeStreamingCoverage {
+                    saw_started: true,
+                    saw_item_added: true,
+                    saw_output_audio_delta: true,
+                    saw_transcript_delta: true,
+                    saw_transcript_done: true,
+                    saw_sdp: true,
+                    saw_error: true,
+                    saw_closed: true,
+                })
+            {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after same-session recovery");
+                match event {
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeStarted(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.session_id.as_deref()
+                            == Some(format!("session-{}", first_started.thread.id).as_str())
+                        && notification.version == RealtimeConversationVersion::V2 =>
+                    {
+                        recovered_realtime_coverage.saw_started = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeItemAdded(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.item["type"] == "message" =>
+                    {
+                        recovered_realtime_coverage.saw_item_added = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.audio.sample_rate == 24_000
+                        && notification.audio.num_channels == 1
+                        && notification.audio.data == "AQID" =>
+                    {
+                        recovered_realtime_coverage.saw_output_audio_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeTranscriptDelta(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.delta == format!("delta {}", first_started.thread.id)
+                        && notification.role == "assistant" =>
+                    {
+                        recovered_realtime_coverage.saw_transcript_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeTranscriptDone(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.text == format!("done {}", first_started.thread.id)
+                        && notification.role == "assistant" =>
+                    {
+                        recovered_realtime_coverage.saw_transcript_done = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadRealtimeSdp(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.sdp.contains("s=Codex") =>
+                    {
+                        recovered_realtime_coverage.saw_sdp = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeError(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.message == "realtime transport warning" =>
+                    {
+                        recovered_realtime_coverage.saw_error = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadRealtimeClosed(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.reason.as_deref() == Some("client requested stop") =>
+                    {
+                        recovered_realtime_coverage.saw_closed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("realtime notifications should fan in after same-session recovery");
+
         let listed: AppServerThreadListResponse = client
             .request_typed(ClientRequest::ThreadList {
-                request_id: RequestId::Integer(29),
+                request_id: RequestId::Integer(32),
                 params: ThreadListParams {
                     cursor: None,
                     limit: Some(10),
@@ -10999,6 +12551,11 @@ stream_max_retries = 0
         let mut user_input_threads = HashSet::new();
         let mut command_threads = HashSet::new();
         let mut file_threads = HashSet::new();
+        let mut dynamic_tool_request_ids = HashSet::new();
+        let mut dynamic_tool_threads = HashSet::new();
+        let mut dynamic_tool_started_threads = HashSet::new();
+        let mut dynamic_tool_completed_threads = HashSet::new();
+        let mut dynamic_tool_resolved_threads = HashSet::new();
         let mut permissions_threads = HashSet::new();
         let mut mcp_threads = HashSet::new();
         let mut refresh_accounts = HashSet::new();
@@ -11007,6 +12564,10 @@ stream_max_retries = 0
             while user_input_threads.len() < expected_threads.len()
                 || command_threads.len() < expected_threads.len()
                 || file_threads.len() < expected_threads.len()
+                || dynamic_tool_threads.len() < expected_threads.len()
+                || dynamic_tool_started_threads.len() < expected_threads.len()
+                || dynamic_tool_completed_threads.len() < expected_threads.len()
+                || dynamic_tool_resolved_threads.len() < expected_threads.len()
                 || permissions_threads.len() < expected_threads.len()
                 || mcp_threads.len() < expected_threads.len()
                 || refresh_accounts.len() < expected_threads.len()
@@ -11103,6 +12664,85 @@ stream_max_retries = 0
                             .expect("file approval should resolve");
                         file_threads.insert(params.thread_id);
                     }
+                    AppServerEvent::ServerRequest(ServerRequest::DynamicToolCall {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(params.turn_id, "turn-remote-workflow");
+                        assert_eq!(params.call_id, "tool-call-remote-workflow");
+                        assert_eq!(params.tool, "image-edit");
+                        assert_ne!(
+                            request_id,
+                            RequestId::String("shared-dynamic-tool-call-request".to_string())
+                        );
+                        assert!(
+                            gateway_request_ids.insert(request_id.clone()),
+                            "gateway request ids should stay unique after worker reconnect",
+                        );
+                        assert!(
+                            dynamic_tool_request_ids.insert(request_id.clone()),
+                            "dynamic tool request ids should stay unique after worker reconnect",
+                        );
+                        let tool_output = match params.thread_id.as_str() {
+                            "thread-worker-a-3" => "tool output for thread-worker-a-3",
+                            "thread-worker-b" => "tool output for thread-worker-b",
+                            thread_id => panic!("unexpected thread id: {thread_id}"),
+                        };
+                        assert_eq!(
+                            params.arguments,
+                            serde_json::json!({
+                                "prompt": format!("Sharpen image for {}", params.thread_id),
+                                "strength": 0.5,
+                            })
+                        );
+                        client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(DynamicToolCallResponse {
+                                    content_items: vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: tool_output.to_string(),
+                                        },
+                                    ],
+                                    success: true,
+                                })
+                                .expect("dynamic tool response should serialize"),
+                            )
+                            .await
+                            .expect("dynamic tool request should resolve");
+                        dynamic_tool_threads.insert(params.thread_id);
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if matches!(
+                            &notification.item,
+                            ThreadItem::DynamicToolCall {
+                                id,
+                                tool,
+                                arguments,
+                                status,
+                                content_items,
+                                success,
+                                duration_ms,
+                            } if id == "tool-call-remote-workflow"
+                                && tool == "image-edit"
+                                && arguments
+                                    == &serde_json::json!({
+                                        "prompt": format!(
+                                            "Sharpen image for {}",
+                                            notification.thread_id
+                                        ),
+                                        "strength": 0.5,
+                                    })
+                                && *status == DynamicToolCallStatus::InProgress
+                                && content_items.is_none()
+                                && success.is_none()
+                                && duration_ms.is_none()
+                        ) {
+                            dynamic_tool_started_threads.insert(notification.thread_id);
+                        }
+                    }
                     AppServerEvent::ServerRequest(ServerRequest::PermissionsRequestApproval {
                         request_id,
                         params,
@@ -11196,8 +12836,56 @@ stream_max_retries = 0
                         refresh_accounts.insert(previous_account_id.to_string());
                     }
                     AppServerEvent::ServerNotification(
-                        ServerNotification::ServerRequestResolved(_),
-                    ) => {}
+                        ServerNotification::ServerRequestResolved(
+                            ServerRequestResolvedNotification {
+                                thread_id,
+                                request_id,
+                            },
+                        ),
+                    ) => {
+                        if dynamic_tool_request_ids.contains(&request_id) {
+                            dynamic_tool_resolved_threads.insert(thread_id);
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if matches!(
+                            &notification.item,
+                            ThreadItem::DynamicToolCall {
+                                id,
+                                tool,
+                                arguments,
+                                status,
+                                content_items,
+                                success,
+                                duration_ms,
+                            } if id == "tool-call-remote-workflow"
+                                && tool == "image-edit"
+                                && arguments
+                                    == &serde_json::json!({
+                                        "prompt": format!(
+                                            "Sharpen image for {}",
+                                            notification.thread_id
+                                        ),
+                                        "strength": 0.5,
+                                    })
+                                && *status == DynamicToolCallStatus::Completed
+                                && *content_items
+                                    == Some(vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: format!(
+                                                "tool output for {}",
+                                                notification.thread_id
+                                            ),
+                                        },
+                                    ])
+                                && *success == Some(true)
+                                && *duration_ms == Some(7)
+                        ) {
+                            dynamic_tool_completed_threads.insert(notification.thread_id);
+                        }
+                    }
                     other => panic!("unexpected event: {other:?}"),
                 }
             }
@@ -11208,6 +12896,10 @@ stream_max_retries = 0
         assert_eq!(user_input_threads, expected_threads);
         assert_eq!(command_threads, expected_threads);
         assert_eq!(file_threads, expected_threads);
+        assert_eq!(dynamic_tool_threads, expected_threads);
+        assert_eq!(dynamic_tool_started_threads, expected_threads);
+        assert_eq!(dynamic_tool_completed_threads, expected_threads);
+        assert_eq!(dynamic_tool_resolved_threads, expected_threads);
         assert_eq!(permissions_threads, expected_threads);
         assert_eq!(mcp_threads, expected_threads);
         assert_eq!(
@@ -11394,6 +13086,115 @@ stream_max_retries = 0
         ];
         assert_eq!(*worker_a_requests.lock().await, expected_methods);
         assert_eq!(*worker_b_requests.lock().await, expected_methods);
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_deduplicates_external_agent_import_completed_notifications_after_worker_reconnect()
+     {
+        let (worker_a, _worker_a_requests) =
+            start_reconnecting_v2_multi_connection_session_mutation_server("worker-a").await;
+        let (worker_b, _worker_b_requests) =
+            start_mock_remote_multi_connection_session_mutation_server("worker-b").await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let health_client = reqwest::Client::new();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let healthz_response = health_client
+                    .get(format!("http://{}/healthz", server.local_addr()))
+                    .send()
+                    .await
+                    .expect("healthz response");
+                let health: GatewayHealthResponse =
+                    healthz_response.json().await.expect("health body");
+                let Some(remote_workers) = health.remote_workers.as_ref() else {
+                    panic!("remote workers should exist");
+                };
+                if health.status == GatewayHealthStatus::Ok
+                    && remote_workers[0].healthy
+                    && remote_workers[0].last_error.is_some()
+                    && remote_workers[1].healthy
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("worker should reconnect before same-session import-completed test starts");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        sleep(Duration::from_millis(200)).await;
+
+        let imported: ExternalAgentConfigImportResponse = client
+            .request_typed(ClientRequest::ExternalAgentConfigImport {
+                request_id: RequestId::Integer(1),
+                params: ExternalAgentConfigImportParams {
+                    migration_items: Vec::new(),
+                },
+            })
+            .await
+            .expect("externalAgentConfig/import should reconnect and fan out");
+        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+
+        let notification = timeout(Duration::from_secs(5), client.next_event())
+            .await
+            .expect("externalAgentConfig/import/completed should finish in time after reconnect")
+            .expect("event stream should stay open after worker reconnect");
+        assert!(matches!(
+            notification,
+            AppServerEvent::ServerNotification(
+                ServerNotification::ExternalAgentConfigImportCompleted(_)
+            )
+        ));
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate externalAgentConfig/import/completed should still be suppressed after reconnect"
+        );
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -12767,6 +14568,97 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn remote_multi_worker_deduplicates_external_agent_import_completed_notifications_over_v2()
+     {
+        let (worker_a, _worker_a_requests) =
+            start_mock_remote_multi_connection_session_mutation_server("worker-a").await;
+        let (worker_b, _worker_b_requests) =
+            start_mock_remote_multi_connection_session_mutation_server("worker-b").await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let imported: ExternalAgentConfigImportResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ExternalAgentConfigImport {
+                request_id: RequestId::Integer(1),
+                params: ExternalAgentConfigImportParams {
+                    migration_items: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("externalAgentConfig/import should finish in time")
+        .expect("externalAgentConfig/import should fan out through multi-worker gateway");
+        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+
+        let notification = timeout(Duration::from_secs(5), client.next_event())
+            .await
+            .expect("externalAgentConfig/import/completed should finish in time")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            notification,
+            AppServerEvent::ServerNotification(
+                ServerNotification::ExternalAgentConfigImportCompleted(_)
+            )
+        ));
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate externalAgentConfig/import/completed should be suppressed"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn remote_multi_worker_supports_drop_in_v2_client_setup_mutation_workflow() {
         let (worker_a, worker_a_requests) =
             start_mock_remote_multi_connection_session_mutation_server("worker-a").await;
@@ -14002,6 +15894,112 @@ stream_max_retries = 0
         .expect("feedback/upload should succeed through multi-worker gateway");
         assert_eq!(feedback.thread_id, "feedback-thread-worker-a");
 
+        let command_exec: CommandExecResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::OneOffCommandExec {
+                request_id: RequestId::Integer(5),
+                params: CommandExecParams {
+                    command: vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        "printf worker-a-command".to_string(),
+                    ],
+                    process_id: Some("proc-worker-a".to_string()),
+                    tty: true,
+                    stream_stdin: true,
+                    stream_stdout_stderr: true,
+                    output_bytes_cap: None,
+                    disable_output_cap: false,
+                    disable_timeout: false,
+                    timeout_ms: None,
+                    cwd: None,
+                    env: None,
+                    size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
+                    sandbox_policy: None,
+                },
+            }),
+        )
+        .await
+        .expect("command/exec should finish in time")
+        .expect("command/exec should succeed through multi-worker gateway");
+        assert_eq!(
+            command_exec,
+            CommandExecResponse {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        );
+
+        let command_output = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::CommandExecOutputDelta(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("command/exec/outputDelta notification should arrive");
+        assert_eq!(command_output.process_id, "proc-worker-a");
+        assert_eq!(command_output.stream, CommandExecOutputStream::Stdout);
+        assert_eq!(command_output.delta_base64, "d29ya2VyLWEtY29tbWFuZA==");
+        assert_eq!(command_output.cap_reached, false);
+
+        let command_write: CommandExecWriteResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::CommandExecWrite {
+                request_id: RequestId::Integer(6),
+                params: CommandExecWriteParams {
+                    process_id: "proc-worker-a".to_string(),
+                    delta_base64: Some("AQID".to_string()),
+                    close_stdin: false,
+                },
+            }),
+        )
+        .await
+        .expect("command/exec/write should finish in time")
+        .expect("command/exec/write should succeed through multi-worker gateway");
+        assert_eq!(command_write, CommandExecWriteResponse {});
+
+        let command_resize: CommandExecResizeResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::CommandExecResize {
+                request_id: RequestId::Integer(7),
+                params: CommandExecResizeParams {
+                    process_id: "proc-worker-a".to_string(),
+                    size: CommandExecTerminalSize {
+                        rows: 40,
+                        cols: 120,
+                    },
+                },
+            }),
+        )
+        .await
+        .expect("command/exec/resize should finish in time")
+        .expect("command/exec/resize should succeed through multi-worker gateway");
+        assert_eq!(command_resize, CommandExecResizeResponse {});
+
+        let command_terminate: CommandExecTerminateResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::CommandExecTerminate {
+                request_id: RequestId::Integer(8),
+                params: CommandExecTerminateParams {
+                    process_id: "proc-worker-a".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("command/exec/terminate should finish in time")
+        .expect("command/exec/terminate should succeed through multi-worker gateway");
+        assert_eq!(command_terminate, CommandExecTerminateResponse {});
+
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
                 .await
@@ -14588,9 +16586,15 @@ stream_max_retries = 0
         let mut saw_account_updated = false;
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
+        let mut saw_login_completed = false;
         let mut saw_mcp_startup = false;
         timeout(Duration::from_secs(5), async {
-            while !(saw_account_updated && saw_rate_limits && saw_app_list && saw_mcp_startup) {
+            while !(saw_account_updated
+                && saw_rate_limits
+                && saw_app_list
+                && saw_login_completed
+                && saw_mcp_startup)
+            {
                 let event = client
                     .next_event()
                     .await
@@ -14616,6 +16620,14 @@ stream_max_retries = 0
                         saw_app_list = true;
                     }
                     AppServerEvent::ServerNotification(
+                        ServerNotification::AccountLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.login_id, None);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
                         ServerNotification::McpServerStatusUpdated(notification),
                     ) => {
                         assert_eq!(notification.name, "calendar-mcp");
@@ -14632,6 +16644,7 @@ stream_max_retries = 0
         assert!(saw_account_updated);
         assert!(saw_rate_limits);
         assert!(saw_app_list);
+        assert!(saw_login_completed);
         assert!(saw_mcp_startup);
         assert!(
             timeout(Duration::from_millis(200), client.next_event())
@@ -14884,7 +16897,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -15026,11 +17039,15 @@ stream_max_retries = 0
                     != (TurnStreamingCoverage {
                         saw_thread_active: true,
                         saw_turn_started: true,
+                        saw_hook_started: false,
+                        saw_item_started: false,
                         saw_agent_delta: true,
                         saw_reasoning_summary_delta: true,
                         saw_reasoning_text_delta: true,
                         saw_command_output_delta: true,
                         saw_file_change_delta: true,
+                        saw_hook_completed: false,
+                        saw_item_completed: false,
                         saw_turn_completed: true,
                     })
             }) {
@@ -15061,6 +17078,40 @@ stream_max_retries = 0
                             && notification.turn.id == *expected_turn_id
                         {
                             coverage.saw_turn_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::HookStarted(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && let Some(coverage) =
+                                lifecycle_by_thread.get_mut(&notification.thread_id)
+                            && notification.turn_id.as_deref() == Some(*expected_turn_id)
+                            && notification.run.id == format!("hook-{}", notification.thread_id)
+                        {
+                            coverage.saw_hook_started = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && let Some(coverage) =
+                                lifecycle_by_thread.get_mut(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::AgentMessage {
+                                    id,
+                                    text,
+                                    ..
+                                } if id == &format!("msg-{}", notification.thread_id)
+                                    && text == "streaming answer in progress"
+                            )
+                        {
+                            coverage.saw_item_started = true;
                         }
                     }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
@@ -15130,6 +17181,40 @@ stream_max_retries = 0
                             coverage.saw_file_change_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && let Some(coverage) =
+                                lifecycle_by_thread.get_mut(&notification.thread_id)
+                            && notification.turn_id.as_deref() == Some(*expected_turn_id)
+                            && notification.run.id == format!("hook-{}", notification.thread_id)
+                        {
+                            coverage.saw_hook_completed = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && let Some(coverage) =
+                                lifecycle_by_thread.get_mut(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && matches!(
+                                &notification.item,
+                                ThreadItem::AgentMessage {
+                                    id,
+                                    text,
+                                    ..
+                                } if id == &format!("msg-{}", notification.thread_id)
+                                    && text == "streaming answer completed"
+                            )
+                        {
+                            coverage.saw_item_completed = true;
+                        }
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         notification,
                     )) => {
@@ -15159,11 +17244,15 @@ stream_max_retries = 0
             Some(&TurnStreamingCoverage {
                 saw_thread_active: true,
                 saw_turn_started: true,
+                saw_hook_started: false,
+                saw_item_started: false,
                 saw_agent_delta: true,
                 saw_reasoning_summary_delta: true,
                 saw_reasoning_text_delta: true,
                 saw_command_output_delta: true,
                 saw_file_change_delta: true,
+                saw_hook_completed: false,
+                saw_item_completed: false,
                 saw_turn_completed: true,
             })
         );
@@ -15172,11 +17261,15 @@ stream_max_retries = 0
             Some(&TurnStreamingCoverage {
                 saw_thread_active: true,
                 saw_turn_started: true,
+                saw_hook_started: false,
+                saw_item_started: false,
                 saw_agent_delta: true,
                 saw_reasoning_summary_delta: true,
                 saw_reasoning_text_delta: true,
                 saw_command_output_delta: true,
                 saw_file_change_delta: true,
+                saw_hook_completed: false,
+                saw_item_completed: false,
                 saw_turn_completed: true,
             })
         );
@@ -15236,7 +17329,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -15588,7 +17681,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -16116,7 +18209,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -16203,7 +18296,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -16678,6 +18771,7 @@ stream_max_retries = 0
         let mut file_threads = HashSet::new();
         let mut permissions_threads = HashSet::new();
         let mut mcp_threads = HashSet::new();
+        let mut dynamic_tool_call_threads = HashSet::new();
         let mut refresh_accounts = HashSet::new();
         timeout(Duration::from_secs(5), async {
             while user_input_threads.len() < expected_threads.len()
@@ -16685,6 +18779,7 @@ stream_max_retries = 0
                 || file_threads.len() < expected_threads.len()
                 || permissions_threads.len() < expected_threads.len()
                 || mcp_threads.len() < expected_threads.len()
+                || dynamic_tool_call_threads.len() < expected_threads.len()
                 || refresh_accounts.len() < expected_threads.len()
             {
                 let event = client
@@ -16841,6 +18936,80 @@ stream_max_retries = 0
                             .expect("mcp elicitation should resolve");
                         mcp_threads.insert(params.thread_id);
                     }
+                    AppServerEvent::ServerRequest(ServerRequest::DynamicToolCall {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(params.turn_id, "turn-remote-workflow");
+                        assert_eq!(params.call_id, "tool-call-remote-workflow");
+                        assert_eq!(params.tool, "image-edit");
+                        assert_ne!(
+                            request_id,
+                            RequestId::String("shared-dynamic-tool-call-request".to_string())
+                        );
+                        assert!(
+                            gateway_request_ids.insert(request_id.clone()),
+                            "gateway request ids should be unique across workers and methods"
+                        );
+                        assert_eq!(
+                            params.arguments,
+                            serde_json::json!({
+                                "prompt": format!("Sharpen image for {}", params.thread_id),
+                                "strength": 0.5,
+                            })
+                        );
+                        let thread_id = params.thread_id.clone();
+                        client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(DynamicToolCallResponse {
+                                    content_items: vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: format!("tool output for {thread_id}"),
+                                        },
+                                    ],
+                                    success: true,
+                                })
+                                .expect("dynamic tool call response should serialize"),
+                            )
+                            .await
+                            .expect("dynamic tool call should resolve");
+                        dynamic_tool_call_threads.insert(params.thread_id);
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.turn_id, "turn-remote-workflow");
+                        assert!(matches!(
+                            &notification.item,
+                            ThreadItem::DynamicToolCall {
+                                id,
+                                tool,
+                                status,
+                                ..
+                            } if id == "tool-call-remote-workflow"
+                                && tool == "image-edit"
+                                && *status == DynamicToolCallStatus::InProgress
+                        ));
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.turn_id, "turn-remote-workflow");
+                        assert!(matches!(
+                            &notification.item,
+                            ThreadItem::DynamicToolCall {
+                                id,
+                                tool,
+                                status,
+                                success,
+                                ..
+                            } if id == "tool-call-remote-workflow"
+                                && tool == "image-edit"
+                                && *status == DynamicToolCallStatus::Completed
+                                && *success == Some(true)
+                        ));
+                    }
                     AppServerEvent::ServerRequest(ServerRequest::ChatgptAuthTokensRefresh {
                         request_id,
                         params,
@@ -16885,6 +19054,7 @@ stream_max_retries = 0
         assert_eq!(file_threads, expected_threads);
         assert_eq!(permissions_threads, expected_threads);
         assert_eq!(mcp_threads, expected_threads);
+        assert_eq!(dynamic_tool_call_threads, expected_threads);
         assert_eq!(
             refresh_accounts,
             HashSet::from(["acct-worker-a".to_string(), "acct-worker-b".to_string(),])
@@ -17186,6 +19356,7 @@ stream_max_retries = 0
         assert_eq!(remote_workers.len(), 1);
         assert_eq!(remote_workers[0].websocket_url, worker_a);
         assert_eq!(remote_workers[0].healthy, true);
+        assert_eq!(remote_workers[0].reconnecting, false);
         assert_eq!(
             remote_workers[0]
                 .last_error
@@ -17193,6 +19364,7 @@ stream_max_retries = 0
                 .is_some_and(|error| error.contains("remote app server")),
             true
         );
+        assert_eq!(remote_workers[0].next_reconnect_at, None);
 
         server.shutdown().await.expect("shutdown");
     }
@@ -17513,6 +19685,166 @@ stream_max_retries = 0
                                 },
                             })
                         );
+
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Notification(
+                                codex_app_server_protocol::JSONRPCNotification {
+                                    method: "serverRequest/resolved".to_string(),
+                                    params: Some(
+                                        serde_json::to_value(ServerRequestResolvedNotification {
+                                            thread_id: "thread-worker-a-2".to_string(),
+                                            request_id: RequestId::String(
+                                                "srv-user-input-after-reconnect".to_string(),
+                                            ),
+                                        })
+                                        .expect(
+                                            "user input serverRequest/resolved should serialize",
+                                        ),
+                                    ),
+                                },
+                            ),
+                        )
+                        .await;
+
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Notification(
+                                codex_app_server_protocol::JSONRPCNotification {
+                                    method: "item/started".to_string(),
+                                    params: Some(
+                                        serde_json::to_value(ItemStartedNotification {
+                                            thread_id: "thread-worker-a-2".to_string(),
+                                            turn_id: "turn-worker-a-2".to_string(),
+                                            item: ThreadItem::DynamicToolCall {
+                                                id: "tool-call-after-reconnect".to_string(),
+                                                tool: "image-edit".to_string(),
+                                                arguments: serde_json::json!({
+                                                    "prompt": "Sharpen image after reconnect",
+                                                    "strength": 0.75,
+                                                }),
+                                                status: DynamicToolCallStatus::InProgress,
+                                                content_items: None,
+                                                success: None,
+                                                duration_ms: None,
+                                            },
+                                        })
+                                        .expect("dynamic tool item/started should serialize"),
+                                    ),
+                                },
+                            ),
+                        )
+                        .await;
+
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                                id: RequestId::String(
+                                    "srv-dynamic-tool-after-reconnect".to_string(),
+                                ),
+                                method: "item/tool/call".to_string(),
+                                params: Some(serde_json::json!({
+                                    "threadId": "thread-worker-a-2",
+                                    "turnId": "turn-worker-a-2",
+                                    "callId": "tool-call-after-reconnect",
+                                    "tool": "image-edit",
+                                    "arguments": {
+                                        "prompt": "Sharpen image after reconnect",
+                                        "strength": 0.75,
+                                    },
+                                })),
+                                trace: None,
+                            }),
+                        )
+                        .await;
+                        let JSONRPCMessage::Response(dynamic_tool_response) =
+                            read_websocket_message(&mut websocket).await
+                        else {
+                            panic!("expected dynamic tool response after reconnect");
+                        };
+                        assert_eq!(
+                            dynamic_tool_response.id,
+                            RequestId::String("srv-dynamic-tool-after-reconnect".to_string())
+                        );
+                        assert_eq!(
+                            dynamic_tool_response.result,
+                            serde_json::json!({
+                                "contentItems": [{
+                                    "type": "inputText",
+                                    "text": "tool output after reconnect",
+                                }],
+                                "success": true,
+                            })
+                        );
+
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Notification(
+                                codex_app_server_protocol::JSONRPCNotification {
+                                    method: "serverRequest/resolved".to_string(),
+                                    params: Some(
+                                        serde_json::to_value(ServerRequestResolvedNotification {
+                                            thread_id: "thread-worker-a-2".to_string(),
+                                            request_id: RequestId::String(
+                                                "srv-dynamic-tool-after-reconnect".to_string(),
+                                            ),
+                                        })
+                                        .expect(
+                                            "dynamic tool serverRequest/resolved should serialize",
+                                        ),
+                                    ),
+                                },
+                            ),
+                        )
+                        .await;
+
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Notification(
+                                codex_app_server_protocol::JSONRPCNotification {
+                                    method: "item/completed".to_string(),
+                                    params: Some(
+                                        serde_json::to_value(ItemCompletedNotification {
+                                            thread_id: "thread-worker-a-2".to_string(),
+                                            turn_id: "turn-worker-a-2".to_string(),
+                                            item: ThreadItem::DynamicToolCall {
+                                                id: "tool-call-after-reconnect".to_string(),
+                                                tool: "image-edit".to_string(),
+                                                arguments: serde_json::json!({
+                                                    "prompt": "Sharpen image after reconnect",
+                                                    "strength": 0.75,
+                                                }),
+                                                status: DynamicToolCallStatus::Completed,
+                                                content_items: Some(vec![
+                                                    DynamicToolCallOutputContentItem::InputText {
+                                                        text: "tool output after reconnect"
+                                                            .to_string(),
+                                                    },
+                                                ]),
+                                                success: Some(true),
+                                                duration_ms: Some(9),
+                                            },
+                                        })
+                                        .expect("dynamic tool item/completed should serialize"),
+                                    ),
+                                },
+                            ),
+                        )
+                        .await;
+
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Notification(
+                                codex_app_server_protocol::JSONRPCNotification {
+                                    method: "turn/completed".to_string(),
+                                    params: Some(serde_json::json!({
+                                        "threadId": "thread-worker-a-2",
+                                        "turn": mock_turn("turn-worker-a-2", "completed"),
+                                    })),
+                                },
+                            ),
+                        )
+                        .await;
                     }
                     _ => unreachable!("unexpected connection index"),
                 }
@@ -17719,6 +20051,202 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookStarted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": "hook-remote-workflow",
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": "/tmp/remote-hooks.json",
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "running",
+                                                    "statusMessage": "remote hook started",
+                                                    "startedAt": 1,
+                                                    "completedAt": null,
+                                                    "durationMs": null,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": "msg-remote-workflow",
+                                                    "text": "streaming answer in progress",
+                                                    "phase": "commentary",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookStarted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "running",
+                                                    "statusMessage": format!("hook started {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": null,
+                                                    "durationMs": null,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer in progress",
+                                                    "phase": "commentary",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookStarted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": "hook-remote-workflow",
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": "/tmp/remote-hooks.json",
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "running",
+                                                    "statusMessage": "remote hook started",
+                                                    "startedAt": 1,
+                                                    "completedAt": null,
+                                                    "durationMs": null,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": "msg-remote-workflow",
+                                                    "text": "streaming answer in progress",
+                                                    "phase": "commentary",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookStarted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "running",
+                                                    "statusMessage": format!("hook started {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": null,
+                                                    "durationMs": null,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer in progress",
+                                                    "phase": "commentary",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
                                             method: "item/agentMessage/delta".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
@@ -17796,6 +20324,202 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": "hook-remote-workflow",
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": "/tmp/remote-hooks.json",
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": "remote hook completed",
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": "msg-remote-workflow",
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": format!("hook completed {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": "hook-remote-workflow",
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": "/tmp/remote-hooks.json",
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": "remote hook completed",
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": "msg-remote-workflow",
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": format!("hook completed {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
                                             method: "turn/completed".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
@@ -17850,6 +20574,8 @@ stream_max_retries = 0
                         let review_thread_id = format!("{thread_id}-review");
                         let review_turn_id = format!("turn-review-{thread_id}");
                         let turn_id = format!("turn-{thread_id}");
+                        let forked_thread_id = format!("{thread_id}-fork");
+                        let forked_preview = format!("{preview}-fork");
                         loop {
                             let request = read_websocket_request(&mut websocket).await;
                             match request.method.as_str() {
@@ -17889,8 +20615,9 @@ stream_max_retries = 0
                                         .expect("thread/read should include threadId");
                                     assert!(
                                         requested_thread_id == thread_id
-                                            || requested_thread_id == review_thread_id,
-                                        "thread/read should target the recovered thread or its review thread",
+                                            || requested_thread_id == review_thread_id
+                                            || requested_thread_id == forked_thread_id,
+                                        "thread/read should target the recovered thread, its fork, or its review thread",
                                     );
                                     let thread = if requested_thread_id == thread_id {
                                         mock_thread_with_name(
@@ -17898,6 +20625,8 @@ stream_max_retries = 0
                                             preview,
                                             thread_name.as_deref(),
                                         )
+                                    } else if requested_thread_id == forked_thread_id {
+                                        mock_thread(&forked_thread_id, &forked_preview)
                                     } else {
                                         mock_thread(&review_thread_id, preview)
                                     };
@@ -17908,6 +20637,70 @@ stream_max_retries = 0
                                             result: serde_json::json!({
                                                 "thread": thread,
                                                 "turns": [],
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "thread/resume" => {
+                                    let requested_thread_id = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("threadId"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("thread/resume should include threadId");
+                                    assert_eq!(requested_thread_id, thread_id);
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread_with_name(
+                                                    thread_id,
+                                                    preview,
+                                                    thread_name.as_deref(),
+                                                ),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": preview,
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "thread/fork" => {
+                                    let requested_thread_id = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("threadId"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("thread/fork should include threadId");
+                                    assert_eq!(requested_thread_id, thread_id);
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread(&forked_thread_id, &forked_preview),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": forked_preview,
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
                                             }),
                                         }),
                                     )
@@ -18266,6 +21059,224 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/status/changed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "status": {
+                                                        "type": "active",
+                                                        "activeFlags": [],
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "turn/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turn": mock_turn(&turn_id, "inProgress"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "hookStarted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "run": {
+                                                        "id": format!("hook-{thread_id}"),
+                                                        "eventName": "userPromptSubmit",
+                                                        "handlerType": "command",
+                                                        "executionMode": "sync",
+                                                        "scope": "turn",
+                                                        "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                        "source": "user",
+                                                        "displayOrder": 0,
+                                                        "status": "running",
+                                                        "statusMessage": format!("hook started {thread_id}"),
+                                                        "startedAt": 1,
+                                                        "completedAt": null,
+                                                        "durationMs": null,
+                                                        "entries": [],
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": format!("msg-{thread_id}"),
+                                                        "text": "streaming answer in progress",
+                                                        "phase": "commentary",
+                                                        "memoryCitation": null,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/agentMessage/delta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("msg-{thread_id}"),
+                                                    "delta": "hello from recovered worker",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/reasoning/summaryTextDelta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("reasoning-summary-{thread_id}"),
+                                                    "delta": format!("summary {thread_id}"),
+                                                    "summaryIndex": 0,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/reasoning/textDelta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("reasoning-{thread_id}"),
+                                                    "delta": format!("reasoning {thread_id}"),
+                                                    "contentIndex": 0,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/commandExecution/outputDelta"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("exec-{thread_id}"),
+                                                    "delta": format!("stdout {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/fileChange/outputDelta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("patch-{thread_id}"),
+                                                    "delta": format!("patch {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "hookCompleted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "run": {
+                                                        "id": format!("hook-{thread_id}"),
+                                                        "eventName": "userPromptSubmit",
+                                                        "handlerType": "command",
+                                                        "executionMode": "sync",
+                                                        "scope": "turn",
+                                                        "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                        "source": "user",
+                                                        "displayOrder": 0,
+                                                        "status": "completed",
+                                                        "statusMessage": format!("hook completed {thread_id}"),
+                                                        "startedAt": 1,
+                                                        "completedAt": 2,
+                                                        "durationMs": 1,
+                                                        "entries": [],
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/completed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": format!("msg-{thread_id}"),
+                                                        "text": "streaming answer completed",
+                                                        "phase": "final_answer",
+                                                        "memoryCitation": null,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "turn/completed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turn": mock_turn(&turn_id, "completed"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 "turn/steer" => {
                                     let requested_thread_id = request
@@ -18333,6 +21344,36 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "sessionId": format!("session-{thread_id}"),
+                                                    "version": "v2",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/itemAdded".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "item": {
+                                                        "type": "message",
+                                                        "id": format!("item-{thread_id}"),
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 "thread/realtime/appendText" => {
                                     let requested_thread_id = request
@@ -18350,6 +21391,36 @@ stream_max_retries = 0
                                             id: request.id,
                                             result: serde_json::json!({}),
                                         }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/transcript/delta"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "role": "assistant",
+                                                    "delta": format!("delta {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/transcript/done"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "role": "assistant",
+                                                    "text": format!("done {thread_id}"),
+                                                })),
+                                            },
+                                        ),
                                     )
                                     .await;
                                 }
@@ -18371,6 +21442,63 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/outputAudio/delta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "audio": {
+                                                        "data": request
+                                                            .params
+                                                            .as_ref()
+                                                            .and_then(|params| params.get("audio"))
+                                                            .and_then(|audio| audio.get("data"))
+                                                            .cloned()
+                                                            .expect("thread/realtime/appendAudio should include audio.data"),
+                                                        "sampleRate": 24_000,
+                                                        "numChannels": 1,
+                                                        "samplesPerChannel": 3,
+                                                        "itemId": request
+                                                            .params
+                                                            .as_ref()
+                                                            .and_then(|params| params.get("audio"))
+                                                            .and_then(|audio| audio.get("itemId"))
+                                                            .cloned()
+                                                            .expect("thread/realtime/appendAudio should include audio.itemId"),
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/sdp".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Codex\r\n",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/error".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "message": "realtime transport warning",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 "thread/realtime/stop" => {
                                     let requested_thread_id = request
@@ -18386,6 +21514,19 @@ stream_max_retries = 0
                                             id: request.id,
                                             result: serde_json::json!({}),
                                         }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/realtime/closed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "reason": "client requested stop",
+                                                })),
+                                            },
+                                        ),
                                     )
                                     .await;
                                 }
@@ -18469,7 +21610,20 @@ stream_max_retries = 0
                             .push(request.method.clone());
 
                         let result = match request.method.as_str() {
-                            "externalAgentConfig/import" => serde_json::json!({}),
+                            "externalAgentConfig/import" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "externalAgentConfig/import/completed"
+                                                .to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({})
+                            }
                             "config/value/write" | "config/batchWrite" => serde_json::json!({
                                 "status": "ok",
                                 "version": worker_label,
@@ -18568,6 +21722,14 @@ stream_max_retries = 0
                                         "labels": null,
                                         "installUrl": null,
                                     }],
+                                },
+                            }),
+                            serde_json::json!({
+                                "method": "account/login/completed",
+                                "params": {
+                                    "loginId": null,
+                                    "success": true,
+                                    "error": null,
                                 },
                             }),
                             serde_json::json!({
@@ -19952,6 +23114,55 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookStarted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "running",
+                                                    "statusMessage": format!("hook started {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": null,
+                                                    "durationMs": null,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer in progress",
+                                                    "phase": "commentary",
+                                                    "memoryCitation": null,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
                                             method: "item/agentMessage/delta".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
@@ -20144,6 +23355,55 @@ stream_max_retries = 0
                                                 "turnId": turn_id,
                                                 "itemId": format!("patch-{thread_id}"),
                                                 "delta": format!("patch {thread_id}"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hookCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": format!("hook completed {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
+                                                    "memoryCitation": null,
+                                                },
                                             })),
                                         },
                                     ),
@@ -20672,7 +23932,20 @@ stream_max_retries = 0
                         received_methods.lock().await.push(request.method.clone());
 
                         let result = match request.method.as_str() {
-                            "externalAgentConfig/import" => serde_json::json!({}),
+                            "externalAgentConfig/import" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "externalAgentConfig/import/completed"
+                                                .to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({})
+                            }
                             "config/value/write" => serde_json::json!({
                                 "status": "ok",
                                 "version": worker_label,
@@ -21303,6 +24576,64 @@ stream_max_retries = 0
                             "feedback/upload" => serde_json::json!({
                                 "threadId": format!("feedback-thread-{worker_label}"),
                             }),
+                            "command/exec" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec should include processId");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "command/exec/outputDelta".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "processId": process_id,
+                                                "stream": "stdout",
+                                                "deltaBase64": "d29ya2VyLWEtY29tbWFuZA==",
+                                                "capReached": false,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({
+                                    "exitCode": 0,
+                                    "stdout": "",
+                                    "stderr": "",
+                                })
+                            }
+                            "command/exec/write" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec/write should include processId");
+                                assert_eq!(process_id, "proc-worker-a");
+                                serde_json::json!({})
+                            }
+                            "command/exec/resize" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec/resize should include processId");
+                                assert_eq!(process_id, "proc-worker-a");
+                                serde_json::json!({})
+                            }
+                            "command/exec/terminate" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec/terminate should include processId");
+                                assert_eq!(process_id, "proc-worker-a");
+                                serde_json::json!({})
+                            }
                             method => panic!("unexpected request method: {method}"),
                         };
                         write_websocket_message(
@@ -22020,6 +25351,14 @@ stream_max_retries = 0
                                     "labels": null,
                                     "installUrl": null,
                                 }],
+                            },
+                        }),
+                        serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": null,
+                                "success": true,
+                                "error": null,
                             },
                         }),
                         serde_json::json!({
@@ -23642,6 +26981,120 @@ stream_max_retries = 0
 
         write_websocket_message(
             websocket,
+            JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+                method: "item/started".to_string(),
+                params: Some(
+                    serde_json::to_value(ItemStartedNotification {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-remote-workflow".to_string(),
+                        item: ThreadItem::DynamicToolCall {
+                            id: "tool-call-remote-workflow".to_string(),
+                            tool: "image-edit".to_string(),
+                            arguments: serde_json::json!({
+                                "prompt": format!("Sharpen image for {thread_id}"),
+                                "strength": 0.5,
+                            }),
+                            status: DynamicToolCallStatus::InProgress,
+                            content_items: None,
+                            success: None,
+                            duration_ms: None,
+                        },
+                    })
+                    .expect("dynamic tool item/started should serialize"),
+                ),
+            }),
+        )
+        .await;
+
+        write_websocket_message(
+            websocket,
+            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                id: RequestId::String("shared-dynamic-tool-call-request".to_string()),
+                method: "item/tool/call".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": thread_id,
+                    "turnId": "turn-remote-workflow",
+                    "callId": "tool-call-remote-workflow",
+                    "tool": "image-edit",
+                    "arguments": {
+                        "prompt": format!("Sharpen image for {thread_id}"),
+                        "strength": 0.5,
+                    },
+                })),
+                trace: None,
+            }),
+        )
+        .await;
+        let JSONRPCMessage::Response(dynamic_tool_response) =
+            read_websocket_message(websocket).await
+        else {
+            panic!("expected dynamic tool call response");
+        };
+        assert_eq!(
+            dynamic_tool_response.id,
+            RequestId::String("shared-dynamic-tool-call-request".to_string())
+        );
+        assert_eq!(
+            dynamic_tool_response.result,
+            serde_json::json!({
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": format!("tool output for {thread_id}"),
+                }],
+                "success": true,
+            })
+        );
+
+        write_websocket_message(
+            websocket,
+            JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+                method: "serverRequest/resolved".to_string(),
+                params: Some(
+                    serde_json::to_value(ServerRequestResolvedNotification {
+                        thread_id: thread_id.to_string(),
+                        request_id: RequestId::String(
+                            "shared-dynamic-tool-call-request".to_string(),
+                        ),
+                    })
+                    .expect("dynamic tool serverRequest/resolved should serialize"),
+                ),
+            }),
+        )
+        .await;
+
+        write_websocket_message(
+            websocket,
+            JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+                method: "item/completed".to_string(),
+                params: Some(
+                    serde_json::to_value(ItemCompletedNotification {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-remote-workflow".to_string(),
+                        item: ThreadItem::DynamicToolCall {
+                            id: "tool-call-remote-workflow".to_string(),
+                            tool: "image-edit".to_string(),
+                            arguments: serde_json::json!({
+                                "prompt": format!("Sharpen image for {thread_id}"),
+                                "strength": 0.5,
+                            }),
+                            status: DynamicToolCallStatus::Completed,
+                            content_items: Some(vec![
+                                DynamicToolCallOutputContentItem::InputText {
+                                    text: format!("tool output for {thread_id}"),
+                                },
+                            ]),
+                            success: Some(true),
+                            duration_ms: Some(7),
+                        },
+                    })
+                    .expect("dynamic tool item/completed should serialize"),
+                ),
+            }),
+        )
+        .await;
+
+        write_websocket_message(
+            websocket,
             JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
                 id: RequestId::String("shared-permissions-request".to_string()),
                 method: "item/permissions/requestApproval".to_string(),
@@ -24222,6 +27675,123 @@ stream_max_retries = 0
                             "_meta": null,
                         })
                     );
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "item/started".to_string(),
+                                params: Some(
+                                    serde_json::to_value(ItemStartedNotification {
+                                        thread_id: "thread-remote-workflow".to_string(),
+                                        turn_id: "turn-remote-workflow".to_string(),
+                                        item: ThreadItem::DynamicToolCall {
+                                            id: "tool-call-remote-workflow".to_string(),
+                                            tool: "image-edit".to_string(),
+                                            arguments: serde_json::json!({
+                                                "prompt": "Sharpen this image",
+                                                "strength": 0.5,
+                                            }),
+                                            status: DynamicToolCallStatus::InProgress,
+                                            content_items: None,
+                                            success: None,
+                                            duration_ms: None,
+                                        },
+                                    })
+                                    .expect("dynamic tool item/started should serialize"),
+                                ),
+                            },
+                        ),
+                    )
+                    .await;
+
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                            id: RequestId::String("srv-dynamic-tool-call".to_string()),
+                            method: "item/tool/call".to_string(),
+                            params: Some(serde_json::json!({
+                                "threadId": "thread-remote-workflow",
+                                "turnId": "turn-remote-workflow",
+                                "callId": "tool-call-remote-workflow",
+                                "tool": "image-edit",
+                                "arguments": {
+                                    "prompt": "Sharpen this image",
+                                    "strength": 0.5,
+                                },
+                            })),
+                            trace: None,
+                        }),
+                    )
+                    .await;
+                    let JSONRPCMessage::Response(dynamic_tool_response) =
+                        read_websocket_message(&mut websocket).await
+                    else {
+                        panic!("expected dynamic tool call response");
+                    };
+                    assert_eq!(
+                        dynamic_tool_response.id,
+                        RequestId::String("srv-dynamic-tool-call".to_string())
+                    );
+                    assert_eq!(
+                        dynamic_tool_response.result,
+                        serde_json::json!({
+                            "contentItems": [{
+                                "type": "inputText",
+                                "text": "tool output",
+                            }],
+                            "success": true,
+                        })
+                    );
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "serverRequest/resolved".to_string(),
+                                params: Some(
+                                    serde_json::to_value(ServerRequestResolvedNotification {
+                                        thread_id: "thread-remote-workflow".to_string(),
+                                        request_id: RequestId::String(
+                                            "srv-dynamic-tool-call".to_string(),
+                                        ),
+                                    })
+                                    .expect("dynamic tool serverRequest/resolved should serialize"),
+                                ),
+                            },
+                        ),
+                    )
+                    .await;
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "item/completed".to_string(),
+                                params: Some(
+                                    serde_json::to_value(ItemCompletedNotification {
+                                        thread_id: "thread-remote-workflow".to_string(),
+                                        turn_id: "turn-remote-workflow".to_string(),
+                                        item: ThreadItem::DynamicToolCall {
+                                            id: "tool-call-remote-workflow".to_string(),
+                                            tool: "image-edit".to_string(),
+                                            arguments: serde_json::json!({
+                                                "prompt": "Sharpen this image",
+                                                "strength": 0.5,
+                                            }),
+                                            status: DynamicToolCallStatus::Completed,
+                                            content_items: Some(vec![
+                                                DynamicToolCallOutputContentItem::InputText {
+                                                    text: "tool output".to_string(),
+                                                },
+                                            ]),
+                                            success: Some(true),
+                                            duration_ms: Some(7),
+                                        },
+                                    })
+                                    .expect("dynamic tool item/completed should serialize"),
+                                ),
+                            },
+                        ),
+                    )
+                    .await;
 
                     write_websocket_message(
                         &mut websocket,
@@ -24295,6 +27865,19 @@ stream_max_retries = 0
                             "chatgptPlanType": "pro",
                         })
                     );
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "turn/completed".to_string(),
+                                params: Some(serde_json::json!({
+                                    "threadId": "thread-remote-workflow",
+                                    "turn": mock_turn("turn-remote-workflow", "completed"),
+                                })),
+                            },
+                        ),
+                    )
+                    .await;
                 });
             }
         });

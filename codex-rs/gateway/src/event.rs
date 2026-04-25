@@ -87,6 +87,24 @@ impl GatewayEvent {
         }
     }
 
+    pub fn reconnecting(
+        worker_id: usize,
+        websocket_url: String,
+        reason: String,
+        retry_delay_seconds: u64,
+    ) -> Self {
+        Self {
+            method: "gateway/reconnecting".to_string(),
+            thread_id: None,
+            data: serde_json::json!({
+                "workerId": worker_id,
+                "websocketUrl": websocket_url,
+                "reason": reason,
+                "retryDelaySeconds": retry_delay_seconds,
+            }),
+        }
+    }
+
     fn from_wire_value(value: Value) -> Self {
         let method = value
             .get("method")
@@ -257,6 +275,28 @@ mod tests {
             json!({
                 "workerId": 2,
                 "websocketUrl": "ws://127.0.0.1:8082",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_reconnecting_workers() {
+        let event = GatewayEvent::reconnecting(
+            2,
+            "ws://127.0.0.1:8082".to_string(),
+            "remote app server event stream ended".to_string(),
+            1,
+        );
+
+        assert_eq!(event.method, "gateway/reconnecting");
+        assert_eq!(event.thread_id, None);
+        assert_eq!(
+            event.data,
+            json!({
+                "workerId": 2,
+                "websocketUrl": "ws://127.0.0.1:8082",
+                "reason": "remote app server event stream ended",
+                "retryDelaySeconds": 1,
             })
         );
     }

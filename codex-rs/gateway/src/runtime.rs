@@ -35,6 +35,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 #[async_trait]
@@ -144,6 +145,10 @@ impl AppServerGatewayRuntime {
         self.scope_registry.thread_context(thread_id)
     }
 
+    pub fn worker_id(&self) -> Option<usize> {
+        self.worker_id
+    }
+
     pub fn store_pending_server_request(
         &self,
         request_id: RequestId,
@@ -181,6 +186,14 @@ impl AppServerGatewayRuntime {
             && let Some(worker_id) = self.worker_id
         {
             remote_worker_health.mark_unhealthy(worker_id, error);
+        }
+    }
+
+    pub fn mark_worker_reconnecting(&self, error: Option<String>, retry_delay: Duration) {
+        if let Some(remote_worker_health) = &self.remote_worker_health
+            && let Some(worker_id) = self.worker_id
+        {
+            remote_worker_health.mark_reconnecting(worker_id, error, retry_delay);
         }
     }
 

@@ -81,6 +81,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::info;
 use tracing::warn;
 
 const INVALID_REQUEST_CODE: i64 = -32600;
@@ -159,6 +160,7 @@ struct GatewayV2EventState {
 #[derive(Clone)]
 struct GatewayV2ReconnectState {
     configured_worker_ids: Vec<usize>,
+    worker_websocket_urls: Vec<String>,
     session_factory: GatewayV2SessionFactory,
     initialize_params: InitializeParams,
     request_context: GatewayRequestContext,
@@ -195,6 +197,19 @@ struct ResolvedServerRequestRoute {
     thread_id: Option<String>,
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct WorkerServerRequestCleanup {
+    resolved_notifications: Vec<ServerRequestResolvedNotification>,
+    resolved_thread_scoped_requests: usize,
+    stranded_connection_scoped_requests: usize,
+}
+
+impl WorkerServerRequestCleanup {
+    fn has_stranded_connection_scoped_requests(&self) -> bool {
+        self.stranded_connection_scoped_requests > 0
+    }
+}
+
 struct GatewayV2DownstreamRouter {
     workers: Vec<DownstreamWorkerHandle>,
     event_tx: mpsc::Sender<DownstreamWorkerEvent>,
@@ -206,6 +221,13 @@ struct GatewayV2DownstreamRouter {
     active_fs_watches: HashMap<String, FsWatchParams>,
     reconnect_retry_after: HashMap<usize, Instant>,
     reconnect_state: Option<GatewayV2ReconnectState>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UnavailableWorkerRouteDiagnostics {
+    worker_id: usize,
+    websocket_url: String,
+    reconnect_backoff_active: bool,
 }
 
 impl GatewayV2DownstreamRouter {
@@ -238,6 +260,10 @@ impl GatewayV2DownstreamRouter {
             GatewayV2SessionFactory::RemoteMulti { connect_args, .. } => {
                 Some(GatewayV2ReconnectState {
                     configured_worker_ids: (0..connect_args.len()).collect(),
+                    worker_websocket_urls: connect_args
+                        .iter()
+                        .map(|args| args.websocket_url.clone())
+                        .collect(),
                     session_factory: session_factory.clone(),
                     initialize_params: initialize_params.clone(),
                     request_context: request_context.clone(),
@@ -268,6 +294,13 @@ impl GatewayV2DownstreamRouter {
 
     fn single_worker(&self) -> bool {
         self.workers.len() == 1
+    }
+
+    fn multi_worker_topology(&self) -> bool {
+        self.reconnect_state
+            .as_ref()
+            .is_some_and(|state| state.configured_worker_ids.len() > 1)
+            || self.workers.len() > 1
     }
 
     fn primary_worker(&self) -> io::Result<&DownstreamWorkerHandle> {
@@ -363,6 +396,18 @@ impl GatewayV2DownstreamRouter {
             if !self.should_attempt_worker_reconnect(worker_id, now) {
                 continue;
             }
+            let websocket_url = reconnect_state
+                .worker_websocket_urls
+                .get(worker_id)
+                .map_or("<unknown>", String::as_str);
+            info!(
+                worker_id,
+                websocket_url,
+                initialized_notification_sent = self.initialized_notification_sent,
+                active_fs_watch_count = self.active_fs_watches.len(),
+                retry_backoff_seconds = reconnect_state.retry_backoff.as_secs(),
+                "attempting to reconnect missing downstream worker session"
+            );
             match reconnect_state
                 .session_factory
                 .connect_worker(
@@ -381,12 +426,23 @@ impl GatewayV2DownstreamRouter {
                         );
                         warn!(
                             worker_id,
+                            websocket_url,
+                            initialized_notification_sent = self.initialized_notification_sent,
+                            active_fs_watch_count = self.active_fs_watches.len(),
+                            retry_backoff_seconds = reconnect_state.retry_backoff.as_secs(),
                             %err,
                             "failed to replay connection state to reconnected downstream worker session"
                         );
                         continue;
                     }
                     self.clear_worker_reconnect_failure(worker_id);
+                    info!(
+                        worker_id,
+                        websocket_url,
+                        initialized_notification_sent = self.initialized_notification_sent,
+                        active_fs_watch_count = self.active_fs_watches.len(),
+                        "reconnected missing downstream worker session"
+                    );
                     self.add_session(session);
                 }
                 Err(err) => {
@@ -397,6 +453,10 @@ impl GatewayV2DownstreamRouter {
                     );
                     warn!(
                         worker_id,
+                        websocket_url,
+                        initialized_notification_sent = self.initialized_notification_sent,
+                        active_fs_watch_count = self.active_fs_watches.len(),
+                        retry_backoff_seconds = reconnect_state.retry_backoff.as_secs(),
                         %err,
                         "failed to reconnect missing downstream worker session"
                     );
@@ -466,6 +526,34 @@ impl GatewayV2DownstreamRouter {
         Err(io::Error::other(format!(
             "required worker routes are unavailable for {label}: {missing_worker_ids:?}"
         )))
+    }
+
+    fn unavailable_worker_route_diagnostics(
+        &self,
+        now: Instant,
+    ) -> Vec<UnavailableWorkerRouteDiagnostics> {
+        let Some(reconnect_state) = &self.reconnect_state else {
+            return Vec::new();
+        };
+
+        reconnect_state
+            .configured_worker_ids
+            .iter()
+            .copied()
+            .filter(|worker_id| !self.has_worker(Some(*worker_id)))
+            .map(|worker_id| UnavailableWorkerRouteDiagnostics {
+                worker_id,
+                websocket_url: reconnect_state
+                    .worker_websocket_urls
+                    .get(worker_id)
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                reconnect_backoff_active: self
+                    .reconnect_retry_after
+                    .get(&worker_id)
+                    .is_some_and(|retry_after| *retry_after > now),
+            })
+            .collect()
     }
 
     async fn replay_connection_state(&self, session: &GatewayV2ConnectedSession) -> io::Result<()> {
@@ -628,24 +716,29 @@ async fn run_websocket_connection(
                 &observability,
                 &context,
                 "initialize_timed_out",
+                Some(INITIALIZE_TIMEOUT_CLOSE_REASON),
                 connection_started_at.elapsed(),
             );
             return Ok(());
         }
         Err(err) if err.kind() == ErrorKind::InvalidData => {
+            let detail = err.to_string();
             observe_v2_connection(
                 &observability,
                 &context,
                 "invalid_client_payload",
+                Some(detail.as_str()),
                 connection_started_at.elapsed(),
             );
             return Ok(());
         }
         Err(err) => {
+            let detail = err.to_string();
             observe_v2_connection(
                 &observability,
                 &context,
                 classify_v2_connection_error(&err),
+                Some(detail.as_str()),
                 connection_started_at.elapsed(),
             );
             return Err(err);
@@ -655,12 +748,13 @@ async fn run_websocket_connection(
     let initialize_params = match request_params::<InitializeParams>(&initialize_request) {
         Ok(params) => params,
         Err(err) => {
+            let detail = err.to_string();
             send_jsonrpc_error(
                 &mut socket,
                 initialize_request_id,
                 JSONRPCErrorError {
                     code: INVALID_REQUEST_CODE,
-                    message: err.to_string(),
+                    message: detail.clone(),
                     data: None,
                 },
                 timeouts.client_send,
@@ -677,6 +771,7 @@ async fn run_websocket_connection(
                 &observability,
                 &context,
                 "initialize_invalid_request",
+                Some(detail.as_str()),
                 connection_started_at.elapsed(),
             );
             return Ok(());
@@ -692,6 +787,7 @@ async fn run_websocket_connection(
     {
         Ok(downstream) => downstream,
         Err(err) => {
+            let detail = err.to_string();
             send_jsonrpc_error(
                 &mut socket,
                 initialize_request_id,
@@ -714,6 +810,7 @@ async fn run_websocket_connection(
                 &observability,
                 &context,
                 "downstream_connect_error",
+                Some(detail.as_str()),
                 connection_started_at.elapsed(),
             );
             return Ok(());
@@ -744,6 +841,7 @@ async fn run_websocket_connection(
         forwarded_connection_notifications: HashMap::new(),
     };
     let mut reject_pending_server_requests_on_exit = false;
+    let mut connection_detail = None;
     let connection = GatewayV2ConnectionContext {
         admission: &admission,
         observability: &observability,
@@ -886,12 +984,14 @@ async fn run_websocket_connection(
         Ok(()) => {
             if let Err(err) = shutdown_result {
                 connection_outcome = classify_v2_connection_error(&err);
+                connection_detail = Some(err.to_string());
                 Err(err)
             } else {
                 Ok(())
             }
         }
         Err(err) => {
+            connection_detail = Some(err.to_string());
             if let Err(shutdown_err) = shutdown_result {
                 warn!(%shutdown_err, "gateway v2 websocket downstream shutdown also failed after connection error");
             }
@@ -902,6 +1002,7 @@ async fn run_websocket_connection(
         &observability,
         &context,
         connection_outcome,
+        connection_detail.as_deref(),
         connection_started_at.elapsed(),
     );
     result
@@ -1034,7 +1135,7 @@ async fn handle_client_message(
         JSONRPCMessage::Request(request) => {
             let started_at = Instant::now();
             let method = request.method.clone();
-            if !downstream.single_worker() && request.method == "skills/list" {
+            if downstream.multi_worker_topology() && request.method == "skills/list" {
                 *skills_changed_pending_refresh = false;
             }
             if request.method == "initialize" {
@@ -1138,6 +1239,7 @@ async fn handle_client_message(
                     );
                 }
                 Err(err) => {
+                    log_fail_closed_multi_worker_request(downstream, connection, &method, &err);
                     send_jsonrpc_error(
                         socket,
                         request_id,
@@ -1164,7 +1266,7 @@ async fn handle_client_message(
             if is_initialized {
                 downstream.mark_initialized();
             }
-            if is_initialized && !downstream.single_worker() {
+            if is_initialized && downstream.multi_worker_topology() {
                 fanout_connection_notification(downstream, ClientNotification::Initialized).await?;
                 return Ok(());
             }
@@ -1246,7 +1348,7 @@ async fn handle_app_server_event(
     }
     let Some(event) = downstream_event.event else {
         if !downstream.single_worker() && downstream.remove_worker(worker_id) {
-            let stranded_connection_server_request = resolve_server_requests_for_worker(
+            let cleanup = resolve_server_requests_for_worker(
                 socket,
                 connection.client_send_timeout,
                 &mut event_state.pending_server_requests,
@@ -1254,7 +1356,16 @@ async fn handle_app_server_event(
                 worker_id,
             )
             .await?;
-            if stranded_connection_server_request {
+            warn!(
+                worker_id = ?worker_id,
+                remaining_worker_count = downstream.worker_count(),
+                resolved_thread_scoped_server_request_count = cleanup
+                    .resolved_thread_scoped_requests,
+                stranded_connection_scoped_server_request_count = cleanup
+                    .stranded_connection_scoped_requests,
+                "downstream worker session ended within shared gateway v2 session"
+            );
+            if cleanup.has_stranded_connection_scoped_requests() {
                 send_close_frame(
                     socket,
                     close_code::ERROR,
@@ -1306,13 +1417,13 @@ async fn handle_app_server_event(
             else {
                 return Ok(None);
             };
-            if !downstream.single_worker()
+            if downstream.multi_worker_topology()
                 && notification.method == "skills/changed"
                 && event_state.skills_changed_pending_refresh
             {
                 return Ok(None);
             }
-            if !downstream.single_worker()
+            if downstream.multi_worker_topology()
                 && should_deduplicate_connection_notification(&notification)
                 && event_state
                     .forwarded_connection_notifications
@@ -1326,10 +1437,10 @@ async fn handle_app_server_event(
                 connection.request_context,
                 &notification,
             ) {
-                if !downstream.single_worker() && notification.method == "skills/changed" {
+                if downstream.multi_worker_topology() && notification.method == "skills/changed" {
                     event_state.skills_changed_pending_refresh = true;
                 }
-                if !downstream.single_worker()
+                if downstream.multi_worker_topology()
                     && should_deduplicate_connection_notification(&notification)
                 {
                     event_state
@@ -1345,10 +1456,10 @@ async fn handle_app_server_event(
             }
         }
         AppServerEvent::ServerRequest(request) => {
-            let gateway_request_id = if downstream.single_worker() {
-                request.id().clone()
-            } else {
+            let gateway_request_id = if downstream.multi_worker_topology() {
                 session_factory.next_server_request_id()
+            } else {
+                request.id().clone()
             };
             let (request, downstream_request_id) =
                 server_request_to_jsonrpc(request, gateway_request_id)?;
@@ -1421,7 +1532,7 @@ async fn handle_app_server_event(
         }
         AppServerEvent::Disconnected { message } => {
             if !downstream.single_worker() && downstream.remove_worker(worker_id) {
-                let stranded_connection_server_request = resolve_server_requests_for_worker(
+                let cleanup = resolve_server_requests_for_worker(
                     socket,
                     connection.client_send_timeout,
                     &mut event_state.pending_server_requests,
@@ -1429,7 +1540,17 @@ async fn handle_app_server_event(
                     worker_id,
                 )
                 .await?;
-                if stranded_connection_server_request {
+                warn!(
+                    worker_id = ?worker_id,
+                    remaining_worker_count = downstream.worker_count(),
+                    resolved_thread_scoped_server_request_count = cleanup
+                        .resolved_thread_scoped_requests,
+                    stranded_connection_scoped_server_request_count = cleanup
+                        .stranded_connection_scoped_requests,
+                    disconnect_message = %message,
+                    "downstream worker disconnected within shared gateway v2 session"
+                );
+                if cleanup.has_stranded_connection_scoped_requests() {
                     send_close_frame(
                         socket,
                         close_code::ERROR,
@@ -1469,41 +1590,14 @@ async fn resolve_server_requests_for_worker(
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
     worker_id: Option<usize>,
-) -> io::Result<bool> {
-    let mut request_resolved_notifications = Vec::new();
-    let mut stranded_connection_server_request = false;
+) -> io::Result<WorkerServerRequestCleanup> {
+    let cleanup = collect_server_request_cleanup_for_worker(
+        pending_server_requests,
+        resolved_server_requests,
+        worker_id,
+    );
 
-    pending_server_requests.retain(|gateway_request_id, route| {
-        if route.worker_id != worker_id {
-            return true;
-        }
-        if let Some(thread_id) = route.thread_id.clone() {
-            request_resolved_notifications.push(ServerRequestResolvedNotification {
-                thread_id,
-                request_id: gateway_request_id.clone(),
-            });
-        } else {
-            stranded_connection_server_request = true;
-        }
-        false
-    });
-
-    resolved_server_requests.retain(|key, route| {
-        if key.worker_id != worker_id {
-            return true;
-        }
-        if let Some(thread_id) = route.thread_id.clone() {
-            request_resolved_notifications.push(ServerRequestResolvedNotification {
-                thread_id,
-                request_id: route.gateway_request_id.clone(),
-            });
-        } else {
-            stranded_connection_server_request = true;
-        }
-        false
-    });
-
-    for notification in request_resolved_notifications {
+    for notification in cleanup.resolved_notifications.iter().cloned() {
         send_jsonrpc(
             socket,
             JSONRPCMessage::Notification(tagged_type_to_notification(
@@ -1514,7 +1608,53 @@ async fn resolve_server_requests_for_worker(
         .await?;
     }
 
-    Ok(stranded_connection_server_request)
+    Ok(cleanup)
+}
+
+fn collect_server_request_cleanup_for_worker(
+    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+    worker_id: Option<usize>,
+) -> WorkerServerRequestCleanup {
+    let mut cleanup = WorkerServerRequestCleanup::default();
+
+    pending_server_requests.retain(|gateway_request_id, route| {
+        if route.worker_id != worker_id {
+            return true;
+        }
+        if let Some(thread_id) = route.thread_id.clone() {
+            cleanup
+                .resolved_notifications
+                .push(ServerRequestResolvedNotification {
+                    thread_id,
+                    request_id: gateway_request_id.clone(),
+                });
+            cleanup.resolved_thread_scoped_requests += 1;
+        } else {
+            cleanup.stranded_connection_scoped_requests += 1;
+        }
+        false
+    });
+
+    resolved_server_requests.retain(|key, route| {
+        if key.worker_id != worker_id {
+            return true;
+        }
+        if let Some(thread_id) = route.thread_id.clone() {
+            cleanup
+                .resolved_notifications
+                .push(ServerRequestResolvedNotification {
+                    thread_id,
+                    request_id: route.gateway_request_id.clone(),
+                });
+            cleanup.resolved_thread_scoped_requests += 1;
+        } else {
+            cleanup.stranded_connection_scoped_requests += 1;
+        }
+        false
+    });
+
+    cleanup
 }
 
 async fn reject_pending_server_requests(
@@ -1546,8 +1686,9 @@ async fn handle_client_request(
         downstream.reconnect_missing_workers().await;
     }
 
-    if !downstream.single_worker()
+    if downstream.multi_worker_topology()
         && let Some(thread_id) = request_thread_id(&request)
+        && !requires_primary_worker_route(&request)
         && connection
             .scope_registry
             .thread_visible_to(connection.request_context, thread_id)
@@ -1565,7 +1706,7 @@ async fn handle_client_request(
         .await?;
     }
 
-    if !downstream.single_worker() {
+    if downstream.multi_worker_topology() {
         if is_multi_worker_fanout_login_request(&request) {
             return fanout_mutating_connection_request(downstream, request).await;
         }
@@ -1984,12 +2125,23 @@ fn worker_for_request<'a>(
     scope_registry: &GatewayScopeRegistry,
     request: &JSONRPCRequest,
 ) -> io::Result<&'a DownstreamWorkerHandle> {
-    if downstream.single_worker() {
+    if !downstream.multi_worker_topology() {
         return downstream.primary_worker();
     }
 
     if request.method == "thread/start" {
         return downstream.next_thread_start_worker();
+    }
+
+    if requires_primary_worker_route(request) && !downstream.has_worker(Some(0)) {
+        return Err(io::Error::other(format!(
+            "primary worker route is unavailable for {}",
+            request.method
+        )));
+    }
+
+    if requires_primary_worker_route(request) {
+        return downstream.primary_worker();
     }
 
     if let Some(thread_id) = request_thread_id(request) {
@@ -2003,13 +2155,6 @@ fn worker_for_request<'a>(
         }
     }
 
-    if requires_primary_worker_route(request) && !downstream.has_worker(Some(0)) {
-        return Err(io::Error::other(format!(
-            "primary worker route is unavailable for {}",
-            request.method
-        )));
-    }
-
     downstream.primary_worker()
 }
 
@@ -2018,7 +2163,7 @@ fn worker_for_notification<'a>(
     scope_registry: &GatewayScopeRegistry,
     notification: &JSONRPCNotification,
 ) -> io::Result<&'a DownstreamWorkerHandle> {
-    if downstream.single_worker() {
+    if !downstream.multi_worker_topology() {
         return downstream.primary_worker();
     }
 
@@ -2053,6 +2198,53 @@ fn worker_for_server_request(
                 "gateway v2 connection has no downstream server-request route for worker {worker_id:?}"
             ))
         })
+}
+
+fn log_fail_closed_multi_worker_request(
+    downstream: &GatewayV2DownstreamRouter,
+    connection: &GatewayV2ConnectionContext<'_>,
+    method: &str,
+    err: &io::Error,
+) {
+    if !downstream.multi_worker_topology() {
+        return;
+    }
+
+    let unavailable_workers = downstream.unavailable_worker_route_diagnostics(Instant::now());
+    if unavailable_workers.is_empty() {
+        return;
+    }
+
+    let available_worker_ids = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let unavailable_worker_ids = unavailable_workers
+        .iter()
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let unavailable_worker_websocket_urls = unavailable_workers
+        .iter()
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_ids = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+
+    warn!(
+        method,
+        tenant_id = connection.request_context.tenant_id.as_str(),
+        project_id = connection.request_context.project_id.as_deref(),
+        available_worker_ids = ?available_worker_ids,
+        unavailable_worker_ids = ?unavailable_worker_ids,
+        unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
+        reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+        %err,
+        "gateway v2 request failed closed because required worker routes are unavailable"
+    );
 }
 
 fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
@@ -2891,6 +3083,7 @@ fn should_deduplicate_connection_notification(notification: &JSONRPCNotification
         notification.method.as_str(),
         "account/updated"
             | "account/rateLimits/updated"
+            | "account/login/completed"
             | "app/list/updated"
             | "mcpServer/startupStatus/updated"
             | "externalAgentConfig/import/completed"
@@ -3025,10 +3218,12 @@ fn observe_v2_connection(
     observability: &GatewayObservability,
     context: &GatewayRequestContext,
     outcome: &str,
+    detail: Option<&str>,
     duration: std::time::Duration,
 ) {
     observability.record_v2_connection(outcome, duration);
     observability.emit_v2_connection_audit_log(outcome, duration, context);
+    observability.emit_v2_connection_log(outcome, duration, context, detail);
 }
 
 fn classify_v2_connection_error(err: &io::Error) -> &'static str {
@@ -3232,6 +3427,7 @@ async fn send_invalid_payload_close(
 mod tests {
     use super::DownstreamServerRequestKey;
     use super::DownstreamWorkerEvent;
+    use super::DownstreamWorkerHandle;
     use super::GatewayV2ConnectionContext;
     use super::GatewayV2DownstreamRouter;
     use super::GatewayV2EventState;
@@ -3257,6 +3453,10 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::any;
     use codex_app_server_client::AppServerEvent;
+    use codex_app_server_client::AppServerRequestHandle;
+    use codex_app_server_client::EnvironmentManager;
+    use codex_app_server_client::InProcessAppServerClient;
+    use codex_app_server_client::InProcessClientStartArgs;
     use codex_app_server_client::RemoteAppServerConnectArgs;
     use codex_app_server_protocol::AppsListResponse;
     use codex_app_server_protocol::ClientInfo;
@@ -3308,10 +3508,15 @@ mod tests {
     use codex_app_server_protocol::TurnPlanStep;
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_app_server_protocol::TurnPlanUpdatedNotification;
+    use codex_arg0::Arg0DispatchPaths;
     use codex_core::config::Config;
+    use codex_core::config_loader::CloudRequirementsLoader;
+    use codex_core::config_loader::LoaderOverrides;
+    use codex_feedback::CodexFeedback;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::protocol::RealtimeVoice;
     use codex_protocol::protocol::RealtimeVoicesList;
+    use codex_protocol::protocol::SessionSource;
     use futures::SinkExt;
     use futures::StreamExt;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -3320,8 +3525,11 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::io;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::time::Instant;
     use tempfile::tempdir;
     use tokio::io::AsyncRead;
@@ -3340,6 +3548,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
     use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[tokio::test]
     async fn await_io_with_timeout_returns_result_before_timeout() {
@@ -4704,6 +4913,115 @@ mod tests {
     }
 
     #[test]
+    fn collect_server_request_cleanup_for_worker_tracks_thread_and_connection_scoped_routes() {
+        let worker_id = Some(3);
+        let other_worker_id = Some(9);
+        let mut pending_server_requests = HashMap::from([
+            (
+                RequestId::String("gateway-thread-pending".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id,
+                    downstream_request_id: RequestId::String(
+                        "downstream-thread-pending".to_string(),
+                    ),
+                    thread_id: Some("thread-owned".to_string()),
+                },
+            ),
+            (
+                RequestId::String("gateway-connection-pending".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id,
+                    downstream_request_id: RequestId::String(
+                        "downstream-connection-pending".to_string(),
+                    ),
+                    thread_id: None,
+                },
+            ),
+            (
+                RequestId::String("gateway-other-worker".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: other_worker_id,
+                    downstream_request_id: RequestId::String("downstream-other-worker".to_string()),
+                    thread_id: Some("thread-other".to_string()),
+                },
+            ),
+        ]);
+        let mut resolved_server_requests = HashMap::from([
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id,
+                    request_id: RequestId::String("downstream-thread-resolved".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String("gateway-thread-resolved".to_string()),
+                    thread_id: Some("thread-owned".to_string()),
+                },
+            ),
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id,
+                    request_id: RequestId::String("downstream-connection-resolved".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String(
+                        "gateway-connection-resolved".to_string(),
+                    ),
+                    thread_id: None,
+                },
+            ),
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id: other_worker_id,
+                    request_id: RequestId::String("downstream-other-worker-resolved".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String(
+                        "gateway-other-worker-resolved".to_string(),
+                    ),
+                    thread_id: Some("thread-other".to_string()),
+                },
+            ),
+        ]);
+
+        let cleanup = super::collect_server_request_cleanup_for_worker(
+            &mut pending_server_requests,
+            &mut resolved_server_requests,
+            worker_id,
+        );
+
+        assert_eq!(cleanup.resolved_thread_scoped_requests, 2);
+        assert_eq!(cleanup.stranded_connection_scoped_requests, 2);
+        assert_eq!(
+            cleanup.resolved_notifications,
+            vec![
+                ServerRequestResolvedNotification {
+                    thread_id: "thread-owned".to_string(),
+                    request_id: RequestId::String("gateway-thread-pending".to_string()),
+                },
+                ServerRequestResolvedNotification {
+                    thread_id: "thread-owned".to_string(),
+                    request_id: RequestId::String("gateway-thread-resolved".to_string()),
+                },
+            ]
+        );
+        assert_eq!(cleanup.has_stranded_connection_scoped_requests(), true);
+        assert_eq!(pending_server_requests.len(), 1);
+        assert_eq!(
+            pending_server_requests
+                .contains_key(&RequestId::String("gateway-other-worker".to_string())),
+            true
+        );
+        assert_eq!(resolved_server_requests.len(), 1);
+        assert_eq!(
+            resolved_server_requests.contains_key(&super::DownstreamServerRequestKey {
+                worker_id: other_worker_id,
+                request_id: RequestId::String("downstream-other-worker-resolved".to_string()),
+            }),
+            true
+        );
+    }
+
+    #[test]
     fn aggregated_page_bounds_returns_requested_window_when_offset_is_in_range() {
         assert_eq!(
             super::aggregated_page_bounds(5, 1, 2, "apps-offset:"),
@@ -4805,6 +5123,7 @@ mod tests {
                 std::io::ErrorKind::TimedOut,
                 "gateway websocket send timed out",
             )),
+            None,
             Duration::from_millis(9),
         );
 
@@ -8723,16 +9042,58 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_thread_list_response_backfills_multi_worker_routes_for_visible_threads() {
-        let worker_a = start_mock_remote_server_for_thread_list_and_read(
-            "thread-worker-a",
-            "Worker A thread",
-            "/tmp/worker-a",
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "thread/list",
+            serde_json::json!({
+                "data": [{
+                    "id": "thread-worker-a",
+                    "forkedFromId": null,
+                    "preview": "",
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "status": { "type": "idle" },
+                    "path": null,
+                    "cwd": "/tmp/worker-a",
+                    "cliVersion": "0.0.0-test",
+                    "source": "cli",
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "gitInfo": null,
+                    "name": "Worker A thread",
+                    "turns": [],
+                }],
+                "nextCursor": null,
+                "backwardsCursor": null,
+            }),
         )
         .await;
-        let worker_b = start_mock_remote_server_for_thread_list_and_read(
-            "thread-worker-b",
-            "Worker B thread",
-            "/tmp/worker-b",
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "thread/list",
+            serde_json::json!({
+                "data": [{
+                    "id": "thread-worker-b",
+                    "forkedFromId": null,
+                    "preview": "",
+                    "ephemeral": true,
+                    "modelProvider": "openai",
+                    "createdAt": 2,
+                    "updatedAt": 2,
+                    "status": { "type": "idle" },
+                    "path": null,
+                    "cwd": "/tmp/worker-b",
+                    "cliVersion": "0.0.0-test",
+                    "source": "cli",
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "gitInfo": null,
+                    "name": "Worker B thread",
+                    "turns": [],
+                }],
+                "nextCursor": null,
+                "backwardsCursor": null,
+            }),
         )
         .await;
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
@@ -11661,7 +12022,6 @@ mod tests {
 
         let listed: ThreadListResponse =
             serde_json::from_value(result).expect("thread list response should decode");
-        assert_eq!(router.worker_count(), 2);
         assert_eq!(listed.next_cursor, None);
         assert_eq!(listed.backwards_cursor, None);
         assert_eq!(
@@ -12209,7 +12569,11 @@ mod tests {
         );
         assert_eq!(
             *worker_b_requests.lock().await,
-            vec!["fs/watch".to_string(), "fs/unwatch".to_string()]
+            vec![
+                "fs/watch".to_string(),
+                "fs/watch".to_string(),
+                "fs/unwatch".to_string(),
+            ]
         );
     }
 
@@ -13173,6 +13537,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_login_completed_notifications()
+     {
+        let notification_params = serde_json::json!({
+            "loginId": "login-shared",
+            "success": true,
+            "error": null,
+        });
+        let worker_a = start_mock_remote_server_for_connection_notification(
+            "account/login/completed",
+            notification_params.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "account/login/completed",
+            notification_params.clone(),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "account/login/completed",
+            notification_params,
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_external_agent_import_completed_notifications()
      {
         let notification_params = serde_json::json!({});
@@ -14072,6 +14505,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_worker_requests_stay_fail_closed_with_one_live_worker_in_multi_worker_topology()
+     {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(1),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory,
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+
+        let err = match super::worker_for_request(
+            &mut router,
+            &GatewayScopeRegistry::default(),
+            &JSONRPCRequest {
+                id: RequestId::String("command-exec".to_string()),
+                method: "command/exec".to_string(),
+                params: Some(serde_json::json!({
+                    "command": ["pwd"],
+                    "tty": false,
+                    "streamStdin": false,
+                    "streamStdoutStderr": false,
+                })),
+                trace: None,
+            },
+        ) {
+            Ok(_) => panic!("primary-worker request should stay fail-closed"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "primary worker route is unavailable for command/exec"
+        );
+
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn thread_scoped_requests_stay_sticky_with_one_live_worker_in_multi_worker_topology() {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(1),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory,
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+        let scope_registry = GatewayScopeRegistry::default();
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let worker = super::worker_for_request(
+            &mut router,
+            &scope_registry,
+            &JSONRPCRequest {
+                id: RequestId::String("thread-read".to_string()),
+                method: "thread/read".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "includeTurns": false,
+                })),
+                trace: None,
+            },
+        )
+        .expect("thread-scoped request should stay sticky to live worker");
+        assert_eq!(worker.worker_id, Some(1));
+
+        let worker = super::worker_for_notification(
+            &mut router,
+            &scope_registry,
+            &JSONRPCNotification {
+                method: "thread/started".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-worker-b",
+                })),
+            },
+        )
+        .expect("thread-scoped notification should stay sticky to live worker");
+        assert_eq!(worker.worker_id, Some(1));
+
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn reconnectable_router_keeps_multi_worker_topology_with_one_live_worker() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let reconnect_state = super::GatewayV2ReconnectState {
+            configured_worker_ids: vec![0, 1],
+            worker_websocket_urls: vec![
+                "ws://worker-a.invalid".to_string(),
+                "ws://worker-b.invalid".to_string(),
+            ],
+            session_factory,
+            initialize_params: InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            },
+            request_context: GatewayRequestContext::default(),
+            retry_backoff: Duration::from_secs(1),
+        };
+        let router = GatewayV2DownstreamRouter {
+            workers: Vec::new(),
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(reconnect_state),
+        };
+
+        assert!(router.multi_worker_topology());
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_closes_when_downstream_reuses_pending_server_request_id() {
         let websocket_url = start_mock_remote_server_for_initialize().await;
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -14123,9 +14803,9 @@ mod tests {
                         );
                         let mut event_state = GatewayV2EventState {
                             pending_server_requests: HashMap::from([(
-                                RequestId::String("gateway-srv-1".to_string()),
+                                RequestId::String("downstream-request-1".to_string()),
                                 PendingServerRequestRoute {
-                                    worker_id: None,
+                                    worker_id: Some(0),
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
@@ -14143,11 +14823,11 @@ mod tests {
                             &connection,
                             &mut event_state,
                             DownstreamWorkerEvent {
-                                worker_id: None,
+                                worker_id: Some(0),
                                 event: Some(AppServerEvent::ServerRequest(
                                     ServerRequest::ToolRequestUserInput {
                                         request_id: RequestId::String(
-                                            "downstream-request-2".to_string(),
+                                            "downstream-request-1".to_string(),
                                         ),
                                         params: codex_app_server_protocol::ToolRequestUserInputParams {
                                             thread_id: "thread-visible".to_string(),
@@ -16164,6 +16844,206 @@ mod tests {
         assert_eq!(super::websocket_close_reason(&reason).len(), 123);
     }
 
+    #[test]
+    fn login_completed_notifications_are_treated_as_deduplicated_connection_state() {
+        let notification = JSONRPCNotification {
+            method: "account/login/completed".to_string(),
+            params: Some(serde_json::json!({
+                "loginId": "login-shared",
+                "success": true,
+                "error": null,
+            })),
+        };
+
+        assert_eq!(
+            super::should_deduplicate_connection_notification(&notification),
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_worker_route_diagnostics_marks_backoff_workers() {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let now = Instant::now();
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::from([(1, now + Duration::from_secs(30))]),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-b.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+
+        assert_eq!(
+            router.unavailable_worker_route_diagnostics(now),
+            vec![super::UnavailableWorkerRouteDiagnostics {
+                worker_id: 1,
+                websocket_url: "ws://worker-b.invalid".to_string(),
+                reconnect_backoff_active: true,
+            }]
+        );
+
+        router.clear_worker_reconnect_failure(1);
+        assert_eq!(
+            router.unavailable_worker_route_diagnostics(now),
+            vec![super::UnavailableWorkerRouteDiagnostics {
+                worker_id: 1,
+                websocket_url: "ws://worker-b.invalid".to_string(),
+                reconnect_backoff_active: false,
+            }]
+        );
+
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn log_fail_closed_multi_worker_request_includes_worker_route_details() {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-b.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+        router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(30));
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let scope_registry = GatewayScopeRegistry::default();
+        let request_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &request_context,
+            client_send_timeout: Duration::from_secs(1),
+            max_pending_server_requests: 4,
+        };
+
+        let logs = capture_logs(|| {
+            super::log_fail_closed_multi_worker_request(
+                &router,
+                &connection,
+                "config/read",
+                &std::io::Error::other(
+                    "required worker routes are unavailable for config/read: [1]",
+                ),
+            );
+        });
+
+        assert!(logs.contains(
+            "gateway v2 request failed closed because required worker routes are unavailable"
+        ));
+        assert!(logs.contains("config/read"));
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("project-a"));
+        assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("unavailable_worker_ids=[1]"));
+        assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
+        assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
+
+        client.shutdown().await.expect("client should shut down");
+    }
+
     async fn spawn_test_server(
         state: GatewayV2State,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -16270,6 +17150,91 @@ mod tests {
         .await
         .expect("config should load");
         gateway_initialize_response(&config)
+    }
+
+    async fn start_test_request_handle() -> (InProcessAppServerClient, AppServerRequestHandle) {
+        let codex_home = tempdir().expect("tempdir");
+        let config = Arc::new(
+            Config::load_default_with_cli_overrides_for_codex_home(
+                codex_home.path().to_path_buf(),
+                Vec::new(),
+            )
+            .await
+            .expect("config should load"),
+        );
+        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config,
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            log_db: None,
+            environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 4,
+        })
+        .await
+        .expect("in-process client should start");
+        let request_handle = AppServerRequestHandle::InProcess(client.request_handle());
+        (client, request_handle)
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer should lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+
+        let bytes = writer
+            .buffer
+            .lock()
+            .expect("log buffer should lock")
+            .clone();
+        String::from_utf8(bytes).expect("log output should be utf8")
     }
 
     async fn start_mock_remote_server_for_initialize() -> String {
@@ -17268,79 +18233,88 @@ mod tests {
         let thread_name = thread_name.to_string();
         let cwd = cwd.to_string();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept should succeed");
-            let mut websocket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("websocket should accept");
-
-            expect_remote_initialize(&mut websocket).await;
-
             loop {
-                let Some(frame) = websocket.next().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                let frame = frame.expect("frame should decode");
-                let Message::Text(text) = frame else {
-                    continue;
-                };
-                let JSONRPCMessage::Request(request) =
-                    serde_json::from_str(&text).expect("request should decode")
-                else {
-                    continue;
-                };
+                let thread_id = thread_id.clone();
+                let thread_name = thread_name.clone();
+                let cwd = cwd.clone();
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket should accept");
 
-                let result = match request.method.as_str() {
-                    "thread/list" => serde_json::json!({
-                        "data": [{
-                            "id": thread_id,
-                            "forkedFromId": null,
-                            "preview": "",
-                            "ephemeral": true,
-                            "modelProvider": "openai",
-                            "createdAt": if thread_id == "thread-worker-a" { 1 } else { 2 },
-                            "updatedAt": if thread_id == "thread-worker-a" { 1 } else { 2 },
-                            "status": { "type": "idle" },
-                            "path": null,
-                            "cwd": cwd,
-                            "cliVersion": "0.0.0-test",
-                            "source": "cli",
-                            "agentNickname": null,
-                            "agentRole": null,
-                            "gitInfo": null,
-                            "name": thread_name,
-                            "turns": [],
-                        }],
-                        "nextCursor": null,
-                        "backwardsCursor": null,
-                    }),
-                    "thread/read" => serde_json::json!({
-                        "thread": {
-                            "id": thread_id,
-                            "name": thread_name,
-                            "cwd": cwd,
-                        },
-                    }),
-                    "thread/resume" => serde_json::json!({
-                        "thread": {
-                            "id": thread_id,
-                            "name": thread_name,
-                            "cwd": cwd,
-                        },
-                    }),
-                    other => panic!("unexpected request method: {other}"),
-                };
+                    expect_remote_initialize(&mut websocket).await;
 
-                websocket
-                    .send(Message::Text(
-                        serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
-                            id: request.id,
-                            result,
-                        }))
-                        .expect("response should serialize")
-                        .into(),
-                    ))
-                    .await
-                    .expect("response should send");
+                    loop {
+                        let Some(frame) = websocket.next().await else {
+                            break;
+                        };
+                        let frame = frame.expect("frame should decode");
+                        let Message::Text(text) = frame else {
+                            continue;
+                        };
+                        let JSONRPCMessage::Request(request) =
+                            serde_json::from_str(&text).expect("request should decode")
+                        else {
+                            continue;
+                        };
+
+                        let result = match request.method.as_str() {
+                            "thread/list" => serde_json::json!({
+                                "data": [{
+                                    "id": thread_id,
+                                    "forkedFromId": null,
+                                    "preview": "",
+                                    "ephemeral": true,
+                                    "modelProvider": "openai",
+                                    "createdAt": if thread_id == "thread-worker-a" { 1 } else { 2 },
+                                    "updatedAt": if thread_id == "thread-worker-a" { 1 } else { 2 },
+                                    "status": { "type": "idle" },
+                                    "path": null,
+                                    "cwd": cwd,
+                                    "cliVersion": "0.0.0-test",
+                                    "source": "cli",
+                                    "agentNickname": null,
+                                    "agentRole": null,
+                                    "gitInfo": null,
+                                    "name": thread_name,
+                                    "turns": [],
+                                }],
+                                "nextCursor": null,
+                                "backwardsCursor": null,
+                            }),
+                            "thread/read" => serde_json::json!({
+                                "thread": {
+                                    "id": thread_id,
+                                    "name": thread_name,
+                                    "cwd": cwd,
+                                },
+                            }),
+                            "thread/resume" => serde_json::json!({
+                                "thread": {
+                                    "id": thread_id,
+                                    "name": thread_name,
+                                    "cwd": cwd,
+                                },
+                            }),
+                            other => panic!("unexpected request method: {other}"),
+                        };
+
+                        websocket
+                            .send(Message::Text(
+                                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result,
+                                }))
+                                .expect("response should serialize")
+                                .into(),
+                            ))
+                            .await
+                            .expect("response should send");
+                    }
+                });
             }
         });
         format!("ws://{addr}")

@@ -63,7 +63,11 @@ pub struct GatewayRemoteWorkerHealth {
     pub worker_id: usize,
     pub websocket_url: String,
     pub healthy: bool,
+    pub reconnecting: bool,
     pub last_error: Option<String>,
+    pub last_state_change_at: Option<i64>,
+    pub last_error_at: Option<i64>,
+    pub next_reconnect_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

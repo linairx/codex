@@ -279,8 +279,11 @@ Recent progress:
   notifications still arrive on the same northbound v2 connection
 - that embedded harness also covers `turn/start` plus the core turn-lifecycle
   notifications current clients rely on during normal execution:
-  `thread/status/changed`, `turn/started`, `item/agentMessage/delta`, and
-  `turn/completed`
+  `thread/status/changed`, `turn/started`, `item/started`,
+  `item/agentMessage/delta`, `item/completed`, and `turn/completed`
+- that same embedded harness now also covers the streamed reasoning
+  notifications current clients consume during active turns:
+  `item/reasoning/summaryTextDelta` and `item/reasoning/textDelta`
 - the embedded harness now also verifies app-server's current unmaterialized
   thread semantics, preserving the expected `no rollout found for thread id ...`
   errors for `thread/resume` and `thread/fork` over the gateway's northbound v2
@@ -322,12 +325,16 @@ Recent progress:
   transport
 - that remote harness now also covers `turn/start` plus the core turn-lifecycle
   notifications current clients rely on during normal execution:
-  `thread/status/changed`, `turn/started`, `item/agentMessage/delta`, and
-  `turn/completed`
+  `thread/status/changed`, `turn/started`, `item/started`,
+  `item/agentMessage/delta`, `item/completed`, and `turn/completed`
 - that same remote harness now also covers additional streamed turn
   notifications the current TUI consumes during active runs:
   `item/reasoning/summaryTextDelta`, `item/reasoning/textDelta`,
   `item/commandExecution/outputDelta`, and `item/fileChange/outputDelta`
+- that same remote harness now also covers longer-running turn lifecycle
+  notifications the current TUI uses to render item and hook progress,
+  including `item/started`, `item/completed`, `hookStarted`, and
+  `hookCompleted`
 - dedicated northbound gateway coverage now also exercises item lifecycle
   notifications the TUI uses for longer-running turn state, covering
   `item/started` and `item/completed`
@@ -355,6 +362,26 @@ Recent progress:
   unsupported-but-transparent `item/tool/call` server-request round trip, so
   gateway transport behavior is covered even though the current TUI still does
   not handle that request family
+- the real embedded compatibility harness now also exercises that same
+  unsupported-but-transparent `item/tool/call` round trip, so the in-process
+  northbound client transport is covered beyond dedicated passthrough fixtures
+- that same real embedded compatibility harness now also verifies
+  `serverRequest/resolved` plus `item/started` / `item/completed` forwarding
+  for the dynamic-tool call lifecycle through turn completion
+- the real single-worker remote compatibility harness now also exercises that
+  same unsupported-but-transparent `item/tool/call` round trip, so the
+  northbound client transport is covered beyond dedicated passthrough fixtures
+- that same real single-worker remote compatibility harness now also verifies
+  `serverRequest/resolved` plus `item/started` / `item/completed` ordering for
+  the dynamic-tool call lifecycle before turn completion
+- the real single-worker remote compatibility harness now also covers the
+  standalone `command/exec` control plane, validating `command/exec`,
+  `command/exec/outputDelta`, `command/exec/write`, `command/exec/resize`,
+  and `command/exec/terminate` through the gateway-backed remote worker
+  session instead of only through targeted passthrough fixtures
+- the real multi-worker remote compatibility harness now also exercises
+  `item/tool/call`, verifying per-worker request-id translation and one shared
+  northbound session round trip across multiple downstream workers
 
 ### Milestone 4: Coverage Audit and Method Gaps
 
@@ -559,14 +586,26 @@ Recent progress:
   for connector-driven tool flows too
 - the real embedded `RemoteAppServerClient` harness now also covers
   lower-frequency thread-control flows, including `thread/unsubscribe`,
+  `thread/archive`, `thread/unarchive`, `thread/metadata/update`,
+  `thread/turns/list`, `thread/increment_elicitation`,
+  `thread/decrement_elicitation`, `thread/inject_items`,
   `thread/compact/start`, `thread/shellCommand`,
-  `thread/backgroundTerminals/clean`, and `thread/rollback`
+  `thread/backgroundTerminals/clean`, `thread/rollback`, and detached
+  `review/start` followed by `thread/read` on the returned review thread
 - that same real embedded compatibility harness now also covers the
   realtime request workflow for `thread/realtime/start`,
   `thread/realtime/appendText`, `thread/realtime/appendAudio`,
   `thread/realtime/stop`, and `thread/realtime/listVoices`, validating that
   the in-process gateway reaches the realtime sideband transport for start and
   append requests
+- that same real embedded compatibility harness now also covers the resulting
+  realtime notification forwarding for `thread/realtime/itemAdded`,
+  `thread/realtime/outputAudio/delta`,
+  `thread/realtime/transcript/delta`,
+  `thread/realtime/transcript/done`, `thread/realtime/sdp`,
+  `thread/realtime/error`, and `thread/realtime/closed`, validating that
+  sideband events still surface over the gateway's northbound v2 stream in
+  embedded mode
 - that same real embedded compatibility harness now also covers turn-control
   parity for `turn/steer` and `turn/interrupt`, verifying the active turn is
   steered successfully and later completes as `interrupted` through the
@@ -739,6 +778,10 @@ Recent progress:
   streamed turn notifications the current TUI consumes:
   `item/reasoning/summaryTextDelta`, `item/reasoning/textDelta`,
   `item/commandExecution/outputDelta`, and `item/fileChange/outputDelta`
+- that same multi-worker turn-routing regression now also covers
+  longer-running turn lifecycle notifications, including `item/started`,
+  `item/completed`, `hookStarted`, and `hookCompleted`, so one shared client
+  session still sees item and hook progress from the owning worker
 - multi-worker remote runtime now also has a real northbound v2 client
   regression for sticky realtime request routing and notification fan-in
   across two workers on one gateway session, verifying
@@ -778,6 +821,12 @@ Recent progress:
   `RemoteAppServerClient` regression for primary-worker onboarding and
   feedback flows, covering `account/login/start`, `account/login/cancel`,
   `account/login/completed`, and `feedback/upload`
+- that same real multi-worker primary-worker harness now also covers the
+  standalone `command/exec` control plane
+  (`command/exec`, `command/exec/outputDelta`, `command/exec/write`,
+  `command/exec/resize`, and `command/exec/terminate`), so primary-worker
+  command execution has baseline drop-in coverage in addition to reconnect
+  recovery coverage
 - multi-worker remote runtime now also has a real northbound
   `RemoteAppServerClient` setup-mutation regression that exercises one shared
   session through `externalAgentConfig/import`, `config/batchWrite`,
@@ -882,6 +931,10 @@ Recent progress:
   still complete a bidirectional `item/tool/requestUserInput` server-request
   round trip, not just bootstrap and `thread/start`
 - that same single-worker reconnect regression now also verifies the recovered
+  v2 session can still complete an `item/tool/call` dynamic-tool round trip
+  with `serverRequest/resolved` ordering plus `item/started` /
+  `item/completed` forwarding before `turn/completed`
+- that same single-worker reconnect regression now also verifies the recovered
   v2 session can still satisfy `account/read` and `account/rateLimits/read`,
   so bootstrap account state and background rate-limit refresh survive worker
   recovery too
@@ -930,7 +983,8 @@ Recent progress:
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses exact-duplicate connection-state notifications
   across workers for `account/updated`, `account/rateLimits/updated`,
-  `app/list/updated`, `mcpServer/startupStatus/updated`, and
+  `account/login/completed`, `app/list/updated`,
+  `mcpServer/startupStatus/updated`, and
   `externalAgentConfig/import/completed`
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses duplicate `skills/changed` invalidations across
@@ -1011,6 +1065,10 @@ Recent progress:
   downstream worker lazily on later client requests, so the session can again
   route `thread/start`, aggregated `thread/list`, and sticky `thread/read`
   through that worker without forcing a northbound reconnect
+- that same-session recovery path now also verifies sticky `thread/resume` and
+  `thread/fork` on the recovered worker, plus a follow-up `thread/read` of the
+  returned forked thread to confirm worker ownership is re-registered for the
+  new thread id after reconnect
 - that same-session recovery path now also verifies sticky
   `thread/name/set` on the recovered worker, plus a follow-up `thread/read`
   that returns the renamed state over the same northbound session
@@ -1025,6 +1083,18 @@ Recent progress:
   worker, plus a follow-up `thread/read` of the returned review thread so
   newly materialized thread ids are still owned by the recovered worker after
   reconnect
+- that same-session recovery path now also verifies the resulting recovered
+  worker turn and realtime notifications still fan in on the shared northbound
+  session, covering `thread/status/changed`, `turn/started`, `hookStarted`,
+  `item/started`, `item/agentMessage/delta`,
+  `item/reasoning/summaryTextDelta`, `item/reasoning/textDelta`,
+  `item/commandExecution/outputDelta`, `item/fileChange/outputDelta`,
+  `hookCompleted`, `item/completed`, `turn/completed`,
+  `thread/realtime/started`, `thread/realtime/itemAdded`,
+  `thread/realtime/transcript/delta`,
+  `thread/realtime/transcript/done`,
+  `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`,
+  `thread/realtime/error`, and `thread/realtime/closed`
 - that same-session recovery path now also verifies sticky
   `thread/unsubscribe`, `thread/turns/list`,
   `thread/increment_elicitation`, `thread/decrement_elicitation`,
@@ -1080,6 +1150,10 @@ Recent progress:
   registrations to a re-added downstream worker session before later filesystem
   watch traffic routes there, so shared watch subscriptions survive worker
   recovery on one northbound session
+- that same lazy-reconnect path now also emits structured gateway logs for
+  reconnect attempts, reconnect failures, connection-state replay failures, and
+  successful worker re-add with initialized/fs-watch replay context, so
+  multi-worker recovery debugging does not depend only on request-level errors
 - multi-worker lazy reconnect now also applies a short per-worker retry
   backoff after failed reconnect attempts or failed connection-state replay, so
   one repeatedly unhealthy worker does not trigger an immediate reconnect storm
@@ -1097,6 +1171,16 @@ Recent progress:
 - primary-worker-only requests now also fail closed while that primary worker
   remains unavailable during reconnect retry backoff, instead of silently
   drifting onto a surviving secondary worker in the shared session
+- those same multi-worker fail-closed request paths now also emit structured
+  gateway warning logs with request method, scope, live worker ids, missing
+  worker ids, missing worker websocket URLs, and reconnect-backoff worker ids,
+  so degraded routing decisions are visible without relying only on request
+  errors or `/healthz` polling
+- that same reconnect path now also keeps the shared session on multi-worker
+  semantics while only one downstream worker is temporarily live, so
+  connection-scoped fanout and dedupe behavior plus gateway-owned
+  server-request id translation do not silently revert to single-worker
+  handling before the missing workers reconnect
 - dedicated northbound multi-worker v2 websocket regression coverage now also
   verifies shared-session fan-in for the full current realtime notification
   set across workers, including `thread/realtime/started`,
@@ -1270,6 +1354,21 @@ Operational notes:
   (`initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
   `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`) so operators
   can confirm rollout settings without relying only on startup logs
+- `/healthz` remote-worker entries now also expose `lastStateChangeAt` and
+  `lastErrorAt`, so operators can distinguish a worker that is actively
+  flapping from one that is healthy again but still carries a historical
+  `lastError`
+- `/healthz` remote-worker entries also expose `reconnecting` and
+  `nextReconnectAt`, so operators can tell whether a remote worker is still in
+  background reconnect backoff instead of only seeing an unhealthy flag
+- remote worker disconnects, reconnect attempts, reconnect failures, and
+  successful reconnects now also emit structured gateway logs with worker id,
+  websocket URL, and retry timing so rollout debugging does not depend only on
+  repeated `/healthz` polling
+- northbound v2 connections now also emit structured gateway logs with
+  connection outcome, scope, duration, and terminal error detail when present,
+  so rollout debugging can distinguish slow-client, handshake, and downstream
+  session failures without depending only on metrics or audit-enabled logs
 
 ## Caveats
 
@@ -1279,9 +1378,14 @@ Current Stage A compatibility caveats:
   uses `threadId`; history-based and path-based resume are rejected
 - `thread/fork` is only supported through the gateway scope policy when it uses
   `threadId`; path-based fork is rejected
+- release-quality drop-in v2 compatibility currently means embedded runtime or
+  remote runtime with exactly one downstream worker
 - multi-worker remote runtime is now partially supported for v2, but it has
   not reached the same parity and hardening level as embedded and single-worker
   remote deployments
+- multi-worker remote runtime should still be treated as a bounded Stage B
+  profile with explicit rollout guardrails, not as the default drop-in
+  compatibility target
 - backpressure on the downstream app-server event stream fails the northbound
   socket closed instead of silently degrading the session
 - gateway-owned close reasons are truncated to WebSocket-safe length; operators
@@ -1297,6 +1401,16 @@ Recommended rollout order:
 3. Use multi-worker remote mode only for targeted Stage B validation until its
    broader request-routing and hardening work lands.
 
+Topology guidance:
+
+- embedded runtime is the simplest release-quality baseline for drop-in v2
+  validation
+- single-worker remote runtime is the recommended release-quality remote
+  profile when the app-server must run out of process
+- multi-worker remote runtime is suitable for targeted validation of the
+  current Stage B transport, not for broad production rollout that assumes
+  full parity with direct app-server v2 behavior
+
 Suggested validation checklist before widening traffic:
 
 1. Verify a client can complete `initialize`, `account/read`, and `model/list`
@@ -1305,8 +1419,9 @@ Suggested validation checklist before widening traffic:
    turn completion notifications.
 3. Verify one approval or user-input server-request round trip, because that
    exercises the bidirectional request/response path.
-4. Verify `/healthz` reflects the expected runtime mode and worker health
-   profile for the chosen deployment shape.
+4. Verify `/healthz` reflects the expected runtime mode, worker health
+   profile, remote-worker health/error timestamps, and reconnecting/backoff
+   signals for the chosen deployment shape.
 5. If auth is enabled, verify both the WebSocket upgrade and `/v1/*` routes
    reject missing or incorrect Bearer tokens.
 

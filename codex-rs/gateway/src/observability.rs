@@ -175,6 +175,59 @@ impl GatewayObservability {
             "gateway v2 connection completed"
         );
     }
+
+    pub(crate) fn emit_v2_connection_log(
+        &self,
+        outcome: &str,
+        duration: Duration,
+        context: &GatewayRequestContext,
+        detail: Option<&str>,
+    ) {
+        let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        let tenant_id = context.tenant_id.as_str();
+        let project_id = context.project_id.as_deref();
+        match (v2_connection_log_level(outcome), detail) {
+            (Level::INFO, Some(detail)) => tracing::event!(
+                target: "codex_gateway.v2",
+                Level::INFO,
+                outcome,
+                duration_ms,
+                tenant_id,
+                project_id,
+                detail,
+                "gateway v2 connection completed"
+            ),
+            (Level::INFO, None) => tracing::event!(
+                target: "codex_gateway.v2",
+                Level::INFO,
+                outcome,
+                duration_ms,
+                tenant_id,
+                project_id,
+                "gateway v2 connection completed"
+            ),
+            (Level::WARN, Some(detail)) => tracing::event!(
+                target: "codex_gateway.v2",
+                Level::WARN,
+                outcome,
+                duration_ms,
+                tenant_id,
+                project_id,
+                detail,
+                "gateway v2 connection completed"
+            ),
+            (Level::WARN, None) => tracing::event!(
+                target: "codex_gateway.v2",
+                Level::WARN,
+                outcome,
+                duration_ms,
+                tenant_id,
+                project_id,
+                "gateway v2 connection completed"
+            ),
+            _ => unreachable!("v2 connection log level should stay within info/warn"),
+        }
+    }
 }
 
 pub async fn observe_http_request(
@@ -230,6 +283,13 @@ fn status_class(status_code: u16) -> &'static str {
     }
 }
 
+fn v2_connection_log_level(outcome: &str) -> Level {
+    match outcome {
+        "client_closed" | "client_disconnected" => Level::INFO,
+        _ => Level::WARN,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::GatewayObservability;
@@ -239,12 +299,18 @@ mod tests {
     use super::V2_CONNECTION_DURATION_METRIC;
     use super::V2_REQUEST_COUNT_METRIC;
     use super::V2_REQUEST_DURATION_METRIC;
+    use crate::scope::GatewayRequestContext;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+    use std::io;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn records_request_metrics_with_route_and_status_tags() {
@@ -545,5 +611,104 @@ mod tests {
 
         assert_eq!(saw_count, true);
         assert_eq!(saw_duration, true);
+    }
+
+    #[test]
+    fn emits_info_log_for_normal_v2_connection_outcome() {
+        let observability = GatewayObservability::new(None, false);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let logs = capture_logs(|| {
+            observability.emit_v2_connection_log(
+                "client_disconnected",
+                Duration::from_millis(7),
+                &context,
+                None,
+            );
+        });
+
+        assert!(logs.contains("INFO"));
+        assert!(logs.contains("gateway v2 connection completed"));
+        assert!(logs.contains("client_disconnected"));
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("project-a"));
+        assert!(logs.contains("7"));
+    }
+
+    #[test]
+    fn emits_warn_log_for_non_normal_v2_connection_outcome() {
+        let observability = GatewayObservability::new(None, false);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: None,
+        };
+        let logs = capture_logs(|| {
+            observability.emit_v2_connection_log(
+                "downstream_backpressure",
+                Duration::from_millis(11),
+                &context,
+                Some("downstream app-server event stream lagged"),
+            );
+        });
+
+        assert!(logs.contains("WARN"));
+        assert!(logs.contains("gateway v2 connection completed"));
+        assert!(logs.contains("downstream_backpressure"));
+        assert!(logs.contains("downstream app-server event stream lagged"));
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("11"));
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer should lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+
+        let bytes = writer
+            .buffer
+            .lock()
+            .expect("log buffer should lock")
+            .clone();
+        String::from_utf8(bytes).expect("log output should be utf8")
     }
 }
