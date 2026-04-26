@@ -526,6 +526,7 @@ mod tests {
                         websocket_url: "ws://127.0.0.1:8081".to_string(),
                         healthy: false,
                         reconnecting: true,
+                        reconnect_attempt_count: 2,
                         last_error: Some("remote app server event stream ended".to_string()),
                         last_state_change_at: Some(1710000000),
                         last_error_at: Some(1710000001),
@@ -570,7 +571,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":false,"reconnecting":true,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002}]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002}]}"#
         );
     }
 

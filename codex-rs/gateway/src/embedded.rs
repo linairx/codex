@@ -1631,6 +1631,28 @@ mod tests {
             .expect("thread/name/set should succeed through embedded gateway");
         assert_eq!(rename_response, ThreadSetNameResponse {});
 
+        let rename_notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                    notification,
+                )) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/name/updated notification should arrive");
+        assert_eq!(
+            rename_notification.thread_name,
+            Some(renamed_thread_name.clone())
+        );
+
         let renamed: AppServerThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
                 request_id: RequestId::Integer(8),
@@ -1654,25 +1676,6 @@ mod tests {
             .await
             .expect("thread/memoryMode/set should succeed through embedded gateway");
         assert_eq!(memory_mode_response, ThreadMemoryModeSetResponse {});
-
-        let thread_started = timeout(Duration::from_secs(5), async {
-            loop {
-                let event = client
-                    .next_event()
-                    .await
-                    .expect("event stream should stay open");
-                if let AppServerEvent::ServerNotification(ServerNotification::ThreadStarted(
-                    notification,
-                )) = event
-                    && notification.thread.id == started.thread.id
-                {
-                    break notification;
-                }
-            }
-        })
-        .await
-        .expect("thread/started notification should arrive");
-        assert_eq!(thread_started.thread, started.thread);
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -2117,9 +2120,43 @@ mod tests {
             "config/value/write should persist plugin config"
         );
 
+        let watch: FsWatchResponse = client
+            .request_typed(ClientRequest::FsWatch {
+                request_id: RequestId::Integer(16),
+                params: FsWatchParams {
+                    watch_id: "embedded-watch".to_string(),
+                    path: codex_home
+                        .path()
+                        .join("config.toml")
+                        .try_into()
+                        .expect("fs/watch path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/watch should succeed through embedded gateway");
+        assert_eq!(
+            watch.path.as_ref(),
+            codex_home
+                .path()
+                .join("config.toml")
+                .canonicalize()
+                .expect("watched path should canonicalize")
+        );
+
+        let unwatch: FsUnwatchResponse = client
+            .request_typed(ClientRequest::FsUnwatch {
+                request_id: RequestId::Integer(17),
+                params: FsUnwatchParams {
+                    watch_id: "embedded-watch".to_string(),
+                },
+            })
+            .await
+            .expect("fs/unwatch should succeed through embedded gateway");
+        assert_eq!(unwatch, FsUnwatchResponse {});
+
         let reset: MemoryResetResponse = client
             .request_typed(ClientRequest::MemoryReset {
-                request_id: RequestId::Integer(16),
+                request_id: RequestId::Integer(18),
                 params: None,
             })
             .await
@@ -2128,7 +2165,7 @@ mod tests {
 
         let logout: LogoutAccountResponse = client
             .request_typed(ClientRequest::LogoutAccount {
-                request_id: RequestId::Integer(17),
+                request_id: RequestId::Integer(19),
                 params: None,
             })
             .await
@@ -2137,7 +2174,7 @@ mod tests {
 
         let feedback: FeedbackUploadResponse = client
             .request_typed(ClientRequest::FeedbackUpload {
-                request_id: RequestId::Integer(18),
+                request_id: RequestId::Integer(20),
                 params: FeedbackUploadParams {
                     classification: "bug".to_string(),
                     reason: Some("embedded gateway parity regression".to_string()),
@@ -2155,7 +2192,7 @@ mod tests {
         let command_exec_task = tokio::spawn(async move {
             request_handle
                 .request_typed::<CommandExecResponse>(ClientRequest::OneOffCommandExec {
-                    request_id: RequestId::Integer(19),
+                    request_id: RequestId::Integer(21),
                     params: CommandExecParams {
                         command: vec![
                             "sh".to_string(),
@@ -5340,6 +5377,69 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn embedded_server_forwards_config_warning_notifications_over_v2() {
+        let codex_home = tempdir().expect("tempdir");
+        let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .expect("config");
+        config
+            .startup_warnings
+            .push("Gateway embedded config warning".to_string());
+
+        let server = start_embedded_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                enable_codex_api_key_env: false,
+                session_source: SessionSource::Cli,
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to embedded gateway");
+
+        let config_warning = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ConfigWarning(
+                    notification,
+                )) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("configWarning notification should arrive");
+        assert_eq!(config_warning.summary, "Gateway embedded config warning");
+        assert_eq!(config_warning.details, None);
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn remote_server_forwards_thread_creation_requests() {
         let websocket_url = start_mock_remote_server(
             Some("secret-token".to_string()),
@@ -5542,6 +5642,28 @@ stream_max_retries = 0
             .expect("thread/name/set should succeed through remote gateway");
         assert_eq!(rename_response, ThreadSetNameResponse {});
 
+        let rename_notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                    notification,
+                )) = event
+                    && notification.thread_id == started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/name/updated notification should arrive");
+        assert_eq!(
+            rename_notification.thread_name,
+            Some(renamed_thread_name.clone())
+        );
+
         let renamed: AppServerThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
                 request_id: RequestId::Integer(8),
@@ -5565,25 +5687,6 @@ stream_max_retries = 0
             .await
             .expect("thread/memoryMode/set should succeed through remote gateway");
         assert_eq!(memory_mode_response, ThreadMemoryModeSetResponse {});
-
-        let thread_started = timeout(Duration::from_secs(5), async {
-            loop {
-                let event = client
-                    .next_event()
-                    .await
-                    .expect("event stream should stay open");
-                if let AppServerEvent::ServerNotification(ServerNotification::ThreadStarted(
-                    notification,
-                )) = event
-                    && notification.thread.id == started.thread.id
-                {
-                    break notification;
-                }
-            }
-        })
-        .await
-        .expect("thread/started notification should arrive");
-        assert_eq!(thread_started.thread.id, started.thread.id);
 
         let turn_started_response: TurnStartResponse = client
             .request_typed(ClientRequest::TurnStart {
@@ -6938,9 +7041,37 @@ stream_max_retries = 0
         );
         assert_eq!(config_value_write.overridden_metadata, None);
 
+        let watch: FsWatchResponse = client
+            .request_typed(ClientRequest::FsWatch {
+                request_id: RequestId::Integer(19),
+                params: FsWatchParams {
+                    watch_id: "remote-watch".to_string(),
+                    path: PathBuf::from("/tmp/remote-project/config.toml")
+                        .try_into()
+                        .expect("fs/watch path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/watch should succeed through remote gateway");
+        assert_eq!(
+            watch.path.as_ref(),
+            PathBuf::from("/tmp/remote-project/config.toml").as_path()
+        );
+
+        let unwatch: FsUnwatchResponse = client
+            .request_typed(ClientRequest::FsUnwatch {
+                request_id: RequestId::Integer(20),
+                params: FsUnwatchParams {
+                    watch_id: "remote-watch".to_string(),
+                },
+            })
+            .await
+            .expect("fs/unwatch should succeed through remote gateway");
+        assert_eq!(unwatch, FsUnwatchResponse {});
+
         let canceled_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
-                request_id: RequestId::Integer(19),
+                request_id: RequestId::Integer(21),
                 params: LoginAccountParams::ChatgptDeviceCode,
             })
             .await
@@ -6960,7 +7091,7 @@ stream_max_retries = 0
 
         let cancel_login: CancelLoginAccountResponse = client
             .request_typed(ClientRequest::CancelLoginAccount {
-                request_id: RequestId::Integer(20),
+                request_id: RequestId::Integer(22),
                 params: CancelLoginAccountParams {
                     login_id: canceled_login_id,
                 },
@@ -6971,7 +7102,7 @@ stream_max_retries = 0
 
         let completed_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
-                request_id: RequestId::Integer(21),
+                request_id: RequestId::Integer(23),
                 params: LoginAccountParams::Chatgpt,
             })
             .await
@@ -7006,7 +7137,7 @@ stream_max_retries = 0
 
         let feedback: FeedbackUploadResponse = client
             .request_typed(ClientRequest::FeedbackUpload {
-                request_id: RequestId::Integer(22),
+                request_id: RequestId::Integer(24),
                 params: FeedbackUploadParams {
                     classification: "bug".to_string(),
                     reason: Some("gateway parity regression".to_string()),
@@ -7022,7 +7153,7 @@ stream_max_retries = 0
 
         let command_exec: CommandExecResponse = client
             .request_typed(ClientRequest::OneOffCommandExec {
-                request_id: RequestId::Integer(23),
+                request_id: RequestId::Integer(25),
                 params: CommandExecParams {
                     command: vec![
                         "sh".to_string(),
@@ -7077,7 +7208,7 @@ stream_max_retries = 0
 
         let command_write: CommandExecWriteResponse = client
             .request_typed(ClientRequest::CommandExecWrite {
-                request_id: RequestId::Integer(24),
+                request_id: RequestId::Integer(26),
                 params: CommandExecWriteParams {
                     process_id: "proc-remote".to_string(),
                     delta_base64: Some("AQID".to_string()),
@@ -7090,7 +7221,7 @@ stream_max_retries = 0
 
         let command_resize: CommandExecResizeResponse = client
             .request_typed(ClientRequest::CommandExecResize {
-                request_id: RequestId::Integer(25),
+                request_id: RequestId::Integer(27),
                 params: CommandExecResizeParams {
                     process_id: "proc-remote".to_string(),
                     size: CommandExecTerminalSize {
@@ -7105,7 +7236,7 @@ stream_max_retries = 0
 
         let command_terminate: CommandExecTerminateResponse = client
             .request_typed(ClientRequest::CommandExecTerminate {
-                request_id: RequestId::Integer(26),
+                request_id: RequestId::Integer(28),
                 params: CommandExecTerminateParams {
                     process_id: "proc-remote".to_string(),
                 },
@@ -7342,6 +7473,261 @@ stream_max_retries = 0
         })
         .await
         .expect("connection-state notifications should arrive");
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_single_worker_forwards_warning_notifications_over_v2() {
+        let websocket_url = start_mock_remote_warning_notification_server().await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url,
+                        auth_token: None,
+                    }],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to remote gateway");
+
+        let warning = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::Warning(
+                    notification,
+                )) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("warning notification should arrive");
+        assert_eq!(warning.thread_id, None);
+        assert_eq!(warning.message, "Gateway remote warning");
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_single_worker_forwards_config_warning_notifications_over_v2() {
+        let websocket_url = start_mock_remote_config_warning_notification_server().await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url,
+                        auth_token: None,
+                    }],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to remote gateway");
+
+        let config_warning = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ConfigWarning(
+                    notification,
+                )) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("configWarning notification should arrive");
+        assert_eq!(config_warning.summary, "Gateway remote config warning");
+        assert_eq!(
+            config_warning.details.as_deref(),
+            Some("Remote workers should refresh their config."),
+        );
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_single_worker_forwards_deprecation_notice_notifications_over_v2() {
+        let websocket_url = start_mock_remote_deprecation_notice_notification_server().await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url,
+                        auth_token: None,
+                    }],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to remote gateway");
+
+        let deprecation_notice = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::DeprecationNotice(
+                    notification,
+                )) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("deprecationNotice notification should arrive");
+        assert_eq!(deprecation_notice.summary, "Gateway deprecated flow");
+        assert_eq!(
+            deprecation_notice.details.as_deref(),
+            Some("Use the gateway replacement flow.")
+        );
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_single_worker_forwards_mcp_startup_status_notifications_over_v2() {
+        let websocket_url = start_mock_remote_multi_connection_state_notification_server().await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url,
+                        auth_token: None,
+                    }],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to remote gateway");
+
+        let startup_status = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerStatusUpdated(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/startupStatus/updated notification should arrive");
+        assert_eq!(startup_status.name, "calendar-mcp");
+        assert_eq!(startup_status.status, McpServerStartupState::Ready);
+        assert_eq!(startup_status.error, None);
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -8577,8 +8963,15 @@ stream_max_retries = 0
         let mut saw_account_updated = false;
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
+        let mut saw_login_completed = false;
+        let mut saw_mcp_startup_status = false;
         timeout(Duration::from_secs(5), async {
-            while !(saw_account_updated && saw_rate_limits && saw_app_list) {
+            while !(saw_account_updated
+                && saw_rate_limits
+                && saw_app_list
+                && saw_login_completed
+                && saw_mcp_startup_status)
+            {
                 let event = v2_client
                     .next_event()
                     .await
@@ -8602,6 +8995,22 @@ stream_max_retries = 0
                         assert_eq!(notification.data.len(), 1);
                         assert_eq!(notification.data[0].name, "calendar");
                         saw_app_list = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::AccountLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.login_id, None);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpServerStatusUpdated(notification),
+                    ) => {
+                        assert_eq!(notification.name, "calendar-mcp");
+                        assert_eq!(notification.status, McpServerStartupState::Ready);
+                        assert_eq!(notification.error, None);
+                        saw_mcp_startup_status = true;
                     }
                     other => panic!("unexpected notification after worker reconnect: {other:?}"),
                 }
@@ -10554,6 +10963,7 @@ stream_max_retries = 0
         assert_eq!(remote_workers[0].websocket_url, worker_a);
         assert_eq!(remote_workers[0].healthy, false);
         assert_eq!(remote_workers[0].reconnecting, true);
+        assert_eq!(remote_workers[0].reconnect_attempt_count, 0);
         assert_eq!(
             remote_workers[0]
                 .last_error
@@ -10566,6 +10976,7 @@ stream_max_retries = 0
         assert_eq!(remote_workers[1].websocket_url, worker_b);
         assert_eq!(remote_workers[1].healthy, true);
         assert_eq!(remote_workers[1].reconnecting, false);
+        assert_eq!(remote_workers[1].reconnect_attempt_count, 0);
         assert_eq!(remote_workers[1].last_error, None);
         assert_eq!(remote_workers[1].next_reconnect_at, None);
 
@@ -12395,6 +12806,26 @@ stream_max_retries = 0
                 .map(|thread| thread.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["thread-worker-b", "thread-worker-a-3"]
+        );
+
+        let loaded_listed: ThreadLoadedListResponse = client
+            .request_typed(ClientRequest::ThreadLoadedList {
+                request_id: RequestId::Integer(33),
+                params: ThreadLoadedListParams {
+                    cursor: None,
+                    limit: Some(10),
+                },
+            })
+            .await
+            .expect("thread/loaded/list should include recovered and surviving workers");
+        assert_eq!(loaded_listed.next_cursor, None);
+        assert_eq!(
+            loaded_listed
+                .data
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["thread-worker-a-3", "thread-worker-b"]
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -19200,10 +19631,40 @@ stream_max_retries = 0
         .expect("second thread/name/set should route to worker B");
         assert_eq!(second_rename, ThreadSetNameResponse {});
 
+        let first_memory_mode: ThreadMemoryModeSetResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadMemoryModeSet {
+                request_id: RequestId::Integer(5),
+                params: ThreadMemoryModeSetParams {
+                    thread_id: first_started.thread.id.clone(),
+                    mode: ThreadMemoryMode::Enabled,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/memoryMode/set should finish in time")
+        .expect("first thread/memoryMode/set should route to worker A");
+        assert_eq!(first_memory_mode, ThreadMemoryModeSetResponse {});
+
+        let second_memory_mode: ThreadMemoryModeSetResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadMemoryModeSet {
+                request_id: RequestId::Integer(6),
+                params: ThreadMemoryModeSetParams {
+                    thread_id: second_started.thread.id.clone(),
+                    mode: ThreadMemoryMode::Disabled,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/memoryMode/set should finish in time")
+        .expect("second thread/memoryMode/set should route to worker B");
+        assert_eq!(second_memory_mode, ThreadMemoryModeSetResponse {});
+
         let first_read: AppServerThreadReadResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ThreadRead {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(7),
                 params: ThreadReadParams {
                     thread_id: first_started.thread.id.clone(),
                     include_turns: false,
@@ -19223,7 +19684,7 @@ stream_max_retries = 0
         let second_read: AppServerThreadReadResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ThreadRead {
-                request_id: RequestId::Integer(6),
+                request_id: RequestId::Integer(8),
                 params: ThreadReadParams {
                     thread_id: second_started.thread.id.clone(),
                     include_turns: false,
@@ -19243,7 +19704,7 @@ stream_max_retries = 0
         let listed: AppServerThreadListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ThreadList {
-                request_id: RequestId::Integer(7),
+                request_id: RequestId::Integer(9),
                 params: ThreadListParams {
                     cursor: None,
                     limit: Some(10),
@@ -19357,6 +19818,7 @@ stream_max_retries = 0
         assert_eq!(remote_workers[0].websocket_url, worker_a);
         assert_eq!(remote_workers[0].healthy, true);
         assert_eq!(remote_workers[0].reconnecting, false);
+        assert_eq!(remote_workers[0].reconnect_attempt_count, 0);
         assert_eq!(
             remote_workers[0]
                 .last_error
@@ -22655,6 +23117,15 @@ stream_max_retries = 0
                                 "filePath": format!("{preview}/config.toml"),
                                 "overriddenMetadata": null,
                             }),
+                            "fs/watch" => serde_json::json!({
+                                "path": request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("path"))
+                                    .cloned()
+                                    .expect("fs/watch should include path"),
+                            }),
+                            "fs/unwatch" => serde_json::json!({}),
                             "command/exec" => {
                                 let process_id = request
                                     .params
@@ -22807,7 +23278,28 @@ stream_max_retries = 0
                                     .and_then(serde_json::Value::as_str)
                                     .expect("thread/name/set should include name");
                                 thread_name = Some(name.to_string());
-                                serde_json::json!({})
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/name/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "threadName": name,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                continue;
                             }
                             "thread/memoryMode/set" => serde_json::json!({}),
                             "thread/unsubscribe" => serde_json::json!({
@@ -25385,6 +25877,108 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_warning_notification_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
+                    expect_remote_initialize(&mut websocket).await;
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "warning".to_string(),
+                                params: Some(serde_json::json!({
+                                    "threadId": null,
+                                    "message": "Gateway remote warning",
+                                })),
+                            },
+                        ),
+                    )
+                    .await;
+
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_config_warning_notification_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
+                    expect_remote_initialize(&mut websocket).await;
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "configWarning".to_string(),
+                                params: Some(serde_json::json!({
+                                    "summary": "Gateway remote config warning",
+                                    "details": "Remote workers should refresh their config.",
+                                })),
+                            },
+                        ),
+                    )
+                    .await;
+
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_deprecation_notice_notification_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
+                    expect_remote_initialize(&mut websocket).await;
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Notification(
+                            codex_app_server_protocol::JSONRPCNotification {
+                                method: "deprecationNotice".to_string(),
+                                params: Some(serde_json::json!({
+                                    "summary": "Gateway deprecated flow",
+                                    "details": "Use the gateway replacement flow.",
+                                })),
+                            },
+                        ),
+                    )
+                    .await;
+
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     async fn start_mock_remote_multi_connection_workflow_server(
         thread_id: &'static str,
         preview: &'static str,
@@ -27309,6 +27903,44 @@ stream_max_retries = 0
                                     .and_then(serde_json::Value::as_str)
                                     .expect("thread/name/set should include name");
                                 thread_name = Some(name.to_string());
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/name/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "threadName": name,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
+                            "thread/memoryMode/set" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/memoryMode/set should include threadId");
+                                assert_eq!(requested_thread_id, thread_id);
+                                let mode = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("mode"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/memoryMode/set should include mode");
+                                assert!(matches!(mode, "enabled" | "disabled"));
                                 serde_json::json!({})
                             }
                             "thread/read" => {

@@ -11,6 +11,7 @@ struct RemoteWorkerHealthState {
     websocket_url: String,
     healthy: bool,
     reconnecting: bool,
+    reconnect_attempt_count: u32,
     last_error: Option<String>,
     last_state_change_at: Option<i64>,
     last_error_at: Option<i64>,
@@ -31,6 +32,7 @@ impl RemoteWorkerHealthRegistry {
                         websocket_url,
                         healthy: true,
                         reconnecting: false,
+                        reconnect_attempt_count: 0,
                         last_error: None,
                         last_state_change_at: None,
                         last_error_at: None,
@@ -53,6 +55,7 @@ impl RemoteWorkerHealthRegistry {
             let state_changed = worker.healthy || worker.reconnecting;
             worker.healthy = false;
             worker.reconnecting = false;
+            worker.reconnect_attempt_count = 0;
             worker.last_error = error;
             if state_changed {
                 worker.last_state_change_at = Some(now);
@@ -71,6 +74,11 @@ impl RemoteWorkerHealthRegistry {
         let now = unix_timestamp_now();
         if let Some(worker) = write_guard(&self.workers).get_mut(worker_id) {
             let state_changed = worker.healthy || !worker.reconnecting;
+            worker.reconnect_attempt_count = if worker.reconnecting {
+                worker.reconnect_attempt_count.saturating_add(1)
+            } else {
+                0
+            };
             worker.healthy = false;
             worker.reconnecting = true;
             worker.last_error = error;
@@ -88,6 +96,7 @@ impl RemoteWorkerHealthRegistry {
             let state_changed = !worker.healthy || worker.reconnecting;
             worker.healthy = true;
             worker.reconnecting = false;
+            worker.reconnect_attempt_count = 0;
             if state_changed {
                 worker.last_state_change_at = Some(now);
             }
@@ -104,6 +113,7 @@ impl RemoteWorkerHealthRegistry {
                 websocket_url: worker.websocket_url.clone(),
                 healthy: worker.healthy,
                 reconnecting: worker.reconnecting,
+                reconnect_attempt_count: worker.reconnect_attempt_count,
                 last_error: worker.last_error.clone(),
                 last_state_change_at: worker.last_state_change_at,
                 last_error_at: worker.last_error_at,
@@ -170,6 +180,7 @@ mod tests {
                 websocket_url: "ws://127.0.0.1:8081".to_string(),
                 healthy: true,
                 reconnecting: false,
+                reconnect_attempt_count: 0,
                 last_error: None,
                 last_state_change_at: None,
                 last_error_at: None,
@@ -180,6 +191,7 @@ mod tests {
         assert_eq!(snapshot[1].websocket_url, "ws://127.0.0.1:8082");
         assert_eq!(snapshot[1].healthy, false);
         assert_eq!(snapshot[1].reconnecting, false);
+        assert_eq!(snapshot[1].reconnect_attempt_count, 0);
         assert_eq!(snapshot[1].last_error.as_deref(), Some("socket closed"));
         assert_eq!(snapshot[1].last_state_change_at.is_some(), true);
         assert_eq!(snapshot[1].last_error_at.is_some(), true);
@@ -200,8 +212,10 @@ mod tests {
         assert_eq!(healthy_snapshot.len(), 1);
         assert_eq!(unhealthy_snapshot[0].healthy, false);
         assert_eq!(unhealthy_snapshot[0].reconnecting, false);
+        assert_eq!(unhealthy_snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(healthy_snapshot[0].healthy, true);
         assert_eq!(healthy_snapshot[0].reconnecting, false);
+        assert_eq!(healthy_snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(
             healthy_snapshot[0].last_error,
             Some("socket closed".to_string())
@@ -224,6 +238,7 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].healthy, false);
         assert_eq!(snapshot[0].reconnecting, false);
+        assert_eq!(snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(snapshot[0].last_error, None);
         assert_eq!(snapshot[0].last_state_change_at.is_some(), true);
         assert_eq!(snapshot[0].last_error_at, None);
@@ -246,6 +261,7 @@ mod tests {
         assert_eq!(reconnecting_snapshot.len(), 1);
         assert_eq!(reconnecting_snapshot[0].healthy, false);
         assert_eq!(reconnecting_snapshot[0].reconnecting, true);
+        assert_eq!(reconnecting_snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(
             reconnecting_snapshot[0].last_error.as_deref(),
             Some("remote app server event stream ended")
@@ -260,6 +276,7 @@ mod tests {
         assert_eq!(recovered_snapshot.len(), 1);
         assert_eq!(recovered_snapshot[0].healthy, true);
         assert_eq!(recovered_snapshot[0].reconnecting, false);
+        assert_eq!(recovered_snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(recovered_snapshot[0].next_reconnect_at, None);
     }
 
@@ -284,8 +301,10 @@ mod tests {
         assert_eq!(second_snapshot.len(), 1);
         assert_eq!(first_snapshot[0].healthy, false);
         assert_eq!(first_snapshot[0].reconnecting, true);
+        assert_eq!(first_snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(second_snapshot[0].healthy, false);
         assert_eq!(second_snapshot[0].reconnecting, true);
+        assert_eq!(second_snapshot[0].reconnect_attempt_count, 1);
         assert_eq!(
             second_snapshot[0].last_error.as_deref(),
             Some("second reconnect failure")

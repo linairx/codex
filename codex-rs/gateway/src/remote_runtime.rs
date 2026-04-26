@@ -658,6 +658,7 @@ mod tests {
                 websocket_url: "ws://127.0.0.1:8081".to_string(),
                 healthy: true,
                 reconnecting: false,
+                reconnect_attempt_count: 0,
                 last_error: None,
                 last_state_change_at: None,
                 last_error_at: None,
@@ -668,6 +669,7 @@ mod tests {
         assert_eq!(remote_workers[1].websocket_url, "ws://127.0.0.1:8082");
         assert_eq!(remote_workers[1].healthy, false);
         assert_eq!(remote_workers[1].reconnecting, false);
+        assert_eq!(remote_workers[1].reconnect_attempt_count, 0);
         assert_eq!(
             remote_workers[1].last_error.as_deref(),
             Some("socket closed")
@@ -716,6 +718,7 @@ mod tests {
         assert_eq!(remote_workers[0].websocket_url, "ws://127.0.0.1:8081");
         assert_eq!(remote_workers[0].healthy, false);
         assert_eq!(remote_workers[0].reconnecting, true);
+        assert_eq!(remote_workers[0].reconnect_attempt_count, 0);
         assert_eq!(
             remote_workers[0].last_error.as_deref(),
             Some("remote app server event stream ended")

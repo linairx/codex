@@ -201,7 +201,9 @@ struct ResolvedServerRequestRoute {
 struct WorkerServerRequestCleanup {
     resolved_notifications: Vec<ServerRequestResolvedNotification>,
     resolved_thread_scoped_requests: usize,
+    resolved_thread_scoped_request_ids: Vec<RequestId>,
     stranded_connection_scoped_requests: usize,
+    stranded_connection_scoped_request_ids: Vec<RequestId>,
 }
 
 impl WorkerServerRequestCleanup {
@@ -975,8 +977,14 @@ async fn run_websocket_connection(
             .err()
             .is_some_and(should_reject_pending_server_requests_after_connection_error)
     {
-        reject_pending_server_requests(&downstream, &mut event_state.pending_server_requests)
-            .await?;
+        reject_pending_server_requests(
+            &downstream,
+            connection.request_context,
+            connection_outcome,
+            connection_detail.as_deref(),
+            &mut event_state.pending_server_requests,
+        )
+        .await?;
     }
 
     let shutdown_result = downstream.shutdown().await;
@@ -1277,6 +1285,12 @@ async fn handle_client_message(
         }
         JSONRPCMessage::Response(response) => {
             let Some(route) = pending_server_requests.remove(&response.id) else {
+                log_unexpected_client_server_request_response(
+                    connection.request_context,
+                    "response",
+                    &response.id,
+                    pending_server_requests,
+                );
                 let err = io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -1304,6 +1318,12 @@ async fn handle_client_message(
         }
         JSONRPCMessage::Error(error) => {
             let Some(route) = pending_server_requests.remove(&error.id) else {
+                log_unexpected_client_server_request_response(
+                    connection.request_context,
+                    "error",
+                    &error.id,
+                    pending_server_requests,
+                );
                 let err = io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -1356,14 +1376,12 @@ async fn handle_app_server_event(
                 worker_id,
             )
             .await?;
-            warn!(
-                worker_id = ?worker_id,
-                remaining_worker_count = downstream.worker_count(),
-                resolved_thread_scoped_server_request_count = cleanup
-                    .resolved_thread_scoped_requests,
-                stranded_connection_scoped_server_request_count = cleanup
-                    .stranded_connection_scoped_requests,
-                "downstream worker session ended within shared gateway v2 session"
+            log_worker_server_request_cleanup(
+                worker_id,
+                downstream.worker_count(),
+                None,
+                &cleanup,
+                "downstream worker session ended within shared gateway v2 session",
             );
             if cleanup.has_stranded_connection_scoped_requests() {
                 send_close_frame(
@@ -1411,6 +1429,7 @@ async fn handle_app_server_event(
         AppServerEvent::ServerNotification(notification) => {
             let Some(notification) = server_notification_to_jsonrpc(
                 notification,
+                connection.request_context,
                 worker_id,
                 &mut event_state.resolved_server_requests,
             )?
@@ -1421,6 +1440,11 @@ async fn handle_app_server_event(
                 && notification.method == "skills/changed"
                 && event_state.skills_changed_pending_refresh
             {
+                log_suppressed_skills_changed_notification(
+                    connection.request_context,
+                    worker_id,
+                    &notification,
+                );
                 return Ok(None);
             }
             if downstream.multi_worker_topology()
@@ -1430,6 +1454,11 @@ async fn handle_app_server_event(
                     .get(&notification.method)
                     .is_some_and(|params| *params == notification.params)
             {
+                log_suppressed_duplicate_connection_notification(
+                    connection.request_context,
+                    worker_id,
+                    &notification,
+                );
                 return Ok(None);
             }
             if notification_visible_to(
@@ -1467,6 +1496,13 @@ async fn handle_app_server_event(
                 .pending_server_requests
                 .contains_key(&request.id)
             {
+                log_duplicate_downstream_server_request(
+                    connection.request_context,
+                    worker_id,
+                    &request.id,
+                    &request.method,
+                    &event_state.pending_server_requests,
+                );
                 send_close_frame(
                     socket,
                     close_code::ERROR,
@@ -1488,12 +1524,13 @@ async fn handle_app_server_event(
                     event_state.pending_server_requests.len(),
                     connection.max_pending_server_requests,
                 ) {
-                    warn!(
-                        pending_server_request_count = event_state.pending_server_requests.len(),
-                        limit = connection.max_pending_server_requests,
-                        request_id = ?request.id,
-                        method = request.method,
-                        "rejecting downstream server request because the gateway websocket connection is saturated"
+                    log_rejected_saturated_server_request(
+                        connection.request_context,
+                        worker_id,
+                        &request.id,
+                        &request.method,
+                        &event_state.pending_server_requests,
+                        connection.max_pending_server_requests,
                     );
                     worker_for_server_request(downstream, worker_id)?
                         .request_handle
@@ -1516,6 +1553,13 @@ async fn handle_app_server_event(
                 )
                 .await?;
             } else {
+                log_rejected_hidden_downstream_server_request(
+                    connection.request_context,
+                    worker_id,
+                    &request.id,
+                    &request.method,
+                    request_thread_id(&request),
+                );
                 let message = hidden_thread_error_message(&request).to_string();
                 worker_for_server_request(downstream, worker_id)?
                     .request_handle
@@ -1540,15 +1584,12 @@ async fn handle_app_server_event(
                     worker_id,
                 )
                 .await?;
-                warn!(
-                    worker_id = ?worker_id,
-                    remaining_worker_count = downstream.worker_count(),
-                    resolved_thread_scoped_server_request_count = cleanup
-                        .resolved_thread_scoped_requests,
-                    stranded_connection_scoped_server_request_count = cleanup
-                        .stranded_connection_scoped_requests,
-                    disconnect_message = %message,
-                    "downstream worker disconnected within shared gateway v2 session"
+                log_worker_server_request_cleanup(
+                    worker_id,
+                    downstream.worker_count(),
+                    Some(message.as_str()),
+                    &cleanup,
+                    "downstream worker disconnected within shared gateway v2 session",
                 );
                 if cleanup.has_stranded_connection_scoped_requests() {
                     send_close_frame(
@@ -1630,8 +1671,14 @@ fn collect_server_request_cleanup_for_worker(
                     request_id: gateway_request_id.clone(),
                 });
             cleanup.resolved_thread_scoped_requests += 1;
+            cleanup
+                .resolved_thread_scoped_request_ids
+                .push(gateway_request_id.clone());
         } else {
             cleanup.stranded_connection_scoped_requests += 1;
+            cleanup
+                .stranded_connection_scoped_request_ids
+                .push(gateway_request_id.clone());
         }
         false
     });
@@ -1648,8 +1695,14 @@ fn collect_server_request_cleanup_for_worker(
                     request_id: route.gateway_request_id.clone(),
                 });
             cleanup.resolved_thread_scoped_requests += 1;
+            cleanup
+                .resolved_thread_scoped_request_ids
+                .push(route.gateway_request_id.clone());
         } else {
             cleanup.stranded_connection_scoped_requests += 1;
+            cleanup
+                .stranded_connection_scoped_request_ids
+                .push(route.gateway_request_id.clone());
         }
         false
     });
@@ -1657,10 +1710,181 @@ fn collect_server_request_cleanup_for_worker(
     cleanup
 }
 
+fn log_worker_server_request_cleanup(
+    worker_id: Option<usize>,
+    remaining_worker_count: usize,
+    disconnect_message: Option<&str>,
+    cleanup: &WorkerServerRequestCleanup,
+    message: &str,
+) {
+    warn!(
+        worker_id = ?worker_id,
+        remaining_worker_count,
+        resolved_thread_scoped_server_request_count = cleanup.resolved_thread_scoped_requests,
+        resolved_thread_scoped_server_request_ids = ?cleanup.resolved_thread_scoped_request_ids,
+        stranded_connection_scoped_server_request_count = cleanup
+            .stranded_connection_scoped_requests,
+        stranded_connection_scoped_server_request_ids = ?cleanup
+            .stranded_connection_scoped_request_ids,
+        disconnect_message,
+        "{message}"
+    );
+}
+
+fn log_unexpected_client_server_request_response(
+    request_context: &GatewayRequestContext,
+    response_kind: &str,
+    unexpected_request_id: &RequestId,
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+) {
+    let mut pending_server_request_ids =
+        pending_server_requests.keys().cloned().collect::<Vec<_>>();
+    pending_server_request_ids.sort();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        response_kind,
+        unexpected_request_id = ?unexpected_request_id,
+        pending_server_request_count = pending_server_request_ids.len(),
+        pending_server_request_ids = ?pending_server_request_ids,
+        "gateway v2 client replied to a server request that is no longer pending"
+    );
+}
+
+fn log_rejected_saturated_server_request(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    request_id: &RequestId,
+    method: &str,
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+    limit: usize,
+) {
+    let mut pending_server_request_ids =
+        pending_server_requests.keys().cloned().collect::<Vec<_>>();
+    pending_server_request_ids.sort();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        pending_server_request_count = pending_server_requests.len(),
+        limit,
+        request_id = ?request_id,
+        method,
+        pending_server_request_ids = ?pending_server_request_ids,
+        "rejecting downstream server request because the gateway websocket connection is saturated"
+    );
+}
+
+fn log_rejected_hidden_downstream_server_request(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    request_id: &RequestId,
+    method: &str,
+    thread_id: Option<&str>,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        request_id = ?request_id,
+        method,
+        thread_id,
+        "rejecting downstream server request for a thread outside the gateway request scope"
+    );
+}
+
+fn log_duplicate_downstream_server_request(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    request_id: &RequestId,
+    method: &str,
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+) {
+    let mut pending_server_request_ids =
+        pending_server_requests.keys().cloned().collect::<Vec<_>>();
+    pending_server_request_ids.sort();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        request_id = ?request_id,
+        method,
+        pending_server_request_count = pending_server_request_ids.len(),
+        pending_server_request_ids = ?pending_server_request_ids,
+        "closing gateway v2 connection because a downstream session reused a pending server-request id"
+    );
+}
+
+fn log_dropped_duplicate_resolved_server_request(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    downstream_request_id: &RequestId,
+    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+) {
+    let mut remaining_resolved_route_request_ids = resolved_server_requests
+        .keys()
+        .map(|key| key.request_id.clone())
+        .collect::<Vec<_>>();
+    remaining_resolved_route_request_ids.sort();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        downstream_request_id = ?downstream_request_id,
+        remaining_resolved_route_count = remaining_resolved_route_request_ids.len(),
+        remaining_resolved_route_request_ids = ?remaining_resolved_route_request_ids,
+        "dropping duplicate downstream serverRequest/resolved replay after request-id translation"
+    );
+}
+
+fn log_suppressed_skills_changed_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        method = notification.method,
+        params = ?notification.params,
+        "suppressing duplicate multi-worker skills/changed notification until the client refreshes skills/list"
+    );
+}
+
+fn log_suppressed_duplicate_connection_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        method = notification.method,
+        params = ?notification.params,
+        "suppressing exact-duplicate multi-worker connection notification"
+    );
+}
+
 async fn reject_pending_server_requests(
     downstream: &GatewayV2DownstreamRouter,
+    request_context: &GatewayRequestContext,
+    connection_outcome: &str,
+    connection_detail: Option<&str>,
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
 ) -> io::Result<()> {
+    log_rejected_pending_server_requests(
+        request_context,
+        connection_outcome,
+        connection_detail,
+        pending_server_requests,
+    );
+
     for (_gateway_request_id, route) in pending_server_requests.drain() {
         worker_for_server_request(downstream, route.worker_id)?
             .request_handle
@@ -1675,6 +1899,57 @@ async fn reject_pending_server_requests(
             .await?;
     }
     Ok(())
+}
+
+fn log_rejected_pending_server_requests(
+    request_context: &GatewayRequestContext,
+    connection_outcome: &str,
+    connection_detail: Option<&str>,
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+) {
+    if pending_server_requests.is_empty() {
+        return;
+    }
+
+    let mut pending_server_request_ids =
+        pending_server_requests.keys().cloned().collect::<Vec<_>>();
+    pending_server_request_ids.sort();
+
+    let mut thread_scoped_request_ids = pending_server_requests
+        .iter()
+        .filter(|(_, route)| route.thread_id.is_some())
+        .map(|(request_id, _)| request_id.clone())
+        .collect::<Vec<_>>();
+    thread_scoped_request_ids.sort();
+
+    let mut connection_scoped_request_ids = pending_server_requests
+        .iter()
+        .filter(|(_, route)| route.thread_id.is_none())
+        .map(|(request_id, _)| request_id.clone())
+        .collect::<Vec<_>>();
+    connection_scoped_request_ids.sort();
+
+    let mut worker_ids = pending_server_requests
+        .values()
+        .filter_map(|route| route.worker_id)
+        .collect::<Vec<_>>();
+    worker_ids.sort();
+    worker_ids.dedup();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        connection_outcome,
+        connection_detail,
+        pending_server_request_count = pending_server_request_ids.len(),
+        thread_scoped_pending_server_request_count = thread_scoped_request_ids.len(),
+        connection_scoped_pending_server_request_count = connection_scoped_request_ids.len(),
+        pending_server_request_ids = ?pending_server_request_ids,
+        thread_scoped_pending_server_request_ids = ?thread_scoped_request_ids,
+        connection_scoped_pending_server_request_ids = ?connection_scoped_request_ids,
+        worker_ids = ?worker_ids,
+        "rejecting unresolved downstream server requests because the gateway v2 connection ended"
+    );
 }
 
 async fn handle_client_request(
@@ -3085,6 +3360,9 @@ fn should_deduplicate_connection_notification(notification: &JSONRPCNotification
             | "account/rateLimits/updated"
             | "account/login/completed"
             | "app/list/updated"
+            | "warning"
+            | "configWarning"
+            | "deprecationNotice"
             | "mcpServer/startupStatus/updated"
             | "externalAgentConfig/import/completed"
     )
@@ -3250,6 +3528,7 @@ fn jsonrpc_notification_to_client_notification(
 
 fn server_notification_to_jsonrpc(
     notification: ServerNotification,
+    request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) -> io::Result<Option<JSONRPCNotification>> {
@@ -3262,11 +3541,17 @@ fn server_notification_to_jsonrpc(
             serde_json::from_value::<RequestId>(request_id_value).map_err(io::Error::other)?;
         if let Some(route) = resolved_server_requests.remove(&DownstreamServerRequestKey {
             worker_id,
-            request_id: downstream_request_id,
+            request_id: downstream_request_id.clone(),
         }) {
             params["requestId"] =
                 serde_json::to_value(route.gateway_request_id).map_err(io::Error::other)?;
         } else if worker_id.is_some() {
+            log_dropped_duplicate_resolved_server_request(
+                request_context,
+                worker_id,
+                &downstream_request_id,
+                resolved_server_requests,
+            );
             return Ok(None);
         }
     }
@@ -3500,6 +3785,7 @@ mod tests {
     use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ThreadListResponse;
     use codex_app_server_protocol::ThreadLoadedListResponse;
+    use codex_app_server_protocol::ThreadNameUpdatedNotification;
     use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
     use codex_app_server_protocol::ThreadTokenUsage;
     use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -3549,6 +3835,11 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
     use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
     use tracing_subscriber::layer::SubscriberExt;
+
+    static ASYNC_LOG_CAPTURE_LOCK: std::sync::LazyLock<Mutex<()>> =
+        std::sync::LazyLock::new(|| Mutex::new(()));
+    static SYNC_LOG_CAPTURE_LOCK: std::sync::LazyLock<StdMutex<()>> =
+        std::sync::LazyLock::new(|| StdMutex::new(()));
 
     #[tokio::test]
     async fn await_io_with_timeout_returns_result_before_timeout() {
@@ -4884,9 +5175,14 @@ mod tests {
                 thread_id: "thread-worker-1".to_string(),
                 request_id: downstream_request_id,
             });
+        let request_context = GatewayRequestContext {
+            tenant_id: "tenant-visible".to_string(),
+            project_id: Some("project-visible".to_string()),
+        };
 
         let translated = super::server_notification_to_jsonrpc(
             notification.clone(),
+            &request_context,
             worker_id,
             &mut resolved_server_requests,
         )
@@ -4905,6 +5201,7 @@ mod tests {
 
         let duplicate = super::server_notification_to_jsonrpc(
             notification,
+            &request_context,
             worker_id,
             &mut resolved_server_requests,
         )
@@ -4991,6 +5288,20 @@ mod tests {
 
         assert_eq!(cleanup.resolved_thread_scoped_requests, 2);
         assert_eq!(cleanup.stranded_connection_scoped_requests, 2);
+        assert_eq!(
+            cleanup.resolved_thread_scoped_request_ids,
+            vec![
+                RequestId::String("gateway-thread-pending".to_string()),
+                RequestId::String("gateway-thread-resolved".to_string()),
+            ]
+        );
+        assert_eq!(
+            cleanup.stranded_connection_scoped_request_ids,
+            vec![
+                RequestId::String("gateway-connection-pending".to_string()),
+                RequestId::String("gateway-connection-resolved".to_string()),
+            ]
+        );
         assert_eq!(
             cleanup.resolved_notifications,
             vec![
@@ -5202,6 +5513,32 @@ mod tests {
 
         assert_eq!(saw_count, true);
         assert_eq!(saw_duration, true);
+    }
+
+    #[test]
+    fn observe_v2_connection_emits_terminal_detail_in_connection_log() {
+        let observability = GatewayObservability::new(None, false);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+
+        let logs = capture_logs(|| {
+            super::observe_v2_connection(
+                &observability,
+                &context,
+                "protocol_violation",
+                Some("unexpected gateway websocket server-request response"),
+                Duration::from_millis(13),
+            );
+        });
+
+        assert!(logs.contains("gateway v2 connection completed"));
+        assert!(logs.contains("protocol_violation"));
+        assert!(logs.contains("unexpected gateway websocket server-request response"));
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("project-a"));
+        assert!(logs.contains("13"));
     }
 
     #[tokio::test]
@@ -6886,6 +7223,296 @@ mod tests {
             ))
             .await
             .expect("unexpected response should send");
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(u16::from(close_frame.code), close_code::PROTOCOL);
+        assert_eq!(
+            close_frame.reason,
+            "unexpected gateway websocket server-request response: String(\"unknown-server-request\")"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_logs_scope_and_pending_request_ids_when_client_responds_to_unknown_server_request()
+     {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let downstream_addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("server-request-1".to_string()),
+                        method: "item/commandExecution/requestApproval".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-visible",
+                            "turnId": "turn-visible",
+                            "itemId": "item-visible-1",
+                            "reason": "Need approval 1",
+                            "command": "pwd",
+                        })),
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+
+            let Message::Text(text) = websocket
+                .next()
+                .await
+                .expect("server request rejection should exist")
+                .expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection text frame");
+            };
+            let JSONRPCMessage::Error(error) =
+                serde_json::from_str(&text).expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection");
+            };
+            assert_eq!(error.id, RequestId::String("server-request-1".to_string()));
+            assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+            assert_eq!(
+                error.error.message,
+                super::PENDING_SERVER_REQUEST_ABORTED_MESSAGE
+            );
+        });
+
+        let initialize_response = test_initialize_response().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext {
+                tenant_id: "tenant-visible".to_string(),
+                project_id: Some("project-visible".to_string()),
+            },
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url: format!("ws://{downstream_addr}"),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let logs = capture_logs_async(async move {
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-visible".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-visible".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            let JSONRPCMessage::Request(first_request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected forwarded server request");
+            };
+            assert_eq!(
+                first_request.id,
+                RequestId::String("server-request-1".to_string())
+            );
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: RequestId::String("unknown-server-request".to_string()),
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("unexpected response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("unexpected response should send");
+
+            let frame = wait_for_close_frame(&mut websocket).await;
+            let Message::Close(Some(close_frame)) = frame else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(u16::from(close_frame.code), close_code::PROTOCOL);
+            assert_eq!(
+                close_frame.reason,
+                "unexpected gateway websocket server-request response: String(\"unknown-server-request\")"
+            );
+
+            server_task.abort();
+            let _ = server_task.await;
+        })
+        .await;
+
+        assert!(
+            logs.contains(
+                "gateway v2 client replied to a server request that is no longer pending"
+            )
+        );
+        assert!(logs.contains(
+            "rejecting unresolved downstream server requests because the gateway v2 connection ended"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("unexpected_request_id=String(\"unknown-server-request\")"));
+        assert!(logs.contains("pending_server_request_count=1"));
+        assert!(logs.contains("pending_server_request_ids=[String(\"server-request-1\")]"));
+        assert!(logs.contains("thread_scoped_pending_server_request_count=1"));
+        assert!(logs.contains("connection_scoped_pending_server_request_count=0"));
+        assert!(logs.contains("connection_outcome"));
+        assert!(logs.contains("protocol_violation"));
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_pending_server_requests_when_client_errors_unknown_server_request()
+     {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let downstream_addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("server-request-1".to_string()),
+                        method: "item/commandExecution/requestApproval".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-visible",
+                            "turnId": "turn-visible",
+                            "itemId": "item-visible-1",
+                            "reason": "Need approval 1",
+                            "command": "pwd",
+                        })),
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+
+            let Message::Text(text) = websocket
+                .next()
+                .await
+                .expect("server request rejection should exist")
+                .expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection text frame");
+            };
+            let JSONRPCMessage::Error(error) =
+                serde_json::from_str(&text).expect("server request rejection should decode")
+            else {
+                panic!("expected server request rejection");
+            };
+            assert_eq!(error.id, RequestId::String("server-request-1".to_string()));
+            assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+            assert_eq!(
+                error.error.message,
+                super::PENDING_SERVER_REQUEST_ABORTED_MESSAGE
+            );
+        });
+
+        let initialize_response = test_initialize_response().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext {
+                tenant_id: "default".to_string(),
+                project_id: None,
+            },
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url: format!("ws://{downstream_addr}"),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 8,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let JSONRPCMessage::Request(first_request) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected forwarded server request");
+        };
+        assert_eq!(
+            first_request.id,
+            RequestId::String("server-request-1".to_string())
+        );
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                    id: RequestId::String("unknown-server-request".to_string()),
+                    error: JSONRPCErrorError {
+                        code: -32000,
+                        message: "user rejected".to_string(),
+                        data: None,
+                    },
+                }))
+                .expect("unexpected error should serialize")
+                .into(),
+            ))
+            .await
+            .expect("unexpected error should send");
 
         let frame = wait_for_close_frame(&mut websocket).await;
         let Message::Close(Some(close_frame)) = frame else {
@@ -13606,6 +14233,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_warning_notifications() {
+        let notification_params = serde_json::json!({
+            "message": "shared worker warning",
+            "threadId": null,
+        });
+        let worker_a = start_mock_remote_server_for_connection_notification(
+            "warning",
+            notification_params.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "warning",
+            notification_params.clone(),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "warning",
+            notification_params,
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_config_warning_notifications()
+     {
+        let notification_params = serde_json::json!({
+            "summary": "shared config warning",
+            "details": null,
+        });
+        let worker_a = start_mock_remote_server_for_connection_notification(
+            "configWarning",
+            notification_params.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "configWarning",
+            notification_params.clone(),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "configWarning",
+            notification_params,
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_deprecation_notice_notifications()
+     {
+        let notification_params = serde_json::json!({
+            "summary": "shared deprecation notice",
+            "details": null,
+        });
+        let worker_a = start_mock_remote_server_for_connection_notification(
+            "deprecationNotice",
+            notification_params.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "deprecationNotice",
+            notification_params.clone(),
+        )
+        .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "deprecationNotice",
+            notification_params,
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_external_agent_import_completed_notifications()
      {
         let notification_params = serde_json::json!({});
@@ -14473,6 +15303,261 @@ mod tests {
             .expect("router should shut down");
     }
 
+    #[tokio::test]
+    async fn reconnect_missing_workers_logs_attempt_and_success_context() {
+        let worker_a =
+            start_mock_remote_server_for_reconnectable_initialized_and_fs_watch_replay().await;
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a.clone(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+
+        router.mark_initialized();
+        router.record_fs_watch(FsWatchParams {
+            watch_id: "watch-shared".to_string(),
+            path: PathBuf::from("/tmp/shared/project/.git/HEAD")
+                .try_into()
+                .expect("fs watch path should be absolute"),
+        });
+        assert!(router.remove_worker(Some(0)));
+
+        let logs = capture_logs_async(async move {
+            router.reconnect_missing_workers_at(Instant::now()).await;
+            timeout(Duration::from_secs(2), router.shutdown())
+                .await
+                .expect("router shutdown should finish in time")
+                .expect("router should shut down");
+        })
+        .await;
+
+        assert!(
+            logs.contains("attempting to reconnect missing downstream worker session"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("reconnected missing downstream worker session"),
+            "{logs}"
+        );
+        assert!(logs.contains("worker_id=0"), "{logs}");
+        assert!(
+            logs.contains(format!("websocket_url=\"{worker_a}\"").as_str()),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("initialized_notification_sent=true"),
+            "{logs}"
+        );
+        assert!(logs.contains("active_fs_watch_count=1"), "{logs}");
+        assert!(logs.contains("retry_backoff_seconds=1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_logs_connect_failure_context() {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let worker_a = start_mock_remote_server_for_initialize().await;
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: true,
+            active_fs_watches: HashMap::from([(
+                "watch-shared".to_string(),
+                FsWatchParams {
+                    watch_id: "watch-shared".to_string(),
+                    path: PathBuf::from("/tmp/shared/project/.git/HEAD")
+                        .try_into()
+                        .expect("fs watch path should be absolute"),
+                },
+            )]),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![worker_a, "ws://127.0.0.1:1".to_string()],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://127.0.0.1:9".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://127.0.0.1:1".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(7),
+            }),
+        };
+
+        let logs = capture_logs_async(async move {
+            router.reconnect_missing_workers_at(Instant::now()).await;
+            timeout(Duration::from_secs(2), router.shutdown())
+                .await
+                .expect("router shutdown should finish in time")
+                .expect("router should shut down");
+        })
+        .await;
+
+        assert!(logs.contains("attempting to reconnect missing downstream worker session"));
+        assert!(logs.contains("failed to reconnect missing downstream worker session"));
+        assert!(logs.contains("worker_id=1"));
+        assert!(logs.contains("websocket_url=\"ws://127.0.0.1:1\""));
+        assert!(logs.contains("initialized_notification_sent=true"));
+        assert!(logs.contains("active_fs_watch_count=1"));
+        assert!(logs.contains("retry_backoff_seconds=7"));
+
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_logs_replay_failure_context() {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let worker_a = start_mock_remote_server_for_initialize().await;
+        let replay_failure_worker =
+            start_mock_remote_server_that_disconnects_after_initialize().await;
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: true,
+            active_fs_watches: HashMap::from([(
+                "watch-shared".to_string(),
+                FsWatchParams {
+                    watch_id: "watch-shared".to_string(),
+                    path: PathBuf::from("/tmp/shared/project/.git/HEAD")
+                        .try_into()
+                        .expect("fs watch path should be absolute"),
+                },
+            )]),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![worker_a, replay_failure_worker.clone()],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://127.0.0.1:9".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: replay_failure_worker.clone(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(5),
+            }),
+        };
+
+        let logs = capture_logs_async(async move {
+            router.reconnect_missing_workers_at(Instant::now()).await;
+            timeout(Duration::from_secs(2), router.shutdown())
+                .await
+                .expect("router shutdown should finish in time")
+                .expect("router should shut down");
+        })
+        .await;
+
+        assert!(logs.contains("attempting to reconnect missing downstream worker session"));
+        assert!(logs.contains(
+            "failed to replay connection state to reconnected downstream worker session"
+        ));
+        assert!(logs.contains("worker_id=1"));
+        assert!(logs.contains(format!("websocket_url=\"{replay_failure_worker}\"").as_str()));
+        assert!(logs.contains("initialized_notification_sent=true"));
+        assert!(logs.contains("active_fs_watch_count=1"));
+        assert!(logs.contains("retry_backoff_seconds=5"));
+
+        client.shutdown().await.expect("client should shut down");
+    }
+
     #[test]
     fn worker_reconnect_backoff_suppresses_immediate_retry_attempts() {
         let (event_tx, event_rx) = mpsc::channel(1);
@@ -14881,6 +15966,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_logs_scope_worker_and_pending_ids_when_downstream_reuses_pending_server_request_id()
+     {
+        let websocket_url = start_mock_remote_server_for_initialize().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let websocket_url = websocket_url.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::default();
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext {
+                            tenant_id: "tenant-visible".to_string(),
+                            project_id: Some("project-visible".to_string()),
+                        };
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_secs(10),
+                            max_pending_server_requests: 4,
+                        };
+                        let (event_tx, event_rx) = mpsc::channel(1);
+                        let mut router = GatewayV2DownstreamRouter {
+                            workers: Vec::new(),
+                            event_tx,
+                            event_rx,
+                            shutdown_txs: Vec::new(),
+                            event_tasks: Vec::new(),
+                            next_worker: 0,
+                            initialized_notification_sent: false,
+                            active_fs_watches: HashMap::new(),
+                            reconnect_retry_after: HashMap::new(),
+                            reconnect_state: None,
+                        };
+                        let session_factory = GatewayV2SessionFactory::remote_single(
+                            RemoteAppServerConnectArgs {
+                                websocket_url,
+                                auth_token: None,
+                                client_name: "codex-gateway".to_string(),
+                                client_version: "0.0.0-test".to_string(),
+                                experimental_api: false,
+                                opt_out_notification_methods: Vec::new(),
+                                channel_capacity: 4,
+                            },
+                            test_initialize_response().await,
+                        );
+                        let mut event_state = GatewayV2EventState {
+                            pending_server_requests: HashMap::from([(
+                                RequestId::String("downstream-request-1".to_string()),
+                                PendingServerRequestRoute {
+                                    worker_id: Some(0),
+                                    downstream_request_id: RequestId::String(
+                                        "downstream-request-1".to_string(),
+                                    ),
+                                    thread_id: Some("thread-visible".to_string()),
+                                },
+                            )]),
+                            resolved_server_requests: HashMap::new(),
+                            skills_changed_pending_refresh: false,
+                            forwarded_connection_notifications: HashMap::new(),
+                        };
+                        let should_close = handle_app_server_event(
+                            &mut socket,
+                            &mut router,
+                            &session_factory,
+                            &connection,
+                            &mut event_state,
+                            DownstreamWorkerEvent {
+                                worker_id: Some(0),
+                                event: Some(AppServerEvent::ServerRequest(
+                                    ServerRequest::ToolRequestUserInput {
+                                        request_id: RequestId::String(
+                                            "downstream-request-1".to_string(),
+                                        ),
+                                        params: codex_app_server_protocol::ToolRequestUserInputParams {
+                                            thread_id: "thread-visible".to_string(),
+                                            turn_id: "turn-visible".to_string(),
+                                            item_id: "tool-call-2".to_string(),
+                                            questions: vec![codex_app_server_protocol::ToolRequestUserInputQuestion {
+                                                id: "mode".to_string(),
+                                                header: "Mode".to_string(),
+                                                question: "Continue?".to_string(),
+                                                is_other: false,
+                                                is_secret: false,
+                                                options: Some(vec![codex_app_server_protocol::ToolRequestUserInputOption {
+                                                    label: "yes".to_string(),
+                                                    description: "Continue".to_string(),
+                                                }]),
+                                            }],
+                                        },
+                                    },
+                                )),
+                            },
+                        )
+                        .await
+                        .expect("duplicate server request should be handled");
+                        assert_eq!(
+                            should_close
+                                .map(|close| (close.outcome, close.reject_pending_server_requests)),
+                            Some(("duplicate_downstream_server_request", true))
+                        );
+                    })
+                }
+            }),
+        );
+        let server = axum::serve(listener, app);
+        let server_task = tokio::spawn(server.into_future());
+
+        let logs = capture_logs_async(async move {
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await
+            else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(u16::from(close_frame.code), close_code::ERROR);
+            assert_eq!(
+                close_frame.reason,
+                super::DUPLICATE_DOWNSTREAM_SERVER_REQUEST_CLOSE_REASON
+            );
+
+            server_task.abort();
+            let _ = server_task.await;
+        })
+        .await;
+
+        assert!(logs.contains(
+            "closing gateway v2 connection because a downstream session reused a pending server-request id"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(0)"));
+        assert!(logs.contains("request_id=String(\"downstream-request-1\")"));
+        assert!(logs.contains("item/tool/requestUserInput"));
+        assert!(logs.contains("pending_server_request_count=1"));
+        assert!(logs.contains("pending_server_request_ids=[String(\"downstream-request-1\")]"));
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_closes_when_worker_disconnects_with_pending_connection_server_request()
      {
         let worker_a = start_mock_remote_server_for_initialize().await;
@@ -15003,6 +16236,148 @@ mod tests {
 
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_logs_worker_cleanup_ids_when_worker_disconnects_with_pending_connection_server_request()
+     {
+        let worker_a = start_mock_remote_server_for_initialize().await;
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let worker_a = worker_a.clone();
+                let worker_b = worker_b.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::default();
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext::default();
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_secs(10),
+                            max_pending_server_requests: 4,
+                        };
+                        let session_factory = GatewayV2SessionFactory::remote_multi(
+                            vec![
+                                RemoteAppServerConnectArgs {
+                                    websocket_url: worker_a,
+                                    auth_token: None,
+                                    client_name: "codex-gateway".to_string(),
+                                    client_version: "0.0.0-test".to_string(),
+                                    experimental_api: false,
+                                    opt_out_notification_methods: Vec::new(),
+                                    channel_capacity: 4,
+                                },
+                                RemoteAppServerConnectArgs {
+                                    websocket_url: worker_b,
+                                    auth_token: None,
+                                    client_name: "codex-gateway".to_string(),
+                                    client_version: "0.0.0-test".to_string(),
+                                    experimental_api: false,
+                                    opt_out_notification_methods: Vec::new(),
+                                    channel_capacity: 4,
+                                },
+                            ],
+                            test_initialize_response().await,
+                        );
+                        let initialize_params = InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        };
+                        let mut router = GatewayV2DownstreamRouter::connect(
+                            &session_factory,
+                            &initialize_params,
+                            &request_context,
+                        )
+                        .await
+                        .expect("downstream router should connect");
+                        let mut event_state = GatewayV2EventState {
+                            pending_server_requests: HashMap::from([(
+                                RequestId::String("gateway-srv-1".to_string()),
+                                PendingServerRequestRoute {
+                                    worker_id: Some(0),
+                                    downstream_request_id: RequestId::String(
+                                        "downstream-request-1".to_string(),
+                                    ),
+                                    thread_id: None,
+                                },
+                            )]),
+                            resolved_server_requests: HashMap::new(),
+                            skills_changed_pending_refresh: false,
+                            forwarded_connection_notifications: HashMap::new(),
+                        };
+                        let should_close = handle_app_server_event(
+                            &mut socket,
+                            &mut router,
+                            &session_factory,
+                            &connection,
+                            &mut event_state,
+                            DownstreamWorkerEvent {
+                                worker_id: Some(0),
+                                event: Some(AppServerEvent::Disconnected {
+                                    message: "worker-a lost".to_string(),
+                                }),
+                            },
+                        )
+                        .await
+                        .expect("disconnect event should be handled");
+                        assert_eq!(
+                            should_close
+                                .map(|close| (close.outcome, close.reject_pending_server_requests)),
+                            Some(("stranded_connection_scoped_server_request", true))
+                        );
+                    })
+                }
+            }),
+        );
+        let server = axum::serve(listener, app);
+        let server_task = tokio::spawn(server.into_future());
+
+        let logs = capture_logs_async(async move {
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await
+            else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(u16::from(close_frame.code), close_code::ERROR);
+            assert_eq!(
+                close_frame.reason,
+                super::STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON
+            );
+
+            server_task.abort();
+            let _ = server_task.await;
+        })
+        .await;
+
+        assert!(logs.contains("downstream worker disconnected within shared gateway v2 session"));
+        assert!(logs.contains("worker_id=Some(0)"));
+        assert!(logs.contains("remaining_worker_count=1"));
+        assert!(logs.contains("disconnect_message"));
+        assert!(logs.contains("worker-a lost"));
+        assert!(logs.contains("resolved_thread_scoped_server_request_count=0"));
+        assert!(logs.contains("stranded_connection_scoped_server_request_count=1"));
+        assert!(
+            logs.contains(
+                "stranded_connection_scoped_server_request_ids=[String(\"gateway-srv-1\")]"
+            )
+        );
     }
 
     #[tokio::test]
@@ -15627,6 +17002,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_logs_scope_worker_and_thread_id_for_hidden_downstream_server_requests()
+     {
+        let logs = capture_logs_async(async {
+            let initialize_response = test_initialize_response().await;
+            let websocket_url = start_mock_remote_server_for_hidden_server_request().await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            scope_registry.register_thread(
+                "thread-visible".to_string(),
+                GatewayRequestContext {
+                    tenant_id: "tenant-a".to_string(),
+                    project_id: Some("project-a".to_string()),
+                },
+            );
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::default(),
+                scope_registry,
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-a".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-a".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            let hidden_request = timeout(Duration::from_millis(200), websocket.next()).await;
+            assert_eq!(hidden_request.is_err(), true);
+
+            server_task.abort();
+            let _ = server_task.await;
+        })
+        .await;
+
+        assert!(logs.contains(
+            "rejecting downstream server request for a thread outside the gateway request scope"
+        ));
+        assert!(
+            logs.contains("request_id=String(\"hidden-server-request\")"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("item/commandExecution/requestApproval"),
+            "{logs}"
+        );
+        assert!(logs.contains("thread-hidden"));
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_forwards_item_delta_notifications_for_visible_threads() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_item_delta_notification().await;
@@ -15827,6 +17276,10 @@ mod tests {
                     step: "Verify northbound forwarding".to_string(),
                     status: TurnPlanStepStatus::InProgress,
                 }],
+            }),
+            ServerNotification::ThreadNameUpdated(ThreadNameUpdatedNotification {
+                thread_id: "thread-visible".to_string(),
+                thread_name: Some("Gateway renamed thread".to_string()),
             }),
             ServerNotification::ThreadTokenUsageUpdated(ThreadTokenUsageUpdatedNotification {
                 thread_id: "thread-visible".to_string(),
@@ -16861,6 +18314,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn visible_connection_warning_notifications_are_treated_as_deduplicated_connection_state() {
+        for method in ["warning", "configWarning", "deprecationNotice"] {
+            let notification = JSONRPCNotification {
+                method: method.to_string(),
+                params: Some(match method {
+                    "warning" => serde_json::json!({
+                        "message": "shared worker warning",
+                        "threadId": null,
+                    }),
+                    "configWarning" => serde_json::json!({
+                        "summary": "shared config warning",
+                        "details": null,
+                    }),
+                    "deprecationNotice" => serde_json::json!({
+                        "summary": "shared deprecation notice",
+                        "details": null,
+                    }),
+                    _ => unreachable!("method list should stay exhaustive"),
+                }),
+            };
+
+            assert_eq!(
+                super::should_deduplicate_connection_notification(&notification),
+                true
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unavailable_worker_route_diagnostics_marks_backoff_workers() {
         let (client, request_handle) = start_test_request_handle().await;
@@ -17044,6 +18526,427 @@ mod tests {
         client.shutdown().await.expect("client should shut down");
     }
 
+    #[test]
+    fn log_worker_server_request_cleanup_includes_cleaned_up_request_ids() {
+        let logs = capture_logs(|| {
+            super::log_worker_server_request_cleanup(
+                Some(1),
+                1,
+                Some("worker-b lost"),
+                &super::WorkerServerRequestCleanup {
+                    resolved_notifications: vec![ServerRequestResolvedNotification {
+                        thread_id: "thread-visible".to_string(),
+                        request_id: RequestId::String("gateway-thread-1".to_string()),
+                    }],
+                    resolved_thread_scoped_requests: 1,
+                    resolved_thread_scoped_request_ids: vec![RequestId::String(
+                        "gateway-thread-1".to_string(),
+                    )],
+                    stranded_connection_scoped_requests: 1,
+                    stranded_connection_scoped_request_ids: vec![RequestId::String(
+                        "gateway-connection-1".to_string(),
+                    )],
+                },
+                "downstream worker disconnected within shared gateway v2 session",
+            );
+        });
+
+        assert!(logs.contains("downstream worker disconnected within shared gateway v2 session"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("remaining_worker_count=1"));
+        assert!(logs.contains("disconnect_message"));
+        assert!(logs.contains("worker-b lost"));
+        assert!(logs.contains("resolved_thread_scoped_server_request_count=1"));
+        assert!(
+            logs.contains(
+                "resolved_thread_scoped_server_request_ids=[String(\"gateway-thread-1\")]"
+            )
+        );
+        assert!(logs.contains("stranded_connection_scoped_server_request_count=1"));
+        assert!(logs.contains(
+            "stranded_connection_scoped_server_request_ids=[String(\"gateway-connection-1\")]"
+        ));
+    }
+
+    #[test]
+    fn log_unexpected_client_server_request_response_includes_pending_request_ids() {
+        let logs = capture_logs(|| {
+            super::log_unexpected_client_server_request_response(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                "response",
+                &RequestId::String("gateway-unexpected".to_string()),
+                &HashMap::from([
+                    (
+                        RequestId::String("gateway-connection-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(0),
+                            downstream_request_id: RequestId::String(
+                                "downstream-connection-1".to_string(),
+                            ),
+                            thread_id: None,
+                        },
+                    ),
+                    (
+                        RequestId::String("gateway-thread-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(1),
+                            downstream_request_id: RequestId::String(
+                                "downstream-thread-1".to_string(),
+                            ),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    ),
+                ]),
+            );
+        });
+
+        assert!(
+            logs.contains(
+                "gateway v2 client replied to a server request that is no longer pending"
+            )
+        );
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("response_kind"));
+        assert!(logs.contains("response"));
+        assert!(logs.contains("unexpected_request_id=String(\"gateway-unexpected\")"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains(
+            "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
+        ));
+    }
+
+    #[test]
+    fn log_unexpected_client_server_request_error_includes_pending_request_ids() {
+        let logs = capture_logs(|| {
+            super::log_unexpected_client_server_request_response(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                "error",
+                &RequestId::String("gateway-unexpected".to_string()),
+                &HashMap::from([
+                    (
+                        RequestId::String("gateway-connection-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(0),
+                            downstream_request_id: RequestId::String(
+                                "downstream-connection-1".to_string(),
+                            ),
+                            thread_id: None,
+                        },
+                    ),
+                    (
+                        RequestId::String("gateway-thread-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(1),
+                            downstream_request_id: RequestId::String(
+                                "downstream-thread-1".to_string(),
+                            ),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    ),
+                ]),
+            );
+        });
+
+        assert!(
+            logs.contains(
+                "gateway v2 client replied to a server request that is no longer pending"
+            )
+        );
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("response_kind"));
+        assert!(logs.contains("error"));
+        assert!(logs.contains("unexpected_request_id=String(\"gateway-unexpected\")"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains(
+            "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
+        ));
+    }
+
+    #[test]
+    fn log_rejected_saturated_server_request_includes_scope_worker_and_pending_request_ids() {
+        let logs = capture_logs(|| {
+            super::log_rejected_saturated_server_request(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(1),
+                &RequestId::String("gateway-incoming".to_string()),
+                "item/tool/requestUserInput",
+                &HashMap::from([
+                    (
+                        RequestId::String("gateway-connection-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(0),
+                            downstream_request_id: RequestId::String(
+                                "downstream-connection-1".to_string(),
+                            ),
+                            thread_id: None,
+                        },
+                    ),
+                    (
+                        RequestId::String("gateway-thread-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(1),
+                            downstream_request_id: RequestId::String(
+                                "downstream-thread-1".to_string(),
+                            ),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    ),
+                ]),
+                2,
+            );
+        });
+
+        assert!(logs.contains(
+            "rejecting downstream server request because the gateway websocket connection is saturated"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains("limit=2"));
+        assert!(logs.contains("request_id=String(\"gateway-incoming\")"));
+        assert!(logs.contains("item/tool/requestUserInput"));
+        assert!(logs.contains(
+            "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
+        ));
+    }
+
+    #[test]
+    fn log_rejected_hidden_downstream_server_request_includes_scope_worker_and_thread_id() {
+        let logs = capture_logs(|| {
+            super::log_rejected_hidden_downstream_server_request(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-hidden".to_string(),
+                    project_id: Some("project-hidden".to_string()),
+                },
+                Some(3),
+                &RequestId::String("gateway-hidden".to_string()),
+                "item/commandExecution/requestApproval",
+                Some("thread-hidden"),
+            );
+        });
+
+        assert!(logs.contains(
+            "rejecting downstream server request for a thread outside the gateway request scope"
+        ));
+        assert!(logs.contains("tenant-hidden"));
+        assert!(logs.contains("project-hidden"));
+        assert!(logs.contains("worker_id=Some(3)"));
+        assert!(logs.contains("request_id=String(\"gateway-hidden\")"));
+        assert!(logs.contains("item/commandExecution/requestApproval"));
+        assert!(logs.contains("thread-hidden"));
+    }
+
+    #[test]
+    fn log_rejected_pending_server_requests_includes_scope_outcome_and_request_ids() {
+        let logs = capture_logs(|| {
+            super::log_rejected_pending_server_requests(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                "protocol_violation",
+                Some("unexpected gateway websocket server-request response"),
+                &HashMap::from([
+                    (
+                        RequestId::String("gateway-connection-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(0),
+                            downstream_request_id: RequestId::String(
+                                "downstream-connection-1".to_string(),
+                            ),
+                            thread_id: None,
+                        },
+                    ),
+                    (
+                        RequestId::String("gateway-thread-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(1),
+                            downstream_request_id: RequestId::String(
+                                "downstream-thread-1".to_string(),
+                            ),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    ),
+                ]),
+            );
+        });
+
+        assert!(logs.contains(
+            "rejecting unresolved downstream server requests because the gateway v2 connection ended"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("connection_outcome"));
+        assert!(logs.contains("protocol_violation"));
+        assert!(logs.contains("connection_detail"));
+        assert!(logs.contains("unexpected gateway websocket server-request response"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains("thread_scoped_pending_server_request_count=1"));
+        assert!(logs.contains("connection_scoped_pending_server_request_count=1"));
+        assert!(logs.contains(
+            "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
+        ));
+        assert!(
+            logs.contains(
+                "thread_scoped_pending_server_request_ids=[String(\"gateway-thread-1\")]"
+            )
+        );
+        assert!(logs.contains(
+            "connection_scoped_pending_server_request_ids=[String(\"gateway-connection-1\")]"
+        ));
+        assert!(logs.contains("worker_ids=[0, 1]"));
+    }
+
+    #[test]
+    fn log_duplicate_downstream_server_request_includes_scope_worker_and_pending_ids() {
+        let logs = capture_logs(|| {
+            super::log_duplicate_downstream_server_request(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(1),
+                &RequestId::String("gateway-duplicate".to_string()),
+                "item/tool/requestUserInput",
+                &HashMap::from([
+                    (
+                        RequestId::String("gateway-connection-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(0),
+                            downstream_request_id: RequestId::String(
+                                "downstream-connection-1".to_string(),
+                            ),
+                            thread_id: None,
+                        },
+                    ),
+                    (
+                        RequestId::String("gateway-thread-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(1),
+                            downstream_request_id: RequestId::String(
+                                "downstream-thread-1".to_string(),
+                            ),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    ),
+                ]),
+            );
+        });
+
+        assert!(logs.contains(
+            "closing gateway v2 connection because a downstream session reused a pending server-request id"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("request_id=String(\"gateway-duplicate\")"));
+        assert!(logs.contains("item/tool/requestUserInput"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains(
+            "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
+        ));
+    }
+
+    #[test]
+    fn log_dropped_duplicate_resolved_server_request_includes_scope_worker_and_routes() {
+        let logs = capture_logs(|| {
+            super::log_dropped_duplicate_resolved_server_request(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(1),
+                &RequestId::String("downstream-duplicate".to_string()),
+                &HashMap::from([(
+                    super::DownstreamServerRequestKey {
+                        worker_id: Some(2),
+                        request_id: RequestId::String("downstream-remaining".to_string()),
+                    },
+                    super::ResolvedServerRequestRoute {
+                        gateway_request_id: RequestId::String("gateway-remaining".to_string()),
+                        thread_id: Some("thread-visible".to_string()),
+                    },
+                )]),
+            );
+        });
+
+        assert!(logs.contains(
+            "dropping duplicate downstream serverRequest/resolved replay after request-id translation"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("downstream_request_id=String(\"downstream-duplicate\")"));
+        assert!(logs.contains("remaining_resolved_route_count=1"));
+        assert!(
+            logs.contains(
+                "remaining_resolved_route_request_ids=[String(\"downstream-remaining\")]"
+            )
+        );
+    }
+
+    #[test]
+    fn log_suppressed_skills_changed_notification_includes_scope_worker_and_params() {
+        let logs = capture_logs(|| {
+            super::log_suppressed_skills_changed_notification(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(1),
+                &JSONRPCNotification {
+                    method: "skills/changed".to_string(),
+                    params: Some(serde_json::json!({"source":"worker-b"})),
+                },
+            );
+        });
+
+        assert!(logs.contains(
+            "suppressing duplicate multi-worker skills/changed notification until the client refreshes skills/list"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("method=\"skills/changed\""));
+        assert!(logs.contains("source"));
+        assert!(logs.contains("worker-b"));
+    }
+
+    #[test]
+    fn log_suppressed_duplicate_connection_notification_includes_scope_worker_and_params() {
+        let logs = capture_logs(|| {
+            super::log_suppressed_duplicate_connection_notification(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(2),
+                &JSONRPCNotification {
+                    method: "account/updated".to_string(),
+                    params: Some(serde_json::json!({"requiresOpenaiAuth":true})),
+                },
+            );
+        });
+
+        assert!(logs.contains("suppressing exact-duplicate multi-worker connection notification"));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("method=\"account/updated\""));
+        assert!(logs.contains("requiresOpenaiAuth"));
+        assert!(logs.contains("true"));
+    }
+
     async fn spawn_test_server(
         state: GatewayV2State,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -17220,6 +19123,9 @@ mod tests {
     }
 
     fn capture_logs(f: impl FnOnce()) -> String {
+        let _guard = SYNC_LOG_CAPTURE_LOCK
+            .lock()
+            .expect("sync log capture lock should lock");
         let writer = SharedWriter::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -17228,6 +19134,27 @@ mod tests {
                 .with_writer(writer.clone()),
         );
         tracing::subscriber::with_default(subscriber, f);
+
+        let bytes = writer
+            .buffer
+            .lock()
+            .expect("log buffer should lock")
+            .clone();
+        String::from_utf8(bytes).expect("log output should be utf8")
+    }
+
+    async fn capture_logs_async(f: impl Future<Output = ()>) -> String {
+        let _guard = ASYNC_LOG_CAPTURE_LOCK.lock().await;
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(writer.clone()),
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default_guard = tracing::dispatcher::set_default(&dispatch);
+        f.await;
 
         let bytes = writer
             .buffer

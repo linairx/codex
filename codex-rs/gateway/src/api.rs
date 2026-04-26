@@ -64,6 +64,7 @@ pub struct GatewayRemoteWorkerHealth {
     pub websocket_url: String,
     pub healthy: bool,
     pub reconnecting: bool,
+    pub reconnect_attempt_count: u32,
     pub last_error: Option<String>,
     pub last_state_change_at: Option<i64>,
     pub last_error_at: Option<i64>,
