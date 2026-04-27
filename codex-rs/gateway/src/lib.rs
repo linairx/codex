@@ -14,3 +14,4 @@ pub mod remote_worker;
 pub mod runtime;
 pub mod scope;
 pub mod v2;
+pub mod v2_connection_health;

@@ -565,6 +565,15 @@ Recent progress:
   still pending or awaiting downstream `serverRequest/resolved` on a shared
   multi-worker session, the gateway fails closed instead of silently dropping
   the unresolved prompt
+- the real multi-worker `RemoteAppServerClient` harness now also covers that
+  stranded connection-scoped prompt path, verifying that a pending
+  `account/chatgptAuthTokens/refresh` request reaches the client before the
+  gateway closes the shared session on worker disconnect
+- that same real multi-worker harness now also covers the answered-but-
+  unresolved variant of that prompt path, verifying that the shared session
+  still fails closed if the client has already replied to
+  `account/chatgptAuthTokens/refresh` but the owning worker disconnects before
+  downstream `serverRequest/resolved`
 - those disconnect-driven cleanup paths now also emit structured gateway
   warning logs with the gateway request ids that were auto-resolved for
   thread-scoped prompts and the gateway request ids that stranded the session
@@ -919,10 +928,21 @@ Recent progress:
   closer to the embedded parity harness
 - that reconnect regression now waits for `/healthz` to report a recovered
   single-worker compatibility profile, so it covers both worker recovery and
-  subsequent northbound v2 admission
+  operator-visible health convergence after reconnect and subsequent
+  northbound v2 admission
+- `/healthz` operator coverage now also includes a slow-client fail-closed
+  regression in single-worker remote mode, and the real multi-worker health
+  harness now also pins the same operator-visible teardown path, pinning
+  `v2Connections.lastConnectionOutcome=client_send_timed_out` and the gateway-
+  owned timeout detail instead of only the normal `client_closed` path
 - that reconnect regression now also verifies the recovered v2 session can
   still complete a bidirectional `item/tool/requestUserInput` server-request
   round trip, not just bootstrap and `thread/start`
+- the real single-worker remote reconnect harness now also covers lower-
+  frequency thread-control and detached review flows, verifying that a later
+  client session can still `thread/unsubscribe`, `thread/archive`,
+  `thread/unarchive`, `thread/metadata/update`, `thread/turns/list`, and
+  detached `review/start` through the recovered worker
 - that same single-worker reconnect regression now also verifies the recovered
   v2 session can still complete an `item/tool/call` dynamic-tool round trip
   with `serverRequest/resolved` ordering plus `item/started` /
@@ -1128,6 +1148,23 @@ Recent progress:
   that is no longer pending, including rejection of any still-pending
   downstream prompts; and structured warning logs for both
   protocol-violation cleanup and unresolved server-request saturation
+- downstream app-server event-stream backpressure now also emits a structured
+  warning log with scope, worker id, skipped-event count, and any still-pending
+  gateway server-request ids before the gateway closes the northbound session,
+  so lag-driven teardown is visible without reconstructing the session from
+  connection outcomes alone
+- slow-client send timeouts now also emit a structured warning log with scope,
+  terminal timeout detail, and any still-pending gateway server-request ids
+  before pending downstream prompts are rejected, so `client_send_timed_out`
+  outcomes can be tied back to the stranded session state directly from logs
+- v2 connection accounting now also records terminal outcome and decrements the
+  active connection count even if an early handshake-time close frame or
+  JSON-RPC error response cannot be delivered, so `/healthz` does not retain
+  stale active-session state after setup-time send failures
+- that slow-client path now also has a real northbound regression where one
+  pending downstream server request is left unresolved while large follow-up
+  notifications wedge the client send path, verifying the timeout warning,
+  `client_send_timed_out` outcome, and downstream prompt rejection together
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   request-id translation now also emit structured warning logs with scope,
   worker id, the replayed downstream request id, and any still-buffered
@@ -1137,6 +1174,28 @@ Recent progress:
   worker id, and params until the client refreshes `skills/list`, and exact-
   duplicate connection-state notifications include the same context when they
   are dropped
+- real multi-worker `RemoteAppServerClient` scope coverage now also verifies
+  that hidden-thread downstream server requests are rejected before they reach
+  a cross-scope northbound client, while that shared client session remains
+  usable for later filtered requests such as `thread/list`
+- downstream disconnect cleanup now also covers the single-worker and final-
+  worker paths: unresolved thread-scoped server requests are translated into
+  `serverRequest/resolved` before the northbound session closes, while
+  unresolved connection-scoped requests fail closed with the stranded-session
+  close reason instead of being dropped silently on disconnect
+- that same cleanup policy now has explicit end-of-stream regression coverage
+  for both single-worker and shared multi-worker sessions, so natural
+  downstream session termination preserves the same fail-closed behavior for
+  connection-scoped prompts and the same synthesized resolution path for
+  thread-scoped prompts as the explicit disconnect path
+- downstream worker disconnects are now also treated as single-delivery
+  terminal events at the v2 transport boundary, so a later end-of-stream from
+  the same dropped worker cannot evict a lazily re-added worker or spuriously
+  close a surviving shared multi-worker session
+- worker-loss cleanup logs now also have explicit end-of-stream regression
+  coverage on both the single-worker and shared multi-worker paths, pinning
+  the resolved-versus-stranded request-id fields that operators use to
+  diagnose cleanup behavior after natural downstream session termination
 - fail-closed handling for a downstream session that reuses a still-pending
   server-request id now also emits a structured warning log with scope, worker
   id, the colliding request id/method, and the gateway request ids already
@@ -1146,12 +1205,38 @@ Recent progress:
   pending gateway request ids, per-scope counts, and worker ids, so
   disconnect-driven cleanup is visible without reconstructing the session from
   downstream errors alone
+- multi-worker `thread/list` dedupe now also emits a structured log with scope,
+  thread id, selected worker, discarded worker, and snapshot timestamps when
+  the gateway chooses one visible thread copy over another, so cross-worker
+  snapshot selection is observable without reproducing the merged response path
+- missing multi-worker thread routes now also emit structured success/failure
+  logs when the gateway probes downstream `thread/read` to recover ownership,
+  including scope, thread id, and recovered or attempted worker ids, so lazy
+  route recovery no longer depends on inferring behavior from later request
+  routing alone
 - multi-worker thread routing now also deduplicates repeated `thread/list`
   entries, backfills sticky ownership from the selected visible winner, probes
   downstream ownership to recover missing routes for already-visible threads,
   and has real northbound `RemoteAppServerClient` regression coverage for
   `thread/resume` and `thread/fork`, including sticky routing plus follow-up
   `thread/read` on the returned forked thread
+- that same real multi-worker `RemoteAppServerClient` harness now also covers
+  the gateway-owned scope-policy rejection path for history/path-based
+  `thread/resume` and path-based `thread/fork`, so those guarded flows are
+  exercised through one shared multi-worker client session in addition to the
+  embedded and single-worker remote compatibility harnesses
+- dedicated northbound request-routing regression coverage now also verifies
+  same-session sticky recovery for `thread/name/set` and
+  `thread/memoryMode/set`, so thread-scoped mutations reconnect the missing
+  owning worker before routing instead of drifting onto the surviving worker
+- that same reconnect-on-demand coverage now also verifies `thread/fork`
+  re-registers the returned thread id onto the recovered worker and that a
+  follow-up `thread/read` stays sticky to that worker within the same shared
+  session
+- that same reconnect-on-demand coverage now also verifies `review/start`
+  re-registers the detached review thread onto the recovered worker and that a
+  follow-up `thread/read` of the review thread stays sticky to that worker on
+  the same shared session
 
 ## Operator Guidance
 
@@ -1200,6 +1285,9 @@ Operational notes:
 - v2 compatibility is fully enabled in this profile
 - request scoping, auth, audit logs, metrics, and rate limiting apply to v2
   traffic the same way they apply to HTTP traffic
+- `/healthz` exposes `v2Connections.activeConnectionCount` plus the latest
+  completed v2 connection outcome/detail/timestamp for quick northbound
+  compatibility-session diagnostics
 - initialize timeout and downstream disconnects surface as explicit WebSocket
   close frames, not silent socket drops
 - tune `--v2-initialize-timeout-seconds` and
@@ -1243,6 +1331,12 @@ Operational notes:
 - this is the recommended remote rollout profile for current v2 compatibility
 - v2 compatibility is fully enabled in this profile
 - existing remote-worker health and reconnect behavior still applies
+- `/healthz` exposes the same `v2Connections` snapshot in this profile, so
+  operators can see whether compatibility sessions are currently active and
+  what the last completed session ended with
+- that `v2Connections` snapshot now also has real remote single-worker
+  regression coverage, pinning the active-connection count while a client is
+  connected and the last-outcome fields after the client closes
 - worker disconnects surface to the v2 client as explicit close frames with a
   gateway-owned reason
 - the same `--v2-initialize-timeout-seconds` and
@@ -1290,6 +1384,9 @@ Operational notes:
   (`initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
   `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`) so operators
   can confirm rollout settings without relying only on startup logs
+- `/healthz` also exposes the same `v2Connections` snapshot in this profile,
+  and that connection-health view now has real multi-worker regression
+  coverage for one shared northbound client session
 - `/healthz` remote-worker entries now also expose `lastStateChangeAt` and
   `lastErrorAt`, so operators can distinguish a worker that is actively
   flapping from one that is healthy again but still carries a historical

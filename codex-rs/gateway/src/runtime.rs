@@ -23,6 +23,7 @@ use crate::event::GatewayEvent;
 use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
+use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use async_trait::async_trait;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::RequestId;
@@ -91,6 +92,14 @@ pub struct AppServerGatewayRuntime {
     scope_registry: Arc<GatewayScopeRegistry>,
     remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
     v2_transport: GatewayV2TransportConfig,
+    v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
+}
+
+#[derive(Clone)]
+pub struct GatewayRuntimeHealthConfig {
+    pub remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
+    pub v2_transport: GatewayV2TransportConfig,
+    pub v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
 }
 
 impl AppServerGatewayRuntime {
@@ -99,7 +108,7 @@ impl AppServerGatewayRuntime {
         execution_mode: GatewayExecutionMode,
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
-        v2_transport: GatewayV2TransportConfig,
+        health_config: GatewayRuntimeHealthConfig,
     ) -> Self {
         Self::new_with_worker_id(
             app_server,
@@ -107,8 +116,7 @@ impl AppServerGatewayRuntime {
             execution_mode,
             events,
             scope_registry,
-            None,
-            v2_transport,
+            health_config,
         )
     }
 
@@ -118,8 +126,7 @@ impl AppServerGatewayRuntime {
         execution_mode: GatewayExecutionMode,
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
-        remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
-        v2_transport: GatewayV2TransportConfig,
+        health_config: GatewayRuntimeHealthConfig,
     ) -> Self {
         Self {
             app_server,
@@ -128,8 +135,9 @@ impl AppServerGatewayRuntime {
             next_request_id: Arc::new(AtomicI64::new(1)),
             events,
             scope_registry,
-            remote_worker_health,
-            v2_transport,
+            remote_worker_health: health_config.remote_worker_health,
+            v2_transport: health_config.v2_transport,
+            v2_connection_health: health_config.v2_connection_health,
         }
     }
 
@@ -373,6 +381,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
             execution_mode: self.execution_mode,
             v2_compatibility: GatewayV2CompatibilityMode::Embedded,
             v2_transport: self.v2_transport,
+            v2_connections: self.v2_connection_health.snapshot(),
             remote_workers: None,
         }
     }

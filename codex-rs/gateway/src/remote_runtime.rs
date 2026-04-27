@@ -25,6 +25,7 @@ use crate::remote_worker::GatewayRemoteWorker;
 use crate::runtime::GatewayRuntime;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
+use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use async_trait::async_trait;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListResponse as AppServerThreadListResponse;
@@ -50,6 +51,7 @@ pub struct RemoteWorkerGatewayRuntime {
     scope_registry: Arc<GatewayScopeRegistry>,
     worker_health: Arc<RemoteWorkerHealthRegistry>,
     v2_transport: GatewayV2TransportConfig,
+    v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
 }
 
 impl RemoteWorkerGatewayRuntime {
@@ -60,6 +62,7 @@ impl RemoteWorkerGatewayRuntime {
         scope_registry: Arc<GatewayScopeRegistry>,
         worker_health: Arc<RemoteWorkerHealthRegistry>,
         v2_transport: GatewayV2TransportConfig,
+        v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
     ) -> Result<Self, GatewayError> {
         if workers.is_empty() {
             return Err(GatewayError::InvalidRequest(
@@ -76,6 +79,7 @@ impl RemoteWorkerGatewayRuntime {
             scope_registry,
             worker_health,
             v2_transport,
+            v2_connection_health,
         })
     }
 
@@ -440,6 +444,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                 GatewayV2CompatibilityMode::RemoteMultiWorker
             },
             v2_transport: self.v2_transport,
+            v2_connections: self.v2_connection_health.snapshot(),
             remote_workers: Some(remote_workers),
         }
     }
@@ -463,6 +468,7 @@ mod tests {
     use crate::api::GatewayThreadSortKey;
     use crate::api::GatewayThreadStatus;
     use crate::api::GatewayV2CompatibilityMode;
+    use crate::api::GatewayV2ConnectionHealth;
     use crate::api::GatewayV2TransportConfig;
     use crate::api::ListThreadsRequest;
     use crate::config::GatewayRemoteSelectionPolicy;
@@ -471,6 +477,7 @@ mod tests {
     use crate::runtime::GatewayRuntime;
     use crate::scope::GatewayRequestContext;
     use crate::scope::GatewayScopeRegistry;
+    use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use std::sync::atomic::AtomicI64;
@@ -488,6 +495,10 @@ mod tests {
             updated_at,
             status: GatewayThreadStatus::Idle,
         }
+    }
+
+    fn empty_v2_connection_health() -> Arc<GatewayV2ConnectionHealthRegistry> {
+        Arc::new(GatewayV2ConnectionHealthRegistry::default())
     }
 
     #[test]
@@ -508,6 +519,7 @@ mod tests {
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
             },
+            v2_connection_health: empty_v2_connection_health(),
         };
         let mut threads = vec![
             test_thread("thread-1", 1, 10),
@@ -548,6 +560,7 @@ mod tests {
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
             },
+            v2_connection_health: empty_v2_connection_health(),
         };
         let mut threads = vec![
             test_thread("thread-1", 1, 10),
@@ -630,6 +643,7 @@ mod tests {
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
             },
+            v2_connection_health: empty_v2_connection_health(),
         };
 
         assert_eq!(runtime.health().status, GatewayHealthStatus::Degraded);
@@ -647,6 +661,15 @@ mod tests {
                 client_send_timeout_seconds: 10,
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
+            }
+        );
+        assert_eq!(
+            health.v2_connections,
+            GatewayV2ConnectionHealth {
+                active_connection_count: 0,
+                last_connection_completed_at: None,
+                last_connection_outcome: None,
+                last_connection_detail: None,
             }
         );
         let remote_workers = health.remote_workers.expect("remote workers");
@@ -703,6 +726,7 @@ mod tests {
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
             },
+            v2_connection_health: empty_v2_connection_health(),
         };
 
         let health = runtime.health();

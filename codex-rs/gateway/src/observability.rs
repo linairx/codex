@@ -1,4 +1,5 @@
 use crate::scope::GatewayRequestContext;
+use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use axum::extract::MatchedPath;
 use axum::extract::State;
 use axum::http::Request;
@@ -6,6 +7,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use codex_otel::MetricsClient;
 use codex_otel::OtelProvider;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::Level;
@@ -27,6 +29,7 @@ type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync 
 pub struct GatewayObservability {
     metrics: Option<MetricsClient>,
     audit_logs_enabled: bool,
+    v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
 }
 
 impl GatewayObservability {
@@ -34,6 +37,7 @@ impl GatewayObservability {
         Self {
             metrics,
             audit_logs_enabled,
+            v2_connection_health: Arc::new(GatewayV2ConnectionHealthRegistry::default()),
         }
     }
 
@@ -91,6 +95,10 @@ impl GatewayObservability {
                 tracing::warn!("failed to record gateway v2 connection duration metric: {err}");
             }
         }
+    }
+
+    pub fn v2_connection_health(&self) -> Arc<GatewayV2ConnectionHealthRegistry> {
+        Arc::clone(&self.v2_connection_health)
     }
 
     fn emit_audit_log(

@@ -82,12 +82,22 @@ pub struct GatewayV2TransportConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayV2ConnectionHealth {
+    pub active_connection_count: usize,
+    pub last_connection_completed_at: Option<i64>,
+    pub last_connection_outcome: Option<String>,
+    pub last_connection_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayHealthResponse {
     pub status: GatewayHealthStatus,
     pub runtime_mode: String,
     pub execution_mode: GatewayExecutionMode,
     pub v2_compatibility: GatewayV2CompatibilityMode,
     pub v2_transport: GatewayV2TransportConfig,
+    pub v2_connections: GatewayV2ConnectionHealth,
     pub remote_workers: Option<Vec<GatewayRemoteWorkerHealth>>,
 }
 

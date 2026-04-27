@@ -230,7 +230,8 @@ Recent progress:
   later northbound v2 client session, so a second client can still
   `thread/resume` and then `thread/read` a previously materialized thread
   after the original client disconnects
-- the real embedded and single-worker remote harnesses now also verify the
+- the real embedded, single-worker remote, and multi-worker remote harnesses
+  now also verify the
   gateway-owned scope-policy rejection path for history/path-based
   `thread/resume` and path-based `thread/fork`, so those guarded flows are
   exercised through a real `RemoteAppServerClient` session instead of only raw
@@ -335,6 +336,17 @@ Recent progress:
   that `thread/name/set` stays sticky to the owning worker and the aggregated
   `thread/read` / `thread/list` results reflect each worker's renamed thread
   state on the shared northbound connection
+- multi-worker remote runtime now also has a real northbound v2 client
+  regression covering lower-frequency thread-control and detached review
+  routing across two workers, verifying that `thread/unsubscribe`,
+  `thread/archive`, `thread/unarchive`, `thread/metadata/update`,
+  `thread/turns/list`, `thread/increment_elicitation`,
+  `thread/decrement_elicitation`, `thread/inject_items`,
+  `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, `thread/rollback`, and detached
+  `review/start` all stay sticky to the owning worker, including follow-up
+  `thread/read` of worker-owned review threads on the shared northbound
+  connection
 - dedicated northbound notification coverage now also pins
   `thread/name/updated`, and the real embedded plus single-worker remote
   compatibility harnesses now also observe that rename notification during
@@ -345,6 +357,11 @@ Recent progress:
   `mcpServer/startupStatus/updated`, so those visible notification paths are
   exercised through unmodified `RemoteAppServerClient` sessions in addition to
   dedicated northbound coverage
+- the real multi-worker connection-state notification regressions now also
+  cover `account/login/completed`, `warning`, `configWarning`, and
+  `deprecationNotice` dedupe in both steady state and after worker reconnect,
+  so onboarding-complete and other visible connection-state notifications stay
+  single-delivery on one shared northbound session
 - multi-worker remote runtime now also has a real northbound v2 client
   regression covering tenant/project scope enforcement across worker-owned
   threads, verifying that same-scope clients can re-enter aggregated
@@ -401,6 +418,11 @@ Recent progress:
 - that reconnect coverage now also verifies the recovered v2 session can still
   complete a bidirectional `item/tool/requestUserInput` server-request round
   trip, not just bootstrap and `thread/start`
+- the real single-worker remote reconnect harness now also covers lower-
+  frequency thread-control and detached review flows, verifying that a later
+  client session can still `thread/unsubscribe`, `thread/archive`,
+  `thread/unarchive`, `thread/metadata/update`, `thread/turns/list`, and
+  detached `review/start` through the recovered worker
 - that same single-worker reconnect coverage now also verifies the recovered
   v2 session can still complete an `item/tool/call` dynamic-tool round trip
   with `serverRequest/resolved` ordering plus `item/started` /
@@ -617,6 +639,11 @@ Recent progress:
   include the gateway request ids that were auto-resolved for thread-scoped
   prompts versus the ids that stranded the session for connection-scoped
   prompts
+- dedicated northbound request-routing regressions now also pin those
+  reconnect-backoff fail-closed warning logs on real `command/exec` and
+  cwd-aware `config/read` request paths, so the operator-facing worker-route
+  diagnostics stay tied to the actual degraded-session behavior rather than
+  only helper-level log formatting tests
 - protocol and dedupe hardening now covers exact-duplicate suppression for
   connection-state notifications, `warning`, `configWarning`,
   `deprecationNotice`, `externalAgentConfig/import/completed`, and
@@ -625,6 +652,19 @@ Recent progress:
   replies to a server request that is no longer pending, including rejection
   of any still-pending downstream prompts; and structured warning logs for both
   protocol-violation cleanup and unresolved server-request saturation
+- downstream app-server event-stream backpressure now also emits a structured
+  warning log with scope, worker id, skipped-event count, and any still-pending
+  gateway server-request ids before the gateway closes the northbound session,
+  so lag-driven teardown is visible without reconstructing the session from
+  connection outcomes alone
+- slow-client send timeouts now also emit a structured warning log with scope,
+  terminal timeout detail, and any still-pending gateway server-request ids
+  before pending downstream prompts are rejected, so `client_send_timed_out`
+  outcomes can be tied back to the stranded session state directly from logs
+- that slow-client path now also has a real northbound regression where one
+  pending downstream server request is left unresolved while large follow-up
+  notifications wedge the client send path, verifying the timeout warning,
+  `client_send_timed_out` outcome, and downstream prompt rejection together
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   request-id translation now also emit structured warning logs with scope,
   worker id, the replayed downstream request id, and any still-buffered
@@ -639,6 +679,37 @@ Recent progress:
   translated gateway request id, method, and hidden thread id, so approval
   prompts dropped at the transport boundary are visible without reproducing the
   client session
+- real multi-worker `RemoteAppServerClient` scope coverage now also verifies
+  that hidden-thread downstream server requests are rejected before they reach
+  a cross-scope northbound client, while that shared client session remains
+  usable for later filtered requests such as `thread/list`
+- downstream disconnect cleanup now also covers the single-worker and final-
+  worker paths: unresolved thread-scoped server requests are translated into
+  `serverRequest/resolved` before the northbound session closes, while
+  unresolved connection-scoped requests fail closed with the stranded-session
+  close reason instead of being dropped silently on disconnect
+- the real multi-worker `RemoteAppServerClient` harness now also covers that
+  stranded connection-scoped path, verifying that a pending
+  `account/chatgptAuthTokens/refresh` prompt is delivered northbound and then
+  forces the shared session to fail closed when the owning worker disconnects
+- that same real multi-worker harness now also covers the answered-but-
+  unresolved variant of that connection-scoped path, verifying that the shared
+  session still fails closed if the client has already replied to
+  `account/chatgptAuthTokens/refresh` but the owning worker disconnects before
+  downstream `serverRequest/resolved`
+- that same cleanup policy now has explicit end-of-stream regression coverage
+  for both single-worker and shared multi-worker sessions, so natural
+  downstream session termination preserves the same fail-closed behavior for
+  connection-scoped prompts and the same synthesized resolution path for
+  thread-scoped prompts as the explicit disconnect path
+- downstream worker disconnects are now also treated as single-delivery
+  terminal events at the v2 transport boundary, so a later end-of-stream from
+  the same dropped worker cannot evict a lazily re-added worker or spuriously
+  close a surviving shared multi-worker session
+- worker-loss cleanup logs now also have explicit end-of-stream regression
+  coverage on both the single-worker and shared multi-worker paths, pinning
+  the resolved-versus-stranded request-id fields that operators use to
+  diagnose cleanup behavior after natural downstream session termination
 - fail-closed handling for a downstream session that reuses a still-pending
   server-request id now also emits a structured warning log with scope, worker
   id, the colliding request id/method, and the gateway request ids already
@@ -648,12 +719,37 @@ Recent progress:
   pending gateway request ids, per-scope counts, and worker ids, so
   disconnect-driven cleanup is visible without reconstructing the session from
   downstream errors alone
+- multi-worker `thread/list` dedupe now also emits a structured log with scope,
+  thread id, selected worker, discarded worker, and snapshot timestamps when
+  the gateway chooses one visible thread copy over another, so cross-worker
+  snapshot selection is observable without reproducing the merged response path
+- missing multi-worker thread routes now also emit structured success/failure
+  logs when the gateway probes downstream `thread/read` to recover ownership,
+  including scope, thread id, and recovered or attempted worker ids, so lazy
+  route recovery no longer depends on inferring behavior from later request
+  routing alone
 - multi-worker thread routing now also deduplicates repeated `thread/list`
   entries, backfills sticky ownership from the selected visible winner, probes
   downstream ownership to recover missing routes for already-visible threads,
   and has real northbound `RemoteAppServerClient` regression coverage for
   `thread/resume` and `thread/fork`, including sticky routing plus route
   backfill for follow-up `thread/read`
+- dedicated northbound request-routing regression coverage now also verifies
+  same-session sticky recovery for `thread/name/set` and
+  `thread/memoryMode/set`, so thread-scoped mutations reconnect the missing
+  owning worker before routing instead of drifting onto the surviving worker
+- that same reconnect-on-demand coverage now also verifies `thread/fork`
+  re-registers the returned thread id onto the recovered worker and that a
+  follow-up `thread/read` stays sticky to that worker within the same shared
+  session
+- that same reconnect-on-demand coverage now also verifies `review/start`
+  re-registers the detached review thread onto the recovered worker and that a
+  follow-up `thread/read` of the review thread stays sticky to that worker on
+  the same shared session
+- dedicated northbound log regression coverage now also pins the structured
+  multi-worker `thread/list` dedupe and visible-thread route recovery logs, so
+  operator diagnostics for snapshot selection and downstream `thread/read`
+  ownership probes stay stable as Phase 6 transport hardening continues
 
 ## Current Work
 
@@ -758,9 +854,22 @@ Phase 6 is in progress with:
   `initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
   `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`; remote-worker
   entries expose `lastStateChangeAt`, `lastErrorAt`, `reconnecting`,
-  `reconnectAttemptCount`, and `nextReconnectAt`; structured logs now cover
-  remote worker disconnect / reconnect activity plus northbound v2 connection
-  outcome, scope, duration, and terminal error detail
+  `reconnectAttemptCount`, and `nextReconnectAt`; `/healthz` now also exposes
+  `v2Connections.activeConnectionCount` plus the latest completed v2
+  connection outcome/detail/timestamp; structured logs now cover remote worker
+  disconnect / reconnect activity plus northbound v2 connection outcome,
+  scope, duration, and terminal error detail
+- that operator-facing `v2Connections` health snapshot now also has direct
+  embedded, single-worker remote, and multi-worker remote regression coverage,
+  pinning both the active-connection count during a live client session and
+  the last-outcome fields after the session closes; multi-worker remote
+  `/healthz` coverage now also pins the gateway-owned
+  `client_send_timed_out` outcome and detail after a slow-client teardown via
+  a real northbound WebSocket session
+- v2 connection accounting now also records terminal outcome and decrements the
+  active connection count even when an early handshake-time close frame or
+  JSON-RPC error response cannot be delivered, so `/healthz` does not retain
+  stale `activeConnectionCount` under setup-time send failures
 - those operator-facing v2 connection and reconnect logs now also have direct
   regression coverage, pinning the fields and outcome mapping that rollout
   debugging relies on
