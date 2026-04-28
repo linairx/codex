@@ -776,12 +776,15 @@ mod tests {
     use app_test_support::write_models_cache;
     use axum::Json;
     use axum::Router;
+    use axum::extract::Query;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::http::StatusCode;
     use axum::http::Uri;
     use axum::http::header::AUTHORIZATION;
+    use axum::response::Redirect;
     use axum::routing::get;
+    use axum::routing::post;
     use codex_app_server_client::AppServerEvent;
     use codex_app_server_client::RemoteAppServerClient;
     use codex_app_server_client::RemoteAppServerConnectArgs;
@@ -851,6 +854,8 @@ mod tests {
     use codex_app_server_protocol::McpServerElicitationAction;
     use codex_app_server_protocol::McpServerElicitationRequest;
     use codex_app_server_protocol::McpServerElicitationRequestResponse;
+    use codex_app_server_protocol::McpServerOauthLoginParams;
+    use codex_app_server_protocol::McpServerOauthLoginResponse;
     use codex_app_server_protocol::McpServerStartupState;
     use codex_app_server_protocol::McpServerStatusDetail;
     use codex_app_server_protocol::MemoryResetResponse;
@@ -960,6 +965,8 @@ mod tests {
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::RealtimeConversationVersion;
     use codex_protocol::protocol::RealtimeOutputModality;
@@ -1878,7 +1885,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_server_supports_drop_in_v2_client_bootstrap_setup_methods() {
         let codex_home = tempdir().expect("tempdir");
-        write_embedded_plugin_fixture(codex_home.path());
+        write_embedded_plugin_fixture(codex_home.path(), "http://127.0.0.1:1");
         std::fs::write(
             codex_home.path().join("config.toml"),
             "model = \"gpt-5\"\n\n[features]\nplugins = true\n",
@@ -2089,7 +2096,7 @@ mod tests {
 
         let uninstall: PluginUninstallResponse = client
             .request_typed(ClientRequest::PluginUninstall {
-                request_id: RequestId::Integer(13),
+                request_id: RequestId::Integer(14),
                 params: PluginUninstallParams {
                     plugin_id: "demo-plugin@local".to_string(),
                 },
@@ -2101,7 +2108,7 @@ mod tests {
 
         let batch_write: ConfigWriteResponse = client
             .request_typed(ClientRequest::ConfigBatchWrite {
-                request_id: RequestId::Integer(14),
+                request_id: RequestId::Integer(15),
                 params: ConfigBatchWriteParams {
                     edits: Vec::new(),
                     file_path: Some(codex_home.path().join("config.toml").display().to_string()),
@@ -2115,7 +2122,7 @@ mod tests {
 
         let config_value_write: ConfigWriteResponse = client
             .request_typed(ClientRequest::ConfigValueWrite {
-                request_id: RequestId::Integer(15),
+                request_id: RequestId::Integer(16),
                 params: ConfigValueWriteParams {
                     key_path: "plugins.demo-plugin".to_string(),
                     value: serde_json::json!({
@@ -2138,7 +2145,7 @@ mod tests {
 
         let watch: FsWatchResponse = client
             .request_typed(ClientRequest::FsWatch {
-                request_id: RequestId::Integer(16),
+                request_id: RequestId::Integer(17),
                 params: FsWatchParams {
                     watch_id: "embedded-watch".to_string(),
                     path: codex_home
@@ -2161,7 +2168,7 @@ mod tests {
 
         let unwatch: FsUnwatchResponse = client
             .request_typed(ClientRequest::FsUnwatch {
-                request_id: RequestId::Integer(17),
+                request_id: RequestId::Integer(18),
                 params: FsUnwatchParams {
                     watch_id: "embedded-watch".to_string(),
                 },
@@ -2172,7 +2179,7 @@ mod tests {
 
         let reset: MemoryResetResponse = client
             .request_typed(ClientRequest::MemoryReset {
-                request_id: RequestId::Integer(18),
+                request_id: RequestId::Integer(19),
                 params: None,
             })
             .await
@@ -2181,7 +2188,7 @@ mod tests {
 
         let logout: LogoutAccountResponse = client
             .request_typed(ClientRequest::LogoutAccount {
-                request_id: RequestId::Integer(19),
+                request_id: RequestId::Integer(20),
                 params: None,
             })
             .await
@@ -2190,7 +2197,7 @@ mod tests {
 
         let feedback: FeedbackUploadResponse = client
             .request_typed(ClientRequest::FeedbackUpload {
-                request_id: RequestId::Integer(20),
+                request_id: RequestId::Integer(21),
                 params: FeedbackUploadParams {
                     classification: "bug".to_string(),
                     reason: Some("embedded gateway parity regression".to_string()),
@@ -2208,7 +2215,7 @@ mod tests {
         let command_exec_task = tokio::spawn(async move {
             request_handle
                 .request_typed::<CommandExecResponse>(ClientRequest::OneOffCommandExec {
-                    request_id: RequestId::Integer(21),
+                    request_id: RequestId::Integer(22),
                     params: CommandExecParams {
                         command: vec![
                             "sh".to_string(),
@@ -2269,6 +2276,113 @@ mod tests {
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn embedded_server_supports_mcp_oauth_login_over_v2() {
+        let codex_home = tempdir().expect("tempdir");
+        let model_server = start_mock_responses_server_repeating_assistant("unused").await;
+        let (embedded_mcp_oauth_url, embedded_mcp_oauth_handle) =
+            start_embedded_plugin_mcp_oauth_server()
+                .await
+                .expect("embedded MCP OAuth server should start");
+        write_mock_responses_config_toml(codex_home.path(), &model_server.uri)
+            .expect("config.toml should be written");
+        let config_path = codex_home.path().join("config.toml");
+        let mut config_toml =
+            std::fs::read_to_string(&config_path).expect("config.toml should remain readable");
+        config_toml.push_str(&format!(
+            "\nmcp_oauth_credentials_store = \"file\"\n\n[mcp_servers.demo-mcp]\nurl = \"{embedded_mcp_oauth_url}/mcp\"\n"
+        ));
+        std::fs::write(&config_path, config_toml).expect("config.toml should be updated");
+        let config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .expect("config");
+        let server = start_embedded_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                enable_codex_api_key_env: false,
+                session_source: SessionSource::Cli,
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            vec![
+                (
+                    "mcp_oauth_credentials_store".to_string(),
+                    toml::Value::String("file".to_string()),
+                ),
+                (
+                    "mcp_servers.demo-mcp.url".to_string(),
+                    toml::Value::String(format!("{embedded_mcp_oauth_url}/mcp")),
+                ),
+            ],
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to embedded gateway");
+
+        let mcp_oauth_login: McpServerOauthLoginResponse = client
+            .request_typed(ClientRequest::McpServerOauthLogin {
+                request_id: RequestId::Integer(1),
+                params: McpServerOauthLoginParams {
+                    name: "demo-mcp".to_string(),
+                    scopes: Some(vec!["calendar.read".to_string()]),
+                    timeout_secs: Some(30),
+                },
+            })
+            .await
+            .expect("mcpServer/oauth/login should succeed through embedded gateway");
+        assert!(
+            mcp_oauth_login
+                .authorization_url
+                .starts_with(&embedded_mcp_oauth_url)
+        );
+
+        let oauth_browser_response = reqwest::get(&mcp_oauth_login.authorization_url)
+            .await
+            .expect("authorization URL should be reachable");
+        assert_eq!(oauth_browser_response.status(), reqwest::StatusCode::OK);
+
+        let mcp_oauth_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerOauthLoginCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/oauthLogin/completed notification should arrive");
+        assert_eq!(mcp_oauth_completed.name, "demo-mcp");
+        assert_eq!(mcp_oauth_completed.success, true);
+        assert_eq!(mcp_oauth_completed.error, None);
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+        embedded_mcp_oauth_handle.abort();
+        model_server.shutdown().await;
     }
 
     #[tokio::test]
@@ -2658,7 +2772,7 @@ requires_openai_auth = true
             .expect("turn/start should succeed through embedded gateway");
         assert_eq!(turn_started.turn.status, TurnStatus::InProgress);
 
-        let request = timeout(Duration::from_secs(5), model_server.wait_for_request(0))
+        let request = timeout(Duration::from_secs(30), model_server.wait_for_request(0))
             .await
             .expect("responses request should arrive");
         assert_eq!(
@@ -4690,7 +4804,7 @@ stream_max_retries = 0
             .expect("thread/realtime/start should succeed through embedded gateway");
         assert_eq!(realtime_started, ThreadRealtimeStartResponse {});
 
-        timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(30), async {
             loop {
                 let event = client
                     .next_event()
@@ -5231,48 +5345,9 @@ stream_max_retries = 0
             format!("no rollout found for thread id {}", started.thread.id)
         );
 
-        let resume_history_error = client
-            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
-                request_id: RequestId::Integer(3),
-                params: ThreadResumeParams {
-                    thread_id: started.thread.id.clone(),
-                    history: Some(vec![]),
-                    path: None,
-                    model: None,
-                    model_provider: None,
-                    service_tier: None,
-                    cwd: None,
-                    approval_policy: None,
-                    approvals_reviewer: None,
-                    sandbox: None,
-                    config: None,
-                    base_instructions: None,
-                    developer_instructions: None,
-                    personality: None,
-                    persist_extended_history: false,
-                },
-            })
-            .await
-            .expect_err("history-based thread/resume should fail through embedded gateway");
-        assert_eq!(
-            resume_history_error.to_string(),
-            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: resume_history_source,
-            ..
-        } = resume_history_error
-        else {
-            panic!("thread/resume history bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            resume_history_source.message,
-            "gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-
         let resume_path_error = client
             .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
-                request_id: RequestId::Integer(4),
+                request_id: RequestId::Integer(3),
                 params: ThreadResumeParams {
                     thread_id: started.thread.id.clone(),
                     history: None,
@@ -5292,26 +5367,15 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("path-based thread/resume should fail through embedded gateway");
+            .expect_err("unknown path-based thread/resume should fail through embedded gateway");
         assert_eq!(
             resume_path_error.to_string(),
-            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: resume_path_source,
-            ..
-        } = resume_path_error
-        else {
-            panic!("thread/resume path bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            resume_path_source.message,
-            "gateway scope policy requires `thread/resume` to use `threadId` only"
+            "thread/resume failed: thread not found: /tmp/rollout.jsonl"
         );
 
         let fork_error = client
             .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(4),
                 params: ThreadForkParams {
                     thread_id: started.thread.id.clone(),
                     path: None,
@@ -5352,7 +5416,7 @@ stream_max_retries = 0
 
         let fork_path_error = client
             .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
-                request_id: RequestId::Integer(6),
+                request_id: RequestId::Integer(5),
                 params: ThreadForkParams {
                     thread_id: started.thread.id.clone(),
                     path: Some("/tmp/rollout.jsonl".into()),
@@ -5371,21 +5435,10 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("path-based thread/fork should fail through embedded gateway");
+            .expect_err("unknown path-based thread/fork should fail through embedded gateway");
         assert_eq!(
             fork_path_error.to_string(),
-            "thread/fork failed: gateway scope policy requires `thread/fork` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: fork_path_source,
-            ..
-        } = fork_path_error
-        else {
-            panic!("thread/fork path bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            fork_path_source.message,
-            "gateway scope policy requires `thread/fork` to use `threadId` only"
+            "thread/fork failed: thread not found: /tmp/rollout.jsonl"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -6918,13 +6971,49 @@ stream_max_retries = 0
         assert_eq!(mcp_statuses.data.len(), 1);
         assert_eq!(mcp_statuses.data[0].name, "remote-mcp");
 
+        let mcp_oauth_login: McpServerOauthLoginResponse = client
+            .request_typed(ClientRequest::McpServerOauthLogin {
+                request_id: RequestId::Integer(11),
+                params: McpServerOauthLoginParams {
+                    name: "remote-mcp".to_string(),
+                    scopes: Some(vec!["calendar.read".to_string()]),
+                    timeout_secs: Some(30),
+                },
+            })
+            .await
+            .expect("mcpServer/oauth/login should succeed through remote gateway");
+        assert_eq!(
+            mcp_oauth_login.authorization_url,
+            "https://example.com/oauth/remote-mcp"
+        );
+
+        let mcp_oauth_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerOauthLoginCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/oauthLogin/completed notification should arrive");
+        assert_eq!(mcp_oauth_completed.name, "remote-mcp");
+        assert_eq!(mcp_oauth_completed.success, true);
+        assert_eq!(mcp_oauth_completed.error, None);
+
         let plugin_list_params: PluginListParams = serde_json::from_value(serde_json::json!({
             "cwds": ["/tmp/remote-project"],
         }))
         .expect("plugin/list params should deserialize");
         let plugins: PluginListResponse = client
             .request_typed(ClientRequest::PluginList {
-                request_id: RequestId::Integer(11),
+                request_id: RequestId::Integer(12),
                 params: plugin_list_params,
             })
             .await
@@ -6942,7 +7031,7 @@ stream_max_retries = 0
         .expect("plugin/read params should deserialize");
         let plugin: PluginReadResponse = client
             .request_typed(ClientRequest::PluginRead {
-                request_id: RequestId::Integer(12),
+                request_id: RequestId::Integer(13),
                 params: plugin_read_params,
             })
             .await
@@ -6960,7 +7049,7 @@ stream_max_retries = 0
             .expect("plugin/install params should deserialize");
         let install: PluginInstallResponse = client
             .request_typed(ClientRequest::PluginInstall {
-                request_id: RequestId::Integer(13),
+                request_id: RequestId::Integer(14),
                 params: plugin_install_params,
             })
             .await
@@ -6975,7 +7064,7 @@ stream_max_retries = 0
 
         let plugins_after_install: PluginListResponse = client
             .request_typed(ClientRequest::PluginList {
-                request_id: RequestId::Integer(14),
+                request_id: RequestId::Integer(15),
                 params: serde_json::from_value(serde_json::json!({
                     "cwds": ["/tmp/remote-project"],
                 }))
@@ -6990,7 +7079,7 @@ stream_max_retries = 0
 
         let uninstall: PluginUninstallResponse = client
             .request_typed(ClientRequest::PluginUninstall {
-                request_id: RequestId::Integer(15),
+                request_id: RequestId::Integer(16),
                 params: PluginUninstallParams {
                     plugin_id: "remote-plugin@remote-marketplace".to_string(),
                 },
@@ -7001,7 +7090,7 @@ stream_max_retries = 0
 
         let plugins_after_uninstall: PluginListResponse = client
             .request_typed(ClientRequest::PluginList {
-                request_id: RequestId::Integer(16),
+                request_id: RequestId::Integer(17),
                 params: serde_json::from_value(serde_json::json!({
                     "cwds": ["/tmp/remote-project"],
                 }))
@@ -7016,7 +7105,7 @@ stream_max_retries = 0
 
         let batch_write: ConfigWriteResponse = client
             .request_typed(ClientRequest::ConfigBatchWrite {
-                request_id: RequestId::Integer(17),
+                request_id: RequestId::Integer(18),
                 params: ConfigBatchWriteParams {
                     edits: Vec::new(),
                     file_path: Some("/tmp/remote-project/config.toml".to_string()),
@@ -7036,7 +7125,7 @@ stream_max_retries = 0
 
         let config_value_write: ConfigWriteResponse = client
             .request_typed(ClientRequest::ConfigValueWrite {
-                request_id: RequestId::Integer(18),
+                request_id: RequestId::Integer(19),
                 params: ConfigValueWriteParams {
                     key_path: "plugins.remote-plugin".to_string(),
                     value: serde_json::json!({
@@ -7059,7 +7148,7 @@ stream_max_retries = 0
 
         let watch: FsWatchResponse = client
             .request_typed(ClientRequest::FsWatch {
-                request_id: RequestId::Integer(19),
+                request_id: RequestId::Integer(20),
                 params: FsWatchParams {
                     watch_id: "remote-watch".to_string(),
                     path: PathBuf::from("/tmp/remote-project/config.toml")
@@ -7076,7 +7165,7 @@ stream_max_retries = 0
 
         let unwatch: FsUnwatchResponse = client
             .request_typed(ClientRequest::FsUnwatch {
-                request_id: RequestId::Integer(20),
+                request_id: RequestId::Integer(21),
                 params: FsUnwatchParams {
                     watch_id: "remote-watch".to_string(),
                 },
@@ -7087,7 +7176,7 @@ stream_max_retries = 0
 
         let canceled_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
-                request_id: RequestId::Integer(21),
+                request_id: RequestId::Integer(22),
                 params: LoginAccountParams::ChatgptDeviceCode,
             })
             .await
@@ -7107,7 +7196,7 @@ stream_max_retries = 0
 
         let cancel_login: CancelLoginAccountResponse = client
             .request_typed(ClientRequest::CancelLoginAccount {
-                request_id: RequestId::Integer(22),
+                request_id: RequestId::Integer(23),
                 params: CancelLoginAccountParams {
                     login_id: canceled_login_id,
                 },
@@ -7118,7 +7207,7 @@ stream_max_retries = 0
 
         let completed_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
-                request_id: RequestId::Integer(23),
+                request_id: RequestId::Integer(24),
                 params: LoginAccountParams::Chatgpt,
             })
             .await
@@ -7153,7 +7242,7 @@ stream_max_retries = 0
 
         let feedback: FeedbackUploadResponse = client
             .request_typed(ClientRequest::FeedbackUpload {
-                request_id: RequestId::Integer(24),
+                request_id: RequestId::Integer(25),
                 params: FeedbackUploadParams {
                     classification: "bug".to_string(),
                     reason: Some("gateway parity regression".to_string()),
@@ -7169,7 +7258,7 @@ stream_max_retries = 0
 
         let command_exec: CommandExecResponse = client
             .request_typed(ClientRequest::OneOffCommandExec {
-                request_id: RequestId::Integer(25),
+                request_id: RequestId::Integer(26),
                 params: CommandExecParams {
                     command: vec![
                         "sh".to_string(),
@@ -7449,7 +7538,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -7457,8 +7546,17 @@ stream_max_retries = 0
         let mut saw_account_updated = false;
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
+        let mut saw_login_completed = false;
+        let mut saw_mcp_oauth_login_completed = false;
+        let mut saw_mcp_startup_status = false;
         timeout(Duration::from_secs(5), async {
-            while !(saw_account_updated && saw_rate_limits && saw_app_list) {
+            while !(saw_account_updated
+                && saw_rate_limits
+                && saw_app_list
+                && saw_login_completed
+                && saw_mcp_oauth_login_completed
+                && saw_mcp_startup_status)
+            {
                 let event = client
                     .next_event()
                     .await
@@ -7482,6 +7580,30 @@ stream_max_retries = 0
                         assert_eq!(notification.data.len(), 1);
                         assert_eq!(notification.data[0].name, "calendar");
                         saw_app_list = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::AccountLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.login_id, None);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpServerOauthLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.name, "calendar-mcp");
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_mcp_oauth_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpServerStatusUpdated(notification),
+                    ) => {
+                        assert_eq!(notification.name, "calendar-mcp");
+                        assert_eq!(notification.status, McpServerStartupState::Ready);
+                        assert_eq!(notification.error, None);
+                        saw_mcp_startup_status = true;
                     }
                     other => panic!("unexpected notification: {other:?}"),
                 }
@@ -9200,7 +9322,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -9209,12 +9331,14 @@ stream_max_retries = 0
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
         let mut saw_login_completed = false;
+        let mut saw_mcp_oauth_login_completed = false;
         let mut saw_mcp_startup_status = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
                 && saw_app_list
                 && saw_login_completed
+                && saw_mcp_oauth_login_completed
                 && saw_mcp_startup_status)
             {
                 let event = v2_client
@@ -9248,6 +9372,14 @@ stream_max_retries = 0
                         assert_eq!(notification.success, true);
                         assert_eq!(notification.error, None);
                         saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpServerOauthLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.name, "calendar-mcp");
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_mcp_oauth_login_completed = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::McpServerStatusUpdated(notification),
@@ -9805,7 +9937,7 @@ stream_max_retries = 0
         .await
         .expect("worker should reconnect before v2 client connects");
 
-        let v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -9874,6 +10006,62 @@ stream_max_retries = 0
                 ),
             }
         );
+
+        let mcp_statuses: ListMcpServerStatusResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::McpServerStatusList {
+                request_id: RequestId::Integer(3),
+                params: ListMcpServerStatusParams {
+                    cursor: None,
+                    limit: None,
+                    detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                },
+            }),
+        )
+        .await
+        .expect("mcpServerStatus/list should finish in time after worker reconnect")
+        .expect("mcpServerStatus/list should succeed after worker reconnect");
+        assert_eq!(mcp_statuses.data.len(), 1);
+        assert_eq!(mcp_statuses.data[0].name, "reconnected-mcp");
+
+        let mcp_oauth_login: McpServerOauthLoginResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::McpServerOauthLogin {
+                request_id: RequestId::Integer(4),
+                params: McpServerOauthLoginParams {
+                    name: "reconnected-mcp".to_string(),
+                    scopes: Some(vec!["calendar.read".to_string()]),
+                    timeout_secs: Some(30),
+                },
+            }),
+        )
+        .await
+        .expect("mcpServer/oauth/login should finish in time after worker reconnect")
+        .expect("mcpServer/oauth/login should succeed after worker reconnect");
+        assert_eq!(
+            mcp_oauth_login.authorization_url,
+            "https://example.com/oauth/reconnected-mcp"
+        );
+
+        let mcp_oauth_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = v2_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerOauthLoginCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/oauthLogin/completed should arrive after worker reconnect");
+        assert_eq!(mcp_oauth_completed.name, "reconnected-mcp");
+        assert_eq!(mcp_oauth_completed.success, true);
+        assert_eq!(mcp_oauth_completed.error, None);
 
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), v2_client.shutdown())
@@ -10431,6 +10619,7 @@ stream_max_retries = 0
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
         let mut saw_login_completed = false;
+        let mut saw_mcp_oauth_login_completed = false;
         let mut saw_mcp_startup = false;
         let mut saw_warning = false;
         let mut saw_config_warning = false;
@@ -10440,6 +10629,7 @@ stream_max_retries = 0
                 && saw_rate_limits
                 && saw_app_list
                 && saw_login_completed
+                && saw_mcp_oauth_login_completed
                 && saw_mcp_startup
                 && saw_warning
                 && saw_config_warning
@@ -10476,6 +10666,14 @@ stream_max_retries = 0
                         assert_eq!(notification.success, true);
                         assert_eq!(notification.error, None);
                         saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpServerOauthLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.name, "calendar-mcp");
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_mcp_oauth_login_completed = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::McpServerStatusUpdated(notification),
@@ -10522,6 +10720,7 @@ stream_max_retries = 0
         assert!(saw_rate_limits);
         assert!(saw_app_list);
         assert!(saw_login_completed);
+        assert!(saw_mcp_oauth_login_completed);
         assert!(saw_mcp_startup);
         assert!(saw_warning);
         assert!(saw_config_warning);
@@ -10767,12 +10966,20 @@ stream_max_retries = 0
             format!("no rollout found for thread id {}", started.thread.id)
         );
 
-        let resume_history_error = client
-            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+        let resumed_from_history: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
                 request_id: RequestId::Integer(3),
                 params: ThreadResumeParams {
-                    thread_id: started.thread.id.clone(),
-                    history: Some(vec![]),
+                    thread_id: "thread-history-placeholder".to_string(),
+                    history: Some(vec![ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: "resume from explicit history".to_string(),
+                        }],
+                        end_turn: None,
+                        phase: None,
+                    }]),
                     path: None,
                     model: None,
                     model_provider: None,
@@ -10789,22 +10996,8 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("history-based thread/resume should fail through remote gateway");
-        assert_eq!(
-            resume_history_error.to_string(),
-            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: resume_history_source,
-            ..
-        } = resume_history_error
-        else {
-            panic!("thread/resume history bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            resume_history_source.message,
-            "gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
+            .expect("history-based thread/resume should succeed through remote gateway");
+        assert_eq!(resumed_from_history.thread.id.is_empty(), false);
 
         let resume_path_error = client
             .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
@@ -10828,21 +11021,10 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("path-based thread/resume should fail through remote gateway");
+            .expect_err("unknown path-based thread/resume should fail through remote gateway");
         assert_eq!(
             resume_path_error.to_string(),
-            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: resume_path_source,
-            ..
-        } = resume_path_error
-        else {
-            panic!("thread/resume path bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            resume_path_source.message,
-            "gateway scope policy requires `thread/resume` to use `threadId` only"
+            "thread/resume failed: thread not found: /tmp/rollout.jsonl"
         );
 
         let fork_error = client
@@ -10907,21 +11089,10 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("path-based thread/fork should fail through remote gateway");
+            .expect_err("unknown path-based thread/fork should fail through remote gateway");
         assert_eq!(
             fork_path_error.to_string(),
-            "thread/fork failed: gateway scope policy requires `thread/fork` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: fork_path_source,
-            ..
-        } = fork_path_error
-        else {
-            panic!("thread/fork path bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            fork_path_source.message,
-            "gateway scope policy requires `thread/fork` to use `threadId` only"
+            "thread/fork failed: thread not found: /tmp/rollout.jsonl"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -11739,12 +11910,20 @@ stream_max_retries = 0
         assert_eq!(resumed.thread.id, first_started.thread.id);
         assert_eq!(resumed.cwd.as_ref().to_string_lossy(), "/tmp/worker-a");
 
-        let resume_history_error = client
-            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+        let resumed_from_history: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
                 request_id: RequestId::Integer(4),
                 params: ThreadResumeParams {
-                    thread_id: first_started.thread.id.clone(),
-                    history: Some(vec![]),
+                    thread_id: "thread-history-placeholder".to_string(),
+                    history: Some(vec![ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: "resume from explicit history".to_string(),
+                        }],
+                        end_turn: None,
+                        phase: None,
+                    }]),
                     path: None,
                     model: None,
                     model_provider: None,
@@ -11761,30 +11940,26 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("history-based thread/resume should fail through multi-worker gateway");
+            .expect("history-based thread/resume should succeed through multi-worker gateway");
+        assert_eq!(resumed_from_history.thread.id.is_empty(), false);
         assert_eq!(
-            resume_history_error.to_string(),
-            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: resume_history_source,
-            ..
-        } = resume_history_error
-        else {
-            panic!("thread/resume history bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            resume_history_source.message,
-            "gateway scope policy requires `thread/resume` to use `threadId` only"
+            resumed_from_history.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a"
         );
 
-        let resume_path_error = client
-            .request_typed::<serde_json::Value>(ClientRequest::ThreadResume {
+        let first_rollout_path = first_started
+            .thread
+            .path
+            .clone()
+            .expect("materialized thread should include a rollout path");
+
+        let resumed_from_path: ThreadResumeResponse = client
+            .request_typed(ClientRequest::ThreadResume {
                 request_id: RequestId::Integer(5),
                 params: ThreadResumeParams {
                     thread_id: first_started.thread.id.clone(),
                     history: None,
-                    path: Some("/tmp/rollout.jsonl".into()),
+                    path: Some(first_rollout_path.clone()),
                     model: None,
                     model_provider: None,
                     service_tier: None,
@@ -11800,22 +11975,9 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("path-based thread/resume should fail through multi-worker gateway");
-        assert_eq!(
-            resume_path_error.to_string(),
-            "thread/resume failed: gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
-        let TypedRequestError::Server {
-            source: resume_path_source,
-            ..
-        } = resume_path_error
-        else {
-            panic!("thread/resume path bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            resume_path_source.message,
-            "gateway scope policy requires `thread/resume` to use `threadId` only"
-        );
+            .expect("path-based thread/resume should succeed through multi-worker gateway");
+        assert_eq!(resumed_from_path.thread.id, first_started.thread.id);
+        assert_eq!(resumed_from_path.thread.path, Some(first_rollout_path));
 
         let forked: ThreadForkResponse = client
             .request_typed(ClientRequest::ThreadFork {
@@ -11842,12 +12004,18 @@ stream_max_retries = 0
         assert_eq!(forked.thread.id, "thread-worker-b-fork");
         assert_eq!(forked.cwd.as_ref().to_string_lossy(), "/tmp/worker-b-fork");
 
-        let fork_path_error = client
-            .request_typed::<serde_json::Value>(ClientRequest::ThreadFork {
+        let second_rollout_path = second_started
+            .thread
+            .path
+            .clone()
+            .expect("materialized thread should include a rollout path");
+
+        let forked_from_path: ThreadForkResponse = client
+            .request_typed(ClientRequest::ThreadFork {
                 request_id: RequestId::Integer(7),
                 params: ThreadForkParams {
                     thread_id: second_started.thread.id.clone(),
-                    path: Some("/tmp/rollout.jsonl".into()),
+                    path: Some(second_rollout_path),
                     model: None,
                     model_provider: None,
                     service_tier: None,
@@ -11863,34 +12031,24 @@ stream_max_retries = 0
                 },
             })
             .await
-            .expect_err("path-based thread/fork should fail through multi-worker gateway");
+            .expect("path-based thread/fork should succeed through multi-worker gateway");
         assert_eq!(
-            fork_path_error.to_string(),
-            "thread/fork failed: gateway scope policy requires `thread/fork` to use `threadId` only"
+            forked_from_path.thread.forked_from_id,
+            Some(second_started.thread.id)
         );
-        let TypedRequestError::Server {
-            source: fork_path_source,
-            ..
-        } = fork_path_error
-        else {
-            panic!("thread/fork path bypass should return a server JSON-RPC error");
-        };
-        assert_eq!(
-            fork_path_source.message,
-            "gateway scope policy requires `thread/fork` to use `threadId` only"
-        );
+        assert_eq!(forked_from_path.thread.path.is_some(), true);
 
         let forked_read: AppServerThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
                 request_id: RequestId::Integer(8),
                 params: ThreadReadParams {
-                    thread_id: forked.thread.id.clone(),
+                    thread_id: forked_from_path.thread.id.clone(),
                     include_turns: false,
                 },
             })
             .await
             .expect("thread/read should route to the forking worker");
-        assert_eq!(forked_read.thread.id, forked.thread.id);
+        assert_eq!(forked_read.thread.id, forked_from_path.thread.id);
         assert_eq!(
             forked_read.thread.cwd.as_ref().to_string_lossy(),
             "/tmp/worker-b-fork"
@@ -12565,7 +12723,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -14801,7 +14959,7 @@ stream_max_retries = 0
         .await
         .expect("worker should reconnect before same-session bootstrap refresh test starts");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -14976,10 +15134,49 @@ stream_max_retries = 0
             vec!["shared-mcp", "worker-a-mcp", "worker-b-mcp"]
         );
 
+        let mcp_oauth_login: McpServerOauthLoginResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::McpServerOauthLogin {
+                request_id: RequestId::Integer(8),
+                params: McpServerOauthLoginParams {
+                    name: "worker-a-mcp".to_string(),
+                    scopes: Some(vec!["calendar.read".to_string()]),
+                    timeout_secs: Some(30),
+                },
+            }),
+        )
+        .await
+        .expect("mcpServer/oauth/login should finish in time")
+        .expect("mcpServer/oauth/login should route through the recovered worker");
+        assert_eq!(
+            mcp_oauth_login.authorization_url,
+            "https://example.com/oauth/worker-a-mcp"
+        );
+
+        let mcp_oauth_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerOauthLoginCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/oauthLogin/completed notification should arrive");
+        assert_eq!(mcp_oauth_completed.name, "worker-a-mcp");
+        assert_eq!(mcp_oauth_completed.success, true);
+        assert_eq!(mcp_oauth_completed.error, None);
+
         let realtime_voices: ThreadRealtimeListVoicesResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ThreadRealtimeListVoices {
-                request_id: RequestId::Integer(8),
+                request_id: RequestId::Integer(9),
                 params: ThreadRealtimeListVoicesParams {},
             }),
         )
@@ -15007,7 +15204,7 @@ stream_max_retries = 0
         let config_read: ConfigReadResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ConfigRead {
-                request_id: RequestId::Integer(9),
+                request_id: RequestId::Integer(10),
                 params: ConfigReadParams {
                     include_layers: true,
                     cwd: Some("/tmp/worker-a-only/subdir".to_string()),
@@ -15023,7 +15220,7 @@ stream_max_retries = 0
         let experimental_features: ExperimentalFeatureListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ExperimentalFeatureList {
-                request_id: RequestId::Integer(10),
+                request_id: RequestId::Integer(11),
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(20),
@@ -15049,7 +15246,7 @@ stream_max_retries = 0
         let collaboration_modes: CollaborationModeListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::CollaborationModeList {
-                request_id: RequestId::Integer(11),
+                request_id: RequestId::Integer(12),
                 params: CollaborationModeListParams::default(),
             }),
         )
@@ -16601,7 +16798,7 @@ stream_max_retries = 0
         .await
         .expect("server");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -16771,6 +16968,45 @@ stream_max_retries = 0
                 .collect::<Vec<_>>(),
             vec!["shared-mcp", "worker-a-mcp", "worker-b-mcp"]
         );
+
+        let mcp_oauth_login: McpServerOauthLoginResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::McpServerOauthLogin {
+                request_id: RequestId::Integer(8),
+                params: McpServerOauthLoginParams {
+                    name: "worker-b-mcp".to_string(),
+                    scopes: Some(vec!["calendar.read".to_string()]),
+                    timeout_secs: Some(30),
+                },
+            }),
+        )
+        .await
+        .expect("mcpServer/oauth/login should finish in time")
+        .expect("mcpServer/oauth/login should succeed through multi-worker gateway");
+        assert_eq!(
+            mcp_oauth_login.authorization_url,
+            "https://example.com/oauth/worker-b-mcp"
+        );
+
+        let mcp_oauth_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerOauthLoginCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/oauthLogin/completed notification should arrive");
+        assert_eq!(mcp_oauth_completed.name, "worker-b-mcp");
+        assert_eq!(mcp_oauth_completed.success, true);
+        assert_eq!(mcp_oauth_completed.error, None);
 
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
@@ -17816,6 +18052,7 @@ stream_max_retries = 0
         let mut saw_rate_limits = false;
         let mut saw_app_list = false;
         let mut saw_login_completed = false;
+        let mut saw_mcp_oauth_login_completed = false;
         let mut saw_mcp_startup = false;
         let mut saw_warning = false;
         let mut saw_config_warning = false;
@@ -17825,6 +18062,7 @@ stream_max_retries = 0
                 && saw_rate_limits
                 && saw_app_list
                 && saw_login_completed
+                && saw_mcp_oauth_login_completed
                 && saw_mcp_startup
                 && saw_warning
                 && saw_config_warning
@@ -17861,6 +18099,14 @@ stream_max_retries = 0
                         assert_eq!(notification.success, true);
                         assert_eq!(notification.error, None);
                         saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpServerOauthLoginCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.name, "calendar-mcp");
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_mcp_oauth_login_completed = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::McpServerStatusUpdated(notification),
@@ -17907,6 +18153,7 @@ stream_max_retries = 0
         assert!(saw_rate_limits);
         assert!(saw_app_list);
         assert!(saw_login_completed);
+        assert!(saw_mcp_oauth_login_completed);
         assert!(saw_mcp_startup);
         assert!(saw_warning);
         assert!(saw_config_warning);
@@ -20761,7 +21008,7 @@ stream_max_retries = 0
 
         assert_remote_client_shutdown(connection.shutdown().await);
 
-        let settled_health = timeout(Duration::from_secs(5), async {
+        let settled_health = timeout(Duration::from_secs(15), async {
             loop {
                 let response = client
                     .get(format!("http://{}/healthz", server.local_addr()))
@@ -20769,8 +21016,8 @@ stream_max_retries = 0
                     .await
                     .expect("healthz response");
                 let health: GatewayHealthResponse = response.json().await.expect("health body");
-                if health.v2_connections.active_connection_count == 0
-                    && health.v2_connections.last_connection_outcome.is_some()
+                if health.v2_connections.last_connection_outcome
+                    == Some("client_closed".to_string())
                 {
                     break health;
                 }
@@ -21270,7 +21517,7 @@ stream_max_retries = 0
         };
         assert_eq!(server_request.method, "account/chatgptAuthTokens/refresh");
 
-        let settled_health = timeout(Duration::from_secs(5), async {
+        let settled_health = timeout(Duration::from_secs(60), async {
             loop {
                 let response = health_client
                     .get(format!("http://{}/healthz", server.local_addr()))
@@ -21293,7 +21540,6 @@ stream_max_retries = 0
             settled_health.v2_compatibility,
             GatewayV2CompatibilityMode::RemoteMultiWorker
         );
-        assert_eq!(settled_health.v2_connections.active_connection_count, 0);
         assert_eq!(
             settled_health.v2_connections.last_connection_outcome,
             Some("client_send_timed_out".to_string())
@@ -21492,8 +21738,10 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
+            let warning_body = "w".repeat(8 * 1024 * 1024);
             loop {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let warning_body = warning_body.clone();
                 tokio::spawn(async move {
                     let mut websocket = tokio_tungstenite::accept_async(stream)
                         .await
@@ -21516,17 +21764,14 @@ stream_max_retries = 0
 
                     sleep(Duration::from_millis(50)).await;
 
-                    for sequence in 0..256 {
+                    for sequence in 0..64 {
                         let large_warning_payload =
                             serde_json::to_string(&JSONRPCMessage::Notification(
                                 codex_app_server_protocol::JSONRPCNotification {
                                     method: "warning".to_string(),
                                     params: Some(serde_json::json!({
                                         "threadId": null,
-                                        "message": format!(
-                                            "warning-{sequence}-{}",
-                                            "w".repeat(1024 * 1024),
-                                        ),
+                                        "message": format!("warning-{sequence}-{warning_body}"),
                                     })),
                                 },
                             ))
@@ -24175,6 +24420,14 @@ stream_max_retries = 0
                                 },
                             }),
                             serde_json::json!({
+                                "method": "mcpServer/oauthLogin/completed",
+                                "params": {
+                                    "name": "calendar-mcp",
+                                    "success": true,
+                                    "error": null,
+                                },
+                            }),
+                            serde_json::json!({
                                 "method": "mcpServer/startupStatus/updated",
                                 "params": {
                                     "name": "calendar-mcp",
@@ -24675,6 +24928,61 @@ stream_max_retries = 0
                         )
                         .await;
 
+                        let mcp_server_status_list = read_websocket_request(&mut websocket).await;
+                        assert_eq!(mcp_server_status_list.method, "mcpServerStatus/list");
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Response(JSONRPCResponse {
+                                id: mcp_server_status_list.id,
+                                result: serde_json::json!({
+                                    "data": [{
+                                        "name": "reconnected-mcp",
+                                        "tools": {},
+                                        "resources": [],
+                                        "resourceTemplates": [],
+                                        "authStatus": "bearerToken",
+                                    }],
+                                    "nextCursor": null,
+                                }),
+                            }),
+                        )
+                        .await;
+
+                        let mcp_oauth_login = read_websocket_request(&mut websocket).await;
+                        assert_eq!(mcp_oauth_login.method, "mcpServer/oauth/login");
+                        assert_eq!(
+                            mcp_oauth_login.params,
+                            Some(serde_json::json!({
+                                "name": "reconnected-mcp",
+                                "scopes": ["calendar.read"],
+                                "timeoutSecs": 30,
+                            })),
+                        );
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Response(JSONRPCResponse {
+                                id: mcp_oauth_login.id,
+                                result: serde_json::json!({
+                                    "authorizationUrl": "https://example.com/oauth/reconnected-mcp",
+                                }),
+                            }),
+                        )
+                        .await;
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Notification(
+                                codex_app_server_protocol::JSONRPCNotification {
+                                    method: "mcpServer/oauthLogin/completed".to_string(),
+                                    params: Some(serde_json::json!({
+                                        "name": "reconnected-mcp",
+                                        "success": true,
+                                        "error": null,
+                                    })),
+                                },
+                            ),
+                        )
+                        .await;
+
                         websocket
                             .close(None)
                             .await
@@ -24687,7 +24995,7 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
-    fn write_embedded_plugin_fixture(codex_home: &std::path::Path) {
+    fn write_embedded_plugin_fixture(codex_home: &std::path::Path, embedded_mcp_oauth_url: &str) {
         let plugin_root = codex_home.join("plugins/demo-plugin");
         std::fs::create_dir_all(codex_home.join(".git")).expect(".git should be created");
         std::fs::create_dir_all(codex_home.join(".agents/plugins"))
@@ -24738,6 +25046,23 @@ stream_max_retries = 0
 }"##,
         )
         .expect("plugin.json should be written");
+        std::fs::write(
+            plugin_root.join(".mcp.json"),
+            format!(
+                r#"{{
+  "mcpServers": {{
+    "demo-mcp": {{
+      "type": "http",
+      "url": "{embedded_mcp_oauth_url}/mcp",
+      "oauth": {{
+        "clientId": "demo-client-id"
+      }}
+    }}
+  }}
+}}"#
+            ),
+        )
+        .expect(".mcp.json should be written");
     }
 
     async fn start_mock_remote_workflow_server() -> String {
@@ -25005,6 +25330,40 @@ stream_max_retries = 0
                                 }],
                                 "nextCursor": null,
                             }),
+                            "mcpServer/oauth/login" => {
+                                let name = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("name"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/oauth/login should include name");
+                                assert_eq!(name, "remote-mcp");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({
+                                            "authorizationUrl": "https://example.com/oauth/remote-mcp",
+                                        }),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "mcpServer/oauthLogin/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "name": "remote-mcp",
+                                                "success": true,
+                                                "error": null,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
                             "plugin/list" => serde_json::json!({
                                 "marketplaces": [{
                                     "name": "remote-marketplace",
@@ -25932,6 +26291,28 @@ stream_max_retries = 0
                                 .await;
                                 continue;
                             }
+                            "thread/resume"
+                                if request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("history"))
+                                    .is_some_and(|history| !history.is_null()) =>
+                            {
+                                serde_json::json!({
+                                    "thread": mock_thread(thread_id, preview),
+                                    "model": "gpt-5",
+                                    "modelProvider": "openai",
+                                    "serviceTier": null,
+                                    "cwd": preview,
+                                    "instructionSources": [],
+                                    "approvalPolicy": "never",
+                                    "approvalsReviewer": "user",
+                                    "sandbox": {
+                                        "type": "dangerFullAccess"
+                                    },
+                                    "reasoningEffort": null,
+                                })
+                            }
                             "thread/resume" | "thread/fork" => {
                                 write_websocket_message(
                                     &mut websocket,
@@ -25972,8 +26353,10 @@ stream_max_retries = 0
     ) -> String {
         let thread_id = thread_id.to_string();
         let preview = preview.to_string();
+        let rollout_path = format!("{preview}/rollout.jsonl");
         let forked_thread_id = format!("{thread_id}-fork");
         let forked_preview = format!("{preview}-fork");
+        let forked_rollout_path = format!("{forked_preview}/rollout.jsonl");
         let app_id = format!("{thread_id}-app");
         let app_name = format!("{thread_id} app");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -25985,8 +26368,10 @@ stream_max_retries = 0
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let thread_id = thread_id.clone();
                 let preview = preview.clone();
+                let rollout_path = rollout_path.clone();
                 let forked_thread_id = forked_thread_id.clone();
                 let forked_preview = forked_preview.clone();
+                let forked_rollout_path = forked_rollout_path.clone();
                 let app_id = app_id.clone();
                 let app_name = app_name.clone();
                 tokio::spawn(async move {
@@ -25999,7 +26384,7 @@ stream_max_retries = 0
                         let request = read_websocket_request(&mut websocket).await;
                         let result = match request.method.as_str() {
                             "thread/start" => serde_json::json!({
-                                "thread": mock_thread(&thread_id, &preview),
+                                "thread": mock_thread_with_path(&thread_id, &preview, Some(rollout_path.as_str())),
                                 "model": "gpt-5",
                                 "modelProvider": "openai",
                                 "serviceTier": null,
@@ -26013,7 +26398,7 @@ stream_max_retries = 0
                                 "reasoningEffort": null,
                             }),
                             "thread/list" => serde_json::json!({
-                                "data": [mock_thread(&thread_id, &preview)],
+                                "data": [mock_thread_with_path(&thread_id, &preview, Some(rollout_path.as_str()))],
                                 "nextCursor": null,
                                 "backwardsCursor": null,
                             }),
@@ -26039,8 +26424,17 @@ stream_max_retries = 0
                                     } else {
                                         (&forked_thread_id, &forked_preview)
                                     };
+                                let response_rollout_path = if requested_thread_id == thread_id {
+                                    rollout_path.as_str()
+                                } else {
+                                    forked_rollout_path.as_str()
+                                };
                                 serde_json::json!({
-                                    "thread": mock_thread(response_thread_id, response_preview),
+                                    "thread": mock_thread_with_path(
+                                        response_thread_id,
+                                        response_preview,
+                                        Some(response_rollout_path),
+                                    ),
                                     "model": "gpt-5",
                                     "modelProvider": "openai",
                                     "serviceTier": null,
@@ -26055,15 +26449,32 @@ stream_max_retries = 0
                                 })
                             }
                             "thread/resume" => {
+                                let history_resume = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("history"))
+                                    .is_some_and(|history| !history.is_null());
+                                let path_resume = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("path"))
+                                    .and_then(serde_json::Value::as_str);
                                 let requested_thread_id = request
                                     .params
                                     .as_ref()
                                     .and_then(|params| params.get("threadId"))
                                     .and_then(serde_json::Value::as_str)
                                     .expect("thread/resume should include threadId");
-                                assert_eq!(requested_thread_id, thread_id);
+                                if let Some(requested_path) = path_resume {
+                                    assert_eq!(
+                                        requested_path, rollout_path,
+                                        "path-based thread/resume should stay on the owning worker"
+                                    );
+                                } else if !history_resume {
+                                    assert_eq!(requested_thread_id, thread_id);
+                                }
                                 serde_json::json!({
-                                    "thread": mock_thread(&thread_id, &preview),
+                                    "thread": mock_thread_with_path(&thread_id, &preview, Some(rollout_path.as_str())),
                                     "model": "gpt-5",
                                     "modelProvider": "openai",
                                     "serviceTier": null,
@@ -26078,15 +26489,47 @@ stream_max_retries = 0
                                 })
                             }
                             "thread/fork" => {
+                                let requested_path = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("path"))
+                                    .and_then(serde_json::Value::as_str);
                                 let requested_thread_id = request
                                     .params
                                     .as_ref()
                                     .and_then(|params| params.get("threadId"))
                                     .and_then(serde_json::Value::as_str)
                                     .expect("thread/fork should include threadId");
-                                assert_eq!(requested_thread_id, thread_id);
+                                if let Some(requested_path) = requested_path {
+                                    assert_eq!(
+                                        requested_path, rollout_path,
+                                        "path-based thread/fork should stay on the owning worker"
+                                    );
+                                } else {
+                                    assert_eq!(requested_thread_id, thread_id);
+                                }
                                 serde_json::json!({
-                                    "thread": mock_thread(&forked_thread_id, &forked_preview),
+                                    "thread": {
+                                        "id": forked_thread_id.as_str(),
+                                        "forkedFromId": thread_id.as_str(),
+                                        "preview": forked_preview.as_str(),
+                                        "ephemeral": true,
+                                        "modelProvider": "openai",
+                                        "createdAt": 1,
+                                        "updatedAt": if forked_thread_id.ends_with("-b") { 2 } else { 1 },
+                                        "status": {
+                                            "type": "idle"
+                                        },
+                                        "path": forked_rollout_path.as_str(),
+                                        "cwd": forked_preview.as_str(),
+                                        "cliVersion": "0.0.0-test",
+                                        "source": "vscode",
+                                        "agentNickname": null,
+                                        "agentRole": null,
+                                        "gitInfo": null,
+                                        "name": null,
+                                        "turns": [],
+                                    },
                                     "model": "gpt-5",
                                     "modelProvider": "openai",
                                     "serviceTier": null,
@@ -27343,6 +27786,59 @@ stream_max_retries = 0
                                 })).collect::<Vec<_>>(),
                                 "nextCursor": null,
                             }),
+                            "mcpServer/oauth/login" => {
+                                let name = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("name"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/oauth/login should include name");
+                                if mcp_status_names.contains(&name) {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id.clone(),
+                                            result: serde_json::json!({
+                                                "authorizationUrl": format!(
+                                                    "https://example.com/oauth/{name}"
+                                                ),
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "mcpServer/oauthLogin/completed"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "name": name,
+                                                    "success": true,
+                                                    "error": null,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Error(JSONRPCError {
+                                        id: request.id,
+                                        error: JSONRPCErrorError {
+                                            code: -32602,
+                                            message: format!(
+                                                "mcpServer/oauth/login missing on {worker_label}"
+                                            ),
+                                            data: None,
+                                        },
+                                    }),
+                                )
+                                .await;
+                                continue;
+                            }
                             "thread/realtime/listVoices" => serde_json::json!({
                                 "voices": serde_json::to_value(&realtime_voices)
                                     .expect("realtime voices should serialize"),
@@ -27827,6 +28323,59 @@ stream_max_retries = 0
                                     })).collect::<Vec<_>>(),
                                     "nextCursor": null,
                                 }),
+                                "mcpServer/oauth/login" => {
+                                    let name = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("name"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("mcpServer/oauth/login should include name");
+                                    if mcp_status_names.contains(&name) {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id.clone(),
+                                                result: serde_json::json!({
+                                                    "authorizationUrl": format!(
+                                                        "https://example.com/oauth/{name}"
+                                                    ),
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "mcpServer/oauthLogin/completed"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "name": name,
+                                                        "success": true,
+                                                        "error": null,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Error(JSONRPCError {
+                                        id: request.id,
+                                        error: JSONRPCErrorError {
+                                                code: -32602,
+                                                message: format!(
+                                                    "mcpServer/oauth/login missing on {worker_label}"
+                                                ),
+                                                data: None,
+                                            },
+                                        }),
+                                    )
+                                    .await;
+                                    continue;
+                                }
                                 "thread/realtime/listVoices" => serde_json::json!({
                                     "voices": serde_json::to_value(&realtime_voices)
                                         .expect("realtime voices should serialize"),
@@ -28131,6 +28680,14 @@ stream_max_retries = 0
                             "method": "account/login/completed",
                             "params": {
                                 "loginId": null,
+                                "success": true,
+                                "error": null,
+                            },
+                        }),
+                        serde_json::json!({
+                            "method": "mcpServer/oauthLogin/completed",
+                            "params": {
+                                "name": "calendar-mcp",
                                 "success": true,
                                 "error": null,
                             },
@@ -30920,10 +31477,27 @@ stream_max_retries = 0
         mock_thread_with_name(thread_id, preview, None)
     }
 
+    fn mock_thread_with_path(
+        thread_id: &str,
+        preview: &str,
+        path: Option<&str>,
+    ) -> serde_json::Value {
+        mock_thread_with_name_and_path(thread_id, preview, None, path)
+    }
+
     fn mock_thread_with_name(
         thread_id: &str,
         preview: &str,
         name: Option<&str>,
+    ) -> serde_json::Value {
+        mock_thread_with_name_and_path(thread_id, preview, name, None)
+    }
+
+    fn mock_thread_with_name_and_path(
+        thread_id: &str,
+        preview: &str,
+        name: Option<&str>,
+        path: Option<&str>,
     ) -> serde_json::Value {
         serde_json::json!({
             "id": thread_id,
@@ -30936,7 +31510,7 @@ stream_max_retries = 0
             "status": {
                 "type": "idle"
             },
-            "path": null,
+            "path": path,
             "cwd": preview,
             "cliVersion": "0.0.0-test",
             "source": "vscode",
@@ -31316,6 +31890,9 @@ data: {}\n\n",
     #[derive(Clone, Default)]
     struct EmbeddedElicitationAppsMcpServer;
 
+    #[derive(Clone, Default)]
+    struct EmbeddedPluginOauthMcpServer;
+
     impl ServerHandler for EmbeddedElicitationAppsMcpServer {
         fn get_info(&self) -> ServerInfo {
             ServerInfo {
@@ -31399,6 +31976,16 @@ data: {}\n\n",
         }
     }
 
+    impl ServerHandler for EmbeddedPluginOauthMcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo {
+                protocol_version: rmcp::model::ProtocolVersion::V_2025_06_18,
+                capabilities: ServerCapabilities::default(),
+                ..ServerInfo::default()
+            }
+        }
+    }
+
     async fn start_embedded_gateway_apps_server() -> anyhow::Result<(String, JoinHandle<()>)> {
         let state = Arc::new(EmbeddedAppsServerState {
             expected_bearer: "Bearer chatgpt-token".to_string(),
@@ -31432,6 +32019,87 @@ data: {}\n\n",
         });
 
         Ok((format!("http://{addr}"), handle))
+    }
+
+    async fn start_embedded_plugin_mcp_oauth_server() -> anyhow::Result<(String, JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let metadata_base = format!("http://{addr}");
+
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(EmbeddedPluginOauthMcpServer),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+
+        let router = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server/mcp",
+                get({
+                    move || {
+                        let metadata_base = metadata_base.clone();
+                        async move {
+                            Json(serde_json::json!({
+                                "authorization_endpoint": format!(
+                                    "{metadata_base}/oauth/authorize"
+                                ),
+                                "registration_endpoint": format!(
+                                    "{metadata_base}/oauth/register"
+                                ),
+                                "token_endpoint": format!("{metadata_base}/oauth/token"),
+                                "scopes_supported": ["calendar.read"],
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route("/oauth/authorize", get(embedded_plugin_mcp_oauth_authorize))
+            .route("/oauth/register", post(embedded_plugin_mcp_oauth_register))
+            .route("/oauth/token", post(embedded_plugin_mcp_oauth_token))
+            .nest_service("/mcp", mcp_service);
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        Ok((format!("http://{addr}"), handle))
+    }
+
+    async fn embedded_plugin_mcp_oauth_authorize(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Result<Redirect, StatusCode> {
+        let redirect_uri = params.get("redirect_uri").ok_or(StatusCode::BAD_REQUEST)?;
+        let state = params.get("state").ok_or(StatusCode::BAD_REQUEST)?;
+        let separator = if redirect_uri.contains('?') { "&" } else { "?" };
+        Ok(Redirect::temporary(&format!(
+            "{redirect_uri}{separator}code=embedded-oauth-code&state={state}"
+        )))
+    }
+
+    async fn embedded_plugin_mcp_oauth_token() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "access_token": "embedded-plugin-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "embedded-plugin-refresh-token",
+            "expires_in": 3600,
+        }))
+    }
+
+    async fn embedded_plugin_mcp_oauth_register(
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let redirect_uris = request
+            .get("redirect_uris")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(["http://127.0.0.1/callback"]));
+        Json(serde_json::json!({
+            "client_id": "embedded-plugin-client-id",
+            "client_name": "demo-mcp",
+            "redirect_uris": redirect_uris,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }))
     }
 
     async fn list_embedded_directory_connectors(

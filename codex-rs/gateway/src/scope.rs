@@ -8,6 +8,7 @@ use axum::http::request::Parts;
 use codex_app_server_protocol::RequestId;
 use std::collections::HashMap;
 use std::future::ready;
+use std::path::Path;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
@@ -83,6 +84,7 @@ struct ThreadScope {
 #[derive(Default)]
 pub struct GatewayScopeRegistry {
     thread_contexts: RwLock<HashMap<String, ThreadScope>>,
+    thread_paths: RwLock<HashMap<String, ThreadScope>>,
     pending_server_requests: RwLock<HashMap<RequestId, PendingServerRequest>>,
 }
 
@@ -112,6 +114,53 @@ impl GatewayScopeRegistry {
             .and_then(|scope| scope.worker_id)
     }
 
+    pub fn register_thread_path_with_worker(
+        &self,
+        thread_path: impl AsRef<Path>,
+        context: GatewayRequestContext,
+        worker_id: Option<usize>,
+    ) {
+        let thread_path = thread_path.as_ref().to_string_lossy().to_string();
+        write_guard(&self.thread_paths).insert(thread_path, ThreadScope { context, worker_id });
+    }
+
+    pub fn thread_path_context(
+        &self,
+        thread_path: impl AsRef<Path>,
+    ) -> Option<GatewayRequestContext> {
+        let thread_path = thread_path.as_ref().to_string_lossy().to_string();
+        read_guard(&self.thread_paths)
+            .get(&thread_path)
+            .map(|scope| scope.context.clone())
+    }
+
+    pub fn thread_path_worker_id(&self, thread_path: impl AsRef<Path>) -> Option<usize> {
+        let thread_path = thread_path.as_ref().to_string_lossy().to_string();
+        read_guard(&self.thread_paths)
+            .get(&thread_path)
+            .and_then(|scope| scope.worker_id)
+    }
+
+    pub fn register_thread_path_worker_if_visible(
+        &self,
+        thread_path: impl AsRef<Path>,
+        context: &GatewayRequestContext,
+        worker_id: Option<usize>,
+    ) -> bool {
+        let thread_path = thread_path.as_ref().to_string_lossy().to_string();
+        let mut thread_paths = write_guard(&self.thread_paths);
+        let Some(scope) = thread_paths.get_mut(&thread_path) else {
+            return false;
+        };
+        if &scope.context != context {
+            return false;
+        }
+        if worker_id.is_some() {
+            scope.worker_id = worker_id;
+        }
+        true
+    }
+
     pub fn register_thread_worker_if_visible(
         &self,
         thread_id: &str,
@@ -133,6 +182,14 @@ impl GatewayScopeRegistry {
 
     pub fn thread_visible_to(&self, context: &GatewayRequestContext, thread_id: &str) -> bool {
         self.thread_context(thread_id).as_ref() == Some(context)
+    }
+
+    pub fn thread_path_visible_to(
+        &self,
+        context: &GatewayRequestContext,
+        thread_path: impl AsRef<Path>,
+    ) -> bool {
+        self.thread_path_context(thread_path).as_ref() == Some(context)
     }
 
     pub fn filter_thread_ids(
@@ -379,5 +436,64 @@ mod tests {
             false
         );
         assert_eq!(registry.thread_worker_id("thread-a"), Some(7));
+    }
+
+    #[test]
+    fn register_thread_path_worker_if_visible_only_updates_matching_scope() {
+        let registry = GatewayScopeRegistry::default();
+        let visible_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let other_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+        registry.register_thread_path_with_worker(
+            "/tmp/thread-a.json",
+            visible_context.clone(),
+            None,
+        );
+
+        assert_eq!(
+            registry.register_thread_path_worker_if_visible(
+                "/tmp/thread-a.json",
+                &visible_context,
+                Some(7),
+            ),
+            true
+        );
+        assert_eq!(
+            registry.thread_path_worker_id("/tmp/thread-a.json"),
+            Some(7)
+        );
+        assert_eq!(
+            registry.register_thread_path_worker_if_visible(
+                "/tmp/thread-a.json",
+                &other_context,
+                Some(8),
+            ),
+            false
+        );
+        assert_eq!(
+            registry.register_thread_path_worker_if_visible(
+                "/tmp/thread-missing.json",
+                &visible_context,
+                Some(9),
+            ),
+            false
+        );
+        assert_eq!(
+            registry.thread_path_worker_id("/tmp/thread-a.json"),
+            Some(7)
+        );
+        assert_eq!(
+            registry.thread_path_visible_to(&visible_context, "/tmp/thread-a.json"),
+            true
+        );
+        assert_eq!(
+            registry.thread_path_visible_to(&other_context, "/tmp/thread-a.json"),
+            false
+        );
     }
 }

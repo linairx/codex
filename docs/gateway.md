@@ -231,9 +231,8 @@ Recent progress:
   `thread/resume` and then `thread/read` a previously materialized thread
   after the original client disconnects
 - the real embedded, single-worker remote, and multi-worker remote harnesses
-  now also verify the
-  gateway-owned scope-policy rejection path for history/path-based
-  `thread/resume` and path-based `thread/fork`, so those guarded flows are
+  now also verify path-based `thread/resume` and path-based `thread/fork`
+  through the gateway's scope policy, so those rollout-path flows are
   exercised through a real `RemoteAppServerClient` session instead of only raw
   JSON-RPC regression fixtures
 - the real embedded harness now also exercises the standalone
@@ -353,7 +352,8 @@ Recent progress:
   `thread/name/set` flows through unmodified `RemoteAppServerClient` sessions
 - the real embedded compatibility harness now also covers `configWarning`
   during startup, and the real single-worker remote compatibility harness now
-  also covers `warning`, `configWarning`, `deprecationNotice`, and
+  also covers `warning`, `configWarning`, `deprecationNotice`,
+  `account/login/completed`, `mcpServer/oauthLogin/completed`, and
   `mcpServer/startupStatus/updated`, so those visible notification paths are
   exercised through unmodified `RemoteAppServerClient` sessions in addition to
   dedicated northbound coverage
@@ -378,7 +378,7 @@ Recent progress:
 - multi-worker remote runtime now also aggregates setup-time discovery requests
   that should reflect more than one worker, including
   `externalAgentConfig/detect`, threadless `app/list`,
-  `mcpServerStatus/list`, and `skills/list`,
+  `mcpServerStatus/list`, `mcpServer/oauth/login`, and `skills/list`,
   deduplicating imported-config items, paginating the merged app inventory at
   the gateway boundary, paginating merged MCP inventory, and merging
   per-`cwd` skill results instead of exposing only the primary worker's local
@@ -644,6 +644,23 @@ Recent progress:
   cwd-aware `config/read` request paths, so the operator-facing worker-route
   diagnostics stay tied to the actual degraded-session behavior rather than
   only helper-level log formatting tests
+- worker-discovery fallback routing now also covers `mcpServer/oauth/login`,
+  with dedicated passthrough coverage for the request itself and a
+  reconnect-on-demand regression showing the gateway can re-add a recovered
+  worker before selecting the downstream session that owns the named MCP
+  server
+- the real multi-worker same-session recovery harness now also verifies that
+  `mcpServer/oauth/login` routes back to a lazily re-added worker and still
+  forwards the resulting `mcpServer/oauthLogin/completed` notification on the
+  shared northbound client session
+- the real single-worker and multi-worker remote compatibility harnesses now
+  also exercise `mcpServer/oauth/login` plus the follow-up
+  `mcpServer/oauthLogin/completed` notification over the gateway's northbound
+  v2 client transport
+- the real single-worker reconnect harness now also verifies that later
+  `mcpServerStatus/list` and `mcpServer/oauth/login` requests still succeed
+  after worker recovery, including the follow-up
+  `mcpServer/oauthLogin/completed` notification on the recovered session
 - protocol and dedupe hardening now covers exact-duplicate suppression for
   connection-state notifications, `warning`, `configWarning`,
   `deprecationNotice`, `externalAgentConfig/import/completed`, and
@@ -652,11 +669,20 @@ Recent progress:
   replies to a server request that is no longer pending, including rejection
   of any still-pending downstream prompts; and structured warning logs for both
   protocol-violation cleanup and unresolved server-request saturation
+- that same protocol-violation logging now also includes any answered-but-
+  unresolved server-request routes when the client replies to an unknown
+  request id, and a real northbound regression now pins that ordering-sensitive
+  path after one prior server request has already been answered
 - downstream app-server event-stream backpressure now also emits a structured
   warning log with scope, worker id, skipped-event count, and any still-pending
   gateway server-request ids before the gateway closes the northbound session,
   so lag-driven teardown is visible without reconstructing the session from
   connection outcomes alone
+- that same backpressure path now also includes any answered-but-unresolved
+  server-request routes in those warning logs, and a northbound regression now
+  pins the fail-closed close frame plus translated gateway/downstream request
+  ids after the client has already answered but downstream
+  `serverRequest/resolved` never arrives before lag closes the session
 - slow-client send timeouts now also emit a structured warning log with scope,
   terminal timeout detail, and any still-pending gateway server-request ids
   before pending downstream prompts are rejected, so `client_send_timed_out`
@@ -665,15 +691,33 @@ Recent progress:
   pending downstream server request is left unresolved while large follow-up
   notifications wedge the client send path, verifying the timeout warning,
   `client_send_timed_out` outcome, and downstream prompt rejection together
+- those slow-client and connection-end teardown logs now also include any
+  answered-but-unresolved server-request routes, with translated gateway ids,
+  downstream ids, and worker ids, and that same slow-client path now also has
+  a real northbound regression where the client has already replied but
+  downstream `serverRequest/resolved` never arrives before timeout
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   request-id translation now also emit structured warning logs with scope,
   worker id, the replayed downstream request id, and any still-buffered
-  translated routes
+  translated gateway ids, downstream ids, and worker ids
+- that duplicate-replay path now also has direct northbound regression
+  coverage, pinning the warning log fields emitted when a multi-worker
+  downstream session replays `serverRequest/resolved` after the translated
+  route has already been drained
 - suppressed multi-worker notification dedupe paths now also emit structured
   warning logs: duplicate `skills/changed` invalidations include scope,
   worker id, and params until the client refreshes `skills/list`, and exact-
   duplicate connection-state notifications include the same context when they
   are dropped
+- that same exact-duplicate connection-state suppression now also covers
+  `mcpServer/oauthLogin/completed`, so one shared northbound session does not
+  surface duplicate MCP OAuth completion notifications when more than one
+  worker emits the same payload
+- the real multi-worker connection-state harnesses now also verify that
+  `mcpServer/oauthLogin/completed` is emitted exactly once both in steady
+  state and after worker reconnect, so that dedupe path is exercised through
+  an unmodified `RemoteAppServerClient` session in addition to dedicated
+  northbound regressions
 - hidden-thread downstream server requests that are rejected by gateway scope
   policy now also emit structured warning logs with scope, worker id, the
   translated gateway request id, method, and hidden thread id, so approval
@@ -710,6 +754,21 @@ Recent progress:
   coverage on both the single-worker and shared multi-worker paths, pinning
   the resolved-versus-stranded request-id fields that operators use to
   diagnose cleanup behavior after natural downstream session termination
+- those same worker-loss cleanup logs now also include downstream request ids
+  for both resolved thread-scoped prompts and stranded connection-scoped
+  prompts, and a real shared-session regression now pins the answered-but-
+  unresolved connection-scoped path where the client already replied but the
+  worker session ends before downstream `serverRequest/resolved`
+- history-based `thread/resume` now also passes through gateway v2 scope
+  enforcement in embedded, single-worker remote, and multi-worker remote
+  mode, treating that app-server flow as connection-scoped instead of
+  rejecting it up front just because the placeholder request `threadId` is not
+  yet visible
+- legacy v2 `execCommandApproval` and `applyPatchApproval` server requests now
+  also participate in gateway thread visibility checks via their
+  `conversationId`, so hidden-thread legacy prompts are rejected instead of
+  bypassing scope enforcement; dedicated northbound regressions now also pin
+  the legacy approval round-trip transport for both methods
 - fail-closed handling for a downstream session that reuses a still-pending
   server-request id now also emits a structured warning log with scope, worker
   id, the colliding request id/method, and the gateway request ids already
