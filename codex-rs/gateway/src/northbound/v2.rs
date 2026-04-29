@@ -406,11 +406,16 @@ impl GatewayV2DownstreamRouter {
         self.workers.len() != original_len
     }
 
-    async fn reconnect_missing_workers(&mut self) {
-        self.reconnect_missing_workers_at(Instant::now()).await;
+    async fn reconnect_missing_workers(&mut self, observability: &GatewayObservability) {
+        self.reconnect_missing_workers_at(Instant::now(), observability)
+            .await;
     }
 
-    async fn reconnect_missing_workers_at(&mut self, now: Instant) {
+    async fn reconnect_missing_workers_at(
+        &mut self,
+        now: Instant,
+        observability: &GatewayObservability,
+    ) {
         let Some(reconnect_state) = self.reconnect_state.clone() else {
             return;
         };
@@ -423,12 +428,14 @@ impl GatewayV2DownstreamRouter {
                 continue;
             }
             if !self.should_attempt_worker_reconnect(worker_id, now) {
+                observability.record_v2_worker_reconnect(worker_id, "backoff_suppressed");
                 continue;
             }
             let websocket_url = reconnect_state
                 .worker_websocket_urls
                 .get(worker_id)
                 .map_or("<unknown>", String::as_str);
+            observability.record_v2_worker_reconnect(worker_id, "attempt");
             info!(
                 worker_id,
                 websocket_url,
@@ -453,6 +460,7 @@ impl GatewayV2DownstreamRouter {
                             now,
                             reconnect_state.retry_backoff,
                         );
+                        observability.record_v2_worker_reconnect(worker_id, "replay_failure");
                         warn!(
                             worker_id,
                             websocket_url,
@@ -465,6 +473,7 @@ impl GatewayV2DownstreamRouter {
                         continue;
                     }
                     self.clear_worker_reconnect_failure(worker_id);
+                    observability.record_v2_worker_reconnect(worker_id, "success");
                     info!(
                         worker_id,
                         websocket_url,
@@ -480,6 +489,7 @@ impl GatewayV2DownstreamRouter {
                         now,
                         reconnect_state.retry_backoff,
                     );
+                    observability.record_v2_worker_reconnect(worker_id, "connect_failure");
                     warn!(
                         worker_id,
                         websocket_url,
@@ -744,7 +754,8 @@ async fn run_websocket_connection(
         .v2_connection_health()
         .mark_connection_started();
     let run_result = match async {
-        let initialize_request = match recv_initialize_request(&mut socket, timeouts).await {
+        let initialize_request =
+            match recv_initialize_request(&mut socket, timeouts, &observability).await {
             Ok(request) => request,
             Err(err) if err.kind() == ErrorKind::TimedOut => {
                 send_close_frame(
@@ -895,6 +906,10 @@ async fn run_websocket_connection(
                             let message = match parse_client_jsonrpc_text(&text) {
                                 Ok(message) => message,
                                 Err(err) => {
+                                    connection.observability.record_v2_protocol_violation(
+                                        "post_initialize",
+                                        protocol_violation_reason_from_invalid_payload(&err),
+                                    );
                                     send_invalid_payload_close(
                                         &mut socket,
                                         &err,
@@ -923,6 +938,10 @@ async fn run_websocket_connection(
                             let message = match parse_client_jsonrpc_binary(&bytes) {
                                 Ok(message) => message,
                                 Err(err) => {
+                                    connection.observability.record_v2_protocol_violation(
+                                        "post_initialize",
+                                        protocol_violation_reason_from_invalid_payload(&err),
+                                    );
                                     send_invalid_payload_close(
                                         &mut socket,
                                         &err,
@@ -1006,6 +1025,7 @@ async fn run_websocket_connection(
         if let Err(err) = &loop_result
             && err.kind() == ErrorKind::TimedOut
         {
+            connection.observability.record_v2_client_send_timeout();
             log_client_send_timeout(
                 connection.request_context,
                 err.to_string().as_str(),
@@ -1026,6 +1046,7 @@ async fn run_websocket_connection(
         {
             reject_pending_server_requests(
                 &downstream,
+                connection.observability,
                 connection.request_context,
                 connection_outcome,
                 connection_detail.as_deref(),
@@ -1088,6 +1109,7 @@ async fn run_websocket_connection(
 async fn recv_initialize_request(
     socket: &mut WebSocket,
     timeouts: GatewayV2Timeouts,
+    observability: &GatewayObservability,
 ) -> io::Result<JSONRPCRequest> {
     tokio::time::timeout(timeouts.initialize, async {
         loop {
@@ -1102,12 +1124,21 @@ async fn recv_initialize_request(
                     let message = match parse_client_jsonrpc_text(&text) {
                         Ok(message) => message,
                         Err(err) => {
+                            observability.record_v2_protocol_violation(
+                                "pre_initialize",
+                                protocol_violation_reason_from_invalid_payload(&err),
+                            );
                             send_invalid_payload_close(socket, &err, timeouts.client_send).await?;
                             return Err(err);
                         }
                     };
-                    if let Some(request) =
-                        handle_pre_initialize_message(socket, message, timeouts.client_send).await?
+                    if let Some(request) = handle_pre_initialize_message(
+                        socket,
+                        message,
+                        timeouts.client_send,
+                        observability,
+                    )
+                    .await?
                     {
                         return Ok(request);
                     }
@@ -1116,12 +1147,21 @@ async fn recv_initialize_request(
                     let message = match parse_client_jsonrpc_binary(&bytes) {
                         Ok(message) => message,
                         Err(err) => {
+                            observability.record_v2_protocol_violation(
+                                "pre_initialize",
+                                protocol_violation_reason_from_invalid_payload(&err),
+                            );
                             send_invalid_payload_close(socket, &err, timeouts.client_send).await?;
                             return Err(err);
                         }
                     };
-                    if let Some(request) =
-                        handle_pre_initialize_message(socket, message, timeouts.client_send).await?
+                    if let Some(request) = handle_pre_initialize_message(
+                        socket,
+                        message,
+                        timeouts.client_send,
+                        observability,
+                    )
+                    .await?
                     {
                         return Ok(request);
                     }
@@ -1172,14 +1212,25 @@ fn parse_client_jsonrpc_binary(bytes: &[u8]) -> io::Result<JSONRPCMessage> {
     parse_client_jsonrpc_text(text)
 }
 
+fn protocol_violation_reason_from_invalid_payload(err: &io::Error) -> &'static str {
+    let message = err.to_string();
+    if message.starts_with(INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON) {
+        "invalid_utf8"
+    } else {
+        "invalid_jsonrpc"
+    }
+}
+
 async fn handle_pre_initialize_message(
     socket: &mut WebSocket,
     message: JSONRPCMessage,
     client_send_timeout: Duration,
+    observability: &GatewayObservability,
 ) -> io::Result<Option<JSONRPCRequest>> {
     match message {
         JSONRPCMessage::Request(request) if request.method == "initialize" => Ok(Some(request)),
         JSONRPCMessage::Request(request) => {
+            observability.record_v2_protocol_violation("pre_initialize", "initialize_order");
             send_jsonrpc_error(
                 socket,
                 request.id,
@@ -1216,6 +1267,9 @@ async fn handle_client_message(
                 *skills_changed_pending_refresh = false;
             }
             if request.method == "initialize" {
+                connection
+                    .observability
+                    .record_v2_protocol_violation("post_initialize", "repeated_initialize");
                 send_jsonrpc_error(
                     socket,
                     request.id,
@@ -1363,6 +1417,12 @@ async fn handle_client_message(
                     pending_server_requests,
                     resolved_server_requests,
                 );
+                connection
+                    .observability
+                    .record_v2_server_request_lifecycle_event(
+                        "unexpected_client_server_request_response",
+                        "response",
+                    );
                 let err = io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -1397,6 +1457,12 @@ async fn handle_client_message(
                     pending_server_requests,
                     resolved_server_requests,
                 );
+                connection
+                    .observability
+                    .record_v2_server_request_lifecycle_event(
+                        "unexpected_client_server_request_response",
+                        "error",
+                    );
                 let err = io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
@@ -1445,6 +1511,7 @@ async fn handle_app_server_event(
             cleanup = resolve_server_requests_for_worker(
                 socket,
                 connection.client_send_timeout,
+                connection.observability,
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
                 worker_id,
@@ -1479,6 +1546,7 @@ async fn handle_app_server_event(
             cleanup = resolve_server_requests_for_worker(
                 socket,
                 connection.client_send_timeout,
+                connection.observability,
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
                 worker_id,
@@ -1528,6 +1596,9 @@ async fn handle_app_server_event(
                 &event_state.pending_server_requests,
                 &event_state.resolved_server_requests,
             );
+            connection
+                .observability
+                .record_v2_downstream_backpressure(worker_id);
             send_close_frame(
                 socket,
                 close_code::POLICY,
@@ -1544,6 +1615,7 @@ async fn handle_app_server_event(
             let Some(notification) = server_notification_to_jsonrpc(
                 notification,
                 connection.request_context,
+                connection.observability,
                 worker_id,
                 &mut event_state.resolved_server_requests,
             )?
@@ -1559,6 +1631,9 @@ async fn handle_app_server_event(
                     worker_id,
                     &notification,
                 );
+                connection
+                    .observability
+                    .record_v2_suppressed_notification(&notification.method, "pending_refresh");
                 return Ok(None);
             }
             if downstream.multi_worker_topology()
@@ -1573,6 +1648,9 @@ async fn handle_app_server_event(
                     worker_id,
                     &notification,
                 );
+                connection
+                    .observability
+                    .record_v2_suppressed_notification(&notification.method, "duplicate");
                 return Ok(None);
             }
             if notification_visible_to(
@@ -1596,6 +1674,15 @@ async fn handle_app_server_event(
                     connection.client_send_timeout,
                 )
                 .await?;
+            } else {
+                log_suppressed_hidden_thread_notification(
+                    connection.request_context,
+                    worker_id,
+                    &notification,
+                );
+                connection
+                    .observability
+                    .record_v2_suppressed_notification(&notification.method, "hidden_thread");
             }
         }
         AppServerEvent::ServerRequest(request) => {
@@ -1617,6 +1704,12 @@ async fn handle_app_server_event(
                     &request.method,
                     &event_state.pending_server_requests,
                 );
+                connection
+                    .observability
+                    .record_v2_server_request_lifecycle_event(
+                        "duplicate_pending_request",
+                        &request.method,
+                    );
                 send_close_frame(
                     socket,
                     close_code::ERROR,
@@ -1646,6 +1739,9 @@ async fn handle_app_server_event(
                         &event_state.pending_server_requests,
                         connection.max_pending_server_requests,
                     );
+                    connection
+                        .observability
+                        .record_v2_server_request_rejection(&request.method, "pending_limit");
                     worker_for_server_request(downstream, worker_id)?
                         .request_handle
                         .reject_server_request(downstream_request_id, error)
@@ -1674,6 +1770,9 @@ async fn handle_app_server_event(
                     &request.method,
                     request_thread_id(&request),
                 );
+                connection
+                    .observability
+                    .record_v2_server_request_rejection(&request.method, "hidden_thread");
                 let message = hidden_thread_error_message(&request).to_string();
                 worker_for_server_request(downstream, worker_id)?
                     .request_handle
@@ -1694,6 +1793,7 @@ async fn handle_app_server_event(
                 cleanup = resolve_server_requests_for_worker(
                     socket,
                     connection.client_send_timeout,
+                    connection.observability,
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
                     worker_id,
@@ -1728,6 +1828,7 @@ async fn handle_app_server_event(
                 cleanup = resolve_server_requests_for_worker(
                     socket,
                     connection.client_send_timeout,
+                    connection.observability,
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
                     worker_id,
@@ -1776,6 +1877,7 @@ async fn handle_app_server_event(
 async fn resolve_server_requests_for_worker(
     socket: &mut WebSocket,
     client_send_timeout: Duration,
+    observability: &GatewayObservability,
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
     worker_id: Option<usize>,
@@ -1785,6 +1887,8 @@ async fn resolve_server_requests_for_worker(
         resolved_server_requests,
         worker_id,
     );
+
+    record_worker_server_request_cleanup_metrics(observability, &cleanup);
 
     for notification in cleanup.resolved_notifications.iter().cloned() {
         send_jsonrpc(
@@ -1798,6 +1902,22 @@ async fn resolve_server_requests_for_worker(
     }
 
     Ok(cleanup)
+}
+
+fn record_worker_server_request_cleanup_metrics(
+    observability: &GatewayObservability,
+    cleanup: &WorkerServerRequestCleanup,
+) {
+    observability.record_v2_server_request_lifecycle_events(
+        "worker_cleanup_resolved_thread_scoped",
+        "serverRequest/resolved",
+        cleanup.resolved_thread_scoped_requests as i64,
+    );
+    observability.record_v2_server_request_lifecycle_events(
+        "worker_cleanup_stranded_connection_scoped",
+        "connectionScopedServerRequest",
+        cleanup.stranded_connection_scoped_requests as i64,
+    );
 }
 
 fn collect_server_request_cleanup_for_worker(
@@ -2102,8 +2222,28 @@ fn log_suppressed_duplicate_connection_notification(
     );
 }
 
+fn log_suppressed_hidden_thread_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        method = notification.method,
+        thread_id = notification
+            .params
+            .as_ref()
+            .and_then(notification_thread_id),
+        params = ?notification.params,
+        "suppressing downstream notification for a thread outside the gateway request scope"
+    );
+}
+
 async fn reject_pending_server_requests(
     downstream: &GatewayV2DownstreamRouter,
+    observability: &GatewayObservability,
     request_context: &GatewayRequestContext,
     connection_outcome: &str,
     connection_detail: Option<&str>,
@@ -2114,6 +2254,11 @@ async fn reject_pending_server_requests(
         request_context,
         connection_outcome,
         connection_detail,
+        pending_server_requests,
+        resolved_server_requests,
+    );
+    record_client_server_request_cleanup_metrics(
+        observability,
         pending_server_requests,
         resolved_server_requests,
     );
@@ -2132,6 +2277,36 @@ async fn reject_pending_server_requests(
             .await?;
     }
     Ok(())
+}
+
+fn record_client_server_request_cleanup_metrics(
+    observability: &GatewayObservability,
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+) {
+    let rejected_thread_scoped_requests = pending_server_requests
+        .values()
+        .filter(|route| route.thread_id.is_some())
+        .count();
+    let rejected_connection_scoped_requests = pending_server_requests
+        .values()
+        .filter(|route| route.thread_id.is_none())
+        .count();
+    observability.record_v2_server_request_lifecycle_events(
+        "client_cleanup_rejected_thread_scoped",
+        "serverRequest/pending",
+        rejected_thread_scoped_requests as i64,
+    );
+    observability.record_v2_server_request_lifecycle_events(
+        "client_cleanup_rejected_connection_scoped",
+        "serverRequest/pending",
+        rejected_connection_scoped_requests as i64,
+    );
+    observability.record_v2_server_request_lifecycle_events(
+        "client_cleanup_answered_but_unresolved",
+        "serverRequest/resolved",
+        resolved_server_requests.len() as i64,
+    );
 }
 
 fn log_rejected_pending_server_requests(
@@ -2235,7 +2410,9 @@ async fn handle_client_request(
     let request_method = request.method.clone();
     let result = async {
         if downstream.reconnect_state.is_some() {
-            downstream.reconnect_missing_workers().await;
+            downstream
+                .reconnect_missing_workers(connection.observability)
+                .await;
         }
 
         if downstream.multi_worker_topology()
@@ -2253,6 +2430,7 @@ async fn handle_client_request(
                 downstream,
                 connection.scope_registry,
                 connection.request_context,
+                connection.observability,
                 thread_id,
             )
             .await?;
@@ -2290,6 +2468,7 @@ async fn handle_client_request(
                         downstream,
                         connection.scope_registry,
                         connection.request_context,
+                        connection.observability,
                         &request,
                     )
                     .await
@@ -2429,6 +2608,7 @@ async fn recover_visible_thread_worker_route(
     downstream: &GatewayV2DownstreamRouter,
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     thread_id: &str,
 ) -> io::Result<()> {
     let attempted_worker_ids = downstream
@@ -2456,12 +2636,14 @@ async fn recover_visible_thread_worker_route(
                 worker.worker_id,
             );
             log_recovered_visible_thread_worker_route(context, thread_id, worker.worker_id);
+            observability.record_v2_thread_route_recovery("success");
             break;
         }
     }
 
     if scope_registry.thread_worker_id(thread_id).is_none() {
         log_failed_visible_thread_worker_route_recovery(context, thread_id, &attempted_worker_ids);
+        observability.record_v2_thread_route_recovery("miss");
     }
 
     Ok(())
@@ -2873,6 +3055,11 @@ fn log_fail_closed_multi_worker_request(
         .filter(|worker| worker.reconnect_backoff_active)
         .map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    if is_fail_closed_multi_worker_route_error(err) {
+        connection
+            .observability
+            .record_v2_fail_closed_request(method, !reconnect_backoff_worker_ids.is_empty());
+    }
 
     warn!(
         method,
@@ -2987,6 +3174,7 @@ async fn aggregate_thread_list_response(
     downstream: &GatewayV2DownstreamRouter,
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
     let params = request_params::<ThreadListParams>(request)?;
@@ -3065,6 +3253,7 @@ async fn aggregate_thread_list_response(
                             discarded_created_at,
                         },
                     );
+                    observability.record_v2_thread_list_deduplication(selected_worker_id);
                     if replace_existing {
                         entry.insert((thread, worker.worker_id));
                     }
@@ -4160,8 +4349,22 @@ fn observe_v2_connection(
         pending_server_request_count,
         answered_but_unresolved_server_request_count,
     );
-    observability.emit_v2_connection_audit_log(outcome, duration, context);
-    observability.emit_v2_connection_log(outcome, duration, context, detail);
+    observability.emit_v2_connection_audit_log(
+        outcome,
+        duration,
+        context,
+        detail,
+        pending_server_request_count,
+        answered_but_unresolved_server_request_count,
+    );
+    observability.emit_v2_connection_log(
+        outcome,
+        duration,
+        context,
+        detail,
+        pending_server_request_count,
+        answered_but_unresolved_server_request_count,
+    );
 }
 
 fn classify_v2_connection_error(err: &io::Error) -> &'static str {
@@ -4189,6 +4392,7 @@ fn jsonrpc_notification_to_client_notification(
 fn server_notification_to_jsonrpc(
     notification: ServerNotification,
     request_context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     worker_id: Option<usize>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) -> io::Result<Option<JSONRPCNotification>> {
@@ -4211,6 +4415,10 @@ fn server_notification_to_jsonrpc(
                 worker_id,
                 &downstream_request_id,
                 resolved_server_requests,
+            );
+            observability.record_v2_server_request_lifecycle_event(
+                "duplicate_resolved_replay",
+                "serverRequest/resolved",
             );
             return Ok(None);
         }
@@ -4611,10 +4819,11 @@ mod tests {
     async fn initialize_must_be_the_first_request_for_binary_frames_too() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -4660,6 +4869,7 @@ mod tests {
         assert_eq!(error.id, RequestId::String("model-list".to_string()));
         assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
         assert_eq!(error.error.message, "initialize must be the first request");
+        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "initialize_order");
 
         send_initialize_with_capabilities(
             &mut websocket,
@@ -4678,10 +4888,20 @@ mod tests {
     async fn initialize_must_be_the_first_request_for_text_frames_too() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -4727,6 +4947,7 @@ mod tests {
         assert_eq!(error.id, RequestId::String("model-list".to_string()));
         assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
         assert_eq!(error.error.message, "initialize must be the first request");
+        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "initialize_order");
 
         send_initialize_with_capabilities(
             &mut websocket,
@@ -4980,10 +5201,20 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_closes_when_pre_initialize_text_is_not_jsonrpc() {
         let initialize_response = test_initialize_response().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5021,6 +5252,7 @@ mod tests {
                 .reason
                 .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
         );
+        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "invalid_jsonrpc");
 
         server_task.abort();
         let _ = server_task.await;
@@ -5030,10 +5262,11 @@ mod tests {
     async fn websocket_upgrade_closes_when_post_initialize_text_is_not_jsonrpc() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5073,6 +5306,7 @@ mod tests {
                 .reason
                 .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
         );
+        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "invalid_jsonrpc");
 
         server_task.abort();
         let _ = server_task.await;
@@ -5081,10 +5315,11 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_closes_when_pre_initialize_binary_is_not_utf8() {
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5123,6 +5358,7 @@ mod tests {
                 .reason
                 .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
         );
+        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "invalid_utf8");
 
         server_task.abort();
         let _ = server_task.await;
@@ -5132,10 +5368,20 @@ mod tests {
     async fn websocket_upgrade_closes_when_post_initialize_binary_is_not_utf8() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5175,6 +5421,7 @@ mod tests {
                 .reason
                 .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
         );
+        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "invalid_utf8");
 
         server_task.abort();
         let _ = server_task.await;
@@ -5667,10 +5914,20 @@ mod tests {
     async fn websocket_upgrade_rejects_repeated_initialize_after_handshake() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5724,6 +5981,7 @@ mod tests {
         assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
         assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
         assert_eq!(error.error.message, "connection is already initialized");
+        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "repeated_initialize");
 
         server_task.abort();
         let _ = server_task.await;
@@ -5733,10 +5991,11 @@ mod tests {
     async fn websocket_upgrade_rejects_repeated_initialize_binary_after_handshake() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5790,6 +6049,7 @@ mod tests {
         assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
         assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
         assert_eq!(error.error.message, "connection is already initialized");
+        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "repeated_initialize");
 
         server_task.abort();
         let _ = server_task.await;
@@ -5842,10 +6102,22 @@ mod tests {
             tenant_id: "tenant-visible".to_string(),
             project_id: Some("project-visible".to_string()),
         };
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
 
         let translated = super::server_notification_to_jsonrpc(
             notification.clone(),
             &request_context,
+            &observability,
             worker_id,
             &mut resolved_server_requests,
         )
@@ -5865,11 +6137,17 @@ mod tests {
         let duplicate = super::server_notification_to_jsonrpc(
             notification,
             &request_context,
+            &observability,
             worker_id,
             &mut resolved_server_requests,
         )
         .expect("duplicate resolved notification should succeed");
         assert_eq!(duplicate, None);
+        assert_v2_server_request_lifecycle_metric(
+            &metrics,
+            "duplicate_resolved_replay",
+            "serverRequest/resolved",
+        );
     }
 
     #[test]
@@ -5992,6 +6270,116 @@ mod tests {
                 request_id: RequestId::String("downstream-other-worker-resolved".to_string()),
             }),
             true
+        );
+    }
+
+    #[test]
+    fn record_worker_server_request_cleanup_metrics_records_cleanup_counts() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let cleanup = super::WorkerServerRequestCleanup {
+            resolved_thread_scoped_requests: 2,
+            stranded_connection_scoped_requests: 1,
+            ..Default::default()
+        };
+
+        super::record_worker_server_request_cleanup_metrics(&observability, &cleanup);
+
+        assert_v2_server_request_lifecycle_metrics(
+            &metrics,
+            &[
+                (
+                    "worker_cleanup_resolved_thread_scoped",
+                    "serverRequest/resolved",
+                    2,
+                ),
+                (
+                    "worker_cleanup_stranded_connection_scoped",
+                    "connectionScopedServerRequest",
+                    1,
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn record_client_server_request_cleanup_metrics_records_cleanup_counts() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+
+        super::record_client_server_request_cleanup_metrics(
+            &observability,
+            &HashMap::from([
+                (
+                    RequestId::String("gateway-thread-pending".to_string()),
+                    super::PendingServerRequestRoute {
+                        worker_id: Some(0),
+                        downstream_request_id: RequestId::String(
+                            "downstream-thread-pending".to_string(),
+                        ),
+                        thread_id: Some("thread-owned".to_string()),
+                    },
+                ),
+                (
+                    RequestId::String("gateway-connection-pending".to_string()),
+                    super::PendingServerRequestRoute {
+                        worker_id: Some(1),
+                        downstream_request_id: RequestId::String(
+                            "downstream-connection-pending".to_string(),
+                        ),
+                        thread_id: None,
+                    },
+                ),
+            ]),
+            &HashMap::from([(
+                super::DownstreamServerRequestKey {
+                    worker_id: Some(0),
+                    request_id: RequestId::String("downstream-resolved".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String("gateway-resolved".to_string()),
+                    thread_id: Some("thread-owned".to_string()),
+                },
+            )]),
+        );
+
+        assert_v2_server_request_lifecycle_metrics(
+            &metrics,
+            &[
+                (
+                    "client_cleanup_rejected_thread_scoped",
+                    "serverRequest/pending",
+                    1,
+                ),
+                (
+                    "client_cleanup_rejected_connection_scoped",
+                    "serverRequest/pending",
+                    1,
+                ),
+                (
+                    "client_cleanup_answered_but_unresolved",
+                    "serverRequest/resolved",
+                    1,
+                ),
+            ],
         );
     }
 
@@ -6130,6 +6518,8 @@ mod tests {
 
         let mut saw_count = false;
         let mut saw_duration = false;
+        let mut saw_pending_server_requests = false;
+        let mut saw_answered_but_unresolved_server_requests = false;
         for metric in metrics {
             match metric.name() {
                 "gateway_v2_connections" => {
@@ -6192,12 +6582,78 @@ mod tests {
                         _ => panic!("unexpected v2 connection duration type"),
                     }
                 }
+                "gateway_v2_connection_pending_server_requests" => {
+                    saw_pending_server_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 2.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection pending aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection pending type"),
+                    }
+                }
+                "gateway_v2_connection_answered_but_unresolved_server_requests" => {
+                    saw_answered_but_unresolved_server_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 1.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected v2 connection answered-but-unresolved aggregation"
+                            ),
+                        },
+                        _ => panic!("unexpected v2 connection answered-but-unresolved type"),
+                    }
+                }
                 _ => {}
             }
         }
 
-        assert_eq!(saw_count, true);
-        assert_eq!(saw_duration, true);
+        assert!(saw_count);
+        assert!(saw_duration);
+        assert!(saw_pending_server_requests);
+        assert!(saw_answered_but_unresolved_server_requests);
     }
 
     #[test]
@@ -6226,10 +6682,414 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("13"));
+        assert!(logs.contains("pending_server_request_count=1"));
+        assert!(logs.contains("answered_but_unresolved_server_request_count=2"));
+    }
+
+    fn assert_v2_server_request_rejection_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        reason: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_server_request_rejection_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_server_request_rejections" {
+                saw_server_request_rejection_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    ("reason".to_string(), reason.to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected server-request rejection count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request rejection count type"),
+                }
+            }
+        }
+        assert!(saw_server_request_rejection_count);
+    }
+
+    fn in_memory_metrics() -> codex_otel::MetricsClient {
+        codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics")
+    }
+
+    fn assert_v2_fail_closed_request_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        reconnect_backoff_active: bool,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let reconnect_backoff_active = reconnect_backoff_active.to_string();
+        let mut saw_fail_closed_request_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_fail_closed_requests" {
+                saw_fail_closed_request_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    (
+                                        "reconnect_backoff_active".to_string(),
+                                        reconnect_backoff_active.clone(),
+                                    ),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected fail-closed request count aggregation"),
+                    },
+                    _ => panic!("unexpected fail-closed request count type"),
+                }
+            }
+        }
+        assert!(saw_fail_closed_request_count);
+    }
+
+    fn assert_v2_suppressed_notification_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        reason: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_suppressed_notification_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_suppressed_notifications" {
+                saw_suppressed_notification_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    ("reason".to_string(), reason.to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected suppressed notification count aggregation"),
+                    },
+                    _ => panic!("unexpected suppressed notification count type"),
+                }
+            }
+        }
+        assert!(saw_suppressed_notification_count);
+    }
+
+    fn assert_v2_server_request_lifecycle_metric(
+        metrics: &codex_otel::MetricsClient,
+        event: &str,
+        method: &str,
+    ) {
+        assert_v2_server_request_lifecycle_metrics(metrics, &[(event, method, 1)]);
+    }
+
+    fn assert_v2_server_request_lifecycle_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected: &[(&str, &str, u64)],
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut expected_points = expected
+            .iter()
+            .map(|(event, method, value)| {
+                (
+                    BTreeMap::from([
+                        ("event".to_string(), (*event).to_string()),
+                        ("method".to_string(), (*method).to_string()),
+                    ]),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_points.sort();
+
+        let mut actual_points = Vec::new();
+        for metric in metrics {
+            if metric.name() == "gateway_v2_server_request_lifecycle_events" {
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            actual_points.extend(sum.data_points().map(|point| {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (attributes, point.value())
+                            }));
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                }
+            }
+        }
+        actual_points.sort();
+        assert_eq!(actual_points, expected_points);
+    }
+
+    fn assert_v2_protocol_violation_metric(
+        metrics: &codex_otel::MetricsClient,
+        phase: &str,
+        reason: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_protocol_violation_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_protocol_violations" {
+                saw_protocol_violation_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("phase".to_string(), phase.to_string()),
+                                    ("reason".to_string(), reason.to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected protocol violation count aggregation"),
+                    },
+                    _ => panic!("unexpected protocol violation count type"),
+                }
+            }
+        }
+        assert!(saw_protocol_violation_count);
+    }
+
+    fn assert_v2_downstream_backpressure_metric(
+        metrics: &codex_otel::MetricsClient,
+        worker_id: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_backpressure_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_downstream_backpressure_events" {
+                saw_backpressure_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([("worker_id".to_string(), worker_id.to_string()),])
+                            );
+                        }
+                        _ => panic!("unexpected downstream backpressure count aggregation"),
+                    },
+                    _ => panic!("unexpected downstream backpressure count type"),
+                }
+            }
+        }
+        assert!(saw_backpressure_count);
+    }
+
+    fn assert_v2_client_send_timeout_metric(metrics: &codex_otel::MetricsClient) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_client_send_timeout_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_client_send_timeouts" {
+                saw_client_send_timeout_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                        }
+                        _ => panic!("unexpected client send timeout count aggregation"),
+                    },
+                    _ => panic!("unexpected client send timeout count type"),
+                }
+            }
+        }
+        assert!(saw_client_send_timeout_count);
+    }
+
+    fn assert_v2_worker_reconnect_metric(
+        metrics: &codex_otel::MetricsClient,
+        worker_id: usize,
+        outcome: &str,
+    ) {
+        assert_v2_worker_reconnect_metrics(metrics, &[(worker_id, outcome)]);
+    }
+
+    fn assert_v2_worker_reconnect_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected: &[(usize, &str)],
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut expected_attributes = expected
+            .iter()
+            .map(|(worker_id, outcome)| {
+                (
+                    BTreeMap::from([
+                        ("worker_id".to_string(), worker_id.to_string()),
+                        ("outcome".to_string(), (*outcome).to_string()),
+                    ]),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        for metric in metrics {
+            if metric.name() == "gateway_v2_worker_reconnects" {
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                if let Some((_, seen)) = expected_attributes
+                                    .iter_mut()
+                                    .find(|(expected, _)| *expected == attributes)
+                                {
+                                    *seen = true;
+                                    assert_eq!(point.value(), 1);
+                                }
+                            }
+                        }
+                        _ => panic!("unexpected worker reconnect count aggregation"),
+                    },
+                    _ => panic!("unexpected worker reconnect count type"),
+                }
+            }
+        }
+        let missing = expected_attributes
+            .into_iter()
+            .filter_map(|(attributes, seen)| (!seen).then_some(attributes))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "missing gateway_v2_worker_reconnects metric points: {missing:?}"
+        );
     }
 
     #[tokio::test]
     async fn websocket_upgrade_rejects_server_requests_above_pending_limit_without_closing() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (rejection_observed_tx, rejection_observed_rx) = oneshot::channel();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -6369,7 +7229,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -6472,6 +7332,12 @@ mod tests {
                 "data": [],
                 "nextCursor": null,
             })
+        );
+
+        assert_v2_server_request_rejection_metric(
+            &metrics,
+            "item/commandExecution/requestApproval",
+            "pending_limit",
         );
 
         server_task.abort();
@@ -7359,18 +8225,30 @@ mod tests {
     #[tokio::test]
     async fn handle_app_server_event_closes_with_policy_reason_when_downstream_lags() {
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
+        let metrics_for_server = metrics.clone();
         let app = Router::new().route(
             "/",
             any(move |websocket: WebSocketUpgrade| {
                 let websocket_url = websocket_url.clone();
+                let metrics = metrics_for_server.clone();
                 async move {
                     websocket.on_upgrade(move |mut socket| async move {
                         let admission = GatewayAdmissionController::default();
-                        let observability = GatewayObservability::default();
+                        let observability = GatewayObservability::new(Some(metrics), false);
                         let scope_registry = Arc::new(GatewayScopeRegistry::default());
                         let request_context = GatewayRequestContext {
                             tenant_id: "tenant-a".to_string(),
@@ -7459,6 +8337,7 @@ mod tests {
 
         server_task.abort();
         let _ = server_task.await;
+        assert_v2_downstream_backpressure_metric(&metrics, "none");
     }
 
     #[tokio::test]
@@ -8443,7 +9322,9 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_logs_and_rejects_pending_server_requests_when_client_send_times_out()
     {
-        let logs = capture_logs_async(async {
+        let metrics = in_memory_metrics();
+        let observed_metrics = metrics.clone();
+        let logs = capture_logs_async(async move {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
@@ -8543,7 +9424,7 @@ mod tests {
             let (addr, server_task) = spawn_test_server(GatewayV2State {
                 auth: GatewayAuth::Disabled,
                 admission: GatewayAdmissionController::default(),
-                observability: GatewayObservability::default(),
+                observability: GatewayObservability::new(Some(metrics), false),
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
@@ -8620,6 +9501,7 @@ mod tests {
         ));
         assert!(logs.contains("connection_outcome"));
         assert!(logs.contains("client_send_timed_out"));
+        assert_v2_client_send_timeout_metric(&observed_metrics);
     }
 
     #[tokio::test]
@@ -8823,10 +9705,20 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_closes_when_client_responds_to_unknown_server_request() {
         let initialize_response = test_initialize_response().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -8878,6 +9770,11 @@ mod tests {
         assert_eq!(
             close_frame.reason,
             "unexpected gateway websocket server-request response: String(\"unknown-server-request\")"
+        );
+        assert_v2_server_request_lifecycle_metric(
+            &metrics,
+            "unexpected_client_server_request_response",
+            "response",
         );
 
         server_task.abort();
@@ -12168,6 +13065,7 @@ mod tests {
             &router,
             &scope_registry,
             &GatewayRequestContext::default(),
+            &GatewayObservability::default(),
             &JSONRPCRequest {
                 id: RequestId::String("thread-list".to_string()),
                 method: "thread/list".to_string(),
@@ -12328,6 +13226,7 @@ mod tests {
                 &router,
                 &scope_registry,
                 &context,
+                &GatewayObservability::default(),
                 &JSONRPCRequest {
                     id: RequestId::String("thread-list".to_string()),
                     method: "thread/list".to_string(),
@@ -13278,6 +14177,7 @@ mod tests {
             &router,
             &scope_registry,
             &context,
+            &GatewayObservability::default(),
             &JSONRPCRequest {
                 id: RequestId::String("thread-list".to_string()),
                 method: "thread/list".to_string(),
@@ -13676,6 +14576,7 @@ mod tests {
                 &router,
                 &scope_registry,
                 &context,
+                &GatewayObservability::default(),
                 "thread-missing",
             )
             .await
@@ -13759,8 +14660,18 @@ mod tests {
             GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
                 .await
                 .expect("downstream router should connect");
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let admission = GatewayAdmissionController::default();
-        let observability = GatewayObservability::default();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
         let connection = GatewayV2ConnectionContext {
             admission: &admission,
             observability: &observability,
@@ -13881,8 +14792,18 @@ mod tests {
             GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
                 .await
                 .expect("downstream router should connect");
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let admission = GatewayAdmissionController::default();
-        let observability = GatewayObservability::default();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
         let connection = GatewayV2ConnectionContext {
             admission: &admission,
             observability: &observability,
@@ -17943,10 +18864,20 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -17989,6 +18920,7 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "account/updated", "duplicate");
 
         server_task.abort();
         let _ = server_task.await;
@@ -18476,10 +19408,20 @@ mod tests {
         let worker_b =
             start_mock_remote_server_for_skills_changed_and_list("/tmp/worker-b", vec!["skill-b"])
                 .await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -18522,6 +19464,7 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "skills/changed", "pending_refresh");
 
         websocket
             .send(Message::Text(
@@ -22405,9 +23348,12 @@ mod tests {
         );
         assert_eq!(router.worker_count(), 1);
 
-        timeout(Duration::from_secs(2), router.reconnect_missing_workers())
-            .await
-            .expect("worker reconnect should finish in time");
+        timeout(
+            Duration::from_secs(2),
+            router.reconnect_missing_workers(&GatewayObservability::default()),
+        )
+        .await
+        .expect("worker reconnect should finish in time");
         assert_eq!(router.worker_count(), 2);
 
         timeout(Duration::from_secs(2), router.shutdown())
@@ -22483,57 +23429,65 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_missing_workers_logs_attempt_and_success_context() {
-        let worker_a =
-            start_mock_remote_server_for_reconnectable_initialized_and_fs_watch_replay().await;
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
         let worker_b = start_mock_remote_server_for_initialize().await;
-        let context = GatewayRequestContext::default();
-        let session_factory = GatewayV2SessionFactory::remote_multi(
-            vec![
-                RemoteAppServerConnectArgs {
-                    websocket_url: worker_a.clone(),
-                    auth_token: None,
-                    client_name: "codex-gateway".to_string(),
-                    client_version: "0.0.0-test".to_string(),
-                    experimental_api: false,
-                    opt_out_notification_methods: Vec::new(),
-                    channel_capacity: 4,
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec!["ws://worker-a.invalid".to_string(), worker_b.clone()],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b.clone(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
                 },
-                RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
-                    client_name: "codex-gateway".to_string(),
-                    client_version: "0.0.0-test".to_string(),
-                    experimental_api: false,
-                    opt_out_notification_methods: Vec::new(),
-                    channel_capacity: 4,
-                },
-            ],
-            test_initialize_response().await,
-        );
-        let initialize_params = InitializeParams {
-            client_info: ClientInfo {
-                name: "codex-tui".to_string(),
-                title: None,
-                version: "0.0.0-test".to_string(),
-            },
-            capabilities: None,
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
         };
-        let mut router =
-            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
-                .await
-                .expect("downstream router should connect");
-
-        router.mark_initialized();
-        router.record_fs_watch(FsWatchParams {
-            watch_id: "watch-shared".to_string(),
-            path: PathBuf::from("/tmp/shared/project/.git/HEAD")
-                .try_into()
-                .expect("fs watch path should be absolute"),
-        });
-        assert!(router.remove_worker(Some(0)));
 
         let logs = capture_logs_async(async move {
-            router.reconnect_missing_workers_at(Instant::now()).await;
+            router
+                .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default())
+                .await;
             timeout(Duration::from_secs(2), router.shutdown())
                 .await
                 .expect("router shutdown should finish in time")
@@ -22549,17 +23503,19 @@ mod tests {
             logs.contains("reconnected missing downstream worker session"),
             "{logs}"
         );
-        assert!(logs.contains("worker_id=0"), "{logs}");
+        assert!(logs.contains("worker_id=1"), "{logs}");
         assert!(
-            logs.contains(format!("websocket_url=\"{worker_a}\"").as_str()),
+            logs.contains(format!("websocket_url=\"{worker_b}\"").as_str()),
             "{logs}"
         );
         assert!(
-            logs.contains("initialized_notification_sent=true"),
+            logs.contains("initialized_notification_sent=false"),
             "{logs}"
         );
-        assert!(logs.contains("active_fs_watch_count=1"), "{logs}");
+        assert!(logs.contains("active_fs_watch_count=0"), "{logs}");
         assert!(logs.contains("retry_backoff_seconds=1"), "{logs}");
+
+        client.shutdown().await.expect("client should shut down");
     }
 
     #[tokio::test]
@@ -22628,7 +23584,9 @@ mod tests {
         };
 
         let logs = capture_logs_async(async move {
-            router.reconnect_missing_workers_at(Instant::now()).await;
+            router
+                .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default())
+                .await;
             timeout(Duration::from_secs(2), router.shutdown())
                 .await
                 .expect("router shutdown should finish in time")
@@ -22715,7 +23673,9 @@ mod tests {
         };
 
         let logs = capture_logs_async(async move {
-            router.reconnect_missing_workers_at(Instant::now()).await;
+            router
+                .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default())
+                .await;
             timeout(Duration::from_secs(2), router.shutdown())
                 .await
                 .expect("router shutdown should finish in time")
@@ -22733,6 +23693,266 @@ mod tests {
         assert!(logs.contains("active_fs_watch_count=1"));
         assert!(logs.contains("retry_backoff_seconds=5"));
 
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_records_attempt_and_success_metrics() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec!["ws://worker-a.invalid".to_string(), worker_b.clone()],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(3),
+            }),
+        };
+
+        router
+            .reconnect_missing_workers_at(Instant::now(), &observability)
+            .await;
+
+        assert_eq!(router.worker_count(), 2);
+        assert_v2_worker_reconnect_metrics(&metrics, &[(1, "attempt"), (1, "success")]);
+
+        timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("router shutdown should finish in time")
+            .expect("router should shut down");
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_records_attempt_and_connect_failure_metrics() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://127.0.0.1:1".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://127.0.0.1:1".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(3),
+            }),
+        };
+
+        router
+            .reconnect_missing_workers_at(Instant::now(), &observability)
+            .await;
+
+        assert_eq!(router.worker_count(), 1);
+        assert_v2_worker_reconnect_metrics(&metrics, &[(1, "attempt"), (1, "connect_failure")]);
+
+        timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("router shutdown should finish in time")
+            .expect("router should shut down");
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_records_attempt_and_replay_failure_metrics() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let replay_failure_worker =
+            start_mock_remote_server_that_disconnects_after_initialize().await;
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: true,
+            active_fs_watches: HashMap::from([(
+                "watch-shared".to_string(),
+                FsWatchParams {
+                    watch_id: "watch-shared".to_string(),
+                    path: PathBuf::from("/tmp/shared/project/.git/HEAD")
+                        .try_into()
+                        .expect("fs watch path should be absolute"),
+                },
+            )]),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    replay_failure_worker.clone(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: replay_failure_worker,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(3),
+            }),
+        };
+
+        router
+            .reconnect_missing_workers_at(Instant::now(), &observability)
+            .await;
+
+        assert_eq!(router.worker_count(), 1);
+        assert_v2_worker_reconnect_metrics(&metrics, &[(1, "attempt"), (1, "replay_failure")]);
+
+        timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("router shutdown should finish in time")
+            .expect("router should shut down");
         client.shutdown().await.expect("client should shut down");
     }
 
@@ -22765,6 +23985,91 @@ mod tests {
 
         router.clear_worker_reconnect_failure(0);
         assert!(router.should_attempt_worker_reconnect(0, now + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_records_backoff_suppressed_metric() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let now = Instant::now();
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-b.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(3),
+            }),
+        };
+        router.record_worker_reconnect_failure(1, now, Duration::from_secs(3));
+
+        router
+            .reconnect_missing_workers_at(now, &observability)
+            .await;
+
+        assert_v2_worker_reconnect_metric(&metrics, 1, "backoff_suppressed");
+
+        timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("router shutdown should finish in time")
+            .expect("router should shut down");
+        client.shutdown().await.expect("client should shut down");
     }
 
     #[tokio::test]
@@ -23017,18 +24322,30 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_closes_when_downstream_reuses_pending_server_request_id() {
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
+        let test_metrics = metrics.clone();
         let app = Router::new().route(
             "/",
             any(move |websocket: WebSocketUpgrade| {
                 let websocket_url = websocket_url.clone();
+                let metrics = test_metrics.clone();
                 async move {
                     websocket.on_upgrade(move |mut socket| async move {
                         let admission = GatewayAdmissionController::default();
-                        let observability = GatewayObservability::default();
+                        let observability = GatewayObservability::new(Some(metrics), false);
                         let scope_registry = Arc::new(GatewayScopeRegistry::default());
                         let request_context = GatewayRequestContext::default();
                         let connection = GatewayV2ConnectionContext {
@@ -23141,6 +24458,11 @@ mod tests {
 
         server_task.abort();
         let _ = server_task.await;
+        assert_v2_server_request_lifecycle_metric(
+            &metrics,
+            "duplicate_pending_request",
+            "item/tool/requestUserInput",
+        );
     }
 
     #[tokio::test]
@@ -25282,6 +26604,16 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_rejects_hidden_downstream_server_requests() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_hidden_server_request(
             JSONRPCRequest {
@@ -25310,7 +26642,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -25347,6 +26679,12 @@ mod tests {
 
         let hidden_request = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(hidden_request.is_err(), true);
+
+        assert_v2_server_request_rejection_metric(
+            &metrics,
+            "item/commandExecution/requestApproval",
+            "hidden_thread",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -25491,6 +26829,73 @@ mod tests {
                 "itemId": "item-visible",
                 "delta": "streamed text",
             }))
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_suppresses_hidden_thread_notifications() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_for_notification(ServerNotification::AgentMessageDelta(
+                codex_app_server_protocol::AgentMessageDeltaNotification {
+                    thread_id: "thread-hidden".to_string(),
+                    turn_id: "turn-hidden".to_string(),
+                    item_id: "item-hidden".to_string(),
+                    delta: "hidden text".to_string(),
+                },
+            ))
+            .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext::default(),
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let hidden_notification = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert!(hidden_notification.is_err());
+        assert_v2_suppressed_notification_metric(
+            &metrics,
+            "item/agentMessage/delta",
+            "hidden_thread",
         );
 
         server_task.abort();
@@ -26973,8 +28378,18 @@ mod tests {
         };
         router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(30));
 
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
         let admission = GatewayAdmissionController::default();
-        let observability = GatewayObservability::default();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
         let scope_registry = GatewayScopeRegistry::default();
         let request_context = GatewayRequestContext {
             tenant_id: "tenant-a".to_string(),
@@ -26994,9 +28409,10 @@ mod tests {
                 &router,
                 &connection,
                 "config/read",
-                &std::io::Error::other(
-                    "required worker routes are unavailable for config/read: [1]",
-                ),
+                &std::io::Error::other(super::FailClosedMultiWorkerRouteError {
+                    message: "required worker routes are unavailable for config/read: [1]"
+                        .to_string(),
+                }),
             );
         });
 
@@ -27010,6 +28426,7 @@ mod tests {
         assert!(logs.contains("unavailable_worker_ids=[1]"));
         assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
+        assert_v2_fail_closed_request_metric(&metrics, "config/read", true);
 
         client.shutdown().await.expect("client should shut down");
     }
@@ -27631,6 +29048,38 @@ mod tests {
         assert!(logs.contains("method=\"account/updated\""));
         assert!(logs.contains("requiresOpenaiAuth"));
         assert!(logs.contains("true"));
+    }
+
+    #[test]
+    fn log_suppressed_hidden_thread_notification_includes_scope_worker_thread_and_params() {
+        let logs = capture_logs(|| {
+            super::log_suppressed_hidden_thread_notification(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(3),
+                &JSONRPCNotification {
+                    method: "item/agentMessage/delta".to_string(),
+                    params: Some(serde_json::json!({
+                        "threadId": "thread-hidden",
+                        "turnId": "turn-hidden",
+                        "itemId": "item-hidden",
+                        "delta": "hidden text",
+                    })),
+                },
+            );
+        });
+
+        assert!(logs.contains(
+            "suppressing downstream notification for a thread outside the gateway request scope"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(3)"));
+        assert!(logs.contains("method=\"item/agentMessage/delta\""));
+        assert!(logs.contains("thread-hidden"));
+        assert!(logs.contains("hidden text"));
     }
 
     #[test]

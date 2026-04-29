@@ -26,6 +26,17 @@ const V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_pending_server_requests";
 const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_answered_but_unresolved_server_requests";
+const V2_SERVER_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_server_request_rejections";
+const V2_WORKER_RECONNECT_COUNT_METRIC: &str = "gateway_v2_worker_reconnects";
+const V2_FAIL_CLOSED_REQUEST_COUNT_METRIC: &str = "gateway_v2_fail_closed_requests";
+const V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC: &str = "gateway_v2_suppressed_notifications";
+const V2_SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC: &str =
+    "gateway_v2_server_request_lifecycle_events";
+const V2_PROTOCOL_VIOLATION_COUNT_METRIC: &str = "gateway_v2_protocol_violations";
+const V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC: &str = "gateway_v2_downstream_backpressure_events";
+const V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC: &str = "gateway_v2_client_send_timeouts";
+const V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC: &str = "gateway_v2_thread_list_deduplications";
+const V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC: &str = "gateway_v2_thread_route_recoveries";
 
 type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
@@ -125,6 +136,135 @@ impl GatewayObservability {
         }
     }
 
+    pub(crate) fn record_v2_server_request_rejection(&self, method: &str, reason: &str) {
+        let tags = [("method", method), ("reason", reason)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_SERVER_REQUEST_REJECTION_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 server-request rejection metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_worker_reconnect(&self, worker_id: usize, outcome: &str) {
+        let worker_id = worker_id.to_string();
+        let tags = [("worker_id", worker_id.as_str()), ("outcome", outcome)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_WORKER_RECONNECT_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 worker reconnect metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_fail_closed_request(
+        &self,
+        method: &str,
+        reconnect_backoff_active: bool,
+    ) {
+        let reconnect_backoff_active = if reconnect_backoff_active {
+            "true"
+        } else {
+            "false"
+        };
+        let tags = [
+            ("method", method),
+            ("reconnect_backoff_active", reconnect_backoff_active),
+        ];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_FAIL_CLOSED_REQUEST_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 fail-closed request metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_suppressed_notification(&self, method: &str, reason: &str) {
+        let tags = [("method", method), ("reason", reason)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 suppressed notification metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_server_request_lifecycle_event(&self, event: &str, method: &str) {
+        self.record_v2_server_request_lifecycle_events(event, method, 1);
+    }
+
+    pub(crate) fn record_v2_server_request_lifecycle_events(
+        &self,
+        event: &str,
+        method: &str,
+        count: i64,
+    ) {
+        if count <= 0 {
+            return;
+        }
+
+        let tags = [("event", event), ("method", method)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) =
+                metrics.counter(V2_SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC, count, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 server-request lifecycle metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_protocol_violation(&self, phase: &str, reason: &str) {
+        let tags = [("phase", phase), ("reason", reason)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_PROTOCOL_VIOLATION_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 protocol violation metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_downstream_backpressure(&self, worker_id: Option<usize>) {
+        let worker_id =
+            worker_id.map_or_else(|| "none".to_string(), |worker_id| worker_id.to_string());
+        let tags = [("worker_id", worker_id.as_str())];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 downstream backpressure metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_client_send_timeout(&self) {
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC, 1, &[])
+        {
+            tracing::warn!("failed to record gateway v2 client send timeout metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_thread_list_deduplication(&self, selected_worker_id: Option<usize>) {
+        let selected_worker_id = selected_worker_id
+            .map_or_else(|| "none".to_string(), |worker_id| worker_id.to_string());
+        let tags = [("selected_worker_id", selected_worker_id.as_str())];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 thread-list deduplication metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_thread_route_recovery(&self, outcome: &str) {
+        let tags = [("outcome", outcome)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 thread route recovery metric: {err}");
+        }
+    }
+
     pub fn v2_connection_health(&self) -> Arc<GatewayV2ConnectionHealthRegistry> {
         Arc::clone(&self.v2_connection_health)
     }
@@ -192,6 +332,9 @@ impl GatewayObservability {
         outcome: &str,
         duration: Duration,
         context: &GatewayRequestContext,
+        detail: Option<&str>,
+        pending_server_request_count: usize,
+        answered_but_unresolved_server_request_count: usize,
     ) {
         if !self.audit_logs_enabled {
             return;
@@ -208,6 +351,9 @@ impl GatewayObservability {
             duration_ms,
             tenant_id,
             project_id,
+            detail,
+            pending_server_request_count,
+            answered_but_unresolved_server_request_count,
             "gateway v2 connection completed"
         );
     }
@@ -218,6 +364,8 @@ impl GatewayObservability {
         duration: Duration,
         context: &GatewayRequestContext,
         detail: Option<&str>,
+        pending_server_request_count: usize,
+        answered_but_unresolved_server_request_count: usize,
     ) {
         let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         let tenant_id = context.tenant_id.as_str();
@@ -231,6 +379,8 @@ impl GatewayObservability {
                 tenant_id,
                 project_id,
                 detail,
+                pending_server_request_count,
+                answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             (Level::INFO, None) => tracing::event!(
@@ -240,6 +390,8 @@ impl GatewayObservability {
                 duration_ms,
                 tenant_id,
                 project_id,
+                pending_server_request_count,
+                answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             (Level::WARN, Some(detail)) => tracing::event!(
@@ -250,6 +402,8 @@ impl GatewayObservability {
                 tenant_id,
                 project_id,
                 detail,
+                pending_server_request_count,
+                answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             (Level::WARN, None) => tracing::event!(
@@ -259,6 +413,8 @@ impl GatewayObservability {
                 duration_ms,
                 tenant_id,
                 project_id,
+                pending_server_request_count,
+                answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             _ => unreachable!("v2 connection log level should stay within info/warn"),
@@ -331,12 +487,22 @@ mod tests {
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC;
     use super::V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC;
     use super::V2_CONNECTION_COUNT_METRIC;
     use super::V2_CONNECTION_DURATION_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC;
+    use super::V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC;
+    use super::V2_FAIL_CLOSED_REQUEST_COUNT_METRIC;
+    use super::V2_PROTOCOL_VIOLATION_COUNT_METRIC;
     use super::V2_REQUEST_COUNT_METRIC;
     use super::V2_REQUEST_DURATION_METRIC;
+    use super::V2_SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC;
+    use super::V2_SERVER_REQUEST_REJECTION_COUNT_METRIC;
+    use super::V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC;
+    use super::V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC;
+    use super::V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC;
+    use super::V2_WORKER_RECONNECT_COUNT_METRIC;
     use crate::scope::GatewayRequestContext;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -449,7 +615,7 @@ mod tests {
             }
         }
 
-        assert_eq!(saw_count, true);
+        assert!(saw_count);
         assert_eq!(saw_duration, true);
     }
 
@@ -548,7 +714,7 @@ mod tests {
             }
         }
 
-        assert_eq!(saw_count, true);
+        assert!(saw_count);
         assert_eq!(saw_duration, true);
     }
 
@@ -718,10 +884,625 @@ mod tests {
             }
         }
 
-        assert_eq!(saw_count, true);
-        assert_eq!(saw_duration, true);
-        assert_eq!(saw_pending_server_requests, true);
-        assert_eq!(saw_answered_but_unresolved_server_requests, true);
+        assert!(saw_count);
+        assert!(saw_duration);
+        assert!(saw_pending_server_requests);
+        assert!(saw_answered_but_unresolved_server_requests);
+    }
+
+    #[test]
+    fn records_v2_server_request_rejection_metrics_with_reason_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability
+            .record_v2_server_request_rejection("item/tool/requestUserInput", "pending_limit");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_SERVER_REQUEST_REJECTION_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    (
+                                        "method".to_string(),
+                                        "item/tool/requestUserInput".to_string(),
+                                    ),
+                                    ("reason".to_string(), "pending_limit".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected server-request rejection count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request rejection count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_worker_reconnect_metrics_with_worker_and_outcome_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_worker_reconnect(7, "success");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_WORKER_RECONNECT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("worker_id".to_string(), "7".to_string()),
+                                    ("outcome".to_string(), "success".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected worker reconnect count aggregation"),
+                    },
+                    _ => panic!("unexpected worker reconnect count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_fail_closed_request_metrics_with_method_and_backoff_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_fail_closed_request("config/read", true);
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_FAIL_CLOSED_REQUEST_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), "config/read".to_string()),
+                                    ("reconnect_backoff_active".to_string(), "true".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected fail-closed request count aggregation"),
+                    },
+                    _ => panic!("unexpected fail-closed request count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_suppressed_notification_metrics_with_reason_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_suppressed_notification("skills/changed", "pending_refresh");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), "skills/changed".to_string()),
+                                    ("reason".to_string(), "pending_refresh".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected suppressed notification count aggregation"),
+                    },
+                    _ => panic!("unexpected suppressed notification count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_server_request_lifecycle_metrics_with_event_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_server_request_lifecycle_event(
+            "duplicate_resolved_replay",
+            "serverRequest/resolved",
+        );
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("event".to_string(), "duplicate_resolved_replay".to_string(),),
+                                    ("method".to_string(), "serverRequest/resolved".to_string(),),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_protocol_violation_metrics_with_phase_and_reason_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_protocol_violation("post_initialize", "invalid_jsonrpc");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_PROTOCOL_VIOLATION_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("phase".to_string(), "post_initialize".to_string()),
+                                    ("reason".to_string(), "invalid_jsonrpc".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected protocol violation count aggregation"),
+                    },
+                    _ => panic!("unexpected protocol violation count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_downstream_backpressure_metrics_with_worker_tag() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_downstream_backpressure(Some(3));
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([("worker_id".to_string(), "3".to_string()),])
+                            );
+                        }
+                        _ => panic!("unexpected downstream backpressure count aggregation"),
+                    },
+                    _ => panic!("unexpected downstream backpressure count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_client_send_timeout_metrics() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_client_send_timeout();
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                        }
+                        _ => panic!("unexpected client send timeout count aggregation"),
+                    },
+                    _ => panic!("unexpected client send timeout count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_thread_list_deduplication_metrics_with_selected_worker_tag() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_thread_list_deduplication(Some(4));
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([(
+                                    "selected_worker_id".to_string(),
+                                    "4".to_string(),
+                                )])
+                            );
+                        }
+                        _ => panic!("unexpected thread-list deduplication count aggregation"),
+                    },
+                    _ => panic!("unexpected thread-list deduplication count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_thread_route_recovery_metrics_with_outcome_tag() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_thread_route_recovery("miss");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([("outcome".to_string(), "miss".to_string())])
+                            );
+                        }
+                        _ => panic!("unexpected thread route recovery count aggregation"),
+                    },
+                    _ => panic!("unexpected thread route recovery count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
     }
 
     #[test]
@@ -737,6 +1518,8 @@ mod tests {
                 Duration::from_millis(7),
                 &context,
                 None,
+                2,
+                1,
             );
         });
 
@@ -746,6 +1529,8 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("7"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
     }
 
     #[test]
@@ -761,6 +1546,8 @@ mod tests {
                 Duration::from_millis(11),
                 &context,
                 Some("downstream app-server event stream lagged"),
+                3,
+                2,
             );
         });
 
@@ -770,6 +1557,37 @@ mod tests {
         assert!(logs.contains("downstream app-server event stream lagged"));
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("11"));
+        assert!(logs.contains("pending_server_request_count=3"));
+        assert!(logs.contains("answered_but_unresolved_server_request_count=2"));
+    }
+
+    #[test]
+    fn emits_v2_connection_audit_log_with_server_request_counts() {
+        let observability = GatewayObservability::new(None, true);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-audit".to_string(),
+            project_id: Some("project-audit".to_string()),
+        };
+        let logs = capture_logs(|| {
+            observability.emit_v2_connection_audit_log(
+                "client_send_timed_out",
+                Duration::from_millis(17),
+                &context,
+                Some("gateway websocket send timed out"),
+                4,
+                3,
+            );
+        });
+
+        assert!(logs.contains("codex_gateway.audit"));
+        assert!(logs.contains("gateway v2 connection completed"));
+        assert!(logs.contains("client_send_timed_out"));
+        assert!(logs.contains("tenant-audit"));
+        assert!(logs.contains("project-audit"));
+        assert!(logs.contains("17"));
+        assert!(logs.contains("gateway websocket send timed out"));
+        assert!(logs.contains("pending_server_request_count=4"));
+        assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
     }
 
     #[derive(Clone, Default)]

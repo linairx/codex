@@ -411,6 +411,86 @@ Recent progress:
 - the gateway now also emits per-connection v2 metrics and audit logs for
   northbound WebSocket session outcomes, including initialize timeouts,
   downstream disconnects, protocol violations, and normal client closes
+- v2 connection metrics, audit logs, and operator-facing completion logs now
+  include the terminal pending and answered-but-unresolved server-request
+  counts, and audit / completion logs also include terminal detail, so
+  stranded-session debugging can start from the normal connection outcome
+  record instead of requiring a separate `/healthz` sample
+- v2 server-request saturation and scope-policy rejection now also emit a
+  dedicated rejection counter tagged by server-request method and reason
+  (`pending_limit` or `hidden_thread`), so rollout dashboards can distinguish
+  prompt-state pressure and hidden-thread prompt drops from ordinary request
+  failures or connection outcomes
+- multi-worker v2 reconnect activity now also emits a
+  `gateway_v2_worker_reconnects` counter tagged by worker id and outcome, so
+  operators can alert on repeated reconnect attempts, failures, replay
+  failures, and retry-backoff suppression without scraping structured logs
+- those reconnect outcome counters now also have direct reconnect-path
+  regression coverage for successful reconnects, connection failures, replay
+  failures, and retry-backoff suppression, so the metric contract is pinned at
+  the transport boundary rather than only at the observability helper
+- multi-worker v2 fail-closed requests now also emit a
+  `gateway_v2_fail_closed_requests` counter tagged by method and
+  `reconnect_backoff_active`, so dashboards can separate deliberate degraded
+  topology protection from ordinary upstream request failures
+- suppressed multi-worker connection notifications now also emit
+  `gateway_v2_suppressed_notifications` with notification method and reason
+  tags; current reasons are `duplicate` for exact-duplicate connection-state
+  notifications and `pending_refresh` for repeated `skills/changed`
+  invalidations before the client refreshes `skills/list`, plus
+  `hidden_thread` when a thread-scoped downstream notification is outside the
+  current gateway request scope
+- duplicate downstream `serverRequest/resolved` replays that are dropped after
+  gateway request-id translation now also emit
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=duplicate_resolved_replay` and `method=serverRequest/resolved`, so
+  server-request replay anomalies are visible in metrics alongside the
+  structured warning logs
+- downstream server requests that reuse a still-pending gateway request id now
+  also emit `gateway_v2_server_request_lifecycle_events` with
+  `event=duplicate_pending_request` and the colliding server-request method
+  before the gateway fails the session closed, so request-id collision
+  anomalies are visible in metrics alongside the close outcome and structured
+  warning log
+- worker-loss cleanup now also emits
+  `gateway_v2_server_request_lifecycle_events` for synthetic thread-scoped
+  `serverRequest/resolved` notifications and stranded connection-scoped server
+  requests, so disconnect-driven prompt cleanup is visible in metrics alongside
+  the structured cleanup logs
+- those worker-loss cleanup lifecycle counters are recorded before any
+  synthetic `serverRequest/resolved` notification is sent to the northbound
+  client, so slow-client send timeouts do not hide the route cleanup event from
+  metrics
+- client-side connection cleanup now also emits
+  `gateway_v2_server_request_lifecycle_events` for rejected thread-scoped
+  pending prompts, rejected connection-scoped pending prompts, and
+  answered-but-unresolved prompts left behind by client disconnect,
+  protocol-violation, or slow-send teardown paths
+- client replies for unknown server-request ids now also emit
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=unexpected_client_server_request_response`, so protocol-violation
+  prompt replies are visible in metrics before the gateway fails the v2
+  session closed
+- malformed or out-of-order v2 client traffic now also emits
+  `gateway_v2_protocol_violations` with `phase` and `reason` tags, covering
+  pre-initialize ordering errors, invalid JSON-RPC payloads, invalid UTF-8
+  binary frames, and repeated `initialize` requests after the handshake; direct
+  northbound websocket regressions pin those metric tags at the transport
+  boundary
+- downstream app-server event stream lag/backpressure now also emits
+  `gateway_v2_downstream_backpressure_events` with the affected worker id
+  before the gateway sends the close frame, so operator dashboards can
+  distinguish downstream event loss from ordinary connection closes even when
+  the client is too slow to receive the close frame cleanly
+- slow-client northbound send timeouts now also emit
+  `gateway_v2_client_send_timeouts`, so client backpressure can be tracked
+  directly alongside the `client_send_timed_out` connection outcome and
+  server-request cleanup lifecycle metrics
+- multi-worker `thread/list` dedupe and visible-thread route recovery now also
+  emit `gateway_v2_thread_list_deduplications` and
+  `gateway_v2_thread_route_recoveries`, so duplicate thread snapshots and
+  lazy route probe misses are visible in metrics alongside the existing
+  structured routing logs
 - the v2 transport now applies thread scope enforcement to downstream
   server-request forwarding, rejecting hidden-thread requests at the gateway
   boundary instead of leaking them to the northbound client
@@ -1582,6 +1662,70 @@ Operational notes:
   connection outcome, scope, duration, and terminal error detail when present,
   so rollout debugging can distinguish slow-client, handshake, and downstream
   session failures without depending only on metrics or audit-enabled logs
+- those connection completion logs and audit logs also include terminal detail
+  plus the pending and answered-but-unresolved server-request counts, matching
+  the `/healthz` v2 connection snapshot and connection metrics used to
+  diagnose stranded prompt lifecycles
+- saturated and hidden-thread downstream server-request rejections also
+  increment the `gateway_v2_server_request_rejections` counter with `method`
+  and `reason` tags; current reasons are `pending_limit` and `hidden_thread`
+- multi-worker remote reconnect loops increment
+  `gateway_v2_worker_reconnects` with `worker_id` and `outcome` tags; current
+  outcomes are `attempt`, `success`, `connect_failure`, `replay_failure`, and
+  `backoff_suppressed`
+- multi-worker remote requests that fail closed because required worker routes
+  are unavailable increment `gateway_v2_fail_closed_requests` with `method`
+  and `reconnect_backoff_active` tags, matching the structured warning log
+  emitted for the same event
+- suppressed multi-worker notification dedupe increments
+  `gateway_v2_suppressed_notifications` with `method` and `reason` tags,
+  matching the structured warning logs emitted when duplicate connection-state
+  notifications, repeated `skills/changed` invalidations, or hidden-thread
+  notifications are dropped
+- duplicate downstream `serverRequest/resolved` replays increment
+  `gateway_v2_server_request_lifecycle_events` with `event` and `method`
+  tags, matching the structured warning log emitted when the translated route
+  has already been drained
+- downstream server requests that reuse a still-pending gateway request id also
+  increment `gateway_v2_server_request_lifecycle_events` with
+  `event=duplicate_pending_request` and the colliding server-request method,
+  matching the structured warning log emitted before the gateway closes the
+  session
+- worker-loss cleanup increments
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=worker_cleanup_resolved_thread_scoped` /
+  `method=serverRequest/resolved` for each synthesized resolution, and
+  `event=worker_cleanup_stranded_connection_scoped` /
+  `method=connectionScopedServerRequest` for stranded connection-scoped
+  prompts; the counters are emitted immediately after route cleanup, before
+  any synthetic resolution notification is sent to the client
+- client-side connection cleanup increments
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=client_cleanup_rejected_thread_scoped` /
+  `method=serverRequest/pending`,
+  `event=client_cleanup_rejected_connection_scoped` /
+  `method=serverRequest/pending`, and
+  `event=client_cleanup_answered_but_unresolved` /
+  `method=serverRequest/resolved`
+- client replies for unknown server-request ids increment
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=unexpected_client_server_request_response` and `method=response` or
+  `method=error`, matching the fail-closed protocol-violation path
+- malformed or out-of-order v2 client traffic increments
+  `gateway_v2_protocol_violations` with `phase=pre_initialize` /
+  `post_initialize` and reason tags such as `initialize_order`,
+  `invalid_jsonrpc`, `invalid_utf8`, and `repeated_initialize`, so protocol
+  misuse can be tracked without inferring it from broad connection outcomes
+- downstream app-server event stream lag increments
+  `gateway_v2_downstream_backpressure_events` with a `worker_id` tag before the
+  gateway attempts to send the policy close frame to the northbound client
+- slow-client northbound send timeouts increment
+  `gateway_v2_client_send_timeouts` in addition to the terminal
+  `client_send_timed_out` connection outcome
+- repeated multi-worker `thread/list` snapshots increment
+  `gateway_v2_thread_list_deduplications` with the selected worker id, and
+  lazy visible-thread ownership probes increment
+  `gateway_v2_thread_route_recoveries` with `success` or `miss` outcomes
 - dedicated northbound v2 regression coverage now also asserts those
   connection logs directly, pinning the outcome/detail mapping that operators
   rely on when diagnosing protocol-violation and other terminal session paths
