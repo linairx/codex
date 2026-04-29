@@ -667,9 +667,14 @@ mod tests {
             health.v2_connections,
             GatewayV2ConnectionHealth {
                 active_connection_count: 0,
+                peak_active_connection_count: 0,
+                total_connection_count: 0,
+                last_connection_started_at: None,
                 last_connection_completed_at: None,
                 last_connection_outcome: None,
                 last_connection_detail: None,
+                last_connection_pending_server_request_count: 0,
+                last_connection_answered_but_unresolved_server_request_count: 0,
             }
         );
         let remote_workers = health.remote_workers.expect("remote workers");

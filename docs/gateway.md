@@ -291,6 +291,13 @@ Recent progress:
   `account/chatgptAuthTokens/refresh`, verifying that the gateway translates
   those IDs uniquely at the northbound boundary and routes each resolved
   response back to the owning worker session
+- that same multi-worker server-request coverage now also pins the concurrent
+  overlap path where two workers keep the same downstream request id pending
+  at once for `item/tool/requestUserInput`,
+  `item/permissions/requestApproval`, and
+  `mcpServer/elicitation/request`, verifying that the gateway still assigns
+  distinct northbound ids and routes both replies back to the correct worker
+  sessions
 - multi-worker northbound v2 transport now also suppresses exact-duplicate
   `mcpServer/startupStatus/updated` notifications across workers, extending the
   existing connection-scoped dedupe path so one shared client session does not
@@ -431,6 +438,26 @@ Recent progress:
   v2 session can still satisfy `account/read` and `account/rateLimits/read`,
   so bootstrap account state and background rate-limit refresh survive worker
   recovery too
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still satisfy `model/list`, `externalAgentConfig/detect`,
+  threadless `app/list`, `skills/list`, threadless `plugin/list`,
+  threadless `config/read`, `configRequirements/read`,
+  `experimentalFeature/list`, and `collaborationMode/list`, so the broader
+  bootstrap/setup discovery surface used by real clients survives worker
+  recovery too
+- that same single-worker reconnect coverage now also re-exercises the broader
+  typed server-request surface after worker recovery:
+  `item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval`,
+  `item/permissions/requestApproval`,
+  `mcpServer/elicitation/request`, and
+  `account/chatgptAuthTokens/refresh`, so the real release-gate client path
+  now verifies approval, elicitation, and token-refresh payload families in
+  both steady state and recovered-session mode
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still complete the post-bootstrap plugin-management path:
+  `plugin/read`, `plugin/install`, and `plugin/uninstall`, including the
+  resulting installed-state refreshes through `plugin/list`
 - that same single-worker reconnect coverage now also verifies the recovered
   v2 session can still complete a realtime workflow for
   `thread/realtime/listVoices`, `thread/realtime/start`,
@@ -580,6 +607,9 @@ Recent progress:
   `thread/fork` on the recovered worker, plus a follow-up `thread/read` of the
   returned forked thread to confirm worker ownership is re-registered for the
   new thread id after reconnect
+- that same-session recovery path now also verifies visible path-based
+  `thread/resume` and `thread/fork` on the recovered worker, so rollout-path
+  routing stays sticky after reconnect on one shared northbound session
 - that same-session recovery path now also verifies sticky
   `thread/name/set` on the recovered worker, plus a follow-up `thread/read`
   that returns the renamed state over the same northbound session
@@ -607,15 +637,21 @@ Recent progress:
   recovered workers are re-added into connection-scoped fanout and discovery
   paths such as `fs/watch` / `fs/unwatch`, `account/read`,
   `account/rateLimits/read`, `model/list`, threadless `app/list`,
-  `skills/list`, `mcpServerStatus/list`, `thread/realtime/listVoices`,
-  cwd-aware `config/read`, `experimentalFeature/list`, and
-  `collaborationMode/list`; recovered primary-worker flows stay usable for
-  `configRequirements/read`, managed `account/login/start` /
-  `account/login/cancel`, `account/login/completed`, `feedback/upload`, and
-  the standalone `command/exec` control plane; and sticky turn / realtime
-  control plus translated approval / elicitation / token-refresh server
-  requests continue routing back through the re-added worker on one shared
-  northbound session
+  threadless `plugin/list`, `skills/list`, `mcpServerStatus/list`,
+  `thread/realtime/listVoices`, threadless and cwd-aware `config/read`,
+  `experimentalFeature/list`, and `collaborationMode/list`; recovered
+  primary-worker flows stay usable for `configRequirements/read`, managed
+  `account/login/start` / `account/login/cancel`,
+  `account/login/completed`, `feedback/upload`, and the standalone
+  `command/exec` control plane; and sticky turn / realtime control plus
+  translated `item/tool/requestUserInput`,
+  `item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval`,
+  `item/permissions/requestApproval`,
+  `mcpServer/elicitation/request`, and
+  `account/chatgptAuthTokens/refresh` server requests continue routing back
+  through the re-added worker on one shared northbound session without
+  leaking stale worker-local request ids
 - that same recovery surface now also keeps notification fan-in intact after a
   worker returns, covering recovered-worker turn lifecycle notifications
   (`thread/status/changed`, `turn/started`, `hookStarted`, `item/started`,
@@ -649,6 +685,73 @@ Recent progress:
   reconnect-on-demand regression showing the gateway can re-add a recovered
   worker before selecting the downstream session that owns the named MCP
   server
+- that same dedicated northbound reconnect coverage now also pins the follow-
+  up `mcpServer/oauthLogin/completed` notification on the recovered session,
+  so the worker-discovery request path and its completion notification stay
+  coupled at the transport boundary
+- worker-discovery plugin fallback now also has dedicated northbound websocket
+  reconnect coverage for `plugin/read`, `plugin/install`, and
+  `plugin/uninstall`, pinning that one shared client session can route those
+  requests back onto a recovered worker instead of only relying on lower-level
+  request-routing coverage
+- threadless and cwd-aware `config/read` now also have dedicated northbound
+  websocket reconnect coverage, pinning that one shared client session either
+  reselects the recovered primary worker for threadless reads or re-selects
+  the recovered worker whose config layers match the requested `cwd` instead
+  of falling back to stale surviving-worker config
+- aggregated capability discovery now also has dedicated northbound websocket
+  reconnect coverage for `experimentalFeature/list` and
+  `collaborationMode/list`, pinning that one shared client session re-adds a
+  recovered worker before merging the feature and collaboration-mode inventory
+- aggregated bootstrap and discovery refreshes now also have dedicated
+  northbound websocket reconnect coverage for `account/read`,
+  `account/rateLimits/read`, unpaginated `model/list`,
+  `externalAgentConfig/detect`, `skills/list`, threadless `app/list`,
+  threadless `plugin/list`, `mcpServerStatus/list`, and
+  `thread/realtime/listVoices`, pinning that one shared client session re-adds
+  a recovered worker before those merged reads are served back northbound
+- primary-worker reconnect-on-demand now also has dedicated northbound
+  websocket coverage for `configRequirements/read`, managed
+  `account/login/start` / `account/login/cancel`, `feedback/upload`, and the
+  standalone `command/exec` control plane, pinning that one shared client
+  session routes those requests back onto the recovered primary worker instead
+  of silently falling through to a surviving secondary worker
+- connection-scoped setup mutation fanout now also has dedicated northbound
+  websocket reconnect coverage for `externalAgentConfig/import`,
+  `config/batchWrite`, `config/value/write`, `memory/reset`,
+  `account/logout`, and external-auth `account/login/start`, pinning that one
+  shared client session re-adds a recovered worker before those shared writes
+  fan back out across the downstream set
+- connection-scoped filesystem watch fanout now also has dedicated northbound
+  websocket reconnect coverage for `fs/watch` and `fs/unwatch`, pinning that
+  one shared client session re-adds a recovered worker before shared watch
+  setup or teardown is applied across the downstream set
+- aggregated thread discovery now also has dedicated northbound websocket
+  reconnect coverage for `thread/list` and `thread/loaded/list`, pinning that
+  one shared client session re-adds a recovered worker into thread discovery
+  and backfills sticky worker ownership for the visible threads it contributes
+- sticky thread-routed control now also has dedicated northbound websocket
+  reconnect coverage for `thread/unsubscribe`, `thread/archive`,
+  `thread/unarchive`, `thread/metadata/update`, `thread/turns/list`,
+  `thread/increment_elicitation`, `thread/decrement_elicitation`,
+  `thread/inject_items`, `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, `thread/rollback`,
+  `thread/name/set`, `thread/memoryMode/set`, `turn/steer`, and
+  `turn/interrupt`, pinning that one shared client session routes those
+  requests back onto the recovered owning worker
+- that same dedicated northbound reconnect slice now also covers detached
+  `review/start`, pinning that one shared client session re-adds the recovered
+  owning worker before review routing, re-registers the returned detached
+  review thread, and keeps the follow-up `thread/read` sticky to that worker
+- that same dedicated northbound reconnect slice now also covers sticky
+  realtime requests `thread/realtime/start`, `thread/realtime/appendText`,
+  `thread/realtime/appendAudio`, and `thread/realtime/stop`, pinning that one
+  shared client session routes those worker-owned realtime requests back onto
+  the recovered owning worker
+- that same dedicated northbound reconnect slice now also covers sticky
+  `turn/start`, pinning that one shared client session routes a recovered
+  worker-owned turn start back onto the owning worker before the broader turn
+  lifecycle fan-in begins
 - the real multi-worker same-session recovery harness now also verifies that
   `mcpServer/oauth/login` routes back to a lazily re-added worker and still
   forwards the resulting `mcpServer/oauthLogin/completed` notification on the
@@ -658,9 +761,15 @@ Recent progress:
   `mcpServer/oauthLogin/completed` notification over the gateway's northbound
   v2 client transport
 - the real single-worker reconnect harness now also verifies that later
-  `mcpServerStatus/list` and `mcpServer/oauth/login` requests still succeed
-  after worker recovery, including the follow-up
-  `mcpServer/oauthLogin/completed` notification on the recovered session
+  threadless `plugin/list`, `mcpServerStatus/list`, and
+  `mcpServer/oauth/login` requests still succeed after worker recovery,
+  including the follow-up `mcpServer/oauthLogin/completed` notification on
+  the recovered session
+- that same real single-worker reconnect harness now also re-exercises the
+  lower-frequency thread-control path after worker recovery:
+  `thread/increment_elicitation`, `thread/decrement_elicitation`,
+  `thread/inject_items`, `thread/compact/start`, `thread/shellCommand`,
+  `thread/backgroundTerminals/clean`, and `thread/rollback`
 - protocol and dedupe hardening now covers exact-duplicate suppression for
   connection-state notifications, `warning`, `configWarning`,
   `deprecationNotice`, `externalAgentConfig/import/completed`, and
@@ -671,8 +780,18 @@ Recent progress:
   protocol-violation cleanup and unresolved server-request saturation
 - that same protocol-violation logging now also includes any answered-but-
   unresolved server-request routes when the client replies to an unknown
-  request id, and a real northbound regression now pins that ordering-sensitive
-  path after one prior server request has already been answered
+  request id, and real northbound regressions now pin that ordering-sensitive
+  path for both `JSONRPCResponse` and `JSONRPCError` after one prior server
+  request has already been answered
+- dedicated northbound regressions now also pin the scope / pending-request-id
+  warning fields for both `JSONRPCResponse` and `JSONRPCError` when a client
+  replies to an unknown server-request id before the gateway closes the socket
+- malformed post-handshake client payloads now also have dedicated northbound
+  regression coverage for the same teardown warning fields, pinning scope and
+  pending-request ids before the gateway closes the socket
+- that same malformed-payload teardown path now also pins any answered-but-
+  unresolved server-request routes after the client has already replied but
+  downstream `serverRequest/resolved` has not arrived yet
 - downstream app-server event-stream backpressure now also emits a structured
   warning log with scope, worker id, skipped-event count, and any still-pending
   gateway server-request ids before the gateway closes the northbound session,
@@ -696,6 +815,11 @@ Recent progress:
   downstream ids, and worker ids, and that same slow-client path now also has
   a real northbound regression where the client has already replied but
   downstream `serverRequest/resolved` never arrives before timeout
+- that same connection-end teardown path now also has a real northbound
+  regression for client disconnects after one server request has already been
+  answered but before downstream `serverRequest/resolved` arrives, pinning the
+  answered-but-unresolved route ids that should still appear in the teardown
+  warning log
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   request-id translation now also emit structured warning logs with scope,
   worker id, the replayed downstream request id, and any still-buffered
@@ -876,6 +1000,10 @@ Phase 5 has started with:
 - SSE `gateway/reconnecting` and `gateway/reconnected` events so northbound
   clients can observe both entry into the reconnect loop and eventual worker
   recovery
+- dedicated remote-runtime SSE regression coverage now pins those
+  `gateway/reconnecting` and `gateway/reconnected` events end to end, so the
+  operator-facing reconnect signal stays validated alongside `/healthz` in
+  both single-worker and multi-worker remote topologies
 
 The remaining Phase 5 work is:
 
@@ -914,17 +1042,23 @@ Phase 6 is in progress with:
   `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`; remote-worker
   entries expose `lastStateChangeAt`, `lastErrorAt`, `reconnecting`,
   `reconnectAttemptCount`, and `nextReconnectAt`; `/healthz` now also exposes
-  `v2Connections.activeConnectionCount` plus the latest completed v2
-  connection outcome/detail/timestamp; structured logs now cover remote worker
-  disconnect / reconnect activity plus northbound v2 connection outcome,
-  scope, duration, and terminal error detail
+  `v2Connections.activeConnectionCount`,
+  `v2Connections.peakActiveConnectionCount`,
+  `v2Connections.totalConnectionCount`,
+  `v2Connections.lastConnectionStartedAt`,
+  `v2Connections.lastConnectionPendingServerRequestCount`, and
+  `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
+  the latest completed v2 connection outcome/detail/timestamp; structured logs
+  now cover remote worker disconnect / reconnect activity plus northbound v2
+  connection outcome, scope, duration, and terminal error detail
 - that operator-facing `v2Connections` health snapshot now also has direct
   embedded, single-worker remote, and multi-worker remote regression coverage,
-  pinning both the active-connection count during a live client session and
-  the last-outcome fields after the session closes; multi-worker remote
-  `/healthz` coverage now also pins the gateway-owned
-  `client_send_timed_out` outcome and detail after a slow-client teardown via
-  a real northbound WebSocket session
+  pinning active, peak, and total connection counts plus the last-started and
+  last-outcome fields across live and settled client sessions; multi-worker
+  remote `/healthz` coverage now also pins the gateway-owned
+  `client_send_timed_out` outcome/detail plus the last completed connection's
+  pending and answered-but-unresolved server-request counts after a slow-client
+  teardown via a real northbound WebSocket session
 - v2 connection accounting now also records terminal outcome and decrements the
   active connection count even when an early handshake-time close frame or
   JSON-RPC error response cannot be delivered, so `/healthz` does not retain

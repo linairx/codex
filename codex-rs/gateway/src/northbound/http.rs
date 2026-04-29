@@ -305,9 +305,14 @@ mod tests {
     fn default_v2_connections() -> GatewayV2ConnectionHealth {
         GatewayV2ConnectionHealth {
             active_connection_count: 0,
+            peak_active_connection_count: 0,
+            total_connection_count: 0,
+            last_connection_started_at: None,
             last_connection_completed_at: None,
             last_connection_outcome: None,
             last_connection_detail: None,
+            last_connection_pending_server_request_count: 0,
+            last_connection_answered_but_unresolved_server_request_count: 0,
         }
     }
 
@@ -460,7 +465,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"v2Connections":{"activeConnectionCount":0,"lastConnectionCompletedAt":null,"lastConnectionOutcome":null,"lastConnectionDetail":null},"remoteWorkers":null}"#
+            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"v2Connections":{"activeConnectionCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":null}"#
         );
     }
 
@@ -583,7 +588,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"v2Connections":{"activeConnectionCount":0,"lastConnectionCompletedAt":null,"lastConnectionOutcome":null,"lastConnectionDetail":null},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002}]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"v2Connections":{"activeConnectionCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002}]}"#
         );
     }
 
@@ -657,11 +662,16 @@ mod tests {
                     },
                     v2_connections: GatewayV2ConnectionHealth {
                         active_connection_count: 0,
+                        peak_active_connection_count: 3,
+                        total_connection_count: 7,
+                        last_connection_started_at: Some(1710000001),
                         last_connection_completed_at: Some(1710000003),
                         last_connection_outcome: Some("client_send_timed_out".to_string()),
                         last_connection_detail: Some(
                             "gateway websocket send timed out".to_string(),
                         ),
+                        last_connection_pending_server_request_count: 2,
+                        last_connection_answered_but_unresolved_server_request_count: 1,
                     },
                     remote_workers: Some(vec![GatewayRemoteWorkerHealth {
                         worker_id: 0,
@@ -713,7 +723,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"v2Connections":{"activeConnectionCount":0,"lastConnectionCompletedAt":1710000003,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out"},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null}]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64},"v2Connections":{"activeConnectionCount":0,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null}]}"#
         );
     }
 

@@ -22,6 +22,10 @@ const V2_REQUEST_COUNT_METRIC: &str = "gateway_v2_requests";
 const V2_REQUEST_DURATION_METRIC: &str = "gateway_v2_request_duration";
 const V2_CONNECTION_COUNT_METRIC: &str = "gateway_v2_connections";
 const V2_CONNECTION_DURATION_METRIC: &str = "gateway_v2_connection_duration";
+const V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC: &str =
+    "gateway_v2_connection_pending_server_requests";
+const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC: &str =
+    "gateway_v2_connection_answered_but_unresolved_server_requests";
 
 type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
@@ -83,7 +87,13 @@ impl GatewayObservability {
         }
     }
 
-    pub(crate) fn record_v2_connection(&self, outcome: &str, duration: Duration) {
+    pub(crate) fn record_v2_connection(
+        &self,
+        outcome: &str,
+        duration: Duration,
+        pending_server_request_count: usize,
+        answered_but_unresolved_server_request_count: usize,
+    ) {
         let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
         let tags = [("outcome", outcome)];
 
@@ -93,6 +103,24 @@ impl GatewayObservability {
             }
             if let Err(err) = metrics.histogram(V2_CONNECTION_DURATION_METRIC, duration_ms, &tags) {
                 tracing::warn!("failed to record gateway v2 connection duration metric: {err}");
+            }
+            if let Err(err) = metrics.histogram(
+                V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC,
+                pending_server_request_count.min(i64::MAX as usize) as i64,
+                &tags,
+            ) {
+                tracing::warn!(
+                    "failed to record gateway v2 connection pending server request metric: {err}"
+                );
+            }
+            if let Err(err) = metrics.histogram(
+                V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC,
+                answered_but_unresolved_server_request_count.min(i64::MAX as usize) as i64,
+                &tags,
+            ) {
+                tracing::warn!(
+                    "failed to record gateway v2 connection answered-but-unresolved server request metric: {err}"
+                );
             }
         }
     }
@@ -303,8 +331,10 @@ mod tests {
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC;
     use super::V2_CONNECTION_COUNT_METRIC;
     use super::V2_CONNECTION_DURATION_METRIC;
+    use super::V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC;
     use super::V2_REQUEST_COUNT_METRIC;
     use super::V2_REQUEST_DURATION_METRIC;
     use crate::scope::GatewayRequestContext;
@@ -537,7 +567,12 @@ mod tests {
         .expect("metrics");
         let observability = GatewayObservability::new(Some(metrics), true);
 
-        observability.record_v2_connection("downstream_session_ended", Duration::from_millis(14));
+        observability.record_v2_connection(
+            "downstream_session_ended",
+            Duration::from_millis(14),
+            2,
+            1,
+        );
 
         let resource_metrics = observability
             .metrics
@@ -551,9 +586,11 @@ mod tests {
 
         let mut saw_count = false;
         let mut saw_duration = false;
+        let mut saw_pending_server_requests = false;
+        let mut saw_answered_but_unresolved_server_requests = false;
         for metric in metrics {
             match metric.name() {
-                V2_CONNECTION_COUNT_METRIC => {
+                name if name == V2_CONNECTION_COUNT_METRIC => {
                     saw_count = true;
                     match metric.data() {
                         AggregatedMetrics::U64(data) => match data {
@@ -582,7 +619,7 @@ mod tests {
                         _ => panic!("unexpected connection count type"),
                     }
                 }
-                V2_CONNECTION_DURATION_METRIC => {
+                name if name == V2_CONNECTION_DURATION_METRIC => {
                     saw_duration = true;
                     match metric.data() {
                         AggregatedMetrics::F64(data) => match data {
@@ -613,12 +650,78 @@ mod tests {
                         _ => panic!("unexpected connection duration type"),
                     }
                 }
+                name if name == V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC => {
+                    saw_pending_server_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 2.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected pending server request aggregation"),
+                        },
+                        _ => panic!("unexpected pending server request type"),
+                    }
+                }
+                name if name == V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC => {
+                    saw_answered_but_unresolved_server_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 1.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected answered-but-unresolved server request aggregation"
+                            ),
+                        },
+                        _ => panic!("unexpected answered-but-unresolved server request type"),
+                    }
+                }
                 _ => {}
             }
         }
 
         assert_eq!(saw_count, true);
         assert_eq!(saw_duration, true);
+        assert_eq!(saw_pending_server_requests, true);
+        assert_eq!(saw_answered_but_unresolved_server_requests, true);
     }
 
     #[test]
