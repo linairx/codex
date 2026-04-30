@@ -508,6 +508,15 @@ Recent progress:
   `app/list/updated`, `warning`, `configWarning`, `deprecationNotice`,
   `mcpServer/startupStatus/updated`, and
   `externalAgentConfig/import/completed`
+- dedicated northbound v2 regression coverage now also pins the steady-state
+  exact-duplicate suppression path for `account/rateLimits/updated` and
+  `app/list/updated` alongside `account/updated`, so the core connection-state
+  dedupe set is covered directly at the gateway boundary
+- dedicated northbound v2 notification forwarding coverage now also includes
+  the full core connection-state set of `account/updated`,
+  `account/rateLimits/updated`, and `app/list/updated`, so single-worker
+  passthrough and multi-worker dedupe coverage exercise the same notification
+  family
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses duplicate `skills/changed` invalidations across
   workers until the client refreshes with `skills/list`, and still emits one
@@ -1049,19 +1058,20 @@ Phase 6 is in progress with:
   `v2Connections.peakActiveConnectionCount`,
   `v2Connections.totalConnectionCount`,
   `v2Connections.lastConnectionStartedAt`,
+  `v2Connections.lastConnectionDurationMs`,
   `v2Connections.lastConnectionPendingServerRequestCount`, and
   `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
-  the latest completed v2 connection outcome/detail/timestamp; structured logs
-  now cover remote worker disconnect / reconnect activity plus northbound v2
-  connection outcome, scope, duration, and terminal error detail
+  the latest completed v2 connection outcome/detail/timestamp; health, metrics,
+  audit logs, and structured logs now all carry the last v2 connection
+  duration needed to diagnose slow-client and short-lived failure paths
 - that operator-facing `v2Connections` health snapshot now also has direct
   embedded, single-worker remote, and multi-worker remote regression coverage,
   pinning active, peak, and total connection counts plus the last-started and
   last-outcome fields across live and settled client sessions; multi-worker
   remote `/healthz` coverage now also pins the gateway-owned
-  `client_send_timed_out` outcome/detail plus the last completed connection's
-  pending and answered-but-unresolved server-request counts after a slow-client
-  teardown via a real northbound WebSocket session
+  `client_send_timed_out` outcome/detail, duration, plus the last completed
+  connection's pending and answered-but-unresolved server-request counts after
+  a slow-client teardown via a real northbound WebSocket session
 - v2 connection accounting now also records terminal outcome and decrements the
   active connection count even when an early handshake-time close frame or
   JSON-RPC error response cannot be delivered, so `/healthz` does not retain
@@ -1092,12 +1102,23 @@ Phase 6 is in progress with:
   whether any required worker route is currently held in reconnect backoff, so
   degraded-session protection can be measured separately from generic
   `internal_error` request outcomes
+- primary-worker-only multi-worker requests now also have method-family
+  reconnect-backoff regression coverage for config requirements, managed
+  login, login cancellation, feedback upload, and standalone command control,
+  basic filesystem operations, fuzzy file search, and Windows sandbox setup, so
+  degraded-session fail-closed behavior is pinned across the whole primary
+  route set instead of only a representative command request
 - suppressed multi-worker connection notifications now also emit a
   `gateway_v2_suppressed_notifications` counter tagged by notification method
   and suppression reason (`duplicate`, `pending_refresh`, or
   `hidden_thread`), so rollout dashboards can distinguish healthy
   gateway-owned dedupe and scope filtering from missing worker events or
   client-side notification loss
+- exact-duplicate suppression for multi-worker connection-state notifications
+  now also covers `windows/worldWritableWarning` and
+  `windowsSandbox/setupCompleted`, so one shared northbound session does not
+  surface duplicate platform setup notices when more than one worker emits the
+  same payload
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   gateway request-id translation now also emit
   `gateway_v2_server_request_lifecycle_events` with
@@ -1160,6 +1181,64 @@ Phase 6 is in progress with:
   policy, longer-running turn and review lifecycle notifications, dynamic-tool
   `item/tool/call`, standalone command execution, and the current realtime
   request / notification set that the TUI consumes
+- dedicated northbound notification coverage now also includes lower-frequency
+  thread lifecycle notifications for `thread/archived`, `thread/unarchived`,
+  and `thread/closed`, so archive and teardown state changes are pinned at the
+  same v2 compatibility boundary as the existing thread and turn lifecycle
+  streams
+- dedicated northbound notification coverage now also includes connection-
+  scoped filesystem change delivery for `fs/changed`, so the watch setup /
+  teardown surface has a pinned notification path in addition to the existing
+  `fs/watch` and `fs/unwatch` request coverage
+- dedicated northbound passthrough coverage now also includes the
+  `fuzzyFileSearch` request family plus `fuzzyFileSearch/sessionUpdated` and
+  `fuzzyFileSearch/sessionCompleted` notifications, so the file-picker search
+  surface is explicit in the Stage A compatibility gate
+- dedicated northbound passthrough coverage now also includes the basic
+  filesystem operation family (`fs/readFile`, `fs/writeFile`,
+  `fs/createDirectory`, `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and
+  `fs/copy`), so file helper requests are explicit in the Stage A
+  compatibility gate instead of only covering watch setup / teardown
+- dedicated northbound passthrough coverage now also includes the low-frequency
+  Windows sandbox setup surface: `windowsSandbox/setupStart`,
+  `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted`, so
+  platform-specific setup prompts are pinned at the v2 compatibility boundary
+- multi-worker `windowsSandbox/setupStart` routing now also stays
+  primary-worker affine, including reconnect-before-routing coverage plus
+  fail-closed behavior while the primary worker remains in reconnect backoff
+- the real embedded and single-worker remote compatibility harnesses now also
+  exercise the fuzzy-file-search surface through unmodified
+  `RemoteAppServerClient` sessions: embedded mode validates one-shot search
+  against a real temporary filesystem root, and single-worker remote mode
+  validates the one-shot plus streaming session start/update/stop requests
+- those same real embedded and single-worker remote compatibility harnesses
+  now also exercise the basic filesystem operation family through unmodified
+  `RemoteAppServerClient` sessions, with embedded mode validating real local
+  file creation / read / metadata / directory / copy / remove behavior and
+  single-worker remote mode validating the gateway-backed passthrough surface
+- multi-worker `fuzzyFileSearch` routing now also stays primary-worker
+  affine, including real northbound WebSocket coverage for lazy primary-worker
+  reconnect plus fail-closed behavior while the primary worker remains in
+  reconnect backoff, so local file-search state does not silently fall through
+  to a secondary worker
+- multi-worker basic filesystem operations now also stay primary-worker
+  affine, so local file helper state does not silently fall through to a
+  secondary worker while the primary worker is unavailable
+- that filesystem change notification coverage now also verifies multi-worker
+  fan-in, so one shared northbound v2 session receives worker-local
+  `fs/changed` events from more than one downstream app-server session
+- the multi-worker filesystem-watch reconnect coverage now also verifies that
+  a reconnected worker can emit `fs/changed` after a shared `fs/watch` is
+  applied, so watch notification fan-in survives worker loss and lazy re-add
+- multi-worker connection-state reconnect coverage now also verifies
+  `mcpServer/startupStatus/updated` from a lazily re-added worker after
+  `mcpServerStatus/list`, so MCP startup state remains visible on the shared
+  northbound v2 session after worker recovery
+- dedicated reconnect-backoff coverage now also pins the
+  `mcpServer/oauth/login` worker-discovery fail-closed path, so OAuth login
+  routing cannot silently select from an incomplete MCP inventory while a
+  downstream worker remains unavailable; that coverage also asserts the
+  fail-closed metric is tagged with active reconnect backoff
 - multi-worker remote mode now has a broad real shared-session Stage B harness
   for aggregated bootstrap/setup discovery, sticky thread and turn routing,
   translated server-request ids, plugin-management fallback, primary-worker

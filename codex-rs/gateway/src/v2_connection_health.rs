@@ -2,6 +2,7 @@ use crate::api::GatewayV2ConnectionHealth;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -12,6 +13,7 @@ struct GatewayV2ConnectionHealthState {
     total_connection_count: u64,
     last_connection_started_at: Option<i64>,
     last_connection_completed_at: Option<i64>,
+    last_connection_duration_ms: Option<u64>,
     last_connection_outcome: Option<String>,
     last_connection_detail: Option<String>,
     last_connection_pending_server_request_count: usize,
@@ -38,12 +40,15 @@ impl GatewayV2ConnectionHealthRegistry {
         &self,
         outcome: &str,
         detail: Option<&str>,
+        duration: Duration,
         pending_server_request_count: usize,
         answered_but_unresolved_server_request_count: usize,
     ) {
         let mut state = write_guard(&self.state);
         state.active_connection_count = state.active_connection_count.saturating_sub(1);
         state.last_connection_completed_at = Some(unix_timestamp_now());
+        state.last_connection_duration_ms =
+            Some(duration.as_millis().min(u128::from(u64::MAX)) as u64);
         state.last_connection_outcome = Some(outcome.to_string());
         state.last_connection_detail = detail.map(ToString::to_string);
         state.last_connection_pending_server_request_count = pending_server_request_count;
@@ -59,6 +64,7 @@ impl GatewayV2ConnectionHealthRegistry {
             total_connection_count: state.total_connection_count,
             last_connection_started_at: state.last_connection_started_at,
             last_connection_completed_at: state.last_connection_completed_at,
+            last_connection_duration_ms: state.last_connection_duration_ms,
             last_connection_outcome: state.last_connection_outcome.clone(),
             last_connection_detail: state.last_connection_detail.clone(),
             last_connection_pending_server_request_count: state
@@ -95,6 +101,7 @@ mod tests {
     use super::GatewayV2ConnectionHealthRegistry;
     use crate::api::GatewayV2ConnectionHealth;
     use pretty_assertions::assert_eq;
+    use std::time::Duration;
 
     #[test]
     fn snapshot_starts_empty() {
@@ -108,6 +115,7 @@ mod tests {
                 total_connection_count: 0,
                 last_connection_started_at: None,
                 last_connection_completed_at: None,
+                last_connection_duration_ms: None,
                 last_connection_outcome: None,
                 last_connection_detail: None,
                 last_connection_pending_server_request_count: 0,
@@ -128,7 +136,13 @@ mod tests {
         assert_eq!(active_snapshot.total_connection_count, 2);
         assert_eq!(active_snapshot.last_connection_started_at.is_some(), true);
 
-        registry.mark_connection_completed("client_disconnected", Some("socket closed"), 3, 2);
+        registry.mark_connection_completed(
+            "client_disconnected",
+            Some("socket closed"),
+            Duration::from_millis(42),
+            3,
+            2,
+        );
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.active_connection_count, 1);
@@ -142,6 +156,7 @@ mod tests {
             snapshot.last_connection_detail,
             Some("socket closed".to_string())
         );
+        assert_eq!(snapshot.last_connection_duration_ms, Some(42));
         assert_eq!(snapshot.last_connection_pending_server_request_count, 3);
         assert_eq!(
             snapshot.last_connection_answered_but_unresolved_server_request_count,
@@ -149,5 +164,24 @@ mod tests {
         );
         assert_eq!(snapshot.last_connection_started_at.is_some(), true);
         assert_eq!(snapshot.last_connection_completed_at.is_some(), true);
+    }
+
+    #[test]
+    fn snapshot_clamps_last_completed_connection_duration() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+
+        registry.mark_connection_started();
+        registry.mark_connection_completed(
+            "client_disconnected",
+            None,
+            Duration::from_secs(u64::MAX),
+            0,
+            0,
+        );
+
+        assert_eq!(
+            registry.snapshot().last_connection_duration_ms,
+            Some(u64::MAX)
+        );
     }
 }

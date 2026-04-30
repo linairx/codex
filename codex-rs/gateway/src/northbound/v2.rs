@@ -3146,6 +3146,18 @@ fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
             | "command/exec/write"
             | "command/exec/resize"
             | "command/exec/terminate"
+            | "fs/readFile"
+            | "fs/writeFile"
+            | "fs/createDirectory"
+            | "fs/getMetadata"
+            | "fs/readDirectory"
+            | "fs/remove"
+            | "fs/copy"
+            | "fuzzyFileSearch"
+            | "fuzzyFileSearch/sessionStart"
+            | "fuzzyFileSearch/sessionUpdate"
+            | "fuzzyFileSearch/sessionStop"
+            | "windowsSandbox/setupStart"
     ) || (request.method == "account/login/start" && !is_multi_worker_fanout_login_request(request))
 }
 
@@ -4160,6 +4172,8 @@ fn should_deduplicate_connection_notification(notification: &JSONRPCNotification
             | "deprecationNotice"
             | "mcpServer/startupStatus/updated"
             | "externalAgentConfig/import/completed"
+            | "windows/worldWritableWarning"
+            | "windowsSandbox/setupCompleted"
     )
 }
 
@@ -4340,6 +4354,7 @@ fn observe_v2_connection(
         .mark_connection_completed(
             outcome,
             detail,
+            duration,
             pending_server_request_count,
             answered_but_unresolved_server_request_count,
         );
@@ -4623,6 +4638,10 @@ mod tests {
     use codex_app_server_protocol::FsUnwatchResponse;
     use codex_app_server_protocol::FsWatchParams;
     use codex_app_server_protocol::FsWatchResponse;
+    use codex_app_server_protocol::FuzzyFileSearchMatchType;
+    use codex_app_server_protocol::FuzzyFileSearchResult;
+    use codex_app_server_protocol::FuzzyFileSearchSessionCompletedNotification;
+    use codex_app_server_protocol::FuzzyFileSearchSessionUpdatedNotification;
     use codex_app_server_protocol::GetAccountRateLimitsResponse;
     use codex_app_server_protocol::HookCompletedNotification;
     use codex_app_server_protocol::HookStartedNotification;
@@ -4652,6 +4671,8 @@ mod tests {
     use codex_app_server_protocol::ServerRequestResolvedNotification;
     use codex_app_server_protocol::SkillsListResponse;
     use codex_app_server_protocol::TerminalInteractionNotification;
+    use codex_app_server_protocol::ThreadArchivedNotification;
+    use codex_app_server_protocol::ThreadClosedNotification;
     use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ThreadListResponse;
     use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -4659,6 +4680,7 @@ mod tests {
     use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
     use codex_app_server_protocol::ThreadTokenUsage;
     use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
+    use codex_app_server_protocol::ThreadUnarchivedNotification;
     use codex_app_server_protocol::TokenUsageBreakdown;
     use codex_app_server_protocol::TurnDiffUpdatedNotification;
     use codex_app_server_protocol::TurnPlanStep;
@@ -6510,6 +6532,7 @@ mod tests {
             1
         );
         assert_eq!(health_snapshot.last_connection_completed_at.is_some(), true);
+        assert_eq!(health_snapshot.last_connection_duration_ms, Some(9));
 
         let resource_metrics = metrics.snapshot().expect("snapshot");
         let metrics = resource_metrics
@@ -11819,6 +11842,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_forwards_fuzzy_file_search_requests() {
+        let cases = vec![
+            (
+                "fuzzyFileSearch",
+                "fuzzy-file-search",
+                serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-1",
+                }),
+                serde_json::json!({
+                    "files": [{
+                        "root": "/tmp/project",
+                        "path": "docs/gateway.md",
+                        "match_type": "file",
+                        "file_name": "gateway.md",
+                        "score": 42,
+                        "indices": [5, 6, 7, 8],
+                    }],
+                }),
+            ),
+            (
+                "fuzzyFileSearch/sessionStart",
+                "fuzzy-file-search-session-start",
+                serde_json::json!({
+                    "sessionId": "search-session-1",
+                    "roots": ["/tmp/project"],
+                }),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionUpdate",
+                "fuzzy-file-search-session-update",
+                serde_json::json!({
+                    "sessionId": "search-session-1",
+                    "query": "gate",
+                }),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionStop",
+                "fuzzy-file-search-session-stop",
+                serde_json::json!({
+                    "sessionId": "search-session-1",
+                }),
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (method, request_id, params, result) in cases {
+            let initialize_response = test_initialize_response().await;
+            let websocket_url = start_mock_remote_server_for_passthrough_request_with_result(
+                method,
+                params.clone(),
+                result.clone(),
+            )
+            .await;
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::default(),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String(request_id.to_string()),
+                        method: method.to_string(),
+                        params: Some(params),
+                        trace: None,
+                    }))
+                    .expect("fuzzy file search request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("fuzzy file search request should send");
+
+            let message = read_websocket_message(&mut websocket).await;
+            let JSONRPCMessage::Response(response) = message else {
+                panic!("expected fuzzy file search response for {method}, got {message:?}");
+            };
+            assert_eq!(response.id, RequestId::String(request_id.to_string()));
+            assert_eq!(response.result, result);
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_filesystem_operation_requests() {
+        let cases = vec![
+            (
+                "fs/readFile",
+                "fs-read-file",
+                serde_json::json!({
+                    "path": "/tmp/project/input.txt",
+                }),
+                serde_json::json!({
+                    "dataBase64": "Z2F0ZXdheS1maWxl",
+                }),
+            ),
+            (
+                "fs/writeFile",
+                "fs-write-file",
+                serde_json::json!({
+                    "path": "/tmp/project/output.txt",
+                    "dataBase64": "Z2F0ZXdheS13cml0ZQ==",
+                }),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/createDirectory",
+                "fs-create-directory",
+                serde_json::json!({
+                    "path": "/tmp/project/nested",
+                    "recursive": true,
+                }),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/getMetadata",
+                "fs-get-metadata",
+                serde_json::json!({
+                    "path": "/tmp/project/output.txt",
+                }),
+                serde_json::json!({
+                    "isDirectory": false,
+                    "isFile": true,
+                    "isSymlink": false,
+                    "createdAtMs": 0,
+                    "modifiedAtMs": 0,
+                }),
+            ),
+            (
+                "fs/readDirectory",
+                "fs-read-directory",
+                serde_json::json!({
+                    "path": "/tmp/project",
+                }),
+                serde_json::json!({
+                    "entries": [{
+                        "fileName": "output.txt",
+                        "isDirectory": false,
+                        "isFile": true,
+                    }],
+                }),
+            ),
+            (
+                "fs/copy",
+                "fs-copy",
+                serde_json::json!({
+                    "sourcePath": "/tmp/project/output.txt",
+                    "destinationPath": "/tmp/project/copy.txt",
+                }),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/remove",
+                "fs-remove",
+                serde_json::json!({
+                    "path": "/tmp/project/copy.txt",
+                    "recursive": true,
+                    "force": true,
+                }),
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (method, request_id, params, result) in cases {
+            let initialize_response = test_initialize_response().await;
+            let websocket_url = start_mock_remote_server_for_passthrough_request_with_result(
+                method,
+                params.clone(),
+                result.clone(),
+            )
+            .await;
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::default(),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String(request_id.to_string()),
+                        method: method.to_string(),
+                        params: Some(params),
+                        trace: None,
+                    }))
+                    .expect("filesystem request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("filesystem request should send");
+
+            let message = read_websocket_message(&mut websocket).await;
+            let JSONRPCMessage::Response(response) = message else {
+                panic!("expected filesystem response for {method}, got {message:?}");
+            };
+            assert_eq!(response.id, RequestId::String(request_id.to_string()));
+            assert_eq!(response.result, result);
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_forwards_config_value_write_requests() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_passthrough_request_with_result(
@@ -12587,6 +12862,18 @@ mod tests {
                         "model": null,
                         "reasoningEffort": null,
                     }],
+                }),
+            ),
+            (
+                "windowsSandbox/setupStart",
+                "windows-sandbox-setup-start",
+                None,
+                Some(serde_json::json!({
+                    "mode": "unelevated",
+                    "cwd": "/tmp/project",
+                })),
+                serde_json::json!({
+                    "started": true,
                 }),
             ),
         ];
@@ -17933,6 +18220,57 @@ mod tests {
                     "threadId": "feedback-thread-reconnected",
                 }),
             ),
+            (
+                "fuzzyFileSearch",
+                Some(serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-reconnected",
+                })),
+                serde_json::json!({
+                    "files": [{
+                        "root": "/tmp/project",
+                        "path": "docs/gateway.md",
+                        "match_type": "file",
+                        "file_name": "gateway.md",
+                        "score": 42,
+                        "indices": [5, 6, 7, 8],
+                    }],
+                }),
+            ),
+            (
+                "fuzzyFileSearch/sessionStart",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-reconnected",
+                    "roots": ["/tmp/project"],
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionUpdate",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-reconnected",
+                    "query": "gate",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionStop",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-reconnected",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "windowsSandbox/setupStart",
+                Some(serde_json::json!({
+                    "mode": "unelevated",
+                    "cwd": "/tmp/project",
+                })),
+                serde_json::json!({
+                    "started": true,
+                }),
+            ),
         ];
 
         for (method, params, expected_result) in cases {
@@ -18161,6 +18499,415 @@ mod tests {
         )));
         assert!(logs.contains("reconnect_backoff_worker_ids=[0]"));
         assert!(!logs.contains(&worker_b_url));
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_fallback_primary_worker_method_family_during_reconnect_backoff()
+     {
+        let cases = vec![
+            (
+                "configRequirements/read",
+                None,
+                serde_json::json!({
+                    "requirements": [],
+                    "validationErrors": [],
+                }),
+            ),
+            (
+                "account/login/start",
+                Some(serde_json::json!({
+                    "type": "chatgpt",
+                })),
+                serde_json::json!({
+                    "type": "chatgpt",
+                    "loginId": "login-primary",
+                    "authUrl": "https://example.com/login",
+                }),
+            ),
+            (
+                "account/login/cancel",
+                Some(serde_json::json!({
+                    "loginId": "login-primary",
+                })),
+                serde_json::json!({
+                    "status": "canceled",
+                }),
+            ),
+            (
+                "feedback/upload",
+                Some(serde_json::json!({
+                    "classification": "bug",
+                    "reason": "gateway primary-worker backoff regression",
+                    "threadId": "thread-visible",
+                    "includeLogs": false,
+                    "extraLogFiles": [],
+                    "tags": {},
+                })),
+                serde_json::json!({
+                    "threadId": "feedback-thread-primary",
+                }),
+            ),
+            (
+                "command/exec",
+                Some(serde_json::json!({
+                    "command": ["sh", "-lc", "printf gateway-primary"],
+                    "processId": "proc-primary",
+                    "tty": true,
+                    "streamStdin": true,
+                    "streamStdoutStderr": true,
+                    "outputBytesCap": null,
+                    "timeoutMs": null,
+                    "cwd": null,
+                    "env": null,
+                    "size": {
+                        "rows": 24,
+                        "cols": 80,
+                    },
+                    "sandboxPolicy": null,
+                })),
+                serde_json::json!({
+                    "exitCode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }),
+            ),
+            (
+                "command/exec/write",
+                Some(serde_json::json!({
+                    "processId": "proc-primary",
+                    "deltaBase64": "AQID",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "command/exec/resize",
+                Some(serde_json::json!({
+                    "processId": "proc-primary",
+                    "size": {
+                        "rows": 40,
+                        "cols": 120,
+                    },
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "command/exec/terminate",
+                Some(serde_json::json!({
+                    "processId": "proc-primary",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/readFile",
+                Some(serde_json::json!({
+                    "path": "/tmp/project/input.txt",
+                })),
+                serde_json::json!({
+                    "dataBase64": "Z2F0ZXdheS1maWxl",
+                }),
+            ),
+            (
+                "fs/writeFile",
+                Some(serde_json::json!({
+                    "path": "/tmp/project/output.txt",
+                    "dataBase64": "Z2F0ZXdheS13cml0ZQ==",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/createDirectory",
+                Some(serde_json::json!({
+                    "path": "/tmp/project/nested",
+                    "recursive": true,
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/getMetadata",
+                Some(serde_json::json!({
+                    "path": "/tmp/project/output.txt",
+                })),
+                serde_json::json!({
+                    "isDirectory": false,
+                    "isFile": true,
+                    "isSymlink": false,
+                    "createdAtMs": 0,
+                    "modifiedAtMs": 0,
+                }),
+            ),
+            (
+                "fs/readDirectory",
+                Some(serde_json::json!({
+                    "path": "/tmp/project",
+                })),
+                serde_json::json!({
+                    "entries": [{
+                        "fileName": "output.txt",
+                        "isDirectory": false,
+                        "isFile": true,
+                    }],
+                }),
+            ),
+            (
+                "fs/copy",
+                Some(serde_json::json!({
+                    "sourcePath": "/tmp/project/output.txt",
+                    "destinationPath": "/tmp/project/copy.txt",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fs/remove",
+                Some(serde_json::json!({
+                    "path": "/tmp/project/copy.txt",
+                    "recursive": true,
+                    "force": true,
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "windowsSandbox/setupStart",
+                Some(serde_json::json!({
+                    "mode": "unelevated",
+                    "cwd": "/tmp/project",
+                })),
+                serde_json::json!({
+                    "started": true,
+                }),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result,
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            if method == "feedback/upload" {
+                scope_registry.register_thread("thread-visible".to_string(), context.clone());
+            }
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert!(
+                router.remove_worker(Some(0)),
+                "test should drop the primary worker before applying reconnect backoff"
+            );
+            router.record_worker_reconnect_failure(0, Instant::now(), Duration::from_secs(60));
+
+            let metrics = in_memory_metrics();
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false);
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let err = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params,
+                    trace: None,
+                },
+            )
+            .await
+            .expect_err("primary-worker method should not fall back during reconnect backoff");
+
+            assert_eq!(
+                err.to_string(),
+                format!("primary worker route is unavailable for {method}")
+            );
+            assert_eq!(router.worker_count(), 1);
+            assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+            assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+            assert_v2_fail_closed_request_metric(&metrics, method, true);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_does_not_fallback_fuzzy_file_search_during_reconnect_backoff() {
+        let cases = vec![
+            (
+                "fuzzyFileSearch",
+                Some(serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-backoff",
+                })),
+                serde_json::json!({
+                    "files": [{
+                        "root": "/tmp/project",
+                        "path": "docs/gateway.md",
+                        "match_type": "file",
+                        "file_name": "gateway.md",
+                        "score": 42,
+                        "indices": [5, 6, 7, 8],
+                    }],
+                }),
+            ),
+            (
+                "fuzzyFileSearch/sessionStart",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-backoff",
+                    "roots": ["/tmp/project"],
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionUpdate",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-backoff",
+                    "query": "gate",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionStop",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-backoff",
+                })),
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (method, params, expected_result) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    expected_result,
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert!(
+                router.remove_worker(Some(0)),
+                "test should drop the primary worker before applying reconnect backoff"
+            );
+            router.record_worker_reconnect_failure(0, Instant::now(), Duration::from_secs(60));
+
+            let metrics = in_memory_metrics();
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false);
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let err = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params,
+                    trace: None,
+                },
+            )
+            .await
+            .expect_err("fuzzy file search should not fall back during reconnect backoff");
+
+            assert_eq!(
+                err.to_string(),
+                format!("primary worker route is unavailable for {method}")
+            );
+            assert_eq!(router.worker_count(), 1);
+            assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+            assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+            assert_v2_fail_closed_request_metric(&metrics, method, true);
+        }
     }
 
     #[tokio::test]
@@ -18848,82 +19595,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_client_request_does_not_fallback_mcp_oauth_login_during_reconnect_backoff() {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_server_for_reconnectable_request_with_recording(
+                "mcpServer/oauth/login",
+                serde_json::json!({
+                    "authorizationUrl": "https://example.test/oauth/shared-mcp",
+                }),
+            )
+            .await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_server_for_reconnectable_request_with_recording(
+                "mcpServer/oauth/login",
+                serde_json::json!({
+                    "authorizationUrl": "https://example.test/oauth/shared-mcp",
+                }),
+            )
+            .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the fallback worker before applying reconnect backoff"
+        );
+        router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+        let metrics = in_memory_metrics();
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let err = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("mcp-oauth-login-request".to_string()),
+                method: "mcpServer/oauth/login".to_string(),
+                params: Some(serde_json::json!({
+                    "name": "shared-mcp",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("mcpServer/oauth/login should fail closed during reconnect backoff");
+
+        assert_eq!(
+            err.to_string(),
+            "required worker routes are unavailable for mcpServer/oauth/login: [1]"
+        );
+        assert_eq!(router.worker_count(), 1);
+        assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+        assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        assert_v2_fail_closed_request_metric(&metrics, "mcpServer/oauth/login", true);
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_deduplicates_exact_duplicate_multi_worker_connection_notifications()
     {
-        let notification_params = serde_json::json!({
-            "authMode": null,
-            "planType": null,
-        });
-        let worker_a = start_mock_remote_server_for_connection_notification(
-            "account/updated",
-            notification_params.clone(),
-        )
-        .await;
-        let worker_b = start_mock_remote_server_for_connection_notification(
-            "account/updated",
-            notification_params.clone(),
-        )
-        .await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+        let cases = vec![
+            (
+                "account/updated",
+                serde_json::json!({
+                    "authMode": null,
+                    "planType": null,
+                }),
+            ),
+            (
+                "account/rateLimits/updated",
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "primary",
+                        "limitName": "Primary",
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    },
+                }),
+            ),
+            (
+                "app/list/updated",
+                serde_json::json!({
+                    "data": [],
+                }),
+            ),
+            (
+                "windows/worldWritableWarning",
+                serde_json::json!({
+                    "samplePaths": ["/tmp/world-writable"],
+                    "extraCount": 2,
+                    "failedScan": false,
+                }),
+            ),
+            (
+                "windowsSandbox/setupCompleted",
+                serde_json::json!({
+                    "mode": "unelevated",
+                    "success": false,
+                    "error": "setup failed",
+                }),
+            ),
+        ];
+
+        for (method, notification_params) in cases {
+            let worker_a = start_mock_remote_server_for_connection_notification(
+                method,
+                notification_params.clone(),
             )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
-        let (addr, server_task) = spawn_test_server(GatewayV2State {
-            auth: GatewayAuth::Disabled,
-            admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
-            scope_registry: Arc::new(GatewayScopeRegistry::default()),
-            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
-                vec![
-                    RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
-                        client_name: "codex-gateway".to_string(),
-                        client_version: "0.0.0-test".to_string(),
-                        experimental_api: false,
-                        opt_out_notification_methods: Vec::new(),
-                        channel_capacity: 4,
-                    },
-                    RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
-                        client_name: "codex-gateway".to_string(),
-                        client_version: "0.0.0-test".to_string(),
-                        experimental_api: false,
-                        opt_out_notification_methods: Vec::new(),
-                        channel_capacity: 4,
-                    },
-                ],
-                test_initialize_response().await,
-            ))),
-            timeouts: GatewayV2Timeouts::default(),
-        })
-        .await;
+            .await;
+            let worker_b = start_mock_remote_server_for_connection_notification(
+                method,
+                notification_params.clone(),
+            )
+            .await;
+            let metrics = codex_otel::MetricsClient::new(
+                codex_otel::MetricsConfig::in_memory(
+                    "test",
+                    "codex-gateway",
+                    env!("CARGO_PKG_VERSION"),
+                    opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+                )
+                .with_runtime_reader(),
+            )
+            .expect("metrics");
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::new(Some(metrics.clone()), false),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
 
-        send_initialize(&mut websocket).await;
+            send_initialize(&mut websocket).await;
 
-        assert_jsonrpc_notification(
-            read_websocket_message(&mut websocket).await,
-            "account/updated",
-            notification_params,
-        );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                notification_params,
+            );
 
-        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
-        assert_eq!(duplicate.is_err(), true);
-        assert_v2_suppressed_notification_metric(&metrics, "account/updated", "duplicate");
+            let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+            assert_eq!(duplicate.is_err(), true);
+            assert_v2_suppressed_notification_metric(&metrics, method, "duplicate");
 
-        server_task.abort();
-        let _ = server_task.await;
+            server_task.abort();
+            let _ = server_task.await;
+        }
     }
 
     #[tokio::test]
@@ -20483,6 +21372,120 @@ mod tests {
                 "success": true,
             }),
         );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_mcp_startup_status_from_reconnected_worker() {
+        let worker_a =
+            start_mock_remote_server_for_reconnectable_mcp_server_status_list(vec!["worker-a-mcp"])
+                .await;
+        let worker_b =
+            start_mock_remote_server_for_disconnect_then_reconnectable_mcp_status_with_startup_notification(
+            )
+            .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("mcp-status-list".to_string()),
+                    method: "mcpServerStatus/list".to_string(),
+                    params: Some(serde_json::json!({
+                        "cursor": null,
+                        "limit": 25,
+                        "detail": "toolsAndAuthOnly",
+                    })),
+                    trace: None,
+                }))
+                .expect("mcpServerStatus/list request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("mcpServerStatus/list request should send");
+
+        let mut saw_status_response = false;
+        let mut saw_startup_notification = false;
+        for _ in 0..2 {
+            match timeout(
+                Duration::from_secs(2),
+                read_websocket_message(&mut websocket),
+            )
+            .await
+            .expect("mcp status response or startup notification should arrive")
+            {
+                JSONRPCMessage::Response(response) => {
+                    assert_eq!(
+                        response.id,
+                        RequestId::String("mcp-status-list".to_string())
+                    );
+                    let mut status: ListMcpServerStatusResponse =
+                        serde_json::from_value(response.result)
+                            .expect("mcp status response should decode");
+                    status.data.sort_by(|a, b| a.name.cmp(&b.name));
+                    assert_eq!(status.next_cursor, None);
+                    assert_eq!(status.data.len(), 2);
+                    assert_eq!(status.data[0].name, "worker-a-mcp");
+                    assert_eq!(status.data[1].name, "worker-b-mcp");
+                    saw_status_response = true;
+                }
+                JSONRPCMessage::Notification(notification) => {
+                    assert_eq!(notification.method, "mcpServer/startupStatus/updated");
+                    assert_eq!(
+                        notification.params,
+                        Some(serde_json::json!({
+                            "name": "worker-b-mcp",
+                            "status": "ready",
+                            "error": null,
+                        }))
+                    );
+                    saw_startup_notification = true;
+                }
+                message => panic!("unexpected gateway message: {message:?}"),
+            }
+        }
+
+        assert_eq!(saw_status_response, true);
+        assert_eq!(saw_startup_notification, true);
 
         server_task.abort();
         let _ = server_task.await;
@@ -22907,6 +23910,62 @@ mod tests {
                     "threadId": "feedback-thread-reconnected",
                 }),
             ),
+            (
+                "fuzzyFileSearch",
+                "fuzzy-file-search",
+                Some(serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-reconnected",
+                })),
+                serde_json::json!({
+                    "files": [{
+                        "root": "/tmp/project",
+                        "path": "docs/gateway.md",
+                        "match_type": "file",
+                        "file_name": "gateway.md",
+                        "score": 42,
+                        "indices": [5, 6, 7, 8],
+                    }],
+                }),
+            ),
+            (
+                "fuzzyFileSearch/sessionStart",
+                "fuzzy-file-search-session-start",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-reconnected",
+                    "roots": ["/tmp/project"],
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionUpdate",
+                "fuzzy-file-search-session-update",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-reconnected",
+                    "query": "gate",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "fuzzyFileSearch/sessionStop",
+                "fuzzy-file-search-session-stop",
+                Some(serde_json::json!({
+                    "sessionId": "search-session-reconnected",
+                })),
+                serde_json::json!({}),
+            ),
+            (
+                "windowsSandbox/setupStart",
+                "windows-sandbox-setup-start",
+                Some(serde_json::json!({
+                    "mode": "unelevated",
+                    "cwd": "/tmp/project",
+                })),
+                serde_json::json!({
+                    "started": true,
+                }),
+            ),
         ];
 
         for (method, request_id, params, expected_result) in cases {
@@ -23285,6 +24344,120 @@ mod tests {
         assert_eq!(
             *worker_b_requests.lock().await,
             vec!["fs/watch".to_string(), "fs/unwatch".to_string()]
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_fs_changed_from_reconnected_worker_after_fs_watch() {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_server_for_reconnectable_fs_watch_and_unwatch().await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_server_for_disconnect_then_reconnectable_fs_watch_with_changed_notification(
+            )
+            .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("fs-watch".to_string()),
+                    method: "fs/watch".to_string(),
+                    params: Some(serde_json::json!({
+                        "watchId": "watch-reconnected",
+                        "path": "/tmp/shared/project/.git/HEAD",
+                    })),
+                    trace: None,
+                }))
+                .expect("fs/watch request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("fs/watch request should send");
+
+        let mut saw_watch_response = false;
+        let mut saw_changed_notification = false;
+        for _ in 0..2 {
+            match timeout(
+                Duration::from_secs(2),
+                read_websocket_message(&mut websocket),
+            )
+            .await
+            .expect("fs/watch response or fs/changed notification should arrive")
+            {
+                JSONRPCMessage::Response(response) => {
+                    assert_eq!(response.id, RequestId::String("fs-watch".to_string()));
+                    let watch_result: FsWatchResponse = serde_json::from_value(response.result)
+                        .expect("fs/watch response should decode");
+                    assert_eq!(
+                        watch_result.path.as_ref().to_string_lossy(),
+                        "/tmp/shared/project/.git/HEAD"
+                    );
+                    saw_watch_response = true;
+                }
+                JSONRPCMessage::Notification(notification) => {
+                    assert_eq!(notification.method, "fs/changed");
+                    assert_eq!(
+                        notification.params,
+                        Some(serde_json::json!({
+                            "watchId": "watch-reconnected",
+                            "changedPaths": ["/tmp/shared/project/.git/HEAD"],
+                        }))
+                    );
+                    saw_changed_notification = true;
+                }
+                message => panic!("unexpected gateway message: {message:?}"),
+            }
+        }
+
+        assert_eq!(saw_watch_response, true);
+        assert_eq!(saw_changed_notification, true);
+        assert_eq!(
+            *worker_a_requests.lock().await,
+            vec!["fs/watch".to_string()]
+        );
+        assert_eq!(
+            *worker_b_requests.lock().await,
+            vec!["fs/watch".to_string()]
         );
 
         server_task.abort();
@@ -26903,7 +28076,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_upgrade_forwards_additional_turn_notifications_for_visible_threads() {
+    async fn websocket_upgrade_forwards_additional_thread_and_turn_notifications_for_visible_threads()
+     {
         let guardian_review_started: ItemGuardianApprovalReviewStartedNotification =
             serde_json::from_value(serde_json::json!({
                 "threadId": "thread-visible",
@@ -26991,6 +28165,15 @@ mod tests {
         }))
         .expect("hookCompleted notification should deserialize");
         let cases = vec![
+            ServerNotification::ThreadArchived(ThreadArchivedNotification {
+                thread_id: "thread-visible".to_string(),
+            }),
+            ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+                thread_id: "thread-visible".to_string(),
+            }),
+            ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: "thread-visible".to_string(),
+            }),
             ServerNotification::ItemGuardianApprovalReviewStarted(guardian_review_started),
             ServerNotification::ItemGuardianApprovalReviewCompleted(guardian_review_completed),
             ServerNotification::HookStarted(hook_started),
@@ -27810,6 +28993,33 @@ mod tests {
     async fn websocket_upgrade_forwards_user_visible_notifications() {
         let cases = vec![
             (
+                "account/updated",
+                serde_json::json!({
+                    "authMode": null,
+                    "planType": null,
+                }),
+            ),
+            (
+                "account/rateLimits/updated",
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "primary",
+                        "limitName": "Primary",
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    },
+                }),
+            ),
+            (
+                "app/list/updated",
+                serde_json::json!({
+                    "data": [],
+                }),
+            ),
+            (
                 "warning",
                 serde_json::json!({
                     "threadId": null,
@@ -27844,6 +29054,22 @@ mod tests {
                     "loginId": "login-1",
                     "success": true,
                     "error": null,
+                }),
+            ),
+            (
+                "windows/worldWritableWarning",
+                serde_json::json!({
+                    "samplePaths": ["/tmp/world-writable"],
+                    "extraCount": 2,
+                    "failedScan": false,
+                }),
+            ),
+            (
+                "windowsSandbox/setupCompleted",
+                serde_json::json!({
+                    "mode": "unelevated",
+                    "success": false,
+                    "error": "setup failed",
                 }),
             ),
         ];
@@ -27888,6 +29114,203 @@ mod tests {
             server_task.abort();
             let _ = server_task.await;
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_filesystem_changed_notifications() {
+        let params = serde_json::json!({
+            "watchId": "watch-1",
+            "changedPaths": ["/tmp/codex-gateway-fs-change.txt"],
+        });
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_for_connection_notification("fs/changed", params.clone())
+                .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "fs/changed",
+            params,
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_fuzzy_file_search_notifications() {
+        let search_result = FuzzyFileSearchResult {
+            root: "/tmp/project".to_string(),
+            path: "docs/gateway.md".to_string(),
+            match_type: FuzzyFileSearchMatchType::File,
+            file_name: "gateway.md".to_string(),
+            score: 42,
+            indices: Some(vec![5, 6, 7, 8]),
+        };
+        let cases = vec![
+            ServerNotification::FuzzyFileSearchSessionUpdated(
+                FuzzyFileSearchSessionUpdatedNotification {
+                    session_id: "search-session-1".to_string(),
+                    query: "gate".to_string(),
+                    files: vec![search_result],
+                },
+            ),
+            ServerNotification::FuzzyFileSearchSessionCompleted(
+                FuzzyFileSearchSessionCompletedNotification {
+                    session_id: "search-session-1".to_string(),
+                },
+            ),
+        ];
+
+        for notification in cases {
+            let initialize_response = test_initialize_response().await;
+            let expected =
+                tagged_type_to_notification(&notification).expect("notification should serialize");
+            let websocket_url = start_mock_remote_server_for_notification(notification).await;
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::default(),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            let message = read_websocket_message(&mut websocket).await;
+            let JSONRPCMessage::Notification(actual) = message else {
+                panic!("expected fuzzy file search notification, got {message:?}");
+            };
+            assert_eq!(actual, expected);
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_fans_in_multi_worker_filesystem_changed_notifications() {
+        let worker_a_params = serde_json::json!({
+            "watchId": "watch-a",
+            "changedPaths": ["/tmp/codex-gateway-worker-a-change.txt"],
+        });
+        let worker_b_params = serde_json::json!({
+            "watchId": "watch-b",
+            "changedPaths": ["/tmp/codex-gateway-worker-b-change.txt"],
+        });
+        let worker_a =
+            start_mock_remote_server_for_connection_notification("fs/changed", worker_a_params)
+                .await;
+        let worker_b =
+            start_mock_remote_server_for_connection_notification("fs/changed", worker_b_params)
+                .await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let mut changed_paths = Vec::new();
+        for _ in 0..2 {
+            let JSONRPCMessage::Notification(notification) =
+                read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected fs/changed notification");
+            };
+            assert_eq!(notification.method, "fs/changed");
+            changed_paths.push(
+                notification
+                    .params
+                    .and_then(|params| params.get("changedPaths").cloned())
+                    .expect("fs/changed should include changedPaths"),
+            );
+        }
+        changed_paths.sort_by_key(std::string::ToString::to_string);
+        assert_eq!(
+            changed_paths,
+            vec![
+                serde_json::json!(["/tmp/codex-gateway-worker-a-change.txt"]),
+                serde_json::json!(["/tmp/codex-gateway-worker-b-change.txt"]),
+            ]
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[test]
@@ -28224,6 +29647,36 @@ mod tests {
                     "deprecationNotice" => serde_json::json!({
                         "summary": "shared deprecation notice",
                         "details": null,
+                    }),
+                    _ => unreachable!("method list should stay exhaustive"),
+                }),
+            };
+
+            assert_eq!(
+                super::should_deduplicate_connection_notification(&notification),
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn windows_setup_notifications_are_treated_as_deduplicated_connection_state() {
+        for method in [
+            "windows/worldWritableWarning",
+            "windowsSandbox/setupCompleted",
+        ] {
+            let notification = JSONRPCNotification {
+                method: method.to_string(),
+                params: Some(match method {
+                    "windows/worldWritableWarning" => serde_json::json!({
+                        "samplePaths": ["/tmp/world-writable"],
+                        "extraCount": 2,
+                        "failedScan": false,
+                    }),
+                    "windowsSandbox/setupCompleted" => serde_json::json!({
+                        "mode": "unelevated",
+                        "success": false,
+                        "error": "setup failed",
                     }),
                     _ => unreachable!("method list should stay exhaustive"),
                 }),
@@ -31315,6 +32768,79 @@ mod tests {
         (format!("ws://{addr}"), requests)
     }
 
+    async fn start_mock_remote_server_for_disconnect_then_reconnectable_fs_watch_with_changed_notification()
+    -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_task = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let requests = Arc::clone(&requests_for_task);
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket should accept");
+
+                    expect_remote_initialize(&mut websocket).await;
+
+                    match connection_index {
+                        0 => {
+                            websocket
+                                .close(None)
+                                .await
+                                .expect("close frame should send");
+                        }
+                        1 => {
+                            let request = read_websocket_request(&mut websocket).await;
+                            assert_eq!(request.method, "fs/watch");
+                            requests.lock().await.push(request.method.clone());
+                            let params = request
+                                .params
+                                .clone()
+                                .expect("fs/watch should include params");
+                            let path = params
+                                .get("path")
+                                .cloned()
+                                .expect("fs/watch should include path");
+                            websocket
+                                .send(Message::Text(
+                                    serde_json::to_string(&JSONRPCMessage::Response(
+                                        JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "path": path,
+                                            }),
+                                        },
+                                    ))
+                                    .expect("fs/watch response should serialize")
+                                    .into(),
+                                ))
+                                .await
+                                .expect("fs/watch response should send");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            send_remote_notification(
+                                &mut websocket,
+                                "fs/changed",
+                                serde_json::json!({
+                                    "watchId": "watch-reconnected",
+                                    "changedPaths": ["/tmp/shared/project/.git/HEAD"],
+                                }),
+                            )
+                            .await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        _ => unreachable!("unexpected connection index"),
+                    }
+                });
+            }
+        });
+        (format!("ws://{addr}"), requests)
+    }
+
     async fn start_mock_remote_server_for_reconnectable_app_list(
         apps: Vec<(&str, &str)>,
     ) -> String {
@@ -31389,6 +32915,74 @@ mod tests {
             }),
         )
         .await
+    }
+
+    async fn start_mock_remote_server_for_disconnect_then_reconnectable_mcp_status_with_startup_notification()
+    -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            for connection_index in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket should accept");
+
+                    expect_remote_initialize(&mut websocket).await;
+
+                    match connection_index {
+                        0 => {
+                            websocket
+                                .close(None)
+                                .await
+                                .expect("close frame should send");
+                        }
+                        1 => {
+                            let request = read_websocket_request(&mut websocket).await;
+                            assert_eq!(request.method, "mcpServerStatus/list");
+                            websocket
+                                .send(Message::Text(
+                                    serde_json::to_string(&JSONRPCMessage::Response(
+                                        JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "data": [{
+                                                    "name": "worker-b-mcp",
+                                                    "tools": {},
+                                                    "resources": [],
+                                                    "resourceTemplates": [],
+                                                    "authStatus": "bearerToken",
+                                                }],
+                                                "nextCursor": null,
+                                            }),
+                                        },
+                                    ))
+                                    .expect("mcp status response should serialize")
+                                    .into(),
+                                ))
+                                .await
+                                .expect("mcp status response should send");
+                            send_remote_notification(
+                                &mut websocket,
+                                "mcpServer/startupStatus/updated",
+                                serde_json::json!({
+                                    "name": "worker-b-mcp",
+                                    "status": "ready",
+                                    "error": null,
+                                }),
+                            )
+                            .await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        _ => unreachable!("unexpected connection index"),
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
     }
 
     async fn spawn_remote_gateway_v2_test_server(

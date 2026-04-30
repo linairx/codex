@@ -671,6 +671,7 @@ mod tests {
                 total_connection_count: 0,
                 last_connection_started_at: None,
                 last_connection_completed_at: None,
+                last_connection_duration_ms: None,
                 last_connection_outcome: None,
                 last_connection_detail: None,
                 last_connection_pending_server_request_count: 0,

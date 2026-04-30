@@ -88,6 +88,7 @@ pub struct GatewayV2ConnectionHealth {
     pub total_connection_count: u64,
     pub last_connection_started_at: Option<i64>,
     pub last_connection_completed_at: Option<i64>,
+    pub last_connection_duration_ms: Option<u64>,
     pub last_connection_outcome: Option<String>,
     pub last_connection_detail: Option<String>,
     pub last_connection_pending_server_request_count: usize,

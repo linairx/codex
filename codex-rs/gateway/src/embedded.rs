@@ -832,10 +832,33 @@ mod tests {
     use codex_app_server_protocol::FeedbackUploadResponse;
     use codex_app_server_protocol::FileChangeApprovalDecision;
     use codex_app_server_protocol::FileChangeRequestApprovalResponse;
+    use codex_app_server_protocol::FsCopyParams;
+    use codex_app_server_protocol::FsCopyResponse;
+    use codex_app_server_protocol::FsCreateDirectoryParams;
+    use codex_app_server_protocol::FsCreateDirectoryResponse;
+    use codex_app_server_protocol::FsGetMetadataParams;
+    use codex_app_server_protocol::FsGetMetadataResponse;
+    use codex_app_server_protocol::FsReadDirectoryParams;
+    use codex_app_server_protocol::FsReadDirectoryResponse;
+    use codex_app_server_protocol::FsReadFileParams;
+    use codex_app_server_protocol::FsReadFileResponse;
+    use codex_app_server_protocol::FsRemoveParams;
+    use codex_app_server_protocol::FsRemoveResponse;
     use codex_app_server_protocol::FsUnwatchParams;
     use codex_app_server_protocol::FsUnwatchResponse;
     use codex_app_server_protocol::FsWatchParams;
     use codex_app_server_protocol::FsWatchResponse;
+    use codex_app_server_protocol::FsWriteFileParams;
+    use codex_app_server_protocol::FsWriteFileResponse;
+    use codex_app_server_protocol::FuzzyFileSearchMatchType;
+    use codex_app_server_protocol::FuzzyFileSearchParams;
+    use codex_app_server_protocol::FuzzyFileSearchResponse;
+    use codex_app_server_protocol::FuzzyFileSearchSessionStartParams;
+    use codex_app_server_protocol::FuzzyFileSearchSessionStartResponse;
+    use codex_app_server_protocol::FuzzyFileSearchSessionStopParams;
+    use codex_app_server_protocol::FuzzyFileSearchSessionStopResponse;
+    use codex_app_server_protocol::FuzzyFileSearchSessionUpdateParams;
+    use codex_app_server_protocol::FuzzyFileSearchSessionUpdateResponse;
     use codex_app_server_protocol::GetAccountParams;
     use codex_app_server_protocol::GetAccountRateLimitsResponse;
     use codex_app_server_protocol::GetAccountResponse;
@@ -1937,6 +1960,10 @@ mod tests {
             "model = \"gpt-5\"\n\n[features]\nplugins = true\n",
         )
         .expect("config.toml should be written");
+        let fuzzy_root = tempdir().expect("fuzzy search root tempdir");
+        std::fs::write(fuzzy_root.path().join("gateway-alpha.txt"), "x")
+            .expect("fuzzy search fixture should be written");
+        let fs_root = tempdir().expect("filesystem operation root tempdir");
         let config = Config::load_default_with_cli_overrides_for_codex_home(
             codex_home.path().to_path_buf(),
             Vec::new(),
@@ -2035,6 +2062,137 @@ mod tests {
             .await
             .expect("collaborationMode/list should succeed through embedded gateway");
         assert_eq!(collaboration_modes.data.is_empty(), false);
+
+        let fs_dir = fs_root.path().join("nested");
+        let create_directory: FsCreateDirectoryResponse = client
+            .request_typed(ClientRequest::FsCreateDirectory {
+                request_id: RequestId::Integer(29),
+                params: FsCreateDirectoryParams {
+                    path: fs_dir
+                        .clone()
+                        .try_into()
+                        .expect("fs/createDirectory path should be absolute"),
+                    recursive: Some(true),
+                },
+            })
+            .await
+            .expect("fs/createDirectory should succeed through embedded gateway");
+        assert_eq!(create_directory, FsCreateDirectoryResponse {});
+
+        let fs_file = fs_dir.join("gateway.txt");
+        let write_file: FsWriteFileResponse = client
+            .request_typed(ClientRequest::FsWriteFile {
+                request_id: RequestId::Integer(30),
+                params: FsWriteFileParams {
+                    path: fs_file
+                        .clone()
+                        .try_into()
+                        .expect("fs/writeFile path should be absolute"),
+                    data_base64: "Z2F0ZXdheS1lbWJlZGRlZA==".to_string(),
+                },
+            })
+            .await
+            .expect("fs/writeFile should succeed through embedded gateway");
+        assert_eq!(write_file, FsWriteFileResponse {});
+
+        let read_file: FsReadFileResponse = client
+            .request_typed(ClientRequest::FsReadFile {
+                request_id: RequestId::Integer(31),
+                params: FsReadFileParams {
+                    path: fs_file
+                        .clone()
+                        .try_into()
+                        .expect("fs/readFile path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/readFile should succeed through embedded gateway");
+        assert_eq!(read_file.data_base64, "Z2F0ZXdheS1lbWJlZGRlZA==");
+
+        let metadata: FsGetMetadataResponse = client
+            .request_typed(ClientRequest::FsGetMetadata {
+                request_id: RequestId::Integer(32),
+                params: FsGetMetadataParams {
+                    path: fs_file
+                        .clone()
+                        .try_into()
+                        .expect("fs/getMetadata path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/getMetadata should succeed through embedded gateway");
+        assert_eq!(metadata.is_file, true);
+        assert_eq!(metadata.is_directory, false);
+
+        let directory: FsReadDirectoryResponse = client
+            .request_typed(ClientRequest::FsReadDirectory {
+                request_id: RequestId::Integer(33),
+                params: FsReadDirectoryParams {
+                    path: fs_dir
+                        .clone()
+                        .try_into()
+                        .expect("fs/readDirectory path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/readDirectory should succeed through embedded gateway");
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.entries[0].file_name, "gateway.txt");
+        assert_eq!(directory.entries[0].is_file, true);
+
+        let copied_file = fs_dir.join("gateway-copy.txt");
+        let copy: FsCopyResponse = client
+            .request_typed(ClientRequest::FsCopy {
+                request_id: RequestId::Integer(34),
+                params: FsCopyParams {
+                    source_path: fs_file
+                        .clone()
+                        .try_into()
+                        .expect("fs/copy source path should be absolute"),
+                    destination_path: copied_file
+                        .clone()
+                        .try_into()
+                        .expect("fs/copy destination path should be absolute"),
+                    recursive: false,
+                },
+            })
+            .await
+            .expect("fs/copy should succeed through embedded gateway");
+        assert_eq!(copy, FsCopyResponse {});
+
+        let remove: FsRemoveResponse = client
+            .request_typed(ClientRequest::FsRemove {
+                request_id: RequestId::Integer(35),
+                params: FsRemoveParams {
+                    path: copied_file
+                        .try_into()
+                        .expect("fs/remove path should be absolute"),
+                    recursive: Some(true),
+                    force: Some(true),
+                },
+            })
+            .await
+            .expect("fs/remove should succeed through embedded gateway");
+        assert_eq!(remove, FsRemoveResponse {});
+
+        let fuzzy_search: FuzzyFileSearchResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearch {
+                request_id: RequestId::Integer(36),
+                params: FuzzyFileSearchParams {
+                    query: "gate".to_string(),
+                    roots: vec![fuzzy_root.path().display().to_string()],
+                    cancellation_token: Some("embedded-fuzzy-search".to_string()),
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch should succeed through embedded gateway");
+        assert_eq!(fuzzy_search.files.len(), 1);
+        assert_eq!(fuzzy_search.files[0].path, "gateway-alpha.txt");
+        assert_eq!(fuzzy_search.files[0].file_name, "gateway-alpha.txt");
+        assert_eq!(
+            fuzzy_search.files[0].match_type,
+            FuzzyFileSearchMatchType::File
+        );
 
         let skills: SkillsListResponse = client
             .request_typed(ClientRequest::SkillsList {
@@ -7219,6 +7377,165 @@ stream_max_retries = 0
             .await
             .expect("fs/unwatch should succeed through remote gateway");
         assert_eq!(unwatch, FsUnwatchResponse {});
+
+        let create_directory: FsCreateDirectoryResponse = client
+            .request_typed(ClientRequest::FsCreateDirectory {
+                request_id: RequestId::Integer(33),
+                params: FsCreateDirectoryParams {
+                    path: PathBuf::from("/tmp/remote-project/nested")
+                        .try_into()
+                        .expect("fs/createDirectory path should be absolute"),
+                    recursive: Some(true),
+                },
+            })
+            .await
+            .expect("fs/createDirectory should succeed through remote gateway");
+        assert_eq!(create_directory, FsCreateDirectoryResponse {});
+
+        let write_file: FsWriteFileResponse = client
+            .request_typed(ClientRequest::FsWriteFile {
+                request_id: RequestId::Integer(34),
+                params: FsWriteFileParams {
+                    path: PathBuf::from("/tmp/remote-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/writeFile path should be absolute"),
+                    data_base64: "cmVtb3RlLWZpbGU=".to_string(),
+                },
+            })
+            .await
+            .expect("fs/writeFile should succeed through remote gateway");
+        assert_eq!(write_file, FsWriteFileResponse {});
+
+        let read_file: FsReadFileResponse = client
+            .request_typed(ClientRequest::FsReadFile {
+                request_id: RequestId::Integer(35),
+                params: FsReadFileParams {
+                    path: PathBuf::from("/tmp/remote-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/readFile path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/readFile should succeed through remote gateway");
+        assert_eq!(read_file.data_base64, "cmVtb3RlLWZpbGU=");
+
+        let metadata: FsGetMetadataResponse = client
+            .request_typed(ClientRequest::FsGetMetadata {
+                request_id: RequestId::Integer(36),
+                params: FsGetMetadataParams {
+                    path: PathBuf::from("/tmp/remote-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/getMetadata path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/getMetadata should succeed through remote gateway");
+        assert_eq!(metadata.is_file, true);
+        assert_eq!(metadata.is_directory, false);
+
+        let directory: FsReadDirectoryResponse = client
+            .request_typed(ClientRequest::FsReadDirectory {
+                request_id: RequestId::Integer(37),
+                params: FsReadDirectoryParams {
+                    path: PathBuf::from("/tmp/remote-project/nested")
+                        .try_into()
+                        .expect("fs/readDirectory path should be absolute"),
+                },
+            })
+            .await
+            .expect("fs/readDirectory should succeed through remote gateway");
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.entries[0].file_name, "gateway.txt");
+        assert_eq!(directory.entries[0].is_file, true);
+
+        let copy: FsCopyResponse = client
+            .request_typed(ClientRequest::FsCopy {
+                request_id: RequestId::Integer(38),
+                params: FsCopyParams {
+                    source_path: PathBuf::from("/tmp/remote-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/copy source path should be absolute"),
+                    destination_path: PathBuf::from("/tmp/remote-project/nested/gateway-copy.txt")
+                        .try_into()
+                        .expect("fs/copy destination path should be absolute"),
+                    recursive: false,
+                },
+            })
+            .await
+            .expect("fs/copy should succeed through remote gateway");
+        assert_eq!(copy, FsCopyResponse {});
+
+        let remove: FsRemoveResponse = client
+            .request_typed(ClientRequest::FsRemove {
+                request_id: RequestId::Integer(39),
+                params: FsRemoveParams {
+                    path: PathBuf::from("/tmp/remote-project/nested/gateway-copy.txt")
+                        .try_into()
+                        .expect("fs/remove path should be absolute"),
+                    recursive: Some(true),
+                    force: Some(true),
+                },
+            })
+            .await
+            .expect("fs/remove should succeed through remote gateway");
+        assert_eq!(remove, FsRemoveResponse {});
+
+        let fuzzy_search: FuzzyFileSearchResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearch {
+                request_id: RequestId::Integer(29),
+                params: FuzzyFileSearchParams {
+                    query: "gate".to_string(),
+                    roots: vec!["/tmp/remote-project".to_string()],
+                    cancellation_token: Some("remote-fuzzy-search".to_string()),
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch should succeed through remote gateway");
+        assert_eq!(fuzzy_search.files.len(), 1);
+        assert_eq!(fuzzy_search.files[0].root, "/tmp/remote-project");
+        assert_eq!(fuzzy_search.files[0].path, "docs/gateway.md");
+        assert_eq!(
+            fuzzy_search.files[0].match_type,
+            FuzzyFileSearchMatchType::File
+        );
+
+        let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearchSessionStart {
+                request_id: RequestId::Integer(30),
+                params: FuzzyFileSearchSessionStartParams {
+                    session_id: "remote-fuzzy-session".to_string(),
+                    roots: vec!["/tmp/remote-project".to_string()],
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch/sessionStart should succeed through remote gateway");
+        assert_eq!(fuzzy_session_start, FuzzyFileSearchSessionStartResponse {});
+
+        let fuzzy_session_update: FuzzyFileSearchSessionUpdateResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearchSessionUpdate {
+                request_id: RequestId::Integer(31),
+                params: FuzzyFileSearchSessionUpdateParams {
+                    session_id: "remote-fuzzy-session".to_string(),
+                    query: "gate".to_string(),
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch/sessionUpdate should succeed through remote gateway");
+        assert_eq!(
+            fuzzy_session_update,
+            FuzzyFileSearchSessionUpdateResponse {}
+        );
+
+        let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearchSessionStop {
+                request_id: RequestId::Integer(32),
+                params: FuzzyFileSearchSessionStopParams {
+                    session_id: "remote-fuzzy-session".to_string(),
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch/sessionStop should succeed through remote gateway");
+        assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
 
         let canceled_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
@@ -22184,6 +22501,7 @@ stream_max_retries = 0
         assert_eq!(health.v2_connections.total_connection_count, 0);
         assert_eq!(health.v2_connections.last_connection_started_at, None);
         assert_eq!(health.v2_connections.last_connection_completed_at, None);
+        assert_eq!(health.v2_connections.last_connection_duration_ms, None);
         assert_eq!(health.v2_connections.last_connection_outcome, None);
         assert_eq!(health.v2_connections.last_connection_detail, None);
         assert_eq!(
@@ -22253,6 +22571,7 @@ stream_max_retries = 0
             true
         );
         assert_eq!(health.v2_connections.last_connection_completed_at, None);
+        assert_eq!(health.v2_connections.last_connection_duration_ms, None);
         assert_eq!(health.v2_connections.last_connection_outcome, None);
 
         assert_remote_client_shutdown(connection.shutdown().await);
@@ -22296,6 +22615,13 @@ stream_max_retries = 0
             settled_health
                 .v2_connections
                 .last_connection_completed_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_duration_ms
                 .is_some(),
             true
         );
@@ -22517,6 +22843,13 @@ stream_max_retries = 0
                 .is_some(),
             true
         );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_duration_ms
+                .is_some(),
+            true
+        );
 
         server.shutdown().await.expect("shutdown");
     }
@@ -22618,6 +22951,13 @@ stream_max_retries = 0
             settled_health
                 .v2_connections
                 .last_connection_completed_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_duration_ms
                 .is_some(),
             true
         );
@@ -23633,6 +23973,7 @@ stream_max_retries = 0
         assert_eq!(health.v2_connections.total_connection_count, 0);
         assert_eq!(health.v2_connections.last_connection_started_at, None);
         assert_eq!(health.v2_connections.last_connection_completed_at, None);
+        assert_eq!(health.v2_connections.last_connection_duration_ms, None);
         assert_eq!(health.v2_connections.last_connection_outcome, None);
         assert_eq!(health.v2_connections.last_connection_detail, None);
 
@@ -28098,6 +28439,26 @@ stream_max_retries = 0
                                 "filePath": format!("{preview}/config.toml"),
                                 "overriddenMetadata": null,
                             }),
+                            "fs/readFile" => serde_json::json!({
+                                "dataBase64": "cmVtb3RlLWZpbGU=",
+                            }),
+                            "fs/writeFile" => serde_json::json!({}),
+                            "fs/createDirectory" => serde_json::json!({}),
+                            "fs/getMetadata" => serde_json::json!({
+                                "isDirectory": false,
+                                "isFile": true,
+                                "isSymlink": false,
+                                "createdAtMs": 0,
+                                "modifiedAtMs": 0,
+                            }),
+                            "fs/readDirectory" => serde_json::json!({
+                                "entries": [{
+                                    "fileName": "gateway.txt",
+                                    "isDirectory": false,
+                                    "isFile": true,
+                                }],
+                            }),
+                            "fs/remove" | "fs/copy" => serde_json::json!({}),
                             "fs/watch" => serde_json::json!({
                                 "path": request
                                     .params
@@ -28107,6 +28468,19 @@ stream_max_retries = 0
                                     .expect("fs/watch should include path"),
                             }),
                             "fs/unwatch" => serde_json::json!({}),
+                            "fuzzyFileSearch" => serde_json::json!({
+                                "files": [{
+                                    "root": "/tmp/remote-project",
+                                    "path": "docs/gateway.md",
+                                    "match_type": "file",
+                                    "file_name": "gateway.md",
+                                    "score": 42,
+                                    "indices": [5, 6, 7, 8],
+                                }],
+                            }),
+                            "fuzzyFileSearch/sessionStart"
+                            | "fuzzyFileSearch/sessionUpdate"
+                            | "fuzzyFileSearch/sessionStop" => serde_json::json!({}),
                             "command/exec" => {
                                 let process_id = request
                                     .params

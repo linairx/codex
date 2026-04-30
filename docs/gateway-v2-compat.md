@@ -1023,7 +1023,8 @@ Recent progress:
   regression in single-worker remote mode, and the real multi-worker health
   harness now also pins the same operator-visible teardown path, pinning
   `v2Connections.lastConnectionOutcome=client_send_timed_out` and the gateway-
-  owned timeout detail instead of only the normal `client_closed` path
+  owned timeout detail plus `v2Connections.lastConnectionDurationMs` instead of
+  only the normal `client_closed` path
 - that reconnect regression now also verifies the recovered v2 session can
   still complete a bidirectional `item/tool/requestUserInput` server-request
   round trip, not just bootstrap and `thread/start`
@@ -1095,6 +1096,15 @@ Recent progress:
   `configWarning`, `deprecationNotice`,
   `mcpServer/startupStatus/updated`, and
   `externalAgentConfig/import/completed`
+- dedicated northbound v2 regression coverage now also pins the steady-state
+  exact-duplicate suppression path for `account/rateLimits/updated` and
+  `app/list/updated` alongside `account/updated`, so the core connection-state
+  dedupe set is covered directly at the gateway boundary
+- dedicated northbound v2 notification forwarding coverage now also includes
+  the full core connection-state set of `account/updated`,
+  `account/rateLimits/updated`, and `app/list/updated`, so single-worker
+  passthrough and multi-worker dedupe coverage exercise the same notification
+  family
 - that reconnect regression now also verifies the recovered multi-worker v2
   session still suppresses duplicate `skills/changed` invalidations across
   workers until the client refreshes with `skills/list`, and still emits one
@@ -1541,6 +1551,7 @@ Operational notes:
   `v2Connections.peakActiveConnectionCount`,
   `v2Connections.totalConnectionCount`,
   `v2Connections.lastConnectionStartedAt`,
+  `v2Connections.lastConnectionDurationMs`,
   `v2Connections.lastConnectionPendingServerRequestCount`, and
   `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
   the latest completed v2 connection outcome/detail/timestamp for quick
@@ -1660,8 +1671,10 @@ Operational notes:
   repeated `/healthz` polling
 - northbound v2 connections now also emit structured gateway logs with
   connection outcome, scope, duration, and terminal error detail when present,
-  so rollout debugging can distinguish slow-client, handshake, and downstream
-  session failures without depending only on metrics or audit-enabled logs
+  while `/healthz` exposes the same latest completed connection duration via
+  `v2Connections.lastConnectionDurationMs`, so rollout debugging can
+  distinguish slow-client, handshake, and downstream session failures without
+  depending only on metrics or audit-enabled logs
 - those connection completion logs and audit logs also include terminal detail
   plus the pending and answered-but-unresolved server-request counts, matching
   the `/healthz` v2 connection snapshot and connection metrics used to
@@ -1677,6 +1690,11 @@ Operational notes:
   are unavailable increment `gateway_v2_fail_closed_requests` with `method`
   and `reconnect_backoff_active` tags, matching the structured warning log
   emitted for the same event
+- primary-worker-only multi-worker requests now also have method-family
+  reconnect-backoff coverage for config requirements, managed login, login
+  cancellation, feedback upload, standalone command control, basic filesystem
+  operations, fuzzy file search, and Windows sandbox setup, so the fail-closed
+  metric and no-fallback behavior are pinned across the full primary route set
 - suppressed multi-worker notification dedupe increments
   `gateway_v2_suppressed_notifications` with `method` and `reason` tags,
   matching the structured warning logs emitted when duplicate connection-state
@@ -1729,6 +1747,66 @@ Operational notes:
 - dedicated northbound v2 regression coverage now also asserts those
   connection logs directly, pinning the outcome/detail mapping that operators
   rely on when diagnosing protocol-violation and other terminal session paths
+- dedicated northbound notification coverage now also pins lower-frequency
+  thread lifecycle notifications for `thread/archived`, `thread/unarchived`,
+  and `thread/closed`, so archive and teardown state changes are covered at
+  the same gateway v2 compatibility boundary as turn lifecycle streams
+- dedicated northbound notification coverage now also pins `fs/changed`, so
+  filesystem watch change delivery is validated at the gateway v2 compatibility
+  boundary alongside `fs/watch` and `fs/unwatch`
+- dedicated northbound passthrough coverage now also pins
+  `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
+  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`, plus the
+  `fuzzyFileSearch/sessionUpdated` and `fuzzyFileSearch/sessionCompleted`
+  notifications used by streaming file-picker sessions
+- dedicated northbound passthrough coverage now also pins the basic filesystem
+  operation family: `fs/readFile`, `fs/writeFile`, `fs/createDirectory`,
+  `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and `fs/copy`
+- dedicated northbound passthrough coverage now also pins the low-frequency
+  Windows sandbox setup path: `windowsSandbox/setupStart`,
+  `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted`
+- multi-worker `windowsSandbox/setupStart` routing now also remains
+  primary-worker affine, with reconnect-before-routing coverage for a missing
+  primary worker and fail-closed coverage while that worker is still in
+  reconnect backoff
+- exact-duplicate suppression for multi-worker connection-state notifications
+  now also covers `windows/worldWritableWarning` and
+  `windowsSandbox/setupCompleted`, so one shared northbound session does not
+  surface duplicate platform setup notices when more than one worker emits the
+  same payload
+- the real embedded and single-worker remote compatibility harnesses now also
+  cover fuzzy file search through unmodified `RemoteAppServerClient` sessions:
+  embedded mode exercises one-shot search against a real temporary filesystem
+  root, while single-worker remote mode exercises the one-shot request plus the
+  streaming session start/update/stop request family
+- the real embedded and single-worker remote compatibility harnesses now also
+  cover the basic filesystem operation family through unmodified
+  `RemoteAppServerClient` sessions, so file helper reads, writes, metadata,
+  directory listing, copy, and remove paths are validated in the release-gate
+  topologies
+- multi-worker `fuzzyFileSearch` routing now also remains primary-worker
+  affine, with real northbound WebSocket reconnect coverage for a missing
+  primary worker and fail-closed coverage while that worker is still in
+  reconnect backoff
+- multi-worker basic filesystem operations now also remain primary-worker
+  affine, so primary-local filesystem helper state does not silently drift to
+  a secondary worker while the primary worker is unavailable
+- that filesystem change notification coverage now also pins multi-worker
+  fan-in for `fs/changed`, so worker-local watch events from multiple
+  downstream sessions reach one shared northbound v2 client session
+- multi-worker reconnect coverage now also pins `fs/changed` delivery from a
+  lazily re-added worker after the shared `fs/watch` request succeeds, so
+  filesystem watch notification fan-in is covered across worker loss and
+  recovery
+- connection-state reconnect coverage now also pins
+  `mcpServer/startupStatus/updated` delivery from a lazily re-added worker
+  after `mcpServerStatus/list`, so recovered-worker MCP startup state remains
+  visible on the shared northbound v2 session
+- dedicated reconnect-backoff coverage now also pins
+  `mcpServer/oauth/login` fail-closed behavior while a worker-discovery route
+  is unavailable, so gateway routing does not continue from an incomplete MCP
+  inventory during retry backoff; that coverage also asserts the fail-closed
+  metric carries the active reconnect-backoff tag
 - `docs/gateway-v2-method-matrix.md` now explicitly records the current real
   multi-worker steady-state compatibility coverage for `thread/start`,
   aggregated `thread/list` / `thread/loaded/list`, sticky `thread/read` /

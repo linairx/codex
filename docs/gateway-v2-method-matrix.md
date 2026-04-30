@@ -77,8 +77,20 @@ bootstrap hot path, but they still need stable v2 compatibility behavior.
 | `configRequirements/read` | Read config requirements and validation metadata | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus real embedded, single-worker remote, and primary-worker multi-worker compatibility coverage. The real single-worker reconnect harness now also verifies that a later `configRequirements/read` request still succeeds after worker recovery. Dedicated northbound websocket reconnect coverage now also pins that recovered primary-worker path on the shared client session. Real multi-worker same-session recovery coverage now also verifies that `configRequirements/read` still routes through the recovered primary worker on one shared client session. |
 | `experimentalFeature/list` | Discover experimental capability flags | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus real embedded and single-worker remote compatibility harnesses. The real single-worker reconnect harness now also verifies that a later `experimentalFeature/list` refresh still succeeds after worker recovery. Multi-worker remote mode now also aggregates capability discovery across workers. Dedicated reconnect regression coverage now also verifies that a later aggregated `experimentalFeature/list` refresh re-adds a recovered worker into the shared feature inventory. Dedicated northbound websocket reconnect coverage now also pins that recovered-worker aggregation on the shared client session. |
 | `collaborationMode/list` | Discover supported collaboration modes | `transparent passthrough` | Covered by dedicated gateway passthrough tests plus real embedded and single-worker remote compatibility harnesses. The real single-worker reconnect harness now also verifies that a later `collaborationMode/list` refresh still succeeds after worker recovery. Multi-worker remote mode now also deduplicates and sorts the aggregated capability set across workers. Dedicated reconnect regression coverage now also verifies that a later aggregated `collaborationMode/list` refresh re-adds a recovered worker into the shared preset inventory. Dedicated northbound websocket reconnect coverage now also pins that recovered-worker aggregation on the shared client session. |
+| `fuzzyFileSearch` | File picker/search results for local roots | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by the real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode currently follows the primary-worker connection-scoped route for this file-system-local helper, including real northbound WebSocket reconnect and reconnect-backoff fail-closed coverage, while broader multi-worker filesystem search semantics remain part of the Stage B rollout profile. |
+| `fuzzyFileSearch/sessionStart` | Start a streaming fuzzy-file-search session | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests plus the real single-worker remote compatibility harness. Multi-worker remote mode routes this primary-worker-local session setup back to a recovered primary worker through real northbound WebSocket reconnect coverage and fails closed during primary-worker reconnect backoff. |
+| `fuzzyFileSearch/sessionUpdate` | Update the query for a streaming fuzzy-file-search session | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests plus the real single-worker remote compatibility harness, with matching notification forwarding coverage for `fuzzyFileSearch/sessionUpdated`. Multi-worker remote mode routes this primary-worker-local session update back to a recovered primary worker through real northbound WebSocket reconnect coverage and fails closed during primary-worker reconnect backoff. |
+| `fuzzyFileSearch/sessionStop` | Stop a streaming fuzzy-file-search session | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests plus the real single-worker remote compatibility harness, with matching notification forwarding coverage for `fuzzyFileSearch/sessionCompleted`. Multi-worker remote mode routes this primary-worker-local session teardown back to a recovered primary worker through real northbound WebSocket reconnect coverage and fails closed during primary-worker reconnect backoff. |
+| `fs/readFile` | Read local file contents for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
+| `fs/writeFile` | Write local file contents for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
+| `fs/createDirectory` | Create local directories for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
+| `fs/getMetadata` | Read local file metadata for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
+| `fs/readDirectory` | List local directory entries for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
+| `fs/remove` | Remove local files/directories for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
+| `fs/copy` | Copy local files/directories for app/tool filesystem helpers | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests and by real embedded plus single-worker remote compatibility harnesses. Multi-worker remote mode treats this as a primary-worker-local filesystem operation and fails closed during primary-worker reconnect backoff. |
 | `fs/watch` | Subscribe the current connection to filesystem change notifications | `transparent passthrough` | Covered by real embedded and single-worker remote compatibility harnesses. Multi-worker remote mode now fans connection-scoped watches out across workers so one shared northbound session can observe worker-local filesystem changes instead of only the primary worker's watch set. Dedicated reconnect regression coverage now also verifies that a later `fs/watch` request reconnects a recovered worker before the shared watch is applied, and dedicated northbound websocket reconnect coverage now also pins that recovered-worker fanout on the shared client session. Real multi-worker same-session recovery coverage now also verifies that one shared northbound client can still fan `fs/watch` back out across the recovered worker and the surviving worker without reconnecting. |
 | `fs/unwatch` | Remove a prior filesystem watch for the current connection | `transparent passthrough` | Covered by real embedded and single-worker remote compatibility harnesses. Multi-worker remote mode now fans connection-scoped unwatch requests out across workers so one shared northbound session can tear down worker-local watch state consistently. Dedicated reconnect regression coverage now also verifies that a later `fs/unwatch` request reconnects a recovered worker before the shared watch teardown runs, and dedicated northbound websocket reconnect coverage now also pins that recovered-worker fanout on the shared client session. Real multi-worker same-session recovery coverage now also verifies that one shared northbound client can still fan `fs/unwatch` back out across the recovered worker and the surviving worker without reconnecting. |
+| `windowsSandbox/setupStart` | Start Windows sandbox setup from the client UI | `transparent passthrough` | Covered by dedicated northbound gateway passthrough tests. Multi-worker remote mode keeps this low-frequency platform setup helper primary-worker affine, including reconnect-before-routing coverage and reconnect-backoff fail-closed coverage. |
 
 Additional multi-worker recovery coverage:
 
@@ -204,10 +216,13 @@ Current status:
   by real single-worker remote and multi-worker remote turn-workflow
   compatibility tests
 - dedicated gateway notification coverage now also includes
-  `plan/delta`, `reasoning/summaryPartAdded`, `terminalInteraction`,
-  `turn/diffUpdated`, `turn/planUpdated`, `thread/name/updated`,
-  `thread/tokenUsage/updated`, `mcpToolCall/progress`,
-  `contextCompacted`, and `model/rerouted`
+  `thread/archived`, `thread/unarchived`, `thread/closed`, `plan/delta`,
+  `reasoning/summaryPartAdded`, `terminalInteraction`, `turn/diffUpdated`,
+  `turn/planUpdated`, `thread/name/updated`, `thread/tokenUsage/updated`,
+  `mcpToolCall/progress`, `contextCompacted`, and `model/rerouted`
+- dedicated gateway connection-notification coverage now also includes
+  `fuzzyFileSearch/sessionUpdated` and `fuzzyFileSearch/sessionCompleted`, so
+  streaming file-search sessions are pinned alongside their request surface
 - `thread/realtime/started` is covered by a dedicated gateway compatibility
   test for experimental realtime notification forwarding
 - additional experimental realtime notifications now also have dedicated
@@ -273,9 +288,41 @@ Current status:
   `warning`, `configWarning`, and `deprecationNotice`, so one shared
   northbound session does not surface duplicate visible notices when more than
   one worker emits the same payload
+- dedicated northbound v2 regression coverage now also pins the steady-state
+  exact-duplicate suppression path for `account/rateLimits/updated` and
+  `app/list/updated` alongside `account/updated`, so the core connection-state
+  dedupe set is covered directly at the gateway boundary
+- dedicated northbound v2 notification forwarding coverage now also includes
+  the full core connection-state set of `account/updated`,
+  `account/rateLimits/updated`, and `app/list/updated`, so single-worker
+  passthrough and multi-worker dedupe coverage exercise the same notification
+  family
 - dedicated gateway connection-notification coverage now also includes
   `externalAgentConfig/import/completed`, so fanout imports do not surface
   duplicate completion notifications on one shared multi-worker session
+- dedicated gateway connection-notification coverage now also includes
+  exact-duplicate suppression for `windows/worldWritableWarning` and
+  `windowsSandbox/setupCompleted`, so platform setup notices stay
+  single-delivery on one shared multi-worker session
+- dedicated gateway connection-notification coverage now also includes
+  `fs/changed`, so filesystem watch change delivery is pinned at the same
+  northbound boundary as `fs/watch` and `fs/unwatch`
+- dedicated gateway connection-notification coverage now also verifies
+  multi-worker `fs/changed` fan-in, so one shared northbound session receives
+  worker-local filesystem change notifications from more than one downstream
+  app-server session
+- dedicated reconnect coverage now also verifies `fs/changed` fan-in from a
+  lazily re-added worker after shared `fs/watch`, so filesystem watch
+  notifications remain covered across worker loss and same-session recovery
+- dedicated reconnect coverage now also verifies
+  `mcpServer/startupStatus/updated` delivery from a lazily re-added worker
+  after `mcpServerStatus/list`, so recovered-worker MCP startup state remains
+  visible on one shared northbound session
+- dedicated reconnect-backoff coverage now also verifies that
+  `mcpServer/oauth/login` fails closed while a worker-discovery route is still
+  unavailable, so OAuth login routing does not proceed from incomplete MCP
+  inventory during retry backoff, and asserts the fail-closed metric is tagged
+  with active reconnect backoff
 - the real embedded compatibility harness now also covers
   `account/login/completed` during the external-auth onboarding flow
 - the real single-worker remote compatibility harness now also covers
@@ -384,11 +431,11 @@ These are the known gaps that remain after the current Stage A coverage work.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| remote runtime with more than one worker | `partial` | Northbound v2 WebSocket upgrades are now admitted in multi-worker remote mode, with one downstream session per worker plus aggregated `thread/list` / `thread/loaded/list`, deduplicated multi-worker `thread/list` results that keep the newest visible snapshot per thread id, aggregated bootstrap/setup discovery for `account/read`, `model/list`, `externalAgentConfig/detect`, `app/list`, `skills/list`, `mcpServerStatus/list`, and threadless `plugin/list`, translated server-request IDs across workers for `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `mcpServer/elicitation/request`, and `account/chatgptAuthTokens/refresh`, including a dedicated real-client regression where two workers keep the same downstream request id pending at once for `item/tool/requestUserInput`, `item/permissions/requestApproval`, and `mcpServer/elicitation/request` and the gateway still assigns distinct northbound ids, sticky thread routing, worker-discovery routing for `plugin/read` / `plugin/install` / `plugin/uninstall` / `mcpServer/oauth/login`, fanout for connection-scoped setup mutations such as `account/login/start` for external-auth `apiKey` and `chatgptAuthTokens`, `externalAgentConfig/import`, `config/batchWrite`, `memory/reset`, `account/logout`, `fs/watch`, and `fs/unwatch`, deduplicated `skills/changed` invalidation notifications until the client refreshes with `skills/list`, exact-duplicate suppression for connection-state notifications such as `account/updated`, `account/rateLimits/updated`, `account/login/completed`, `app/list/updated`, `warning`, `configWarning`, `deprecationNotice`, `mcpServer/startupStatus/updated`, `mcpServer/oauthLogin/completed`, and `externalAgentConfig/import/completed`, synthesized `serverRequest/resolved` for thread-scoped prompts stranded by a worker disconnect, route backfill for already visible threads discovered through aggregated `thread/list` / `thread/loaded/list` plus lazy route recovery for later thread-scoped requests when that worker mapping is missing, in-session survival when one downstream worker disconnects and the remaining workers can still serve the shared northbound connection, lazy re-add of a recovered worker on later client requests so the same northbound session can resume routing work back onto that worker, and a short per-worker reconnect retry backoff so repeated worker failures do not trigger an immediate reconnect attempt on every later client request. Connection-scoped fanout mutations now also fail closed while any worker remains unavailable during retry backoff, instead of silently drifting shared setup or watch state onto only the surviving subset. Threadless `config/read` now also fails closed while the primary worker remains unavailable during retry backoff, instead of silently falling through to a surviving secondary worker's config. Cwd-aware `config/read` now also fails closed while any worker remains unavailable during retry backoff, instead of silently falling back to a surviving worker whose config layers do not match the requested path. Worker-discovery plugin requests now also fail closed while any worker remains unavailable during retry backoff, instead of selecting from an incomplete plugin inventory. That same worker-discovery fail-closed behavior now also applies to `mcpServer/oauth/login` while any worker remains unavailable during retry backoff, instead of selecting from an incomplete MCP inventory. Primary-worker-only requests now also fail closed while that worker remains unavailable during retry backoff, instead of silently falling through to a surviving secondary worker. That same degraded-session path now keeps multi-worker semantics active while only one worker is temporarily live, so connection-scoped fanout, dedupe, and gateway-owned server-request id translation do not silently collapse into single-worker handling before missing workers reconnect. Later refreshes of aggregated `account/read`, `account/rateLimits/read`, unpaginated `model/list`, threadless `config/read`, aggregated `thread/list`, aggregated `thread/loaded/list`, `plugin/read`, `plugin/install`, `plugin/uninstall`, `mcpServer/oauth/login`, `externalAgentConfig/detect`, `externalAgentConfig/import`, `experimentalFeature/list`, `collaborationMode/list`, `skills/list`, `app/list`, `mcpServerStatus/list`, threadless `plugin/list`, `config/batchWrite`, `config/value/write`, `memory/reset`, `account/logout`, `fs/watch`, and `fs/unwatch` can all now re-add a recovered worker. Broad steady-state and reconnect validation now exists for thread, turn, realtime, approval, setup, and recovery flows, but broader parity and rollout hardening are still pending before this matches embedded or single-worker remote support. |
+| remote runtime with more than one worker | `partial` | Northbound v2 WebSocket upgrades are now admitted in multi-worker remote mode, with one downstream session per worker plus aggregated `thread/list` / `thread/loaded/list`, deduplicated multi-worker `thread/list` results that keep the newest visible snapshot per thread id, aggregated bootstrap/setup discovery for `account/read`, `model/list`, `externalAgentConfig/detect`, `app/list`, `skills/list`, `mcpServerStatus/list`, and threadless `plugin/list`, translated server-request IDs across workers for `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `mcpServer/elicitation/request`, and `account/chatgptAuthTokens/refresh`, including a dedicated real-client regression where two workers keep the same downstream request id pending at once for `item/tool/requestUserInput`, `item/permissions/requestApproval`, and `mcpServer/elicitation/request` and the gateway still assigns distinct northbound ids, sticky thread routing, worker-discovery routing for `plugin/read` / `plugin/install` / `plugin/uninstall` / `mcpServer/oauth/login`, fanout for connection-scoped setup mutations such as `account/login/start` for external-auth `apiKey` and `chatgptAuthTokens`, `externalAgentConfig/import`, `config/batchWrite`, `memory/reset`, `account/logout`, `fs/watch`, and `fs/unwatch`, deduplicated `skills/changed` invalidation notifications until the client refreshes with `skills/list`, exact-duplicate suppression for connection-state notifications such as `account/updated`, `account/rateLimits/updated`, `account/login/completed`, `app/list/updated`, `warning`, `configWarning`, `deprecationNotice`, `mcpServer/startupStatus/updated`, `mcpServer/oauthLogin/completed`, and `externalAgentConfig/import/completed`, synthesized `serverRequest/resolved` for thread-scoped prompts stranded by a worker disconnect, route backfill for already visible threads discovered through aggregated `thread/list` / `thread/loaded/list` plus lazy route recovery for later thread-scoped requests when that worker mapping is missing, in-session survival when one downstream worker disconnects and the remaining workers can still serve the shared northbound connection, lazy re-add of a recovered worker on later client requests so the same northbound session can resume routing work back onto that worker, and a short per-worker reconnect retry backoff so repeated worker failures do not trigger an immediate reconnect attempt on every later client request. Connection-scoped fanout mutations now also fail closed while any worker remains unavailable during retry backoff, instead of silently drifting shared setup or watch state onto only the surviving subset. Threadless `config/read` now also fails closed while the primary worker remains unavailable during retry backoff, instead of silently falling through to a surviving secondary worker's config. Cwd-aware `config/read` now also fails closed while any worker remains unavailable during retry backoff, instead of silently falling back to a surviving worker whose config layers do not match the requested path. Worker-discovery plugin requests now also fail closed while any worker remains unavailable during retry backoff, instead of selecting from an incomplete plugin inventory. That same worker-discovery fail-closed behavior now also applies to `mcpServer/oauth/login` while any worker remains unavailable during retry backoff, instead of selecting from an incomplete MCP inventory. Primary-worker-only requests now also fail closed while that worker remains unavailable during retry backoff, instead of silently falling through to a surviving secondary worker; method-family coverage now pins that behavior for config requirements, managed login, login cancellation, feedback upload, standalone command control, basic filesystem operations, and fuzzy file search. That same degraded-session path now keeps multi-worker semantics active while only one worker is temporarily live, so connection-scoped fanout, dedupe, and gateway-owned server-request id translation do not silently collapse into single-worker handling before missing workers reconnect. Later refreshes of aggregated `account/read`, `account/rateLimits/read`, unpaginated `model/list`, threadless `config/read`, aggregated `thread/list`, aggregated `thread/loaded/list`, `plugin/read`, `plugin/install`, `plugin/uninstall`, `mcpServer/oauth/login`, `externalAgentConfig/detect`, `externalAgentConfig/import`, `experimentalFeature/list`, `collaborationMode/list`, `skills/list`, `app/list`, `mcpServerStatus/list`, threadless `plugin/list`, `config/batchWrite`, `config/value/write`, `memory/reset`, `account/logout`, `fs/watch`, and `fs/unwatch` can all now re-add a recovered worker. Broad steady-state and reconnect validation now exists for thread, turn, realtime, approval, setup, and recovery flows, but broader parity and rollout hardening are still pending before this matches embedded or single-worker remote support. |
 | v2 scope enforcement | `complete` | Embedded, single-worker remote, and multi-worker remote v2 connections now derive tenant/project scope from the WebSocket upgrade headers, enforce thread visibility on thread-scoped requests, filter `thread/list` plus `thread/loaded/list`, reject downstream server requests for hidden threads, backfill worker ownership for already visible threads discovered through aggregated list responses, register resumed/forked thread IDs back into scope ownership, and now also register visible rollout paths so path-based `thread/resume` / `thread/fork` stay scope-checked instead of bypassing ownership. Hidden-thread downstream server requests now also emit structured warning logs with scope, worker id, request id, method, and hidden thread id when the gateway rejects them. History-based `thread/resume` is now treated as a connection-scoped request, so the gateway no longer rejects that app-server flow just because the placeholder `threadId` is not yet visible. Multi-worker remote runtime now also has real northbound `RemoteAppServerClient` regressions covering same-scope re-entry plus cross-scope filtering for aggregated `thread/list` / `thread/loaded/list` / `thread/read`, plus visible-path `thread/resume` / `thread/fork` routing through one shared client session. |
 | v2 admission/rate limiting | `complete` | The gateway now applies the same per-scope request rate limit and turn-start quota policy to v2 JSON-RPC requests that it already applies to HTTP routes. |
 | v2 per-message audit/metrics | `complete` | The gateway now emits per-request v2 metrics and audit logs for `initialize` and subsequent client JSON-RPC requests, tagged by method and outcome. |
-| v2 per-connection observability | `complete` | The gateway emits per-connection metrics, audit logs, health snapshots, and operator-facing completion logs for northbound WebSocket session outcomes. These records include outcome, duration, scope, terminal detail where applicable, and the final pending plus answered-but-unresolved server-request counts used to diagnose stranded prompt lifecycles. Saturated and hidden-thread downstream server-request rejections also emit a dedicated `gateway_v2_server_request_rejections` counter tagged by server-request method and `pending_limit` / `hidden_thread` reason. Multi-worker reconnect attempts, successes, failures, replay failures, and backoff suppression emit `gateway_v2_worker_reconnects` with worker/outcome tags, with direct reconnect-path regression coverage for each outcome. Multi-worker requests that fail closed because required worker routes are unavailable emit `gateway_v2_fail_closed_requests` with method/backoff tags. Suppressed multi-worker connection notifications emit `gateway_v2_suppressed_notifications` with method/reason tags for exact-duplicate connection-state notifications, repeated `skills/changed` invalidations, and hidden-thread notification drops. Duplicate downstream `serverRequest/resolved` replays emit `gateway_v2_server_request_lifecycle_events` with event/method tags after gateway request-id translation has already drained the route, downstream server requests that reuse a still-pending gateway request id emit the same lifecycle metric with `event=duplicate_pending_request` before the gateway fails the session closed, client replies for unknown server-request ids emit the same lifecycle metric with `event=unexpected_client_server_request_response`, worker-loss cleanup emits lifecycle counters for synthesized thread-scoped `serverRequest/resolved` notifications plus stranded connection-scoped prompts, client-side connection cleanup emits lifecycle counters for rejected pending prompts plus answered-but-unresolved prompts left behind by disconnect, protocol-violation, or slow-send teardown paths, malformed or out-of-order client traffic emits `gateway_v2_protocol_violations` with phase/reason tags for initialize ordering, invalid JSON-RPC, invalid UTF-8, and repeated initialize cases, downstream event stream lag emits `gateway_v2_downstream_backpressure_events` with worker tags before the gateway attempts the northbound close, slow-client northbound send timeouts emit `gateway_v2_client_send_timeouts` alongside the terminal `client_send_timed_out` connection outcome, and multi-worker thread routing diagnostics emit `gateway_v2_thread_list_deduplications` plus `gateway_v2_thread_route_recoveries` for duplicate snapshot selection and lazy ownership probe outcomes. |
+| v2 per-connection observability | `complete` | The gateway emits per-connection metrics, audit logs, health snapshots, and operator-facing completion logs for northbound WebSocket session outcomes. These records include outcome, duration, scope, terminal detail where applicable, and the final pending plus answered-but-unresolved server-request counts used to diagnose stranded prompt lifecycles; `/healthz` also exposes the latest completed connection duration as `v2Connections.lastConnectionDurationMs`. Saturated and hidden-thread downstream server-request rejections also emit a dedicated `gateway_v2_server_request_rejections` counter tagged by server-request method and `pending_limit` / `hidden_thread` reason. Multi-worker reconnect attempts, successes, failures, replay failures, and backoff suppression emit `gateway_v2_worker_reconnects` with worker/outcome tags, with direct reconnect-path regression coverage for each outcome. Multi-worker requests that fail closed because required worker routes are unavailable emit `gateway_v2_fail_closed_requests` with method/backoff tags. Suppressed multi-worker connection notifications emit `gateway_v2_suppressed_notifications` with method/reason tags for exact-duplicate connection-state notifications, repeated `skills/changed` invalidations, and hidden-thread notification drops. Duplicate downstream `serverRequest/resolved` replays emit `gateway_v2_server_request_lifecycle_events` with event/method tags after gateway request-id translation has already drained the route, downstream server requests that reuse a still-pending gateway request id emit the same lifecycle metric with `event=duplicate_pending_request` before the gateway fails the session closed, client replies for unknown server-request ids emit the same lifecycle metric with `event=unexpected_client_server_request_response`, worker-loss cleanup emits lifecycle counters for synthesized thread-scoped `serverRequest/resolved` notifications plus stranded connection-scoped prompts, client-side connection cleanup emits lifecycle counters for rejected pending prompts plus answered-but-unresolved prompts left behind by disconnect, protocol-violation, or slow-send teardown paths, malformed or out-of-order client traffic emits `gateway_v2_protocol_violations` with phase/reason tags for initialize ordering, invalid JSON-RPC, invalid UTF-8, and repeated initialize cases, downstream event stream lag emits `gateway_v2_downstream_backpressure_events` with worker tags before the gateway attempts the northbound close, slow-client northbound send timeouts emit `gateway_v2_client_send_timeouts` alongside the terminal `client_send_timed_out` connection outcome, and multi-worker thread routing diagnostics emit `gateway_v2_thread_list_deduplications` plus `gateway_v2_thread_route_recoveries` for duplicate snapshot selection and lazy ownership probe outcomes. |
 
 ## Required Test Subset
 
@@ -414,22 +461,27 @@ The current gateway compatibility tests cover this required subset:
 - `account/login/start`
 - `account/login/cancel`
 - `account/logout`
-- `externalAgentConfig/detect`
-- `externalAgentConfig/import`
-- `app/list`
-- `mcpServerStatus/list`
-- `mcpServer/oauth/login`
-- `skills/list`
-- `plugin/list`
-- `plugin/read`
 - `config/read`
 - `configRequirements/read`
 - `experimentalFeature/list`
 - `collaborationMode/list`
+- `fuzzyFileSearch`
+- `fuzzyFileSearch/sessionStart`
+- `fuzzyFileSearch/sessionUpdate`
+- `fuzzyFileSearch/sessionStop`
 - `feedback/upload`
+- `fs/readFile`
+- `fs/writeFile`
+- `fs/createDirectory`
+- `fs/getMetadata`
+- `fs/readDirectory`
+- `fs/remove`
+- `fs/copy`
 - `fs/watch`
 - `fs/unwatch`
+- `windowsSandbox/setupStart`
 - `command/exec`
+- `command/exec/outputDelta` notification forwarding
 - `command/exec/write`
 - `command/exec/resize`
 - `command/exec/terminate`
@@ -464,6 +516,9 @@ The current gateway compatibility tests cover this required subset:
 - `turn/steer`
 - `thread/started` notification forwarding
 - `thread/status/changed` notification forwarding
+- `thread/archived` notification forwarding
+- `thread/unarchived` notification forwarding
+- `thread/closed` notification forwarding
 - `turn/started` notification forwarding
 - `turn/completed` notification forwarding
 - `hookStarted` notification forwarding
@@ -478,15 +533,29 @@ The current gateway compatibility tests cover this required subset:
 - `item/commandExecution/outputDelta` notification forwarding
 - `item/fileChange/outputDelta` notification forwarding
 - `thread/realtime/started` notification forwarding
+- `thread/realtime/itemAdded` notification forwarding
+- `thread/realtime/outputAudio/delta` notification forwarding
+- `thread/realtime/transcript/delta` notification forwarding
+- `thread/realtime/transcript/done` notification forwarding
+- `thread/realtime/sdp` notification forwarding
+- `thread/realtime/error` notification forwarding
+- `thread/realtime/closed` notification forwarding
 - `account/updated` notification forwarding
 - `account/rateLimits/updated` notification forwarding
 - `app/list/updated` notification forwarding
 - `account/login/completed` notification forwarding
 - `mcpServer/oauthLogin/completed` notification forwarding
+- `mcpServer/startupStatus/updated` notification forwarding
+- `externalAgentConfig/import/completed` notification forwarding
 - `warning` notification forwarding
 - `configWarning` notification forwarding
 - `deprecationNotice` notification forwarding
 - `skills/changed` notification forwarding
+- `fs/changed` notification forwarding
+- `windows/worldWritableWarning` notification forwarding
+- `windowsSandbox/setupCompleted` notification forwarding
+- `fuzzyFileSearch/sessionUpdated` notification forwarding
+- `fuzzyFileSearch/sessionCompleted` notification forwarding
 - `item/commandExecution/requestApproval` server-request round trip
 - `item/fileChange/requestApproval` server-request round trip
 - `item/permissions/requestApproval` server-request round trip
@@ -605,6 +674,12 @@ Embedded-mode coverage notes:
 - that same embedded harness now also covers `feedback/upload`, validating
   operator-facing feedback submission through the real northbound client
   transport instead of only through targeted passthrough fixtures
+- that same embedded harness now also covers one-shot `fuzzyFileSearch` against
+  a real temporary filesystem root through the real northbound client transport
+- that same embedded harness now also covers the basic filesystem operation
+  family (`fs/readFile`, `fs/writeFile`, `fs/createDirectory`,
+  `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and `fs/copy`) against a
+  real temporary filesystem root through the real northbound client transport
 - that same embedded harness now also covers standalone command execution for
   `command/exec`, `command/exec/outputDelta`, `command/exec/write`,
   `command/exec/resize`, and `command/exec/terminate`
@@ -639,6 +714,14 @@ Single-worker remote coverage notes:
 - that same single-worker remote harness now also covers onboarding auth and
   feedback flows for `account/login/start`, `account/login/cancel`,
   `account/login/completed`, and `feedback/upload`
+- that same single-worker remote harness now also covers the fuzzy-file-search
+  request family through the real northbound client transport, including
+  `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
+  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`
+- that same single-worker remote harness now also covers the basic filesystem
+  operation family through the real northbound client transport, including
+  `fs/readFile`, `fs/writeFile`, `fs/createDirectory`, `fs/getMetadata`,
+  `fs/readDirectory`, `fs/remove`, and `fs/copy`
 - that single-worker remote harness now also covers a real
   `item/tool/requestUserInput` server-request round trip over the gateway's
   northbound v2 transport
