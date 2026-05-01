@@ -790,6 +790,8 @@ mod tests {
     use codex_app_server_client::RemoteAppServerConnectArgs;
     use codex_app_server_client::TypedRequestError;
     use codex_app_server_protocol::Account;
+    use codex_app_server_protocol::AddCreditsNudgeCreditType;
+    use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
     use codex_app_server_protocol::AppsListParams;
     use codex_app_server_protocol::AppsListResponse;
     use codex_app_server_protocol::AuthMode;
@@ -822,6 +824,8 @@ mod tests {
     use codex_app_server_protocol::DynamicToolCallResponse;
     use codex_app_server_protocol::DynamicToolCallStatus;
     use codex_app_server_protocol::DynamicToolSpec;
+    use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
+    use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
     use codex_app_server_protocol::ExperimentalFeatureListParams;
     use codex_app_server_protocol::ExperimentalFeatureListResponse;
     use codex_app_server_protocol::ExternalAgentConfigDetectParams;
@@ -873,14 +877,21 @@ mod tests {
     use codex_app_server_protocol::LoginAccountParams;
     use codex_app_server_protocol::LoginAccountResponse;
     use codex_app_server_protocol::LogoutAccountResponse;
+    use codex_app_server_protocol::MarketplaceAddParams;
+    use codex_app_server_protocol::MarketplaceAddResponse;
     use codex_app_server_protocol::McpElicitationSchema;
+    use codex_app_server_protocol::McpResourceReadParams;
+    use codex_app_server_protocol::McpResourceReadResponse;
     use codex_app_server_protocol::McpServerElicitationAction;
     use codex_app_server_protocol::McpServerElicitationRequest;
     use codex_app_server_protocol::McpServerElicitationRequestResponse;
     use codex_app_server_protocol::McpServerOauthLoginParams;
     use codex_app_server_protocol::McpServerOauthLoginResponse;
+    use codex_app_server_protocol::McpServerRefreshResponse;
     use codex_app_server_protocol::McpServerStartupState;
     use codex_app_server_protocol::McpServerStatusDetail;
+    use codex_app_server_protocol::McpServerToolCallParams;
+    use codex_app_server_protocol::McpServerToolCallResponse;
     use codex_app_server_protocol::MemoryResetResponse;
     use codex_app_server_protocol::MergeStrategy;
     use codex_app_server_protocol::ModelListParams;
@@ -904,9 +915,13 @@ mod tests {
     use codex_app_server_protocol::ReviewStartParams;
     use codex_app_server_protocol::ReviewStartResponse;
     use codex_app_server_protocol::ReviewTarget;
+    use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
+    use codex_app_server_protocol::SendAddCreditsNudgeEmailResponse;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::ServerRequestResolvedNotification;
+    use codex_app_server_protocol::SkillsConfigWriteParams;
+    use codex_app_server_protocol::SkillsConfigWriteResponse;
     use codex_app_server_protocol::SkillsListParams;
     use codex_app_server_protocol::SkillsListResponse;
     use codex_app_server_protocol::ThreadArchiveParams;
@@ -979,6 +994,9 @@ mod tests {
     use codex_app_server_protocol::TurnSteerParams;
     use codex_app_server_protocol::TurnSteerResponse;
     use codex_app_server_protocol::UserInput;
+    use codex_app_server_protocol::WindowsSandboxSetupMode;
+    use codex_app_server_protocol::WindowsSandboxSetupStartParams;
+    use codex_app_server_protocol::WindowsSandboxSetupStartResponse;
     use codex_app_server_protocol::WriteStatus;
     use codex_arg0::Arg0DispatchPaths;
     use codex_config::types::AuthCredentialsStoreMode;
@@ -2192,6 +2210,45 @@ mod tests {
         assert_eq!(
             fuzzy_search.files[0].match_type,
             FuzzyFileSearchMatchType::File
+        );
+
+        let windows_setup: WindowsSandboxSetupStartResponse = client
+            .request_typed(ClientRequest::WindowsSandboxSetupStart {
+                request_id: RequestId::Integer(37),
+                params: WindowsSandboxSetupStartParams {
+                    mode: WindowsSandboxSetupMode::Unelevated,
+                    cwd: Some(
+                        codex_home
+                            .path()
+                            .to_path_buf()
+                            .try_into()
+                            .expect("windowsSandbox/setupStart cwd should be absolute"),
+                    ),
+                },
+            })
+            .await
+            .expect("windowsSandbox/setupStart should succeed through embedded gateway");
+        assert_eq!(windows_setup.started, true);
+
+        let windows_setup_completed = timeout(Duration::from_secs(10), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::WindowsSandboxSetupCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("windowsSandbox/setupCompleted notification should arrive");
+        assert_eq!(
+            windows_setup_completed.mode,
+            WindowsSandboxSetupMode::Unelevated
         );
 
         let skills: SkillsListResponse = client
@@ -7100,6 +7157,23 @@ stream_max_retries = 0
         assert_eq!(experimental_features.data.len(), 1);
         assert_eq!(experimental_features.data[0].name, "gateway-test-feature");
 
+        let feature_enablement: ExperimentalFeatureEnablementSetResponse = client
+            .request_typed(ClientRequest::ExperimentalFeatureEnablementSet {
+                request_id: RequestId::Integer(41),
+                params: ExperimentalFeatureEnablementSetParams {
+                    enablement: std::collections::BTreeMap::from([(
+                        "gateway-test-feature".to_string(),
+                        true,
+                    )]),
+                },
+            })
+            .await
+            .expect("experimentalFeature/enablement/set should succeed through remote gateway");
+        assert_eq!(
+            feature_enablement.enablement,
+            std::collections::BTreeMap::from([("gateway-test-feature".to_string(), true)])
+        );
+
         let collaboration_modes: CollaborationModeListResponse = client
             .request_typed(ClientRequest::CollaborationModeList {
                 request_id: RequestId::Integer(6),
@@ -7143,6 +7217,23 @@ stream_max_retries = 0
         assert_eq!(skills.data[0].errors, Vec::new());
         assert_eq!(skills.data[0].skills, Vec::new());
 
+        let skills_config: SkillsConfigWriteResponse = client
+            .request_typed(ClientRequest::SkillsConfigWrite {
+                request_id: RequestId::Integer(42),
+                params: SkillsConfigWriteParams {
+                    path: Some(
+                        PathBuf::from("/tmp/remote-project/skills/remote-skill")
+                            .try_into()
+                            .expect("skills/config/write path should be absolute"),
+                    ),
+                    name: None,
+                    enabled: true,
+                },
+            })
+            .await
+            .expect("skills/config/write should succeed through remote gateway");
+        assert_eq!(skills_config.effective_enabled, true);
+
         let apps: AppsListResponse = client
             .request_typed(ClientRequest::AppsList {
                 request_id: RequestId::Integer(9),
@@ -7174,6 +7265,15 @@ stream_max_retries = 0
         assert_eq!(mcp_statuses.next_cursor, None);
         assert_eq!(mcp_statuses.data.len(), 1);
         assert_eq!(mcp_statuses.data[0].name, "remote-mcp");
+
+        let mcp_refresh: McpServerRefreshResponse = client
+            .request_typed(ClientRequest::McpServerRefresh {
+                request_id: RequestId::Integer(43),
+                params: None,
+            })
+            .await
+            .expect("config/mcpServer/reload should succeed through remote gateway");
+        assert_eq!(mcp_refresh, McpServerRefreshResponse {});
 
         let mcp_oauth_login: McpServerOauthLoginResponse = client
             .request_typed(ClientRequest::McpServerOauthLogin {
@@ -7211,6 +7311,65 @@ stream_max_retries = 0
         assert_eq!(mcp_oauth_completed.success, true);
         assert_eq!(mcp_oauth_completed.error, None);
 
+        let started_for_mcp: AppServerThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(48),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/remote-project".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(false),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect("thread/start should make MCP thread-scoped requests visible");
+        assert_eq!(started_for_mcp.thread.id, "thread-remote-workflow");
+
+        let mcp_resource: McpResourceReadResponse = client
+            .request_typed(ClientRequest::McpResourceRead {
+                request_id: RequestId::Integer(44),
+                params: McpResourceReadParams {
+                    thread_id: started_for_mcp.thread.id.clone(),
+                    server: "remote-mcp".to_string(),
+                    uri: "file:///tmp/remote-project/context.md".to_string(),
+                },
+            })
+            .await
+            .expect("mcpServer/resource/read should succeed through remote gateway");
+        assert_eq!(mcp_resource.contents.len(), 1);
+
+        let mcp_tool: McpServerToolCallResponse = client
+            .request_typed(ClientRequest::McpServerToolCall {
+                request_id: RequestId::Integer(45),
+                params: McpServerToolCallParams {
+                    thread_id: started_for_mcp.thread.id.clone(),
+                    server: "remote-mcp".to_string(),
+                    tool: "lookup".to_string(),
+                    arguments: Some(serde_json::json!({
+                        "query": "gateway",
+                    })),
+                    meta: None,
+                },
+            })
+            .await
+            .expect("mcpServer/tool/call should succeed through remote gateway");
+        assert_eq!(mcp_tool.content.len(), 1);
+        assert_eq!(mcp_tool.is_error, Some(false));
+
         let plugin_list_params: PluginListParams = serde_json::from_value(serde_json::json!({
             "cwds": ["/tmp/remote-project"],
         }))
@@ -7227,6 +7386,24 @@ stream_max_retries = 0
         assert_eq!(plugins.marketplaces[0].plugins.len(), 1);
         assert_eq!(plugins.marketplaces[0].plugins[0].name, "remote-plugin");
         assert_eq!(plugins.marketplaces[0].plugins[0].installed, false);
+
+        let marketplace: MarketplaceAddResponse = client
+            .request_typed(ClientRequest::MarketplaceAdd {
+                request_id: RequestId::Integer(46),
+                params: MarketplaceAddParams {
+                    source: "https://example.com/remote-marketplace.git".to_string(),
+                    ref_name: Some("main".to_string()),
+                    sparse_paths: Some(vec!["plugins/remote-plugin".to_string()]),
+                },
+            })
+            .await
+            .expect("marketplace/add should succeed through remote gateway");
+        assert_eq!(marketplace.marketplace_name, "remote-marketplace");
+        assert_eq!(marketplace.already_added, false);
+        assert_eq!(
+            marketplace.installed_root.as_path(),
+            PathBuf::from("/tmp/remote-project/marketplace").as_path()
+        );
 
         let plugin_read_params: PluginReadParams = serde_json::from_value(serde_json::json!({
             "marketplacePath": "/tmp/remote-project/marketplace.json",
@@ -7537,6 +7714,45 @@ stream_max_retries = 0
             .expect("fuzzyFileSearch/sessionStop should succeed through remote gateway");
         assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
 
+        let windows_setup: WindowsSandboxSetupStartResponse = client
+            .request_typed(ClientRequest::WindowsSandboxSetupStart {
+                request_id: RequestId::Integer(40),
+                params: WindowsSandboxSetupStartParams {
+                    mode: WindowsSandboxSetupMode::Unelevated,
+                    cwd: Some(
+                        PathBuf::from("/tmp/remote-project")
+                            .try_into()
+                            .expect("windowsSandbox/setupStart cwd should be absolute"),
+                    ),
+                },
+            })
+            .await
+            .expect("windowsSandbox/setupStart should succeed through remote gateway");
+        assert_eq!(windows_setup.started, true);
+
+        let windows_setup_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::WindowsSandboxSetupCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("windowsSandbox/setupCompleted notification should arrive");
+        assert_eq!(
+            windows_setup_completed.mode,
+            WindowsSandboxSetupMode::Unelevated
+        );
+        assert_eq!(windows_setup_completed.success, true);
+        assert_eq!(windows_setup_completed.error, None);
+
         let canceled_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
                 request_id: RequestId::Integer(22),
@@ -7602,6 +7818,17 @@ stream_max_retries = 0
         assert_eq!(login_completed.login_id, Some(completed_login_id));
         assert_eq!(login_completed.success, true);
         assert_eq!(login_completed.error, None);
+
+        let add_credits: SendAddCreditsNudgeEmailResponse = client
+            .request_typed(ClientRequest::SendAddCreditsNudgeEmail {
+                request_id: RequestId::Integer(47),
+                params: SendAddCreditsNudgeEmailParams {
+                    credit_type: AddCreditsNudgeCreditType::Credits,
+                },
+            })
+            .await
+            .expect("account/sendAddCreditsNudgeEmail should succeed through remote gateway");
+        assert_eq!(add_credits.status, AddCreditsNudgeEmailStatus::Sent);
 
         let feedback: FeedbackUploadResponse = client
             .request_typed(ClientRequest::FeedbackUpload {
@@ -16933,10 +17160,78 @@ stream_max_retries = 0
         .expect("config/value/write should fan out through multi-worker gateway");
         assert_eq!(config_value_write.version, "worker-a");
 
+        let marketplace: MarketplaceAddResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::MarketplaceAdd {
+                request_id: RequestId::Integer(4),
+                params: MarketplaceAddParams {
+                    source: "https://example.com/shared-marketplace.git".to_string(),
+                    ref_name: Some("main".to_string()),
+                    sparse_paths: Some(vec!["plugins/shared-plugin".to_string()]),
+                },
+            }),
+        )
+        .await
+        .expect("marketplace/add should finish in time")
+        .expect("marketplace/add should fan out through multi-worker gateway");
+        assert_eq!(marketplace.marketplace_name, "shared-marketplace");
+
+        let skills_config: SkillsConfigWriteResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::SkillsConfigWrite {
+                request_id: RequestId::Integer(5),
+                params: SkillsConfigWriteParams {
+                    path: Some(
+                        PathBuf::from("/tmp/shared/skills/shared-skill")
+                            .try_into()
+                            .expect("skills/config/write path should be absolute"),
+                    ),
+                    name: None,
+                    enabled: true,
+                },
+            }),
+        )
+        .await
+        .expect("skills/config/write should finish in time")
+        .expect("skills/config/write should fan out through multi-worker gateway");
+        assert_eq!(skills_config.effective_enabled, true);
+
+        let feature_enablement: ExperimentalFeatureEnablementSetResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ExperimentalFeatureEnablementSet {
+                request_id: RequestId::Integer(6),
+                params: ExperimentalFeatureEnablementSetParams {
+                    enablement: std::collections::BTreeMap::from([(
+                        "gateway-test-feature".to_string(),
+                        true,
+                    )]),
+                },
+            }),
+        )
+        .await
+        .expect("experimentalFeature/enablement/set should finish in time")
+        .expect("experimentalFeature/enablement/set should fan out through multi-worker gateway");
+        assert_eq!(
+            feature_enablement.enablement,
+            std::collections::BTreeMap::from([("gateway-test-feature".to_string(), true)])
+        );
+
+        let mcp_refresh: McpServerRefreshResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::McpServerRefresh {
+                request_id: RequestId::Integer(7),
+                params: None,
+            }),
+        )
+        .await
+        .expect("config/mcpServer/reload should finish in time")
+        .expect("config/mcpServer/reload should fan out through multi-worker gateway");
+        assert_eq!(mcp_refresh, McpServerRefreshResponse {});
+
         let reset: MemoryResetResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::MemoryReset {
-                request_id: RequestId::Integer(4),
+                request_id: RequestId::Integer(8),
                 params: None,
             }),
         )
@@ -16948,7 +17243,7 @@ stream_max_retries = 0
         let logout: LogoutAccountResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::LogoutAccount {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(9),
                 params: None,
             }),
         )
@@ -16961,6 +17256,10 @@ stream_max_retries = 0
             "externalAgentConfig/import".to_string(),
             "config/batchWrite".to_string(),
             "config/value/write".to_string(),
+            "marketplace/add".to_string(),
+            "skills/config/write".to_string(),
+            "experimentalFeature/enablement/set".to_string(),
+            "config/mcpServer/reload".to_string(),
             "memory/reset".to_string(),
             "account/logout".to_string(),
         ];
@@ -17168,10 +17467,78 @@ stream_max_retries = 0
         .expect("config/value/write should fan out through multi-worker gateway");
         assert_eq!(config_value_write.version, "worker-a");
 
+        let marketplace: MarketplaceAddResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::MarketplaceAdd {
+                request_id: RequestId::Integer(4),
+                params: MarketplaceAddParams {
+                    source: "https://example.com/shared-marketplace.git".to_string(),
+                    ref_name: Some("main".to_string()),
+                    sparse_paths: Some(vec!["plugins/shared-plugin".to_string()]),
+                },
+            }),
+        )
+        .await
+        .expect("marketplace/add should finish in time")
+        .expect("marketplace/add should fan out through multi-worker gateway");
+        assert_eq!(marketplace.marketplace_name, "shared-marketplace");
+
+        let skills_config: SkillsConfigWriteResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::SkillsConfigWrite {
+                request_id: RequestId::Integer(5),
+                params: SkillsConfigWriteParams {
+                    path: Some(
+                        PathBuf::from("/tmp/shared/skills/shared-skill")
+                            .try_into()
+                            .expect("skills/config/write path should be absolute"),
+                    ),
+                    name: None,
+                    enabled: true,
+                },
+            }),
+        )
+        .await
+        .expect("skills/config/write should finish in time")
+        .expect("skills/config/write should fan out through multi-worker gateway");
+        assert_eq!(skills_config.effective_enabled, true);
+
+        let feature_enablement: ExperimentalFeatureEnablementSetResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ExperimentalFeatureEnablementSet {
+                request_id: RequestId::Integer(6),
+                params: ExperimentalFeatureEnablementSetParams {
+                    enablement: std::collections::BTreeMap::from([(
+                        "gateway-test-feature".to_string(),
+                        true,
+                    )]),
+                },
+            }),
+        )
+        .await
+        .expect("experimentalFeature/enablement/set should finish in time")
+        .expect("experimentalFeature/enablement/set should fan out through multi-worker gateway");
+        assert_eq!(
+            feature_enablement.enablement,
+            std::collections::BTreeMap::from([("gateway-test-feature".to_string(), true)])
+        );
+
+        let mcp_refresh: McpServerRefreshResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::McpServerRefresh {
+                request_id: RequestId::Integer(7),
+                params: None,
+            }),
+        )
+        .await
+        .expect("config/mcpServer/reload should finish in time")
+        .expect("config/mcpServer/reload should fan out through multi-worker gateway");
+        assert_eq!(mcp_refresh, McpServerRefreshResponse {});
+
         let reset: MemoryResetResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::MemoryReset {
-                request_id: RequestId::Integer(4),
+                request_id: RequestId::Integer(8),
                 params: None,
             }),
         )
@@ -17183,7 +17550,7 @@ stream_max_retries = 0
         let logout: LogoutAccountResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::LogoutAccount {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(9),
                 params: None,
             }),
         )
@@ -17196,11 +17563,326 @@ stream_max_retries = 0
             "externalAgentConfig/import".to_string(),
             "config/batchWrite".to_string(),
             "config/value/write".to_string(),
+            "marketplace/add".to_string(),
+            "skills/config/write".to_string(),
+            "experimentalFeature/enablement/set".to_string(),
+            "config/mcpServer/reload".to_string(),
             "memory/reset".to_string(),
             "account/logout".to_string(),
         ];
         assert_eq!(*worker_a_requests.lock().await, expected_methods);
         assert_eq!(*worker_b_requests.lock().await, expected_methods);
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_routes_filesystem_operations_to_primary_worker_over_v2() {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_multi_connection_filesystem_operations_server("worker-a").await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_multi_connection_filesystem_operations_server("worker-b").await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let create_directory: FsCreateDirectoryResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsCreateDirectory {
+                request_id: RequestId::Integer(1),
+                params: FsCreateDirectoryParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested")
+                        .try_into()
+                        .expect("fs/createDirectory path should be absolute"),
+                    recursive: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("fs/createDirectory should finish in time")
+        .expect("fs/createDirectory should route through multi-worker gateway");
+        assert_eq!(create_directory, FsCreateDirectoryResponse {});
+
+        let write_file: FsWriteFileResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsWriteFile {
+                request_id: RequestId::Integer(2),
+                params: FsWriteFileParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/writeFile path should be absolute"),
+                    data_base64: "cHJpbWFyeS1maWxl".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fs/writeFile should finish in time")
+        .expect("fs/writeFile should route through multi-worker gateway");
+        assert_eq!(write_file, FsWriteFileResponse {});
+
+        let read_file: FsReadFileResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsReadFile {
+                request_id: RequestId::Integer(3),
+                params: FsReadFileParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/readFile path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/readFile should finish in time")
+        .expect("fs/readFile should route through multi-worker gateway");
+        assert_eq!(read_file.data_base64, "d29ya2VyLWEtZmlsZQ==");
+
+        let metadata: FsGetMetadataResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsGetMetadata {
+                request_id: RequestId::Integer(4),
+                params: FsGetMetadataParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/getMetadata path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/getMetadata should finish in time")
+        .expect("fs/getMetadata should route through multi-worker gateway");
+        assert_eq!(metadata.is_file, true);
+        assert_eq!(metadata.is_directory, false);
+
+        let directory: FsReadDirectoryResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsReadDirectory {
+                request_id: RequestId::Integer(5),
+                params: FsReadDirectoryParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested")
+                        .try_into()
+                        .expect("fs/readDirectory path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/readDirectory should finish in time")
+        .expect("fs/readDirectory should route through multi-worker gateway");
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.entries[0].file_name, "worker-a-gateway.txt");
+
+        let copy: FsCopyResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsCopy {
+                request_id: RequestId::Integer(6),
+                params: FsCopyParams {
+                    source_path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/copy source path should be absolute"),
+                    destination_path: PathBuf::from("/tmp/worker-a-primary/nested/copy.txt")
+                        .try_into()
+                        .expect("fs/copy destination path should be absolute"),
+                    recursive: false,
+                },
+            }),
+        )
+        .await
+        .expect("fs/copy should finish in time")
+        .expect("fs/copy should route through multi-worker gateway");
+        assert_eq!(copy, FsCopyResponse {});
+
+        let remove: FsRemoveResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsRemove {
+                request_id: RequestId::Integer(7),
+                params: FsRemoveParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/copy.txt")
+                        .try_into()
+                        .expect("fs/remove path should be absolute"),
+                    recursive: Some(false),
+                    force: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("fs/remove should finish in time")
+        .expect("fs/remove should route through multi-worker gateway");
+        assert_eq!(remove, FsRemoveResponse {});
+
+        let fuzzy_search: FuzzyFileSearchResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearch {
+                request_id: RequestId::Integer(8),
+                params: FuzzyFileSearchParams {
+                    query: "gate".to_string(),
+                    roots: vec!["/tmp/worker-a-primary".to_string()],
+                    cancellation_token: Some("multi-worker-fuzzy-search".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch should finish in time")
+        .expect("fuzzyFileSearch should route through multi-worker gateway");
+        assert_eq!(fuzzy_search.files.len(), 1);
+        assert_eq!(fuzzy_search.files[0].root, "/tmp/worker-a-primary");
+        assert_eq!(fuzzy_search.files[0].path, "docs/gateway.md");
+        assert_eq!(
+            fuzzy_search.files[0].match_type,
+            FuzzyFileSearchMatchType::File
+        );
+
+        let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearchSessionStart {
+                request_id: RequestId::Integer(9),
+                params: FuzzyFileSearchSessionStartParams {
+                    session_id: "multi-worker-fuzzy-session".to_string(),
+                    roots: vec!["/tmp/worker-a-primary".to_string()],
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionStart should finish in time")
+        .expect("fuzzyFileSearch/sessionStart should route through multi-worker gateway");
+        assert_eq!(fuzzy_session_start, FuzzyFileSearchSessionStartResponse {});
+
+        let fuzzy_session_update: FuzzyFileSearchSessionUpdateResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearchSessionUpdate {
+                request_id: RequestId::Integer(10),
+                params: FuzzyFileSearchSessionUpdateParams {
+                    session_id: "multi-worker-fuzzy-session".to_string(),
+                    query: "gate".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionUpdate should finish in time")
+        .expect("fuzzyFileSearch/sessionUpdate should route through multi-worker gateway");
+        assert_eq!(
+            fuzzy_session_update,
+            FuzzyFileSearchSessionUpdateResponse {}
+        );
+
+        let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearchSessionStop {
+                request_id: RequestId::Integer(11),
+                params: FuzzyFileSearchSessionStopParams {
+                    session_id: "multi-worker-fuzzy-session".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionStop should finish in time")
+        .expect("fuzzyFileSearch/sessionStop should route through multi-worker gateway");
+        assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
+
+        let windows_setup: WindowsSandboxSetupStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::WindowsSandboxSetupStart {
+                request_id: RequestId::Integer(12),
+                params: WindowsSandboxSetupStartParams {
+                    mode: WindowsSandboxSetupMode::Unelevated,
+                    cwd: Some(
+                        PathBuf::from("/tmp/worker-a-primary")
+                            .try_into()
+                            .expect("windowsSandbox/setupStart cwd should be absolute"),
+                    ),
+                },
+            }),
+        )
+        .await
+        .expect("windowsSandbox/setupStart should finish in time")
+        .expect("windowsSandbox/setupStart should route through multi-worker gateway");
+        assert_eq!(windows_setup.started, true);
+
+        let windows_setup_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::WindowsSandboxSetupCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("windowsSandbox/setupCompleted notification should arrive");
+        assert_eq!(
+            windows_setup_completed.mode,
+            WindowsSandboxSetupMode::Unelevated
+        );
+        assert_eq!(windows_setup_completed.success, true);
+        assert_eq!(windows_setup_completed.error, None);
+
+        assert_eq!(
+            *worker_a_requests.lock().await,
+            vec![
+                "fs/createDirectory".to_string(),
+                "fs/writeFile".to_string(),
+                "fs/readFile".to_string(),
+                "fs/getMetadata".to_string(),
+                "fs/readDirectory".to_string(),
+                "fs/copy".to_string(),
+                "fs/remove".to_string(),
+                "fuzzyFileSearch".to_string(),
+                "fuzzyFileSearch/sessionStart".to_string(),
+                "fuzzyFileSearch/sessionUpdate".to_string(),
+                "fuzzyFileSearch/sessionStop".to_string(),
+                "windowsSandbox/setupStart".to_string(),
+            ]
+        );
+        assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
 
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
@@ -17469,6 +18151,57 @@ stream_max_retries = 0
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["shared-model"]
+        );
+
+        let first_model_page: ModelListResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ModelList {
+                request_id: RequestId::Integer(4),
+                params: ModelListParams {
+                    cursor: None,
+                    limit: Some(2),
+                    include_hidden: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("model/list first page should finish in time")
+        .expect("model/list first page should aggregate through multi-worker gateway");
+        assert_eq!(
+            first_model_page.next_cursor.as_deref(),
+            Some("model-offset:2")
+        );
+        assert_eq!(
+            first_model_page
+                .data
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared-model", "worker-a-model"]
+        );
+
+        let second_model_page: ModelListResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ModelList {
+                request_id: RequestId::Integer(5),
+                params: ModelListParams {
+                    cursor: first_model_page.next_cursor,
+                    limit: Some(2),
+                    include_hidden: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("model/list second page should finish in time")
+        .expect("model/list second page should aggregate through multi-worker gateway");
+        assert_eq!(second_model_page.next_cursor, None);
+        assert_eq!(
+            second_model_page
+                .data
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worker-b-model"]
         );
 
         assert_remote_client_shutdown(
@@ -18179,6 +18912,120 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn remote_multi_worker_paginates_experimental_feature_discovery_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_experimental_feature_list_server(vec![
+            "worker-a-first",
+            "shared-feature",
+        ])
+        .await;
+        let worker_b = start_mock_remote_multi_connection_experimental_feature_list_server(vec![
+            "worker-b-first",
+            "shared-feature",
+        ])
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let first_page: ExperimentalFeatureListResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ExperimentalFeatureList {
+                request_id: RequestId::Integer(1),
+                params: ExperimentalFeatureListParams {
+                    cursor: None,
+                    limit: Some(2),
+                },
+            }),
+        )
+        .await
+        .expect("experimentalFeature/list first page should finish in time")
+        .expect("experimentalFeature/list first page should aggregate through gateway");
+        assert_eq!(
+            first_page.next_cursor.as_deref(),
+            Some("experimental-feature-offset:2")
+        );
+        assert_eq!(
+            first_page
+                .data
+                .iter()
+                .map(|feature| feature.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared-feature", "worker-a-first"]
+        );
+
+        let second_page: ExperimentalFeatureListResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ExperimentalFeatureList {
+                request_id: RequestId::Integer(2),
+                params: ExperimentalFeatureListParams {
+                    cursor: first_page.next_cursor,
+                    limit: Some(2),
+                },
+            }),
+        )
+        .await
+        .expect("experimentalFeature/list second page should finish in time")
+        .expect("experimentalFeature/list second page should aggregate through gateway");
+        assert_eq!(second_page.next_cursor, None);
+        assert_eq!(
+            second_page
+                .data
+                .iter()
+                .map(|feature| feature.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worker-b-first"]
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn remote_multi_worker_supports_primary_worker_onboarding_and_feedback_flows_over_v2() {
         let worker_a = start_mock_remote_multi_connection_bootstrap_setup_server(
             MultiConnectionBootstrapSetupConfig {
@@ -18344,10 +19191,24 @@ stream_max_retries = 0
         .expect("feedback/upload should succeed through multi-worker gateway");
         assert_eq!(feedback.thread_id, "feedback-thread-worker-a");
 
+        let add_credits: SendAddCreditsNudgeEmailResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::SendAddCreditsNudgeEmail {
+                request_id: RequestId::Integer(5),
+                params: SendAddCreditsNudgeEmailParams {
+                    credit_type: AddCreditsNudgeCreditType::Credits,
+                },
+            }),
+        )
+        .await
+        .expect("account/sendAddCreditsNudgeEmail should finish in time")
+        .expect("account/sendAddCreditsNudgeEmail should succeed through multi-worker gateway");
+        assert_eq!(add_credits.status, AddCreditsNudgeEmailStatus::Sent);
+
         let command_exec: CommandExecResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::OneOffCommandExec {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(6),
                 params: CommandExecParams {
                     command: vec![
                         "sh".to_string(),
@@ -18405,7 +19266,7 @@ stream_max_retries = 0
         let command_write: CommandExecWriteResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::CommandExecWrite {
-                request_id: RequestId::Integer(6),
+                request_id: RequestId::Integer(7),
                 params: CommandExecWriteParams {
                     process_id: "proc-worker-a".to_string(),
                     delta_base64: Some("AQID".to_string()),
@@ -18421,7 +19282,7 @@ stream_max_retries = 0
         let command_resize: CommandExecResizeResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::CommandExecResize {
-                request_id: RequestId::Integer(7),
+                request_id: RequestId::Integer(8),
                 params: CommandExecResizeParams {
                     process_id: "proc-worker-a".to_string(),
                     size: CommandExecTerminalSize {
@@ -18439,7 +19300,7 @@ stream_max_retries = 0
         let command_terminate: CommandExecTerminateResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::CommandExecTerminate {
-                request_id: RequestId::Integer(8),
+                request_id: RequestId::Integer(9),
                 params: CommandExecTerminateParams {
                     process_id: "proc-worker-a".to_string(),
                 },
@@ -28139,6 +29000,17 @@ stream_max_retries = 0
                                 }],
                                 "nextCursor": null,
                             }),
+                            "experimentalFeature/enablement/set" => {
+                                let enablement = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("enablement"))
+                                    .cloned()
+                                    .expect("experimentalFeature/enablement/set should include enablement");
+                                serde_json::json!({
+                                    "enablement": enablement,
+                                })
+                            }
                             "collaborationMode/list" => serde_json::json!({
                                 "data": [{
                                     "name": "default",
@@ -28282,6 +29154,19 @@ stream_max_retries = 0
                                     "errors": [],
                                 }],
                             }),
+                            "skills/config/write" => {
+                                assert_eq!(
+                                    request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("enabled"))
+                                        .and_then(serde_json::Value::as_bool),
+                                    Some(true)
+                                );
+                                serde_json::json!({
+                                    "effectiveEnabled": true,
+                                })
+                            }
                             "mcpServerStatus/list" => serde_json::json!({
                                 "data": [{
                                     "name": "remote-mcp",
@@ -28292,6 +29177,7 @@ stream_max_retries = 0
                                 }],
                                 "nextCursor": null,
                             }),
+                            "config/mcpServer/reload" => serde_json::json!({}),
                             "mcpServer/oauth/login" => {
                                 let name = request
                                     .params
@@ -28325,6 +29211,40 @@ stream_max_retries = 0
                                 )
                                 .await;
                                 continue;
+                            }
+                            "mcpServer/resource/read" => {
+                                let uri = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("uri"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/resource/read should include uri");
+                                serde_json::json!({
+                                    "contents": [{
+                                        "uri": uri,
+                                        "mimeType": "text/markdown",
+                                        "text": "remote resource",
+                                    }],
+                                })
+                            }
+                            "mcpServer/tool/call" => {
+                                let tool = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("tool"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/tool/call should include tool");
+                                assert_eq!(tool, "lookup");
+                                serde_json::json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": "remote tool result",
+                                    }],
+                                    "structuredContent": {
+                                        "matches": 1,
+                                    },
+                                    "isError": false,
+                                })
                             }
                             "plugin/list" => serde_json::json!({
                                 "marketplaces": [{
@@ -28367,6 +29287,11 @@ stream_max_retries = 0
                                 }],
                                 "marketplaceLoadErrors": [],
                                 "featuredPluginIds": ["remote-plugin"],
+                            }),
+                            "marketplace/add" => serde_json::json!({
+                                "marketplaceName": "remote-marketplace",
+                                "installedRoot": format!("{preview}/marketplace"),
+                                "alreadyAdded": false,
                             }),
                             "plugin/read" => serde_json::json!({
                                 "plugin": {
@@ -28481,6 +29406,33 @@ stream_max_retries = 0
                             "fuzzyFileSearch/sessionStart"
                             | "fuzzyFileSearch/sessionUpdate"
                             | "fuzzyFileSearch/sessionStop" => serde_json::json!({}),
+                            "windowsSandbox/setupStart" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({
+                                            "started": true,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "windowsSandbox/setupCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "mode": "unelevated",
+                                                "success": true,
+                                                "error": null,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
                             "command/exec" => {
                                 let process_id = request
                                     .params
@@ -28541,6 +29493,9 @@ stream_max_retries = 0
                             }
                             "feedback/upload" => serde_json::json!({
                                 "threadId": "feedback-thread-remote",
+                            }),
+                            "account/sendAddCreditsNudgeEmail" => serde_json::json!({
+                                "status": "sent",
                             }),
                             "memory/reset" | "account/logout" => serde_json::json!({}),
                             "thread/start" => {
@@ -30170,6 +31125,36 @@ stream_max_retries = 0
                                 "filePath": "/tmp/shared/config.toml",
                                 "overriddenMetadata": null,
                             }),
+                            "marketplace/add" => serde_json::json!({
+                                "marketplaceName": "shared-marketplace",
+                                "installedRoot": "/tmp/shared/marketplace",
+                                "alreadyAdded": false,
+                            }),
+                            "skills/config/write" => {
+                                assert_eq!(
+                                    request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("enabled"))
+                                        .and_then(serde_json::Value::as_bool),
+                                    Some(true)
+                                );
+                                serde_json::json!({
+                                    "effectiveEnabled": true,
+                                })
+                            }
+                            "experimentalFeature/enablement/set" => {
+                                let enablement = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("enablement"))
+                                    .cloned()
+                                    .expect("experimentalFeature/enablement/set should include enablement");
+                                serde_json::json!({
+                                    "enablement": enablement,
+                                })
+                            }
+                            "config/mcpServer/reload" => serde_json::json!({}),
                             "fs/watch" => serde_json::json!({
                                 "path": request
                                     .params
@@ -30354,28 +31339,7 @@ stream_max_retries = 0
                                     "rateLimitsByLimitId": rate_limits_by_limit_id,
                                 })
                             }
-                            "model/list" => serde_json::json!({
-                                "data": models.iter().map(|(id, display_name, is_default)| serde_json::json!({
-                                    "id": id,
-                                    "model": id,
-                                    "upgrade": null,
-                                    "upgradeInfo": null,
-                                    "availabilityNux": null,
-                                    "displayName": display_name,
-                                    "description": format!("{display_name} description"),
-                                    "hidden": false,
-                                    "supportedReasoningEfforts": [{
-                                        "reasoningEffort": "medium",
-                                        "description": "Balanced"
-                                    }],
-                                    "defaultReasoningEffort": "medium",
-                                    "inputModalities": ["text"],
-                                    "supportsPersonality": false,
-                                    "additionalSpeedTiers": [],
-                                    "isDefault": is_default,
-                                })).collect::<Vec<_>>(),
-                                "nextCursor": null,
-                            }),
+                            "model/list" => paginated_model_list_result(&request, &models),
                             method => panic!("unexpected request method: {method}"),
                         };
                         write_websocket_message(
@@ -30391,6 +31355,61 @@ stream_max_retries = 0
             }
         });
         format!("ws://{addr}")
+    }
+
+    fn paginated_model_list_result(
+        request: &codex_app_server_protocol::JSONRPCRequest,
+        models: &[(&'static str, &'static str, bool)],
+    ) -> serde_json::Value {
+        let (start, end, next_cursor) =
+            paginated_mock_bounds(request, models.len(), "worker-model-offset:", "model/list");
+        serde_json::json!({
+            "data": models[start..end].iter().map(|(id, display_name, is_default)| serde_json::json!({
+                "id": id,
+                "model": id,
+                "upgrade": null,
+                "upgradeInfo": null,
+                "availabilityNux": null,
+                "displayName": display_name,
+                "description": format!("{display_name} description"),
+                "hidden": false,
+                "supportedReasoningEfforts": [{
+                    "reasoningEffort": "medium",
+                    "description": "Balanced"
+                }],
+                "defaultReasoningEffort": "medium",
+                "inputModalities": ["text"],
+                "supportsPersonality": false,
+                "additionalSpeedTiers": [],
+                "isDefault": is_default,
+            })).collect::<Vec<_>>(),
+            "nextCursor": next_cursor,
+        })
+    }
+
+    fn paginated_mock_bounds(
+        request: &codex_app_server_protocol::JSONRPCRequest,
+        total_len: usize,
+        cursor_prefix: &str,
+        method: &str,
+    ) -> (usize, usize, Option<String>) {
+        let cursor = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("cursor"))
+            .and_then(serde_json::Value::as_str);
+        let offset = match cursor {
+            Some(cursor) => cursor
+                .strip_prefix(cursor_prefix)
+                .unwrap_or_else(|| panic!("unexpected {method} cursor: {cursor}"))
+                .parse::<usize>()
+                .unwrap_or_else(|err| panic!("invalid {method} cursor {cursor}: {err}")),
+            None => 0,
+        };
+        let start = offset.min(total_len);
+        let end = start.saturating_add(1).min(total_len);
+        let next_cursor = (end < total_len).then(|| format!("{cursor_prefix}{end}"));
+        (start, end, next_cursor)
     }
 
     async fn start_mock_remote_multi_connection_bootstrap_setup_server(
@@ -30843,6 +31862,9 @@ stream_max_retries = 0
                             }),
                             "feedback/upload" => serde_json::json!({
                                 "threadId": format!("feedback-thread-{worker_label}"),
+                            }),
+                            "account/sendAddCreditsNudgeEmail" => serde_json::json!({
+                                "status": "sent",
                             }),
                             "command/exec" => {
                                 let process_id = request
@@ -31481,24 +32503,7 @@ stream_max_retries = 0
                     loop {
                         let request = read_websocket_request(&mut websocket).await;
                         let result = match request.method.as_str() {
-                            "app/list" => serde_json::json!({
-                                "data": apps.iter().map(|(id, name)| serde_json::json!({
-                                    "id": id,
-                                    "name": name,
-                                    "description": format!("{name} description"),
-                                    "logoUrl": null,
-                                    "logoUrlDark": null,
-                                    "distributionChannel": null,
-                                    "branding": null,
-                                    "appMetadata": null,
-                                    "labels": null,
-                                    "installUrl": null,
-                                    "isAccessible": false,
-                                    "isEnabled": true,
-                                    "pluginDisplayNames": [],
-                                })).collect::<Vec<_>>(),
-                                "nextCursor": null,
-                            }),
+                            "app/list" => paginated_apps_list_result(&request, &apps),
                             method => panic!("unexpected request method: {method}"),
                         };
                         write_websocket_message(
@@ -31514,6 +32519,32 @@ stream_max_retries = 0
             }
         });
         format!("ws://{addr}")
+    }
+
+    fn paginated_apps_list_result(
+        request: &codex_app_server_protocol::JSONRPCRequest,
+        apps: &[(&'static str, &'static str)],
+    ) -> serde_json::Value {
+        let (start, end, next_cursor) =
+            paginated_mock_bounds(request, apps.len(), "worker-app-offset:", "app/list");
+        serde_json::json!({
+            "data": apps[start..end].iter().map(|(id, name)| serde_json::json!({
+                "id": id,
+                "name": name,
+                "description": format!("{name} description"),
+                "logoUrl": null,
+                "logoUrlDark": null,
+                "distributionChannel": null,
+                "branding": null,
+                "appMetadata": null,
+                "labels": null,
+                "installUrl": null,
+                "isAccessible": false,
+                "isEnabled": true,
+                "pluginDisplayNames": [],
+            })).collect::<Vec<_>>(),
+            "nextCursor": next_cursor,
+        })
     }
 
     async fn start_mock_remote_multi_connection_mcp_server_status_list_server(
@@ -31536,16 +32567,9 @@ stream_max_retries = 0
                     loop {
                         let request = read_websocket_request(&mut websocket).await;
                         let result = match request.method.as_str() {
-                            "mcpServerStatus/list" => serde_json::json!({
-                                "data": names.iter().map(|name| serde_json::json!({
-                                    "name": name,
-                                    "tools": {},
-                                    "resources": [],
-                                    "resourceTemplates": [],
-                                    "authStatus": "bearerToken",
-                                })).collect::<Vec<_>>(),
-                                "nextCursor": null,
-                            }),
+                            "mcpServerStatus/list" => {
+                                paginated_mcp_server_status_list_result(&request, &names)
+                            }
                             method => panic!("unexpected request method: {method}"),
                         };
                         write_websocket_message(
@@ -31561,6 +32585,198 @@ stream_max_retries = 0
             }
         });
         format!("ws://{addr}")
+    }
+
+    fn paginated_mcp_server_status_list_result(
+        request: &codex_app_server_protocol::JSONRPCRequest,
+        names: &[&'static str],
+    ) -> serde_json::Value {
+        let (start, end, next_cursor) = paginated_mock_bounds(
+            request,
+            names.len(),
+            "worker-mcp-status-offset:",
+            "mcpServerStatus/list",
+        );
+        serde_json::json!({
+            "data": names[start..end].iter().map(|name| serde_json::json!({
+                "name": name,
+                "tools": {},
+                "resources": [],
+                "resourceTemplates": [],
+                "authStatus": "bearerToken",
+            })).collect::<Vec<_>>(),
+            "nextCursor": next_cursor,
+        })
+    }
+
+    async fn start_mock_remote_multi_connection_experimental_feature_list_server(
+        names: Vec<&'static str>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let names = names.clone();
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
+                    expect_remote_initialize(&mut websocket).await;
+
+                    loop {
+                        let request = read_websocket_request(&mut websocket).await;
+                        let result = match request.method.as_str() {
+                            "experimentalFeature/list" => {
+                                paginated_experimental_feature_list_result(&request, &names)
+                            }
+                            method => panic!("unexpected request method: {method}"),
+                        };
+                        write_websocket_message(
+                            &mut websocket,
+                            JSONRPCMessage::Response(JSONRPCResponse {
+                                id: request.id,
+                                result,
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    fn paginated_experimental_feature_list_result(
+        request: &codex_app_server_protocol::JSONRPCRequest,
+        names: &[&'static str],
+    ) -> serde_json::Value {
+        let (start, end, next_cursor) = paginated_mock_bounds(
+            request,
+            names.len(),
+            "worker-experimental-feature-offset:",
+            "experimentalFeature/list",
+        );
+        serde_json::json!({
+            "data": names[start..end].iter().map(|name| serde_json::json!({
+                "name": name,
+                "stage": "beta",
+                "displayName": format!("Gateway Test Feature {name}"),
+                "description": format!("Used by gateway multi-worker passthrough tests for {name}"),
+                "announcement": null,
+                "enabled": false,
+                "defaultEnabled": false,
+            })).collect::<Vec<_>>(),
+            "nextCursor": next_cursor,
+        })
+    }
+
+    async fn start_mock_remote_multi_connection_filesystem_operations_server(
+        worker_label: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept should succeed");
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        let mut websocket = tokio_tungstenite::accept_async(stream)
+                            .await
+                            .expect("websocket upgrade should succeed");
+                        expect_remote_initialize(&mut websocket).await;
+
+                        loop {
+                            let request = read_websocket_request(&mut websocket).await;
+                            requests.lock().await.push(request.method.clone());
+                            let result = match request.method.as_str() {
+                                "fs/createDirectory" | "fs/writeFile" | "fs/copy" | "fs/remove" => {
+                                    serde_json::json!({})
+                                }
+                                "fs/readFile" => serde_json::json!({
+                                    "dataBase64": match worker_label {
+                                        "worker-a" => "d29ya2VyLWEtZmlsZQ==",
+                                        "worker-b" => "d29ya2VyLWItZmlsZQ==",
+                                        other => panic!("unexpected worker label: {other}"),
+                                    },
+                                }),
+                                "fs/getMetadata" => serde_json::json!({
+                                    "isDirectory": false,
+                                    "isFile": true,
+                                    "isSymlink": false,
+                                    "createdAtMs": 0,
+                                    "modifiedAtMs": 0,
+                                }),
+                                "fs/readDirectory" => serde_json::json!({
+                                    "entries": [{
+                                        "fileName": format!("{worker_label}-gateway.txt"),
+                                        "isDirectory": false,
+                                        "isFile": true,
+                                    }],
+                                }),
+                                "fuzzyFileSearch" => serde_json::json!({
+                                    "files": [{
+                                        "root": "/tmp/worker-a-primary",
+                                        "path": "docs/gateway.md",
+                                        "match_type": "file",
+                                        "file_name": "gateway.md",
+                                        "score": 42,
+                                        "indices": [5, 6, 7, 8],
+                                    }],
+                                }),
+                                "fuzzyFileSearch/sessionStart"
+                                | "fuzzyFileSearch/sessionUpdate"
+                                | "fuzzyFileSearch/sessionStop" => serde_json::json!({}),
+                                "windowsSandbox/setupStart" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id.clone(),
+                                            result: serde_json::json!({
+                                                "started": true,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "windowsSandbox/setupCompleted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "mode": "unelevated",
+                                                    "success": true,
+                                                    "error": null,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                method => panic!("unexpected request method: {method}"),
+                            };
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result,
+                                }),
+                            )
+                            .await;
+                        }
+                    });
+                }
+            });
+        }
+        (format!("ws://{addr}"), requests)
     }
 
     async fn start_mock_remote_multi_connection_skills_changed_server() -> String {

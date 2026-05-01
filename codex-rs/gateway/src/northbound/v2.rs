@@ -72,6 +72,7 @@ use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
@@ -106,6 +107,7 @@ const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
     "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
 const MAX_CLOSE_REASON_BYTES: usize = 123;
+const MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD: usize = 256;
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayV2Timeouts {
     pub initialize: Duration,
@@ -154,7 +156,12 @@ struct GatewayV2EventState {
     pending_server_requests: HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
     skills_changed_pending_refresh: bool,
-    forwarded_connection_notifications: HashMap<String, Option<Value>>,
+    forwarded_connection_notifications: HashMap<String, VecDeque<ForwardedConnectionNotification>>,
+}
+
+struct ForwardedConnectionNotification {
+    worker_id: Option<usize>,
+    params: Option<Value>,
 }
 
 struct GatewayV2ConnectionRunResult {
@@ -1263,9 +1270,6 @@ async fn handle_client_message(
         JSONRPCMessage::Request(request) => {
             let started_at = Instant::now();
             let method = request.method.clone();
-            if downstream.multi_worker_topology() && request.method == "skills/list" {
-                *skills_changed_pending_refresh = false;
-            }
             if request.method == "initialize" {
                 connection
                     .observability
@@ -1349,6 +1353,9 @@ async fn handle_client_message(
                         connection.client_send_timeout,
                     )
                     .await?;
+                    if downstream.multi_worker_topology() && method == "skills/list" {
+                        *skills_changed_pending_refresh = false;
+                    }
                     observe_v2_request(
                         connection.observability,
                         connection.request_context,
@@ -1638,10 +1645,11 @@ async fn handle_app_server_event(
             }
             if downstream.multi_worker_topology()
                 && should_deduplicate_connection_notification(&notification)
-                && event_state
-                    .forwarded_connection_notifications
-                    .get(&notification.method)
-                    .is_some_and(|params| *params == notification.params)
+                && forwarded_connection_notification_seen(
+                    &event_state.forwarded_connection_notifications,
+                    worker_id,
+                    &notification,
+                )
             {
                 log_suppressed_duplicate_connection_notification(
                     connection.request_context,
@@ -1664,9 +1672,11 @@ async fn handle_app_server_event(
                 if downstream.multi_worker_topology()
                     && should_deduplicate_connection_notification(&notification)
                 {
-                    event_state
-                        .forwarded_connection_notifications
-                        .insert(notification.method.clone(), notification.params.clone());
+                    record_forwarded_connection_notification(
+                        &mut event_state.forwarded_connection_notifications,
+                        worker_id,
+                        &notification,
+                    );
                 }
                 send_jsonrpc(
                     socket,
@@ -2558,6 +2568,10 @@ async fn handle_client_request(
                     .await;
                 }
                 "externalAgentConfig/import"
+                | "marketplace/add"
+                | "skills/config/write"
+                | "experimentalFeature/enablement/set"
+                | "config/mcpServer/reload"
                 | "config/value/write"
                 | "config/batchWrite"
                 | "memory/reset"
@@ -3141,6 +3155,7 @@ fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
         request.method.as_str(),
         "configRequirements/read"
             | "account/login/cancel"
+            | "account/sendAddCreditsNudgeEmail"
             | "feedback/upload"
             | "command/exec"
             | "command/exec/write"
@@ -3554,35 +3569,49 @@ async fn aggregate_model_list_response_if_supported(
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
     let params = request_params::<ModelListParams>(request)?;
-    if params.cursor.is_some() || params.limit.is_some() {
-        let worker = downstream.primary_worker()?;
-        let response: ModelListResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        return serde_json::to_value(response).map_err(io::Error::other);
-    }
+    let offset = decode_aggregated_offset_cursor(
+        params.cursor.as_deref(),
+        AGGREGATED_MODEL_CURSOR_PREFIX,
+        "model",
+    )?;
+    let fanout_request = JSONRPCRequest {
+        id: request.id.clone(),
+        method: request.method.clone(),
+        params: Some(
+            serde_json::to_value(ModelListParams {
+                cursor: None,
+                limit: None,
+                include_hidden: params.include_hidden,
+            })
+            .map_err(io::Error::other)?,
+        ),
+        trace: request.trace.clone(),
+    };
 
     let mut models = Vec::new();
     let mut seen_ids = HashSet::new();
 
     for worker in &downstream.workers {
-        let response: ModelListResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        for model in response.data {
+        let worker_models = collect_worker_paginated_data::<ModelListParams, ModelListResponse, _>(
+            worker,
+            &fanout_request,
+            |response| (response.data, response.next_cursor),
+        )
+        .await?;
+        for model in worker_models {
             if seen_ids.insert(model.id.clone()) {
                 models.push(model);
             }
         }
     }
 
+    let limit = params.limit.unwrap_or(models.len() as u32).max(1) as usize;
+    let (start, end, next_cursor) =
+        aggregated_page_bounds(models.len(), offset, limit, AGGREGATED_MODEL_CURSOR_PREFIX);
+
     serde_json::to_value(ModelListResponse {
-        data: models,
-        next_cursor: None,
+        data: models[start..end].to_vec(),
+        next_cursor,
     })
     .map_err(io::Error::other)
 }
@@ -3820,8 +3849,11 @@ const AGGREGATED_THREAD_CURSOR_PREFIX: &str = "offset:";
 const AGGREGATED_LOADED_THREAD_CURSOR_PREFIX: &str = "loaded-thread-offset:";
 const AGGREGATED_APPS_CURSOR_PREFIX: &str = "apps-offset:";
 const AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX: &str = "mcp-status-offset:";
+const AGGREGATED_MODEL_CURSOR_PREFIX: &str = "model-offset:";
 const AGGREGATED_EXPERIMENTAL_FEATURE_CURSOR_PREFIX: &str = "experimental-feature-offset:";
 
+/// Request params that can be replayed across worker-local paginated responses
+/// while the gateway owns the northbound pagination cursor.
 trait CursorPaginatedParams: Serialize + DeserializeOwned {
     fn with_cursor_and_limit(self, cursor: Option<String>, limit: Option<u32>) -> Self;
 }
@@ -3858,6 +3890,14 @@ impl CursorPaginatedParams for ListMcpServerStatusParams {
     }
 }
 
+impl CursorPaginatedParams for ModelListParams {
+    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
+        self.cursor = cursor;
+        self.limit = limit;
+        self
+    }
+}
+
 impl CursorPaginatedParams for ExperimentalFeatureListParams {
     fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
         self.cursor = cursor;
@@ -3877,6 +3917,7 @@ where
 {
     let mut cursor = None;
     let mut items = Vec::new();
+    let mut seen_cursors = HashSet::new();
 
     loop {
         let response: R = worker
@@ -3891,6 +3932,15 @@ where
         let Some(next_cursor) = next_cursor else {
             break;
         };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "downstream {} returned repeated pagination cursor: {next_cursor}",
+                    request.method
+                ),
+            ));
+        }
         cursor = Some(next_cursor);
     }
 
@@ -4175,6 +4225,45 @@ fn should_deduplicate_connection_notification(notification: &JSONRPCNotification
             | "windows/worldWritableWarning"
             | "windowsSandbox/setupCompleted"
     )
+}
+
+fn forwarded_connection_notification_seen(
+    forwarded_connection_notifications: &HashMap<String, VecDeque<ForwardedConnectionNotification>>,
+    worker_id: Option<usize>,
+    notification: &JSONRPCNotification,
+) -> bool {
+    forwarded_connection_notifications
+        .get(&notification.method)
+        .is_some_and(|notifications_by_method| {
+            notifications_by_method.iter().any(|forwarded| {
+                forwarded.worker_id != worker_id && forwarded.params == notification.params
+            })
+        })
+}
+
+fn record_forwarded_connection_notification(
+    forwarded_connection_notifications: &mut HashMap<
+        String,
+        VecDeque<ForwardedConnectionNotification>,
+    >,
+    worker_id: Option<usize>,
+    notification: &JSONRPCNotification,
+) {
+    let notifications_by_method = forwarded_connection_notifications
+        .entry(notification.method.clone())
+        .or_default();
+    if let Some(existing_index) = notifications_by_method.iter().position(|forwarded| {
+        forwarded.worker_id == worker_id && forwarded.params == notification.params
+    }) {
+        notifications_by_method.remove(existing_index);
+    }
+    if notifications_by_method.len() >= MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD {
+        notifications_by_method.pop_front();
+    }
+    notifications_by_method.push_back(ForwardedConnectionNotification {
+        worker_id,
+        params: notification.params.clone(),
+    });
 }
 
 fn request_visible_to(
@@ -4632,9 +4721,12 @@ mod tests {
     use codex_app_server_protocol::CollaborationModeListResponse;
     use codex_app_server_protocol::CommandExecOutputDeltaNotification;
     use codex_app_server_protocol::CommandExecOutputStream;
+    use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
     use codex_app_server_protocol::ContextCompactedNotification;
+    use codex_app_server_protocol::ErrorNotification;
     use codex_app_server_protocol::ExecCommandApprovalResponse;
     use codex_app_server_protocol::ExperimentalFeatureListResponse;
+    use codex_app_server_protocol::FileChangeOutputDeltaNotification;
     use codex_app_server_protocol::FsUnwatchResponse;
     use codex_app_server_protocol::FsWatchParams;
     use codex_app_server_protocol::FsWatchResponse;
@@ -4664,7 +4756,11 @@ mod tests {
     use codex_app_server_protocol::ModelReroutedNotification;
     use codex_app_server_protocol::PlanDeltaNotification;
     use codex_app_server_protocol::PluginListResponse;
+    use codex_app_server_protocol::PluginSummary;
+    use codex_app_server_protocol::RawResponseItemCompletedNotification;
     use codex_app_server_protocol::ReasoningSummaryPartAddedNotification;
+    use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
+    use codex_app_server_protocol::ReasoningTextDeltaNotification;
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ServerRequest;
@@ -4683,6 +4779,7 @@ mod tests {
     use codex_app_server_protocol::ThreadUnarchivedNotification;
     use codex_app_server_protocol::TokenUsageBreakdown;
     use codex_app_server_protocol::TurnDiffUpdatedNotification;
+    use codex_app_server_protocol::TurnError;
     use codex_app_server_protocol::TurnPlanStep;
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_app_server_protocol::TurnPlanUpdatedNotification;
@@ -4692,6 +4789,7 @@ mod tests {
     use codex_core::config_loader::LoaderOverrides;
     use codex_feedback::CodexFeedback;
     use codex_protocol::models::MessagePhase;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::RealtimeVoice;
     use codex_protocol::protocol::RealtimeVoicesList;
     use codex_protocol::protocol::ReviewDecision;
@@ -12851,6 +12949,21 @@ mod tests {
                 }),
             ),
             (
+                "experimentalFeature/enablement/set",
+                "experimental-feature-enablement-set",
+                None,
+                Some(serde_json::json!({
+                    "enablement": {
+                        "gateway-test-feature": true,
+                    },
+                })),
+                serde_json::json!({
+                    "enablement": {
+                        "gateway-test-feature": true,
+                    },
+                }),
+            ),
+            (
                 "collaborationMode/list",
                 "collaboration-mode-list",
                 None,
@@ -12862,6 +12975,87 @@ mod tests {
                         "model": null,
                         "reasoningEffort": null,
                     }],
+                }),
+            ),
+            (
+                "marketplace/add",
+                "marketplace-add",
+                None,
+                Some(serde_json::json!({
+                    "source": "https://example.com/gateway-marketplace.git",
+                    "refName": null,
+                    "sparsePaths": null,
+                })),
+                serde_json::json!({
+                    "marketplaceName": "gateway-marketplace",
+                    "installedRoot": "/tmp/project/.codex/plugins/gateway-marketplace",
+                    "alreadyAdded": false,
+                }),
+            ),
+            (
+                "skills/config/write",
+                "skills-config-write",
+                None,
+                Some(serde_json::json!({
+                    "path": "/tmp/project/.codex/skills/gateway-skill/SKILL.md",
+                    "name": null,
+                    "enabled": true,
+                })),
+                serde_json::json!({
+                    "effectiveEnabled": true,
+                }),
+            ),
+            (
+                "config/mcpServer/reload",
+                "mcp-server-reload",
+                None,
+                None,
+                serde_json::json!({}),
+            ),
+            (
+                "mcpServer/resource/read",
+                "mcp-resource-read",
+                Some("thread-visible"),
+                Some(serde_json::json!({
+                    "threadId": "thread-visible",
+                    "server": "gateway-mcp",
+                    "uri": "file:///tmp/project/context.txt",
+                })),
+                serde_json::json!({
+                    "contents": [],
+                }),
+            ),
+            (
+                "mcpServer/tool/call",
+                "mcp-server-tool-call",
+                Some("thread-visible"),
+                Some(serde_json::json!({
+                    "threadId": "thread-visible",
+                    "server": "gateway-mcp",
+                    "tool": "lookup",
+                    "arguments": {
+                        "query": "gateway",
+                    },
+                })),
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "gateway tool result",
+                    }],
+                    "structuredContent": null,
+                    "isError": false,
+                    "_meta": null,
+                }),
+            ),
+            (
+                "account/sendAddCreditsNudgeEmail",
+                "account-send-add-credits-nudge-email",
+                None,
+                Some(serde_json::json!({
+                    "creditType": "credits",
+                })),
+                serde_json::json!({
+                    "status": "sent",
                 }),
             ),
             (
@@ -13690,6 +13884,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_experimental_feature_list_response_drains_downstream_pages_before_gateway_pagination()
+     {
+        let worker_a = start_mock_remote_server_for_paginated_passthrough_requests(
+            "experimentalFeature/list",
+            vec![
+                (
+                    serde_json::json!({
+                        "cursor": null,
+                        "limit": null,
+                    }),
+                    serde_json::json!({
+                        "data": [{
+                            "name": "zeta-feature",
+                            "stage": "beta",
+                            "displayName": "Zeta Feature",
+                            "description": "From worker A page 1",
+                            "announcement": null,
+                            "enabled": false,
+                            "defaultEnabled": false,
+                        }],
+                        "nextCursor": "worker-feature-page-2",
+                    }),
+                ),
+                (
+                    serde_json::json!({
+                        "cursor": "worker-feature-page-2",
+                        "limit": null,
+                    }),
+                    serde_json::json!({
+                        "data": [{
+                            "name": "shared-feature",
+                            "stage": "beta",
+                            "displayName": "Shared Feature",
+                            "description": "From worker A page 2",
+                            "announcement": null,
+                            "enabled": false,
+                            "defaultEnabled": true,
+                        }],
+                        "nextCursor": null,
+                    }),
+                ),
+            ],
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_paginated_passthrough_requests(
+            "experimentalFeature/list",
+            vec![(
+                serde_json::json!({
+                    "cursor": null,
+                    "limit": null,
+                }),
+                serde_json::json!({
+                    "data": [
+                        {
+                            "name": "alpha-feature",
+                            "stage": "beta",
+                            "displayName": "Alpha Feature",
+                            "description": "From worker B",
+                            "announcement": null,
+                            "enabled": false,
+                            "defaultEnabled": false,
+                        },
+                        {
+                            "name": "shared-feature",
+                            "stage": "beta",
+                            "displayName": "Shared Feature",
+                            "description": "From worker B",
+                            "announcement": null,
+                            "enabled": true,
+                            "defaultEnabled": false,
+                        }
+                    ],
+                    "nextCursor": null,
+                }),
+            )],
+        )
+        .await;
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let router = GatewayV2DownstreamRouter::connect(
+            &session_factory,
+            &initialize_params,
+            &GatewayRequestContext::default(),
+        )
+        .await
+        .expect("downstream router should connect");
+
+        let page = super::aggregate_experimental_feature_list_response(
+            &router,
+            &JSONRPCRequest {
+                id: RequestId::String("experimental-features-page".to_string()),
+                method: "experimentalFeature/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": "experimental-feature-offset:1",
+                    "limit": 1,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("experimental feature aggregation should succeed");
+        let page: ExperimentalFeatureListResponse =
+            serde_json::from_value(page).expect("experimental features should decode");
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("experimental-feature-offset:2")
+        );
+        assert_eq!(
+            page.data
+                .iter()
+                .map(|feature| (
+                    feature.name.as_str(),
+                    feature.enabled,
+                    feature.default_enabled
+                ))
+                .collect::<Vec<_>>(),
+            vec![("shared-feature", true, true)]
+        );
+    }
+
+    #[tokio::test]
     async fn aggregate_plugin_list_response_merges_multi_worker_marketplaces() {
         let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
             "plugin/list",
@@ -13903,6 +14247,26 @@ mod tests {
             ]
         );
         assert_eq!(response.marketplace_load_errors.len(), 1);
+    }
+
+    #[test]
+    fn merge_plugin_summary_preserves_installed_copy_across_worker_repeats() {
+        let available =
+            plugin_summary_json("shared-plugin@local", false, false, "Available worker copy");
+        let installed =
+            plugin_summary_json("shared-plugin@local", true, true, "Installed worker copy");
+        let later_available = plugin_summary_json(
+            "shared-plugin@local",
+            false,
+            false,
+            "Later available worker copy",
+        );
+        let mut plugins = vec![available];
+
+        super::merge_plugin_summary(&mut plugins, installed.clone());
+        super::merge_plugin_summary(&mut plugins, later_available);
+
+        assert_eq!(plugins, vec![installed]);
     }
 
     #[tokio::test]
@@ -16634,6 +16998,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_client_request_aggregates_paginated_multi_worker_model_list() {
+        let worker_a = start_mock_remote_server_for_paginated_model_list(vec![
+            (
+                None,
+                serde_json::json!({
+                    "data": [
+                        reconnectable_model_json("worker-a-model-1", "Worker A Model 1", true),
+                    ],
+                    "nextCursor": "worker-a-page-2",
+                }),
+            ),
+            (
+                Some("worker-a-page-2".to_string()),
+                serde_json::json!({
+                    "data": [
+                        reconnectable_model_json("shared-model", "Shared Model From A", false),
+                    ],
+                    "nextCursor": null,
+                }),
+            ),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_paginated_model_list(vec![(
+            None,
+            serde_json::json!({
+                "data": [
+                    reconnectable_model_json("worker-b-model-1", "Worker B Model 1", false),
+                    reconnectable_model_json("shared-model", "Shared Model From B", false),
+                ],
+                "nextCursor": null,
+            }),
+        )])
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let first_page = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("model-list-page-1".to_string()),
+                method: "model/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 2,
+                    "includeHidden": true,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("model/list first page should reach downstream workers")
+        .expect("model/list first page should succeed");
+
+        assert_eq!(
+            first_page,
+            serde_json::json!({
+                "data": [
+                    reconnectable_model_json("worker-a-model-1", "Worker A Model 1", true),
+                    reconnectable_model_json("shared-model", "Shared Model From A", false),
+                ],
+                "nextCursor": "model-offset:2",
+            })
+        );
+
+        let second_page = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("model-list-page-2".to_string()),
+                method: "model/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": "model-offset:2",
+                    "limit": 2,
+                    "includeHidden": true,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("model/list second page should reach downstream workers")
+        .expect("model/list second page should succeed");
+
+        assert_eq!(
+            second_page,
+            serde_json::json!({
+                "data": [
+                    reconnectable_model_json("worker-b-model-1", "Worker B Model 1", false),
+                ],
+                "nextCursor": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_rejects_repeated_worker_pagination_cursor() {
+        let worker = start_mock_remote_server_for_paginated_model_list(vec![
+            (
+                None,
+                serde_json::json!({
+                    "data": [
+                        reconnectable_model_json("worker-model-1", "Worker Model 1", true),
+                    ],
+                    "nextCursor": "worker-loop",
+                }),
+            ),
+            (
+                Some("worker-loop".to_string()),
+                serde_json::json!({
+                    "data": [
+                        reconnectable_model_json("worker-model-2", "Worker Model 2", false),
+                    ],
+                    "nextCursor": "worker-loop",
+                }),
+            ),
+        ])
+        .await;
+        let idle_worker = start_mock_remote_server_for_idle_session().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: idle_worker,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("model-list-loop".to_string()),
+                method: "model/list".to_string(),
+                params: Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 2,
+                    "includeHidden": true,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("repeated worker cursor should fail the aggregated request");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "downstream model/list returned repeated pagination cursor: worker-loop"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_client_request_reconnects_missing_worker_before_aggregated_external_agent_config_detect()
      {
         let worker_a = start_mock_remote_server_for_reconnectable_request(
@@ -17893,6 +18495,48 @@ mod tests {
                 }),
             ),
             (
+                "marketplace/add",
+                serde_json::json!({
+                    "source": "https://example.com/gateway-marketplace.git",
+                    "refName": "main",
+                    "sparsePaths": ["plugins/shared-plugin"],
+                }),
+                serde_json::json!({
+                    "marketplaceName": "gateway-marketplace",
+                    "installedRoot": "/tmp/shared/marketplace",
+                    "alreadyAdded": false,
+                }),
+            ),
+            (
+                "skills/config/write",
+                serde_json::json!({
+                    "path": "/tmp/shared/skills/shared-skill",
+                    "name": null,
+                    "enabled": true,
+                }),
+                serde_json::json!({
+                    "effectiveEnabled": true,
+                }),
+            ),
+            (
+                "experimentalFeature/enablement/set",
+                serde_json::json!({
+                    "enablement": {
+                        "gateway-test-feature": true,
+                    },
+                }),
+                serde_json::json!({
+                    "enablement": {
+                        "gateway-test-feature": true,
+                    },
+                }),
+            ),
+            (
+                "config/mcpServer/reload",
+                serde_json::Value::Null,
+                serde_json::json!({}),
+            ),
+            (
                 "memory/reset",
                 serde_json::Value::Null,
                 serde_json::json!({}),
@@ -18218,6 +18862,15 @@ mod tests {
                 })),
                 serde_json::json!({
                     "threadId": "feedback-thread-reconnected",
+                }),
+            ),
+            (
+                "account/sendAddCreditsNudgeEmail",
+                Some(serde_json::json!({
+                    "creditType": "credits",
+                })),
+                serde_json::json!({
+                    "status": "sent",
                 }),
             ),
             (
@@ -18954,6 +19607,44 @@ mod tests {
                     "overriddenMetadata": null,
                 }),
             ),
+            (
+                "marketplace/add",
+                Some(serde_json::json!({
+                    "source": "https://example.com/gateway-marketplace.git",
+                    "refName": "main",
+                    "sparsePaths": ["plugins/shared-plugin"],
+                })),
+                serde_json::json!({
+                    "marketplaceName": "gateway-marketplace",
+                    "installedRoot": "/tmp/shared/marketplace",
+                    "alreadyAdded": false,
+                }),
+            ),
+            (
+                "skills/config/write",
+                Some(serde_json::json!({
+                    "path": "/tmp/shared/skills/shared-skill",
+                    "name": null,
+                    "enabled": true,
+                })),
+                serde_json::json!({
+                    "effectiveEnabled": true,
+                }),
+            ),
+            (
+                "experimentalFeature/enablement/set",
+                Some(serde_json::json!({
+                    "enablement": {
+                        "gateway-test-feature": true,
+                    },
+                })),
+                serde_json::json!({
+                    "enablement": {
+                        "gateway-test-feature": true,
+                    },
+                }),
+            ),
+            ("config/mcpServer/reload", None, serde_json::json!({})),
             ("memory/reset", None, serde_json::json!({})),
             ("account/logout", None, serde_json::json!({})),
             (
@@ -19878,7 +20569,7 @@ mod tests {
         );
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
-        assert_eq!(duplicate.is_err(), true);
+        assert!(duplicate.is_err());
 
         server_task.abort();
         let _ = server_task.await;
@@ -20083,6 +20774,176 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_warning_notifications() {
+        let first_params = serde_json::json!({
+            "message": "first shared worker warning",
+            "threadId": null,
+        });
+        let second_params = serde_json::json!({
+            "message": "second shared worker warning",
+            "threadId": null,
+        });
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            ("warning", first_params.clone()),
+            ("warning", second_params.clone()),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+            vec![("warning", first_params.clone())],
+            Duration::from_millis(50),
+        )
+        .await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "warning",
+            first_params.clone(),
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "warning",
+            second_params,
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+            else {
+                break;
+            };
+            let message =
+                serde_json::from_str::<JSONRPCMessage>(&text).expect("text frame should decode");
+            if let JSONRPCMessage::Notification(notification) = message {
+                assert!(
+                    notification.method != "warning"
+                        || notification.params.as_ref() != Some(&first_params),
+                    "interleaved duplicate warning notification should be suppressed"
+                );
+            }
+        }
+        assert_v2_suppressed_notification_metric(&metrics, "warning", "duplicate");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_preserves_same_worker_repeated_warning_notifications() {
+        let repeated_params = serde_json::json!({
+            "message": "repeated worker warning",
+            "threadId": null,
+        });
+        let other_params = serde_json::json!({
+            "message": "other worker warning",
+            "threadId": null,
+        });
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            ("warning", repeated_params.clone()),
+            ("warning", other_params.clone()),
+            ("warning", repeated_params.clone()),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications(Vec::new()).await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "warning",
+            repeated_params.clone(),
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "warning",
+            other_params,
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "warning",
+            repeated_params,
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -20437,6 +21298,239 @@ mod tests {
 
         let post_refresh_duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(post_refresh_duplicate.is_err(), true);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_keeps_multi_worker_skills_changed_pending_after_failed_refresh() {
+        let worker_a = start_mock_remote_server_for_skills_changed_and_failing_list().await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "skills/changed",
+            serde_json::json!({}),
+        );
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("failed-skills-list".to_string()),
+                    method: "skills/list".to_string(),
+                    params: Some(serde_json::json!({
+                        "cwds": ["/tmp/worker-a"],
+                        "forceReload": false,
+                        "perCwdExtraUserRoots": null,
+                    })),
+                    trace: None,
+                }))
+                .expect("skills/list request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("skills/list request should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("failed skills/list should return an error");
+        };
+        assert_eq!(
+            error.id,
+            RequestId::String("failed-skills-list".to_string())
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "skills/changed", "pending_refresh");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_reopens_multi_worker_skills_changed_after_failed_then_successful_refresh()
+     {
+        let worker_a =
+            start_mock_remote_server_for_skills_changed_failing_then_successful_list().await;
+        let worker_b =
+            start_mock_remote_server_for_skills_changed_and_list("/tmp/worker-b", vec!["skill-b"])
+                .await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "skills/changed",
+            serde_json::json!({}),
+        );
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("failed-skills-list".to_string()),
+            "skills/list",
+            serde_json::json!({
+                "cwds": ["/tmp/worker-a", "/tmp/worker-b"],
+                "forceReload": false,
+                "perCwdExtraUserRoots": null,
+            }),
+        )
+        .await;
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("failed skills/list should return an error");
+        };
+        assert_eq!(
+            error.id,
+            RequestId::String("failed-skills-list".to_string())
+        );
+
+        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert!(duplicate.is_err());
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("successful-skills-list".to_string()),
+            "skills/list",
+            serde_json::json!({
+                "cwds": ["/tmp/worker-a", "/tmp/worker-b"],
+                "forceReload": false,
+                "perCwdExtraUserRoots": null,
+            }),
+        )
+        .await;
+
+        let mut skills_changed_notifications = 0;
+        let mut skills_list_response = None;
+        for _ in 0..4 {
+            let message = timeout(
+                Duration::from_secs(1),
+                read_websocket_message(&mut websocket),
+            )
+            .await
+            .expect("skills/list response or refreshed notification should arrive");
+            match message {
+                JSONRPCMessage::Notification(notification) => {
+                    assert_eq!(notification.method, "skills/changed");
+                    assert_eq!(notification.params, Some(serde_json::json!({})));
+                    skills_changed_notifications += 1;
+                }
+                JSONRPCMessage::Response(response) => {
+                    if response.id == RequestId::String("successful-skills-list".to_string()) {
+                        skills_list_response = Some(response.result);
+                    }
+                }
+                other => panic!("unexpected message after successful skills/list: {other:?}"),
+            }
+            if skills_list_response.is_some() && skills_changed_notifications == 1 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            skills_list_response,
+            Some(serde_json::json!({
+                "data": [
+                    {
+                        "cwd": "/tmp/worker-a",
+                        "skills": [{
+                            "name": "skill-a",
+                            "description": "skill-a description",
+                            "path": "/tmp/worker-a/skill-a",
+                            "scope": "repo",
+                            "enabled": true,
+                        }],
+                        "errors": [],
+                    },
+                    {
+                        "cwd": "/tmp/worker-b",
+                        "skills": [{
+                            "name": "skill-b",
+                            "description": "skill-b description",
+                            "path": "/tmp/worker-b/skill-b",
+                            "scope": "repo",
+                            "enabled": true,
+                        }],
+                        "errors": [],
+                    }
+                ]
+            }))
+        );
+        assert_eq!(skills_changed_notifications, 1);
+
+        let post_refresh_duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert!(post_refresh_duplicate.is_err());
 
         server_task.abort();
         let _ = server_task.await;
@@ -28165,6 +29259,16 @@ mod tests {
         }))
         .expect("hookCompleted notification should deserialize");
         let cases = vec![
+            ServerNotification::Error(ErrorNotification {
+                thread_id: "thread-visible".to_string(),
+                turn_id: "turn-visible".to_string(),
+                will_retry: false,
+                error: TurnError {
+                    message: "model request failed".to_string(),
+                    codex_error_info: None,
+                    additional_details: Some("gateway notification coverage".to_string()),
+                },
+            }),
             ServerNotification::ThreadArchived(ThreadArchivedNotification {
                 thread_id: "thread-visible".to_string(),
             }),
@@ -28198,11 +29302,23 @@ mod tests {
                     memory_citation: None,
                 },
             }),
+            ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+                thread_id: "thread-visible".to_string(),
+                turn_id: "turn-visible".to_string(),
+                item: ResponseItem::Other,
+            }),
             ServerNotification::PlanDelta(PlanDeltaNotification {
                 thread_id: "thread-visible".to_string(),
                 turn_id: "turn-visible".to_string(),
                 item_id: "item-visible".to_string(),
                 delta: "1. Inspect gateway routing".to_string(),
+            }),
+            ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
+                thread_id: "thread-visible".to_string(),
+                turn_id: "turn-visible".to_string(),
+                item_id: "item-visible".to_string(),
+                delta: "summary delta".to_string(),
+                summary_index: 0,
             }),
             ServerNotification::ReasoningSummaryPartAdded(ReasoningSummaryPartAddedNotification {
                 thread_id: "thread-visible".to_string(),
@@ -28210,12 +29326,33 @@ mod tests {
                 item_id: "item-visible".to_string(),
                 summary_index: 0,
             }),
+            ServerNotification::ReasoningTextDelta(ReasoningTextDeltaNotification {
+                thread_id: "thread-visible".to_string(),
+                turn_id: "turn-visible".to_string(),
+                item_id: "item-visible".to_string(),
+                delta: "reasoning delta".to_string(),
+                content_index: 0,
+            }),
             ServerNotification::TerminalInteraction(TerminalInteractionNotification {
                 thread_id: "thread-visible".to_string(),
                 turn_id: "turn-visible".to_string(),
                 item_id: "item-visible".to_string(),
                 process_id: "proc-visible".to_string(),
                 stdin: "y\n".to_string(),
+            }),
+            ServerNotification::CommandExecutionOutputDelta(
+                CommandExecutionOutputDeltaNotification {
+                    thread_id: "thread-visible".to_string(),
+                    turn_id: "turn-visible".to_string(),
+                    item_id: "item-visible".to_string(),
+                    delta: "stdout delta".to_string(),
+                },
+            ),
+            ServerNotification::FileChangeOutputDelta(FileChangeOutputDeltaNotification {
+                thread_id: "thread-visible".to_string(),
+                turn_id: "turn-visible".to_string(),
+                item_id: "item-visible".to_string(),
+                delta: "file change delta".to_string(),
             }),
             ServerNotification::TurnDiffUpdated(TurnDiffUpdatedNotification {
                 thread_id: "thread-visible".to_string(),
@@ -29232,6 +30369,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_fans_in_multi_worker_raw_response_items() {
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![(
+            "rawResponseItem/completed",
+            serde_json::json!({
+                "threadId": "thread-worker-a",
+                "turnId": "turn-worker-a",
+                "item": {
+                    "type": "other",
+                },
+            }),
+        )])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications(vec![(
+            "rawResponseItem/completed",
+            serde_json::json!({
+                "threadId": "thread-worker-b",
+                "turnId": "turn-worker-b",
+                "item": {
+                    "type": "other",
+                },
+            }),
+        )])
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-a".to_string(), context.clone());
+        scope_registry.register_thread("thread-worker-b".to_string(), context);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let mut forwarded = Vec::new();
+        for _ in 0..2 {
+            let JSONRPCMessage::Notification(notification) =
+                read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected raw response item notification");
+            };
+            forwarded.push(notification.params);
+        }
+        forwarded.sort_by_key(|params| {
+            params
+                .as_ref()
+                .and_then(|params| params.get("threadId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+
+        assert_eq!(
+            forwarded,
+            vec![
+                Some(serde_json::json!({
+                    "threadId": "thread-worker-a",
+                    "turnId": "turn-worker-a",
+                    "item": {
+                        "type": "other",
+                    },
+                })),
+                Some(serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "turnId": "turn-worker-b",
+                    "item": {
+                        "type": "other",
+                    },
+                })),
+            ]
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_fans_in_multi_worker_filesystem_changed_notifications() {
         let worker_a_params = serde_json::json!({
             "watchId": "watch-a",
@@ -29687,6 +30931,175 @@ mod tests {
                 true
             );
         }
+    }
+
+    #[test]
+    fn forwarded_connection_notification_dedupe_remembers_interleaved_payloads() {
+        let mut forwarded_connection_notifications = HashMap::new();
+        let first_notice = JSONRPCNotification {
+            method: "warning".to_string(),
+            params: Some(serde_json::json!({
+                "message": "first warning",
+                "threadId": null,
+            })),
+        };
+        let second_notice = JSONRPCNotification {
+            method: "warning".to_string(),
+            params: Some(serde_json::json!({
+                "message": "second warning",
+                "threadId": null,
+            })),
+        };
+
+        assert!(!super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(1),
+            &first_notice,
+        ));
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(1),
+            &first_notice,
+        );
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(1),
+            &second_notice,
+        );
+
+        assert!(super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(2),
+            &first_notice,
+        ));
+        assert!(super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(2),
+            &second_notice,
+        ));
+        assert!(!super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(1),
+            &first_notice,
+        ));
+    }
+
+    #[test]
+    fn forwarded_connection_notification_dedupe_bounds_payload_history() {
+        let mut forwarded_connection_notifications = HashMap::new();
+        let oldest_notice = JSONRPCNotification {
+            method: "warning".to_string(),
+            params: Some(serde_json::json!({
+                "message": "warning-0",
+                "threadId": null,
+            })),
+        };
+
+        for index in 0..=super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD {
+            super::record_forwarded_connection_notification(
+                &mut forwarded_connection_notifications,
+                Some(index),
+                &JSONRPCNotification {
+                    method: "warning".to_string(),
+                    params: Some(serde_json::json!({
+                        "message": format!("warning-{index}"),
+                        "threadId": null,
+                    })),
+                },
+            );
+        }
+
+        let newest_index = super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD;
+        let newest_notice = JSONRPCNotification {
+            method: "warning".to_string(),
+            params: Some(serde_json::json!({
+                "message": format!("warning-{newest_index}"),
+                "threadId": null,
+            })),
+        };
+        assert!(!super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD + 1),
+            &oldest_notice,
+        ));
+        assert!(super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD + 1),
+            &newest_notice,
+        ));
+        assert_eq!(
+            forwarded_connection_notifications
+                .get("warning")
+                .expect("warning history should exist")
+                .len(),
+            super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD
+        );
+    }
+
+    #[test]
+    fn forwarded_connection_notification_dedupe_refreshes_same_worker_repeats() {
+        let mut forwarded_connection_notifications = HashMap::new();
+        let repeated_notice = JSONRPCNotification {
+            method: "warning".to_string(),
+            params: Some(serde_json::json!({
+                "message": "repeated warning",
+                "threadId": null,
+            })),
+        };
+
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(1),
+            &repeated_notice,
+        );
+        for index in 0..super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD {
+            super::record_forwarded_connection_notification(
+                &mut forwarded_connection_notifications,
+                Some(index + 10),
+                &JSONRPCNotification {
+                    method: "warning".to_string(),
+                    params: Some(serde_json::json!({
+                        "message": format!("warning-{index}"),
+                        "threadId": null,
+                    })),
+                },
+            );
+        }
+
+        assert!(!super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(2),
+            &repeated_notice,
+        ));
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(1),
+            &repeated_notice,
+        );
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(999),
+            &JSONRPCNotification {
+                method: "warning".to_string(),
+                params: Some(serde_json::json!({
+                    "message": "newer warning",
+                    "threadId": null,
+                })),
+            },
+        );
+
+        assert!(super::forwarded_connection_notification_seen(
+            &forwarded_connection_notifications,
+            Some(2),
+            &repeated_notice,
+        ));
+        assert_eq!(
+            forwarded_connection_notifications
+                .get("warning")
+                .expect("warning history should exist")
+                .len(),
+            super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD
+        );
     }
 
     #[tokio::test]
@@ -31604,6 +33017,17 @@ mod tests {
     async fn start_mock_remote_server_for_realtime_notifications(
         notifications: Vec<(&str, serde_json::Value)>,
     ) -> String {
+        start_mock_remote_server_for_realtime_notifications_after_delay(
+            notifications,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn start_mock_remote_server_for_realtime_notifications_after_delay(
+        notifications: Vec<(&str, serde_json::Value)>,
+        delay: Duration,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -31619,6 +33043,7 @@ mod tests {
                 .expect("websocket should accept");
 
             expect_remote_initialize(&mut websocket).await;
+            tokio::time::sleep(delay).await;
             for (method, params) in notifications {
                 send_remote_notification(&mut websocket, &method, params).await;
             }
@@ -31689,6 +33114,46 @@ mod tests {
             response_result,
         )
         .await
+    }
+
+    fn plugin_summary_json(
+        id: &str,
+        installed: bool,
+        enabled: bool,
+        short_description: &str,
+    ) -> PluginSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id.strip_suffix("@local").unwrap_or(id),
+            "source": {
+                "type": "local",
+                "path": format!("/tmp/project/plugins/{id}"),
+            },
+            "installed": installed,
+            "enabled": enabled,
+            "installPolicy": "AVAILABLE",
+            "authPolicy": "ON_USE",
+            "interface": {
+                "displayName": id,
+                "shortDescription": short_description,
+                "longDescription": null,
+                "developerName": null,
+                "category": null,
+                "capabilities": [],
+                "websiteUrl": null,
+                "privacyPolicyUrl": null,
+                "termsOfServiceUrl": null,
+                "defaultPrompt": null,
+                "brandColor": null,
+                "composerIcon": null,
+                "composerIconUrl": null,
+                "logo": null,
+                "logoUrl": null,
+                "screenshots": [],
+                "screenshotUrls": [],
+            },
+        }))
+        .expect("plugin summary should deserialize")
     }
 
     async fn start_mock_remote_server_for_paginated_passthrough_requests(
@@ -32283,6 +33748,23 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_server_for_idle_session() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
     async fn start_mock_remote_server_for_skills_changed_and_list(
         cwd: &str,
         skills: Vec<&str>,
@@ -32347,6 +33829,107 @@ mod tests {
                 send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({}))
                     .await;
             }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_skills_changed_and_failing_list() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({})).await;
+
+            let request = read_websocket_request(&mut websocket).await;
+            assert_eq!(request.method, "skills/list");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                        id: request.id,
+                        error: JSONRPCErrorError {
+                            code: super::INTERNAL_ERROR_CODE,
+                            message: "skills list failed".to_string(),
+                            data: None,
+                        },
+                    }))
+                    .expect("skills/list error should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("skills/list error should send");
+            send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({})).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_for_skills_changed_failing_then_successful_list() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({})).await;
+
+            let failed_request = read_websocket_request(&mut websocket).await;
+            assert_eq!(failed_request.method, "skills/list");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                        id: failed_request.id,
+                        error: JSONRPCErrorError {
+                            code: super::INTERNAL_ERROR_CODE,
+                            message: "first skills list failed".to_string(),
+                            data: None,
+                        },
+                    }))
+                    .expect("skills/list error should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("skills/list error should send");
+            send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({})).await;
+
+            let successful_request = read_websocket_request(&mut websocket).await;
+            assert_eq!(successful_request.method, "skills/list");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: successful_request.id,
+                        result: serde_json::json!({
+                            "data": [{
+                                "cwd": "/tmp/worker-a",
+                                "skills": [{
+                                    "name": "skill-a",
+                                    "description": "skill-a description",
+                                    "path": "/tmp/worker-a/skill-a",
+                                    "scope": "repo",
+                                    "enabled": true,
+                                }],
+                                "errors": [],
+                            }]
+                        }),
+                    }))
+                    .expect("skills/list response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("skills/list response should send");
+            send_remote_notification(&mut websocket, "skills/changed", serde_json::json!({})).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         });
         format!("ws://{addr}")
     }
@@ -32892,6 +34475,72 @@ mod tests {
         })
     }
 
+    async fn start_mock_remote_server_for_paginated_model_list(
+        pages: Vec<(Option<String>, serde_json::Value)>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            while let Some(message) = websocket.next().await {
+                let Message::Text(text) = message.expect("model/list request should decode") else {
+                    continue;
+                };
+                let JSONRPCMessage::Request(request) =
+                    serde_json::from_str(&text).expect("model/list request should deserialize")
+                else {
+                    panic!("expected model/list request");
+                };
+                assert_eq!(request.method, "model/list");
+                assert_eq!(
+                    request
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("limit")),
+                    Some(&Value::Null)
+                );
+                assert_eq!(
+                    request
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("includeHidden"))
+                        .and_then(Value::as_bool),
+                    Some(true)
+                );
+                let cursor = request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("cursor"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let response = pages
+                    .iter()
+                    .find(|(page_cursor, _)| *page_cursor == cursor)
+                    .map(|(_, response)| response.clone())
+                    .unwrap_or_else(|| panic!("unexpected model/list cursor: {cursor:?}"));
+                websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request.id,
+                            result: response,
+                        }))
+                        .expect("model/list response should serialize")
+                        .into(),
+                    ))
+                    .await
+                    .expect("model/list response should send");
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     async fn start_mock_remote_server_for_reconnectable_mcp_server_status_list(
         names: Vec<&str>,
     ) -> String {
@@ -33190,6 +34839,29 @@ mod tests {
             ))
             .await
             .expect("initialized notification should send");
+    }
+
+    async fn send_jsonrpc_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: RequestId,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id,
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                }))
+                .expect("json-rpc request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("json-rpc request should send");
     }
 
     async fn send_initialize_with_capabilities(

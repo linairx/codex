@@ -347,9 +347,12 @@ Recent progress:
   `item/guardianApprovalReviewCompleted`
 - dedicated northbound gateway coverage now also exercises richer turn
   notifications that the TUI consumes opportunistically, including
-  `plan/delta`, `reasoning/summaryPartAdded`, `terminalInteraction`,
-  `turn/diffUpdated`, `turn/planUpdated`, `thread/tokenUsage/updated`,
-  `mcpToolCall/progress`, `contextCompacted`, and `model/rerouted`
+  `error`, `plan/delta`, `reasoning/summaryTextDelta`,
+  `reasoning/summaryPartAdded`, `reasoning/textDelta`,
+  `terminalInteraction`, `commandExecution/outputDelta`,
+  `fileChange/outputDelta`, `turn/diffUpdated`, `turn/planUpdated`,
+  `thread/tokenUsage/updated`, `mcpToolCall/progress`, `contextCompacted`,
+  and `model/rerouted`
 - that same dedicated northbound connection-notification coverage now also
   includes `account/login/completed` for onboarding auth completion flows
 - that same dedicated northbound connection-notification coverage now also
@@ -516,6 +519,12 @@ Recent progress:
   supporting/configuration methods that some clients and test tools use
   outside the main TUI flow: `config/read`, `configRequirements/read`,
   `experimentalFeature/list`, and `collaborationMode/list`
+- that same real single-worker remote harness now also covers low-frequency
+  setup/config/MCP/account paths that previously relied on targeted
+  passthrough fixtures: `marketplace/add`, `skills/config/write`,
+  `experimentalFeature/enablement/set`, `config/mcpServer/reload`,
+  `mcpServer/resource/read`, `mcpServer/tool/call`, and
+  `account/sendAddCreditsNudgeEmail`
 - that same real single-worker remote harness now also covers plugin
   management flows current clients use after bootstrap, including
   `plugin/install` and `plugin/uninstall`, and verifies the resulting
@@ -946,7 +955,8 @@ Recent progress:
 - multi-worker remote runtime now also has a real northbound
   `RemoteAppServerClient` regression for primary-worker onboarding and
   feedback flows, covering `account/login/start`, `account/login/cancel`,
-  `account/login/completed`, and `feedback/upload`
+  `account/login/completed`, `feedback/upload`, and primary-worker-affine
+  `account/sendAddCreditsNudgeEmail`
 - that same real multi-worker primary-worker harness now also covers the
   standalone `command/exec` control plane
   (`command/exec`, `command/exec/outputDelta`, `command/exec/write`,
@@ -955,9 +965,11 @@ Recent progress:
   recovery coverage
 - multi-worker steady-state Stage B coverage now spans the main shared-session
   surface: connection-scoped setup mutations such as
-  `externalAgentConfig/import`, `config/value/write`, `config/batchWrite`,
-  `memory/reset`, and `account/logout` fan out across workers; bootstrap and
-  setup discovery such as `account/read`, `model/list`,
+  `externalAgentConfig/import`, `marketplace/add`, `skills/config/write`,
+  `experimentalFeature/enablement/set`, `config/mcpServer/reload`,
+  `config/value/write`, `config/batchWrite`, `memory/reset`, and
+  `account/logout` fan out across workers; bootstrap and setup discovery such
+  as `account/read`, `model/list`,
   `externalAgentConfig/detect`, and `skills/list` aggregate instead of
   exposing only the primary worker view; and lower-frequency thread-control,
   review, and thread-mutation paths remain sticky to the owning worker,
@@ -981,6 +993,10 @@ Recent progress:
   across workers, and `plugin/read`, `plugin/install`, and
   `plugin/uninstall` route to the worker that can satisfy the selected plugin
   request instead of exposing only the primary worker's local plugin state
+- dedicated plugin-merge coverage now also pins that an installed worker copy
+  of a repeated plugin remains the selected summary even when later workers
+  report the same plugin as only available, keeping aggregated `plugin/list`
+  installed state stable across worker ordering
 - single-worker remote runtime now also has a northbound reconnect regression
   test, verifying that after the gateway reconnects its downstream worker, a
   later v2 client session can still bootstrap and complete `thread/start`
@@ -1130,7 +1146,7 @@ Recent progress:
   recovered worker into the shared marketplace view instead of leaving
   aggregated plugin discovery partially degraded after a transient worker loss
 - that same reconnect-hardening slice now also covers aggregated
-  `account/read` and unpaginated `model/list`, verifying that later bootstrap
+  `account/read` and `model/list`, verifying that later bootstrap
   refreshes re-include a recovered worker in merged auth/model state instead
   of leaving one shared session pinned to stale bootstrap inventory
 - that same reconnect-hardening slice now also covers aggregated
@@ -1315,7 +1331,7 @@ Recent progress:
   recovered worker before merging the feature and collaboration-mode inventory
 - aggregated bootstrap and discovery refreshes now also have dedicated
   northbound websocket reconnect coverage for `account/read`,
-  `account/rateLimits/read`, unpaginated `model/list`,
+  `account/rateLimits/read`, `model/list`,
   `externalAgentConfig/detect`, `skills/list`, threadless `app/list`,
   threadless `plugin/list`, `mcpServerStatus/list`, and
   `thread/realtime/listVoices`, pinning that one shared client session re-adds
@@ -1751,6 +1767,16 @@ Operational notes:
   thread lifecycle notifications for `thread/archived`, `thread/unarchived`,
   and `thread/closed`, so archive and teardown state changes are covered at
   the same gateway v2 compatibility boundary as turn lifecycle streams
+- dedicated northbound notification coverage now also pins streamed item
+  deltas for reasoning summaries, reasoning text, command output, and file
+  changes, covering `item/reasoning/summaryTextDelta`,
+  `item/reasoning/textDelta`, `item/commandExecution/outputDelta`, and
+  `item/fileChange/outputDelta` on the visible-thread forwarding path
+- dedicated northbound notification coverage now also pins the thread-scoped
+  `error` turn-failure notification and internal
+  `rawResponseItem/completed` completion notification, so ordinary turn failure
+  delivery and raw response item replay are covered at the same gateway v2
+  compatibility boundary as turn lifecycle streams
 - dedicated northbound notification coverage now also pins `fs/changed`, so
   filesystem watch change delivery is validated at the gateway v2 compatibility
   boundary alongside `fs/watch` and `fs/unwatch`
@@ -1765,10 +1791,36 @@ Operational notes:
 - dedicated northbound passthrough coverage now also pins the low-frequency
   Windows sandbox setup path: `windowsSandbox/setupStart`,
   `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted`
+- dedicated northbound passthrough coverage now also pins additional
+  low-frequency v2 client requests: `marketplace/add`,
+  `skills/config/write`, `experimentalFeature/enablement/set`,
+  `config/mcpServer/reload`, `mcpServer/resource/read`,
+  `mcpServer/tool/call`, and `account/sendAddCreditsNudgeEmail`
+- the real single-worker remote compatibility harness now also exercises that
+  low-frequency request family through an unmodified `RemoteAppServerClient`
+  session, including a visible thread setup before thread-scoped MCP resource
+  and tool calls
+- the real multi-worker `RemoteAppServerClient` setup mutation harness now also
+  exercises `marketplace/add`, `skills/config/write`,
+  `experimentalFeature/enablement/set`, and `config/mcpServer/reload` as
+  fanout setup mutations, while the primary-worker harness covers
+  `account/sendAddCreditsNudgeEmail` without duplicating the one-shot email
+  side effect across workers
+- the real embedded and single-worker remote compatibility harnesses now also
+  cover `windowsSandbox/setupStart` plus the follow-up
+  `windowsSandbox/setupCompleted` notification through unmodified
+  `RemoteAppServerClient` sessions, so this platform setup flow is part of the
+  release-gate client path instead of only targeted JSON-RPC passthrough
+  coverage
 - multi-worker `windowsSandbox/setupStart` routing now also remains
   primary-worker affine, with reconnect-before-routing coverage for a missing
   primary worker and fail-closed coverage while that worker is still in
   reconnect backoff
+- the real multi-worker `RemoteAppServerClient` primary-worker harness now
+  also covers `windowsSandbox/setupStart` plus the follow-up
+  `windowsSandbox/setupCompleted` notification, so this platform setup flow is
+  exercised through the shared northbound session instead of only targeted
+  routing tests
 - exact-duplicate suppression for multi-worker connection-state notifications
   now also covers `windows/worldWritableWarning` and
   `windowsSandbox/setupCompleted`, so one shared northbound session does not
@@ -1788,9 +1840,19 @@ Operational notes:
   affine, with real northbound WebSocket reconnect coverage for a missing
   primary worker and fail-closed coverage while that worker is still in
   reconnect backoff
+- the real multi-worker `RemoteAppServerClient` primary-worker harness now
+  also validates `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
+  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`, so one
+  shared northbound session keeps file-search helper state on the primary
+  worker
 - multi-worker basic filesystem operations now also remain primary-worker
   affine, so primary-local filesystem helper state does not silently drift to
   a secondary worker while the primary worker is unavailable
+- the real multi-worker `RemoteAppServerClient` filesystem harness now also
+  validates that primary-worker route for `fs/readFile`, `fs/writeFile`,
+  `fs/createDirectory`, `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and
+  `fs/copy`, so one shared northbound session keeps local file helper state on
+  the owning primary worker
 - that filesystem change notification coverage now also pins multi-worker
   fan-in for `fs/changed`, so worker-local watch events from multiple
   downstream sessions reach one shared northbound v2 client session
@@ -1807,6 +1869,49 @@ Operational notes:
   is unavailable, so gateway routing does not continue from an incomplete MCP
   inventory during retry backoff; that coverage also asserts the fail-closed
   metric carries the active reconnect-backoff tag
+- multi-worker exact-duplicate connection-notification suppression now tracks a
+  bounded history of previously forwarded payloads and source workers for each
+  deduplicated notification method, so a second distinct payload no longer
+  immediately resets the duplicate memory for an earlier cross-worker warning
+  or setup-state payload on the shared session while same-worker repeats remain
+  deliverable and refresh their history position, and long-lived sessions keep
+  capped dedupe memory; dedicated regressions pin that interleaved-payload
+  behavior for `warning` notifications, same-worker repeat refreshes, and the
+  per-method history bound
+- multi-worker `skills/changed` invalidation suppression now only clears after
+  a successful `skills/list` refresh has been returned to the northbound
+  client, so failed aggregated refresh attempts do not reopen duplicate
+  invalidation delivery on one shared session; dedicated websocket coverage
+  pins that failed-refresh path alongside the existing successful-refresh path
+- dedicated websocket coverage now also pins the failed-then-successful
+  `skills/list` refresh sequence on one shared multi-worker session, verifying
+  that duplicate `skills/changed` invalidations stay suppressed after the
+  failed refresh and that a later successful aggregated refresh reopens fresh
+  invalidation delivery
+- multi-worker `model/list` aggregation now also supports gateway-owned
+  pagination over merged worker inventories, draining worker-local model pages
+  and returning stable northbound `model-offset:` cursors instead of exposing a
+  primary-worker-only paginated view
+- aggregated worker-local pagination now also fails closed when a downstream
+  worker repeats a page cursor, preventing malformed paginated discovery
+  responses from keeping a shared northbound v2 request open indefinitely
+- the real multi-worker `RemoteAppServerClient` bootstrap harness now also
+  validates that paginated `model/list` path through the gateway's northbound
+  WebSocket surface, including follow-up `model-offset:` continuation requests
+- the real multi-worker `RemoteAppServerClient` app and MCP status aggregation
+  harnesses now also validate downstream worker-local page draining before
+  gateway-owned `apps-offset:` and `mcp-status-offset:` cursors are exposed to
+  the shared northbound session
+- dedicated multi-worker aggregation coverage now also verifies
+  `experimentalFeature/list` drains worker-local pages before applying
+  gateway-owned `experimental-feature-offset:` pagination, keeping capability
+  discovery pagination aligned with the model, app, and MCP inventory
+  aggregation boundary
+- the real multi-worker `RemoteAppServerClient` capability harness now also
+  validates that paginated `experimentalFeature/list` path through the
+  gateway's northbound WebSocket surface, including follow-up
+  `experimental-feature-offset:` continuation requests after worker-local page
+  draining
 - `docs/gateway-v2-method-matrix.md` now explicitly records the current real
   multi-worker steady-state compatibility coverage for `thread/start`,
   aggregated `thread/list` / `thread/loaded/list`, sticky `thread/read` /
@@ -1830,6 +1935,9 @@ Current Stage A compatibility caveats:
   broad validated steady-state and reconnect coverage without yet reaching the
   same parity and hardening level as embedded and single-worker remote
   deployments
+- multi-worker notification fan-in now also has dedicated coverage for
+  `rawResponseItem/completed` across worker-owned visible threads, closing one
+  more turn replay path in the bounded Stage B profile
 - multi-worker remote runtime should still be treated as a bounded Stage B
   profile with explicit rollout guardrails, not as the default drop-in
   compatibility target
