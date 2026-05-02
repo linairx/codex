@@ -29,6 +29,7 @@ const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC: &str =
 const V2_SERVER_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_server_request_rejections";
 const V2_WORKER_RECONNECT_COUNT_METRIC: &str = "gateway_v2_worker_reconnects";
 const V2_FAIL_CLOSED_REQUEST_COUNT_METRIC: &str = "gateway_v2_fail_closed_requests";
+const V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC: &str = "gateway_v2_upstream_request_failures";
 const V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC: &str = "gateway_v2_suppressed_notifications";
 const V2_SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC: &str =
     "gateway_v2_server_request_lifecycle_events";
@@ -37,6 +38,7 @@ const V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC: &str = "gateway_v2_downstream_bac
 const V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC: &str = "gateway_v2_client_send_timeouts";
 const V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC: &str = "gateway_v2_thread_list_deduplications";
 const V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC: &str = "gateway_v2_thread_route_recoveries";
+const V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC: &str = "gateway_v2_degraded_thread_discovery";
 
 type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
@@ -179,6 +181,28 @@ impl GatewayObservability {
         }
     }
 
+    pub(crate) fn record_v2_upstream_request_failure(
+        &self,
+        method: &str,
+        reconnect_backoff_active: bool,
+    ) {
+        let reconnect_backoff_active = if reconnect_backoff_active {
+            "true"
+        } else {
+            "false"
+        };
+        let tags = [
+            ("method", method),
+            ("reconnect_backoff_active", reconnect_backoff_active),
+        ];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 upstream request failure metric: {err}");
+        }
+    }
+
     pub(crate) fn record_v2_suppressed_notification(&self, method: &str, reason: &str) {
         let tags = [("method", method), ("reason", reason)];
 
@@ -262,6 +286,28 @@ impl GatewayObservability {
             && let Err(err) = metrics.counter(V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC, 1, &tags)
         {
             tracing::warn!("failed to record gateway v2 thread route recovery metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_degraded_thread_discovery(
+        &self,
+        method: &str,
+        reconnect_backoff_active: bool,
+    ) {
+        let reconnect_backoff_active = if reconnect_backoff_active {
+            "true"
+        } else {
+            "false"
+        };
+        let tags = [
+            ("method", method),
+            ("reconnect_backoff_active", reconnect_backoff_active),
+        ];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 degraded thread discovery metric: {err}");
         }
     }
 
@@ -492,6 +538,7 @@ mod tests {
     use super::V2_CONNECTION_COUNT_METRIC;
     use super::V2_CONNECTION_DURATION_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC;
+    use super::V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC;
     use super::V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC;
     use super::V2_FAIL_CLOSED_REQUEST_COUNT_METRIC;
     use super::V2_PROTOCOL_VIOLATION_COUNT_METRIC;
@@ -502,6 +549,7 @@ mod tests {
     use super::V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC;
     use super::V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC;
     use super::V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC;
+    use super::V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC;
     use super::V2_WORKER_RECONNECT_COUNT_METRIC;
     use crate::scope::GatewayRequestContext;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -1084,6 +1132,69 @@ mod tests {
     }
 
     #[test]
+    fn records_v2_upstream_request_failure_metrics_with_method_and_backoff_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_upstream_request_failure("config/read", true);
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), "config/read".to_string()),
+                                    ("reconnect_backoff_active".to_string(), "true".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected upstream request failure count aggregation"),
+                    },
+                    _ => panic!("unexpected upstream request failure count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
     fn records_v2_suppressed_notification_metrics_with_reason_tags() {
         let exporter = InMemoryMetricExporter::default();
         let metrics = codex_otel::MetricsClient::new(
@@ -1498,6 +1609,69 @@ mod tests {
                         _ => panic!("unexpected thread route recovery count aggregation"),
                     },
                     _ => panic!("unexpected thread route recovery count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_degraded_thread_discovery_metrics_with_method_and_backoff_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_degraded_thread_discovery("thread/list", true);
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), "thread/list".to_string()),
+                                    ("reconnect_backoff_active".to_string(), "true".to_string(),),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected degraded thread discovery count aggregation"),
+                    },
+                    _ => panic!("unexpected degraded thread discovery count type"),
                 }
             }
         }

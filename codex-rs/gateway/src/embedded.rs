@@ -259,6 +259,27 @@ fn missing_remote_runtime_config() -> io::Error {
 }
 
 fn validate_gateway_config(gateway_config: &GatewayConfig) -> io::Result<()> {
+    if gateway_config.v2_initialize_timeout.is_zero() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "gateway v2 initialize timeout must be greater than zero",
+        ));
+    }
+
+    if gateway_config.v2_client_send_timeout.is_zero() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "gateway v2 client send timeout must be greater than zero",
+        ));
+    }
+
+    if gateway_config.v2_reconnect_retry_backoff.is_zero() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "gateway v2 reconnect retry backoff must be greater than zero",
+        ));
+    }
+
     if gateway_config.v2_max_pending_server_requests == 0 {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -1323,34 +1344,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_rejects_zero_max_pending_v2_server_requests() {
-        let config = Config::load_default_with_cli_overrides(Vec::new())
-            .await
-            .expect("config");
+    async fn gateway_rejects_zero_v2_transport_hardening_values() {
+        let bind_address = "127.0.0.1:0".parse().expect("bind address");
+        let cases = vec![
+            (
+                GatewayConfig {
+                    bind_address,
+                    v2_initialize_timeout: Duration::ZERO,
+                    ..GatewayConfig::default()
+                },
+                "gateway should reject zero initialize timeout",
+                "gateway v2 initialize timeout must be greater than zero",
+            ),
+            (
+                GatewayConfig {
+                    bind_address,
+                    v2_client_send_timeout: Duration::ZERO,
+                    ..GatewayConfig::default()
+                },
+                "gateway should reject zero client send timeout",
+                "gateway v2 client send timeout must be greater than zero",
+            ),
+            (
+                GatewayConfig {
+                    bind_address,
+                    v2_reconnect_retry_backoff: Duration::ZERO,
+                    ..GatewayConfig::default()
+                },
+                "gateway should reject zero reconnect retry backoff",
+                "gateway v2 reconnect retry backoff must be greater than zero",
+            ),
+            (
+                GatewayConfig {
+                    bind_address,
+                    v2_max_pending_server_requests: 0,
+                    ..GatewayConfig::default()
+                },
+                "gateway should reject zero pending server request limit",
+                "gateway v2 max pending server requests must be greater than zero",
+            ),
+        ];
 
-        let result = start_gateway_server(
-            GatewayConfig {
-                bind_address: "127.0.0.1:0".parse().expect("bind address"),
-                v2_max_pending_server_requests: 0,
-                ..GatewayConfig::default()
-            },
-            Arg0DispatchPaths::default(),
-            config,
-            Vec::new(),
-            LoaderOverrides::default(),
-        )
-        .await;
+        for (gateway_config, panic_message, expected_message) in cases {
+            let config = Config::load_default_with_cli_overrides(Vec::new())
+                .await
+                .expect("config");
 
-        let err = match result {
-            Ok(_server) => panic!("gateway should reject zero pending server request limit"),
-            Err(err) => err,
-        };
+            let result = start_gateway_server(
+                gateway_config,
+                Arg0DispatchPaths::default(),
+                config,
+                Vec::new(),
+                LoaderOverrides::default(),
+            )
+            .await;
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            err.to_string(),
-            "gateway v2 max pending server requests must be greater than zero"
-        );
+            let err = match result {
+                Ok(_server) => panic!("{panic_message}"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(err.to_string(), expected_message);
+        }
     }
 
     #[tokio::test]
@@ -3285,6 +3341,28 @@ requires_openai_auth = true
         assert_eq!(params.item_id, "call1");
         assert_eq!(params.questions.len(), 1);
         let resolved_request_id = request_id.clone();
+
+        let health_client = reqwest::Client::new();
+        let healthz_response = health_client
+            .get(format!("http://{}/healthz", server.local_addr()))
+            .send()
+            .await
+            .expect("healthz response");
+        assert_eq!(healthz_response.status(), reqwest::StatusCode::OK);
+        let health: GatewayHealthResponse = healthz_response.json().await.expect("health body");
+        assert_eq!(health.v2_connections.active_connection_count, 1);
+        assert_eq!(
+            health
+                .v2_connections
+                .active_connection_pending_server_request_count,
+            1
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .active_connection_answered_but_unresolved_server_request_count,
+            0
+        );
 
         let mut answers = HashMap::new();
         answers.insert(

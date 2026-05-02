@@ -84,6 +84,8 @@ pub struct GatewayV2TransportConfig {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayV2ConnectionHealth {
     pub active_connection_count: usize,
+    pub active_connection_pending_server_request_count: usize,
+    pub active_connection_answered_but_unresolved_server_request_count: usize,
     pub peak_active_connection_count: usize,
     pub total_connection_count: u64,
     pub last_connection_started_at: Option<i64>,

@@ -164,6 +164,20 @@ struct ForwardedConnectionNotification {
     params: Option<Value>,
 }
 
+fn update_active_v2_connection_server_request_counts(
+    observability: &GatewayObservability,
+    connection_id: u64,
+    event_state: &GatewayV2EventState,
+) {
+    observability
+        .v2_connection_health()
+        .update_connection_server_request_counts(
+            connection_id,
+            event_state.pending_server_requests.len(),
+            answered_but_unresolved_server_request_count(&event_state.resolved_server_requests),
+        );
+}
+
 struct GatewayV2ConnectionRunResult {
     outcome: &'static str,
     detail: Option<String>,
@@ -757,7 +771,7 @@ async fn run_websocket_connection(
 ) -> io::Result<()> {
     let connection_started_at = Instant::now();
     let initialize_started_at = Instant::now();
-    observability
+    let connection_id = observability
         .v2_connection_health()
         .mark_connection_started();
     let run_result = match async {
@@ -902,7 +916,7 @@ async fn run_websocket_connection(
             client_send_timeout: timeouts.client_send,
             max_pending_server_requests: timeouts.max_pending_server_requests,
         };
-        let (loop_result, mut connection_outcome): (io::Result<()>, &'static str) = loop {
+        let (mut loop_result, mut connection_outcome): (io::Result<()>, &'static str) = loop {
             tokio::select! {
                 frame = socket.recv() => {
                     let Some(frame) = frame else {
@@ -940,6 +954,11 @@ async fn run_websocket_connection(
                                 let outcome = classify_v2_connection_error(&err);
                                 break (Err(err), outcome);
                             }
+                            update_active_v2_connection_server_request_counts(
+                                &observability,
+                                connection_id,
+                                &event_state,
+                            );
                         }
                         Ok(WebSocketMessage::Binary(bytes)) => {
                             let message = match parse_client_jsonrpc_binary(&bytes) {
@@ -972,6 +991,11 @@ async fn run_websocket_connection(
                                 let outcome = classify_v2_connection_error(&err);
                                 break (Err(err), outcome);
                             }
+                            update_active_v2_connection_server_request_counts(
+                                &observability,
+                                connection_id,
+                                &event_state,
+                            );
                         }
                         Ok(WebSocketMessage::Close(_)) => {
                             reject_pending_server_requests_on_exit = true;
@@ -1023,8 +1047,18 @@ async fn run_websocket_connection(
                     };
                     if let Some(close) = should_close {
                         reject_pending_server_requests_on_exit = close.reject_pending_server_requests;
+                        update_active_v2_connection_server_request_counts(
+                            &observability,
+                            connection_id,
+                            &event_state,
+                        );
                         break (Ok(()), close.outcome);
                     }
+                    update_active_v2_connection_server_request_counts(
+                        &observability,
+                        connection_id,
+                        &event_state,
+                    );
                 }
             }
         };
@@ -1045,13 +1079,12 @@ async fn run_websocket_connection(
         let answered_but_unresolved_server_request_count =
             answered_but_unresolved_server_request_count(&event_state.resolved_server_requests);
 
-        if reject_pending_server_requests_on_exit
+        if (reject_pending_server_requests_on_exit
             || loop_result
                 .as_ref()
                 .err()
-                .is_some_and(should_reject_pending_server_requests_after_connection_error)
-        {
-            reject_pending_server_requests(
+                .is_some_and(should_reject_pending_server_requests_after_connection_error))
+            && let Err(err) = reject_pending_server_requests(
                 &downstream,
                 connection.observability,
                 connection.request_context,
@@ -1060,8 +1093,12 @@ async fn run_websocket_connection(
                 &mut event_state.pending_server_requests,
                 &event_state.resolved_server_requests,
             )
-            .await?;
-        }
+            .await
+            {
+                connection_outcome = classify_v2_connection_error(&err);
+                connection_detail = Some(err.to_string());
+                loop_result = Err(err);
+            }
 
         let shutdown_result = downstream.shutdown().await;
         let result = match loop_result {
@@ -1103,11 +1140,14 @@ async fn run_websocket_connection(
     };
     observe_v2_connection(
         &observability,
+        connection_id,
         &context,
         run_result.outcome,
         run_result.detail.as_deref(),
-        run_result.pending_server_request_count,
-        run_result.answered_but_unresolved_server_request_count,
+        (
+            run_result.pending_server_request_count,
+            run_result.answered_but_unresolved_server_request_count,
+        ),
         connection_started_at.elapsed(),
     );
     run_result.result
@@ -1377,9 +1417,6 @@ async fn handle_client_message(
                     );
                 }
                 Err(err) => {
-                    if !is_fail_closed_multi_worker_route_error(&err) {
-                        log_fail_closed_multi_worker_request(downstream, connection, &method, &err);
-                    }
                     send_jsonrpc_error(
                         socket,
                         request_id,
@@ -1901,17 +1938,49 @@ async fn resolve_server_requests_for_worker(
     record_worker_server_request_cleanup_metrics(observability, &cleanup);
 
     for notification in cleanup.resolved_notifications.iter().cloned() {
-        send_jsonrpc(
+        let thread_id = notification.thread_id.clone();
+        let request_id = notification.request_id.clone();
+        if let Err(err) = send_jsonrpc(
             socket,
             JSONRPCMessage::Notification(tagged_type_to_notification(
                 ServerNotification::ServerRequestResolved(notification),
             )?),
             client_send_timeout,
         )
-        .await?;
+        .await
+        {
+            record_worker_cleanup_resolution_send_failure(
+                observability,
+                worker_id,
+                &thread_id,
+                &request_id,
+                &err,
+            );
+            return Err(err);
+        }
     }
 
     Ok(cleanup)
+}
+
+fn record_worker_cleanup_resolution_send_failure(
+    observability: &GatewayObservability,
+    worker_id: Option<usize>,
+    thread_id: &str,
+    request_id: &RequestId,
+    err: &io::Error,
+) {
+    observability.record_v2_server_request_lifecycle_event(
+        "worker_cleanup_resolution_send_failed",
+        "serverRequest/resolved",
+    );
+    warn!(
+        worker_id = ?worker_id,
+        thread_id,
+        gateway_request_id = ?request_id,
+        %err,
+        "failed to deliver synthesized serverRequest/resolved during worker cleanup"
+    );
 }
 
 fn record_worker_server_request_cleanup_metrics(
@@ -2273,18 +2342,68 @@ async fn reject_pending_server_requests(
         resolved_server_requests,
     );
 
-    for (_gateway_request_id, route) in pending_server_requests.drain() {
-        worker_for_server_request(downstream, route.worker_id)?
+    let mut first_rejection_error = None;
+    let mut skipped_unavailable_worker_rejections = 0;
+    let mut failed_rejections = 0;
+    for (gateway_request_id, route) in pending_server_requests.drain() {
+        let Ok(worker) = worker_for_server_request(downstream, route.worker_id) else {
+            skipped_unavailable_worker_rejections += 1;
+            warn!(
+                tenant_id = request_context.tenant_id.as_str(),
+                project_id = request_context.project_id.as_deref(),
+                worker_id = ?route.worker_id,
+                gateway_request_id = ?gateway_request_id,
+                downstream_request_id = ?route.downstream_request_id,
+                "skipping pending server-request rejection because the downstream worker route is unavailable"
+            );
+            continue;
+        };
+
+        if let Err(err) = worker
             .request_handle
             .reject_server_request(
-                route.downstream_request_id,
+                route.downstream_request_id.clone(),
                 JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: PENDING_SERVER_REQUEST_ABORTED_MESSAGE.to_string(),
                     data: None,
                 },
             )
-            .await?;
+            .await
+        {
+            warn!(
+                tenant_id = request_context.tenant_id.as_str(),
+                project_id = request_context.project_id.as_deref(),
+                worker_id = ?route.worker_id,
+                gateway_request_id = ?gateway_request_id,
+                downstream_request_id = ?route.downstream_request_id,
+                %err,
+                "failed to reject pending downstream server request during gateway v2 connection cleanup"
+            );
+            failed_rejections += 1;
+            if first_rejection_error.is_none() {
+                first_rejection_error = Some(err);
+            }
+        }
+    }
+
+    if skipped_unavailable_worker_rejections > 0 {
+        observability.record_v2_server_request_lifecycle_events(
+            "client_cleanup_rejection_skipped_unavailable_worker",
+            "serverRequest/pending",
+            skipped_unavailable_worker_rejections,
+        );
+    }
+    if failed_rejections > 0 {
+        observability.record_v2_server_request_lifecycle_events(
+            "client_cleanup_rejection_failed",
+            "serverRequest/pending",
+            failed_rejections,
+        );
+    }
+
+    if let Some(err) = first_rejection_error {
+        return Err(err);
     }
     Ok(())
 }
@@ -2490,6 +2609,7 @@ async fn handle_client_request(
                         downstream,
                         connection.scope_registry,
                         connection.request_context,
+                        connection.observability,
                         &request,
                     )
                     .await
@@ -2600,9 +2720,7 @@ async fn handle_client_request(
     }
     .await;
 
-    if let Err(err) = &result
-        && is_fail_closed_multi_worker_route_error(err)
-    {
+    if let Err(err) = &result {
         log_fail_closed_multi_worker_request(downstream, connection, request_method.as_str(), err);
     }
 
@@ -3076,19 +3194,35 @@ fn log_fail_closed_multi_worker_request(
         connection
             .observability
             .record_v2_fail_closed_request(method, !reconnect_backoff_worker_ids.is_empty());
-    }
 
-    warn!(
-        method,
-        tenant_id = connection.request_context.tenant_id.as_str(),
-        project_id = connection.request_context.project_id.as_deref(),
-        available_worker_ids = ?available_worker_ids,
-        unavailable_worker_ids = ?unavailable_worker_ids,
-        unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
-        reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
-        %err,
-        "gateway v2 request failed closed because required worker routes are unavailable"
-    );
+        warn!(
+            method,
+            tenant_id = connection.request_context.tenant_id.as_str(),
+            project_id = connection.request_context.project_id.as_deref(),
+            available_worker_ids = ?available_worker_ids,
+            unavailable_worker_ids = ?unavailable_worker_ids,
+            unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
+            reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+            %err,
+            "gateway v2 request failed closed because required worker routes are unavailable"
+        );
+    } else {
+        connection
+            .observability
+            .record_v2_upstream_request_failure(method, !reconnect_backoff_worker_ids.is_empty());
+
+        warn!(
+            method,
+            tenant_id = connection.request_context.tenant_id.as_str(),
+            project_id = connection.request_context.project_id.as_deref(),
+            available_worker_ids = ?available_worker_ids,
+            unavailable_worker_ids = ?unavailable_worker_ids,
+            unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
+            reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+            %err,
+            "gateway v2 upstream request failed while worker routes are unavailable"
+        );
+    }
 }
 
 fn is_fail_closed_multi_worker_route_error(err: &io::Error) -> bool {
@@ -3100,6 +3234,7 @@ fn is_fail_closed_multi_worker_route_error(err: &io::Error) -> bool {
 fn log_degraded_multi_worker_thread_discovery(
     downstream: &GatewayV2DownstreamRouter,
     request_context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     method: &str,
 ) {
     if !downstream.multi_worker_topology() {
@@ -3125,6 +3260,8 @@ fn log_degraded_multi_worker_thread_discovery(
         .filter(|worker| worker.reconnect_backoff_active)
         .map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    observability
+        .record_v2_degraded_thread_discovery(method, !reconnect_backoff_worker_ids.is_empty());
 
     warn!(
         method,
@@ -3247,7 +3384,7 @@ async fn aggregate_thread_list_response(
     observability: &GatewayObservability,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
-    log_degraded_multi_worker_thread_discovery(downstream, context, &request.method);
+    log_degraded_multi_worker_thread_discovery(downstream, context, observability, &request.method);
 
     let params = request_params::<ThreadListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
@@ -3366,9 +3503,10 @@ async fn aggregate_loaded_thread_list_response(
     downstream: &GatewayV2DownstreamRouter,
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
-    log_degraded_multi_worker_thread_discovery(downstream, context, &request.method);
+    log_degraded_multi_worker_thread_discovery(downstream, context, observability, &request.method);
 
     let params = request_params::<codex_app_server_protocol::ThreadLoadedListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
@@ -4500,16 +4638,19 @@ fn observe_v2_request(
 
 fn observe_v2_connection(
     observability: &GatewayObservability,
+    connection_id: u64,
     context: &GatewayRequestContext,
     outcome: &str,
     detail: Option<&str>,
-    pending_server_request_count: usize,
-    answered_but_unresolved_server_request_count: usize,
+    server_request_counts: (usize, usize),
     duration: std::time::Duration,
 ) {
+    let (pending_server_request_count, answered_but_unresolved_server_request_count) =
+        server_request_counts;
     observability
         .v2_connection_health()
         .mark_connection_completed(
+            connection_id,
             outcome,
             detail,
             duration,
@@ -6572,6 +6713,135 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reject_pending_server_requests_records_failed_cleanup_delivery() {
+        let (client, request_handle) = start_test_request_handle().await;
+        client.shutdown().await.expect("client should shut down");
+
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: None,
+        };
+
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let request_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let mut pending_server_requests = HashMap::from([
+            (
+                RequestId::String("gateway-failed".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: Some(0),
+                    downstream_request_id: RequestId::String("downstream-failed".to_string()),
+                    thread_id: Some("thread-owned".to_string()),
+                },
+            ),
+            (
+                RequestId::String("gateway-skipped".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: Some(1),
+                    downstream_request_id: RequestId::String("downstream-skipped".to_string()),
+                    thread_id: None,
+                },
+            ),
+        ]);
+
+        let logs = capture_logs_async(async {
+            let err = super::reject_pending_server_requests(
+                &router,
+                &observability,
+                &request_context,
+                "client_disconnected",
+                Some("test cleanup"),
+                &mut pending_server_requests,
+                &HashMap::new(),
+            )
+            .await
+            .expect_err("closed downstream request handle should fail cleanup");
+
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        })
+        .await;
+
+        assert!(pending_server_requests.is_empty());
+        assert!(
+            logs.contains("skipping pending server-request rejection because the downstream worker route is unavailable")
+        );
+        assert!(logs.contains("failed to reject pending downstream server request"));
+        assert_v2_server_request_lifecycle_metrics(
+            &metrics,
+            &[
+                (
+                    "client_cleanup_rejected_thread_scoped",
+                    "serverRequest/pending",
+                    1,
+                ),
+                (
+                    "client_cleanup_rejected_connection_scoped",
+                    "serverRequest/pending",
+                    1,
+                ),
+                (
+                    "client_cleanup_rejection_failed",
+                    "serverRequest/pending",
+                    1,
+                ),
+                (
+                    "client_cleanup_rejection_skipped_unavailable_worker",
+                    "serverRequest/pending",
+                    1,
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn worker_cleanup_records_failed_synthesized_resolved_delivery() {
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let request_id = RequestId::String("gateway-srv-1".to_string());
+        let err = io::Error::new(io::ErrorKind::TimedOut, "gateway websocket send timed out");
+
+        let logs = capture_logs(|| {
+            super::record_worker_cleanup_resolution_send_failure(
+                &observability,
+                Some(2),
+                "thread-visible",
+                &request_id,
+                &err,
+            );
+        });
+
+        assert!(logs.contains(
+            "failed to deliver synthesized serverRequest/resolved during worker cleanup"
+        ));
+        assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("thread_id=\"thread-visible\""));
+        assert!(logs.contains("gateway_request_id=String(\"gateway-srv-1\")"));
+        assert_v2_server_request_lifecycle_metrics(
+            &metrics,
+            &[(
+                "worker_cleanup_resolution_send_failed",
+                "serverRequest/resolved",
+                1,
+            )],
+        );
+    }
+
     #[test]
     fn aggregated_page_bounds_returns_requested_window_when_offset_is_in_range() {
         assert_eq!(
@@ -6666,20 +6936,20 @@ mod tests {
         .expect("metrics");
         let observability = GatewayObservability::new(Some(metrics.clone()), false);
         let context = GatewayRequestContext::default();
-        observability
+        let connection_id = observability
             .v2_connection_health()
             .mark_connection_started();
 
         super::observe_v2_connection(
             &observability,
+            connection_id,
             &context,
             super::classify_v2_connection_error(&std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "gateway websocket send timed out",
             )),
             None,
-            2,
-            1,
+            (2, 1),
             Duration::from_millis(9),
         );
 
@@ -6853,15 +7123,18 @@ mod tests {
             tenant_id: "tenant-a".to_string(),
             project_id: Some("project-a".to_string()),
         };
+        let connection_id = observability
+            .v2_connection_health()
+            .mark_connection_started();
 
         let logs = capture_logs(|| {
             super::observe_v2_connection(
                 &observability,
+                connection_id,
                 &context,
                 "protocol_violation",
                 Some("unexpected gateway websocket server-request response"),
-                1,
-                2,
+                (1, 2),
                 Duration::from_millis(13),
             );
         });
@@ -6981,6 +7254,104 @@ mod tests {
             }
         }
         assert!(saw_fail_closed_request_count);
+    }
+
+    fn assert_v2_degraded_thread_discovery_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        reconnect_backoff_active: bool,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let reconnect_backoff_active = reconnect_backoff_active.to_string();
+        let mut saw_degraded_thread_discovery_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_degraded_thread_discovery" {
+                saw_degraded_thread_discovery_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    (
+                                        "reconnect_backoff_active".to_string(),
+                                        reconnect_backoff_active.clone(),
+                                    ),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected degraded thread discovery count aggregation"),
+                    },
+                    _ => panic!("unexpected degraded thread discovery count type"),
+                }
+            }
+        }
+        assert!(saw_degraded_thread_discovery_count);
+    }
+
+    fn assert_v2_upstream_request_failure_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        reconnect_backoff_active: bool,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let reconnect_backoff_active = reconnect_backoff_active.to_string();
+        let mut saw_upstream_request_failure_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_upstream_request_failures" {
+                saw_upstream_request_failure_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    (
+                                        "reconnect_backoff_active".to_string(),
+                                        reconnect_backoff_active.clone(),
+                                    ),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected upstream request failure count aggregation"),
+                    },
+                    _ => panic!("unexpected upstream request failure count type"),
+                }
+            }
+        }
+        assert!(saw_upstream_request_failure_count);
     }
 
     fn assert_v2_suppressed_notification_metric(
@@ -14765,6 +15136,7 @@ mod tests {
             &router,
             &scope_registry,
             &GatewayRequestContext::default(),
+            &GatewayObservability::default(),
             &JSONRPCRequest {
                 id: RequestId::String("thread-loaded-list".to_string()),
                 method: "thread/loaded/list".to_string(),
@@ -14991,6 +15363,7 @@ mod tests {
             &router,
             &scope_registry,
             &context,
+            &GatewayObservability::default(),
             &JSONRPCRequest {
                 id: RequestId::String("thread-loaded-list".to_string()),
                 method: "thread/loaded/list".to_string(),
@@ -20245,7 +20618,8 @@ mod tests {
                 router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
 
                 let admission = GatewayAdmissionController::default();
-                let observability = GatewayObservability::default();
+                let metrics = in_memory_metrics();
+                let observability = GatewayObservability::new(Some(metrics.clone()), false);
                 let connection = GatewayV2ConnectionContext {
                     admission: &admission,
                     observability: &observability,
@@ -20272,6 +20646,7 @@ mod tests {
                 assert!(result.is_object());
                 assert_eq!(*worker_a_requests.lock().await, vec![method.to_string()]);
                 assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+                assert_v2_degraded_thread_discovery_metric(&metrics, method, true);
             })
             .await;
 
@@ -31720,7 +32095,141 @@ mod tests {
             }]
         );
 
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let request_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let logs = capture_logs(|| {
+            super::log_degraded_multi_worker_thread_discovery(
+                &router,
+                &request_context,
+                &observability,
+                "thread/list",
+            );
+        });
+
+        assert!(
+            logs.contains("serving degraded multi-worker thread discovery from available workers")
+        );
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("project-a"));
+        assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("unavailable_worker_ids=[1]"));
+        assert!(logs.contains("reconnect_backoff_worker_ids=[]"));
+        assert_v2_degraded_thread_discovery_metric(&metrics, "thread/list", false);
+
         client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_records_unavailable_route_upstream_failure_metrics() {
+        let (client, request_handle) = start_test_request_handle().await;
+        client.shutdown().await.expect("client should shut down");
+
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::from([(1, Instant::now() + Duration::from_secs(30))]),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-b.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+
+        let metrics = in_memory_metrics();
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let scope_registry = GatewayScopeRegistry::default();
+        let request_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &request_context,
+            client_send_timeout: Duration::from_secs(1),
+            max_pending_server_requests: 4,
+        };
+
+        let logs = capture_logs_async(async {
+            let err = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String("config-requirements-read".to_string()),
+                    method: "configRequirements/read".to_string(),
+                    params: None,
+                    trace: None,
+                },
+            )
+            .await
+            .expect_err("closed downstream request handle should fail");
+
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        })
+        .await;
+
+        assert!(
+            logs.contains("gateway v2 upstream request failed while worker routes are unavailable")
+        );
+        assert!(logs.contains("configRequirements/read"));
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("project-a"));
+        assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("unavailable_worker_ids=[1]"));
+        assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
+        assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
+        assert_v2_upstream_request_failure_metric(&metrics, "configRequirements/read", true);
     }
 
     #[tokio::test]
@@ -31832,6 +32341,115 @@ mod tests {
         assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
         assert_v2_fail_closed_request_metric(&metrics, "config/read", true);
+
+        router.clear_worker_reconnect_failure(1);
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &request_context,
+            client_send_timeout: Duration::from_secs(1),
+            max_pending_server_requests: 4,
+        };
+
+        let logs = capture_logs(|| {
+            super::log_fail_closed_multi_worker_request(
+                &router,
+                &connection,
+                "config/read",
+                &std::io::Error::other(super::FailClosedMultiWorkerRouteError {
+                    message: "required worker routes are unavailable for config/read: [1]"
+                        .to_string(),
+                }),
+            );
+        });
+
+        assert!(logs.contains(
+            "gateway v2 request failed closed because required worker routes are unavailable"
+        ));
+        assert!(logs.contains("config/read"));
+        assert!(logs.contains("tenant-a"));
+        assert!(logs.contains("project-a"));
+        assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("unavailable_worker_ids=[1]"));
+        assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
+        assert!(logs.contains("reconnect_backoff_worker_ids=[]"));
+        assert_v2_fail_closed_request_metric(&metrics, "config/read", false);
+
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &request_context,
+            client_send_timeout: Duration::from_secs(1),
+            max_pending_server_requests: 4,
+        };
+
+        let logs = capture_logs(|| {
+            super::log_fail_closed_multi_worker_request(
+                &router,
+                &connection,
+                "config/read",
+                &std::io::Error::other("ordinary upstream error"),
+            );
+        });
+
+        assert!(
+            logs.contains("gateway v2 upstream request failed while worker routes are unavailable")
+        );
+        assert!(logs.contains("ordinary upstream error"));
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let mut fail_closed_metric_count = 0;
+        let mut saw_upstream_request_failure_count = false;
+        for metric in resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            match metric.name() {
+                "gateway_v2_fail_closed_requests" => {
+                    fail_closed_metric_count += 1;
+                }
+                "gateway_v2_upstream_request_failures" => {
+                    saw_upstream_request_failure_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("method".to_string(), "config/read".to_string()),
+                                        (
+                                            "reconnect_backoff_active".to_string(),
+                                            "false".to_string(),
+                                        ),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected upstream request failure count aggregation"),
+                        },
+                        _ => panic!("unexpected upstream request failure count type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(fail_closed_metric_count, 0);
+        assert!(saw_upstream_request_failure_count);
 
         client.shutdown().await.expect("client should shut down");
     }

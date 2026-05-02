@@ -1083,6 +1083,8 @@ Phase 6 is in progress with:
   entries expose `lastStateChangeAt`, `lastErrorAt`, `reconnecting`,
   `reconnectAttemptCount`, and `nextReconnectAt`; `/healthz` now also exposes
   `v2Connections.activeConnectionCount`,
+  `v2Connections.activeConnectionPendingServerRequestCount`,
+  `v2Connections.activeConnectionAnsweredButUnresolvedServerRequestCount`,
   `v2Connections.peakActiveConnectionCount`,
   `v2Connections.totalConnectionCount`,
   `v2Connections.lastConnectionStartedAt`,
@@ -1092,6 +1094,10 @@ Phase 6 is in progress with:
   the latest completed v2 connection outcome/detail/timestamp; health, metrics,
   audit logs, and structured logs now all carry the last v2 connection
   duration needed to diagnose slow-client and short-lived failure paths
+- `/healthz` now also rolls up pending and answered-but-unresolved
+  server-request counts across currently active v2 connections, so operators
+  can spot live prompt lifecycle buildup before waiting for a connection to
+  close and become the latest completed snapshot
 - that operator-facing `v2Connections` health snapshot now also has direct
   embedded, single-worker remote, and multi-worker remote regression coverage,
   pinning active, peak, and total connection counts plus the last-started and
@@ -1130,6 +1136,15 @@ Phase 6 is in progress with:
   whether any required worker route is currently held in reconnect backoff, so
   degraded-session protection can be measured separately from generic
   `internal_error` request outcomes
+- multi-worker v2 upstream request failures that occur while worker routes are
+  unavailable now also emit a `gateway_v2_upstream_request_failures` counter
+  tagged by JSON-RPC method and active reconnect backoff, so ordinary
+  downstream/request errors stay distinguishable from gateway-owned
+  fail-closed policy decisions
+- that upstream-failure metric is now recorded once at the real
+  `handle_client_request` routing boundary, so unavailable-worker
+  observability is exercised without double-counting the outer WebSocket
+  error handling path
 - primary-worker-only multi-worker requests now also have method-family
   reconnect-backoff regression coverage for config requirements, managed
   login, login cancellation, add-credits nudge email, feedback upload,
@@ -1172,6 +1187,19 @@ Phase 6 is in progress with:
   thread-scoped pending prompts, rejected connection-scoped pending prompts,
   and answered-but-unresolved prompts left behind by client disconnect,
   protocol-violation, or slow-send teardown paths
+- client-side cleanup now also records lifecycle events when pending
+  server-request rejection delivery fails or must be skipped because the
+  owning downstream worker route is already unavailable, so prompt cleanup
+  loss is visible instead of disappearing behind the terminal connection
+  outcome
+- worker-loss cleanup now also records a lifecycle event and structured
+  warning when delivery of synthesized `serverRequest/resolved` notifications
+  fails, so thread-scoped prompt cleanup failures are visible on the same
+  observability path as rejected pending prompts
+- those cleanup-delivery failures now preserve the connection's pending and
+  answered-but-unresolved server-request counts in the terminal health,
+  metrics, and audit records instead of falling through to a zero-count outer
+  connection error fallback
 - client replies for unknown server-request ids now also emit
   `gateway_v2_server_request_lifecycle_events` with
   `event=unexpected_client_server_request_response`, so protocol-violation
@@ -1192,11 +1220,20 @@ Phase 6 is in progress with:
   connection outcome and server-request cleanup metrics, so dashboards can
   track client backpressure directly without filtering broad connection
   outcomes
+- gateway startup now rejects zero-valued v2 transport hardening settings for
+  initialize timeout, client-send timeout, reconnect retry backoff, and max
+  pending server-request count, so misconfigured rollouts fail before accepting
+  northbound compatibility traffic
 - multi-worker thread routing diagnostics now also emit
   `gateway_v2_thread_list_deduplications` tagged by selected worker and
   `gateway_v2_thread_route_recoveries` tagged by success or miss, so
   operators can quantify cross-worker duplicate snapshots and failed lazy
   route probes during Stage B rollout
+- degraded multi-worker thread discovery now also emits
+  `gateway_v2_degraded_thread_discovery` tagged by request method and active
+  reconnect backoff, so the intentionally partial `thread/list` /
+  `thread/loaded/list` survival path is visible in metrics as well as
+  structured warning logs
 - embedded and single-worker remote now have real `RemoteAppServerClient`
   drop-in harnesses that cover bootstrap and setup discovery, thread lifecycle
   and control, approvals and other server-request round trips,

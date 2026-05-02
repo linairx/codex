@@ -436,6 +436,14 @@ Recent progress:
   `gateway_v2_fail_closed_requests` counter tagged by method and
   `reconnect_backoff_active`, so dashboards can separate deliberate degraded
   topology protection from ordinary upstream request failures
+- ordinary multi-worker upstream request failures observed while worker routes
+  are unavailable now emit `gateway_v2_upstream_request_failures` with the
+  same method and reconnect-backoff tags, so those non-policy failures remain
+  directly measurable
+- dedicated routing-boundary regression coverage now verifies that the same
+  upstream-failure metric is emitted once from `handle_client_request` when a
+  surviving downstream session fails while another required worker route is
+  unavailable, without double-counting the outer WebSocket error handling path
 - suppressed multi-worker connection notifications now also emit
   `gateway_v2_suppressed_notifications` with notification method and reason
   tags; current reasons are `duplicate` for exact-duplicate connection-state
@@ -1392,6 +1400,18 @@ Recent progress:
   answered-but-unresolved server-request counts, so partially completed prompt
   lifecycles remain visible even after the gateway has already rejected or
   cleaned up the stranded downstream work
+- client-side cleanup now also emits server-request lifecycle metrics when
+  pending prompt rejection delivery fails or must be skipped because the owning
+  downstream worker route is already unavailable, and dedicated cleanup
+  coverage pins both the log messages and metric events
+- worker-loss cleanup now also emits a server-request lifecycle metric and
+  structured warning when synthesized `serverRequest/resolved` delivery fails,
+  so thread-scoped prompt cleanup failures are visible before the gateway
+  returns the terminal send error
+- if pending prompt rejection delivery fails during connection teardown, the
+  gateway now still records the terminal connection health, metrics, and audit
+  fields with the pre-cleanup pending and answered-but-unresolved prompt
+  counts instead of replacing them with the zero-count outer error fallback
 - that slow-client path now also has a real northbound regression where one
   pending downstream server request is left unresolved while large follow-up
   notifications wedge the client send path, verifying the timeout warning,
@@ -1578,6 +1598,8 @@ Operational notes:
 - request scoping, auth, audit logs, metrics, and rate limiting apply to v2
   traffic the same way they apply to HTTP traffic
 - `/healthz` exposes `v2Connections.activeConnectionCount`,
+  `v2Connections.activeConnectionPendingServerRequestCount`,
+  `v2Connections.activeConnectionAnsweredButUnresolvedServerRequestCount`,
   `v2Connections.peakActiveConnectionCount`,
   `v2Connections.totalConnectionCount`,
   `v2Connections.lastConnectionStartedAt`,
@@ -1586,11 +1608,17 @@ Operational notes:
   `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
   the latest completed v2 connection outcome/detail/timestamp for quick
   northbound compatibility-session diagnostics
+- those active prompt counters roll up all currently active v2 compatibility
+  sessions, making live server-request buildup visible before a session closes
+  and updates the latest completed connection fields
 - initialize timeout and downstream disconnects surface as explicit WebSocket
   close frames, not silent socket drops
 - tune `--v2-initialize-timeout-seconds` and
   `--v2-client-send-timeout-seconds` when you need stricter or looser
   northbound timeout behavior during rollout
+- v2 transport hardening values are validated at startup: initialize timeout,
+  client-send timeout, reconnect retry backoff, and max pending server-request
+  count must all be greater than zero
 - tune `--v2-max-pending-server-requests` when you need a tighter or looser
   cap on unresolved server-request state for each northbound compatibility
   session
@@ -1683,6 +1711,9 @@ Operational notes:
   (`initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
   `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`) so operators
   can confirm rollout settings without relying only on startup logs
+- startup validation rejects zero-valued v2 transport hardening settings in
+  this profile as well, so a multi-worker rollout cannot accidentally disable
+  handshake, slow-client, reconnect-backoff, or pending-prompt bounds
 - `/healthz` also exposes the same `v2Connections` snapshot in this profile,
   and that connection-health view now has real multi-worker regression
   coverage for live, concurrent, and settled northbound client sessions
@@ -1709,6 +1740,10 @@ Operational notes:
   plus the pending and answered-but-unresolved server-request counts, matching
   the `/healthz` v2 connection snapshot and connection metrics used to
   diagnose stranded prompt lifecycles
+- `/healthz.v2Connections` also exposes active-session pending and
+  answered-but-unresolved server-request totals, so multi-worker prompt
+  lifecycle buildup is visible during a live shared session rather than only
+  after teardown
 - saturated and hidden-thread downstream server-request rejections also
   increment the `gateway_v2_server_request_rejections` counter with `method`
   and `reason` tags; current reasons are `pending_limit` and `hidden_thread`
@@ -1720,6 +1755,15 @@ Operational notes:
   are unavailable increment `gateway_v2_fail_closed_requests` with `method`
   and `reconnect_backoff_active` tags, matching the structured warning log
   emitted for the same event
+- multi-worker remote upstream request failures that happen while worker routes
+  are unavailable increment `gateway_v2_upstream_request_failures` with
+  `method` and `reconnect_backoff_active` tags, so operators can separate
+  downstream/request failures from gateway-owned fail-closed routing policy
+- degraded multi-worker `thread/list` and `thread/loaded/list` requests
+  increment `gateway_v2_degraded_thread_discovery` with `method` and
+  `reconnect_backoff_active` tags, matching the structured warning log emitted
+  when the gateway intentionally serves the surviving workers' partial visible
+  thread set
 - primary-worker-only multi-worker requests now also have method-family
   reconnect-backoff coverage for config requirements, managed login, login
   cancellation, add-credits nudge email, feedback upload, standalone command
