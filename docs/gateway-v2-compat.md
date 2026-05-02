@@ -423,7 +423,8 @@ Recent progress:
   dedicated rejection counter tagged by server-request method and reason
   (`pending_limit` or `hidden_thread`), so rollout dashboards can distinguish
   prompt-state pressure and hidden-thread prompt drops from ordinary request
-  failures or connection outcomes
+  failures or connection outcomes; the matching rejection logs now also
+  include the affected worker websocket URL
 - multi-worker v2 reconnect activity now also emits a
   `gateway_v2_worker_reconnects` counter tagged by worker id and outcome, so
   operators can alert on repeated reconnect attempts, failures, replay
@@ -450,19 +451,22 @@ Recent progress:
   notifications and `pending_refresh` for repeated `skills/changed`
   invalidations before the client refreshes `skills/list`, plus
   `hidden_thread` when a thread-scoped downstream notification is outside the
-  current gateway request scope
+  current gateway request scope. Hidden-thread notification suppression logs
+  include the affected worker websocket URL so operators can identify the
+  downstream session that emitted the hidden event.
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   gateway request-id translation now also emit
   `gateway_v2_server_request_lifecycle_events` with
   `event=duplicate_resolved_replay` and `method=serverRequest/resolved`, so
   server-request replay anomalies are visible in metrics alongside the
-  structured warning logs
+  structured warning logs. Those warning logs include the source worker
+  websocket URL.
 - downstream server requests that reuse a still-pending gateway request id now
   also emit `gateway_v2_server_request_lifecycle_events` with
   `event=duplicate_pending_request` and the colliding server-request method
   before the gateway fails the session closed, so request-id collision
   anomalies are visible in metrics alongside the close outcome and structured
-  warning log
+  warning log. The warning log includes the source worker websocket URL.
 - worker-loss cleanup now also emits
   `gateway_v2_server_request_lifecycle_events` for synthetic thread-scoped
   `serverRequest/resolved` notifications and stranded connection-scoped server
@@ -501,7 +505,9 @@ Recent progress:
   emit `gateway_v2_thread_list_deduplications` and
   `gateway_v2_thread_route_recoveries`, so duplicate thread snapshots and
   lazy route probe misses are visible in metrics alongside the existing
-  structured routing logs
+  structured routing logs; dedupe and route-recovery success/miss logs now
+  also include worker websocket URLs so operators can identify the affected
+  downstream sessions directly
 - the v2 transport now applies thread scope enforcement to downstream
   server-request forwarding, rejecting hidden-thread requests at the gateway
   boundary instead of leaking them to the northbound client
@@ -823,8 +829,9 @@ Recent progress:
   `thread/list` and `thread/loaded/list` scope filtering, verifying that hidden
   threads are stripped from v2 responses at the transport boundary
 - hidden-thread downstream server requests that are rejected by gateway scope
-  policy now also emit structured warning logs with scope, worker id, request
-  id, method, and hidden thread id, with direct northbound regression coverage
+  policy now also emit structured warning logs with scope, worker id, worker
+  websocket URL, request id, method, and hidden thread id, with direct
+  northbound regression coverage
 - multi-worker northbound v2 aggregation now also backfills missing worker
   ownership for already visible threads discovered through `thread/list` and
   `thread/loaded/list`, so later sticky thread-scoped requests such as
@@ -1455,9 +1462,9 @@ Recent progress:
   notification paths through an unmodified `RemoteAppServerClient` session
 - hidden-thread downstream server requests that are rejected by gateway scope
   policy now also emit structured warning logs with scope, worker id, the
-  translated gateway request id, method, and hidden thread id, so approval
-  prompts dropped at the transport boundary are visible without reproducing the
-  client session
+  worker websocket URL, translated gateway request id, method, and hidden
+  thread id, so approval prompts dropped at the transport boundary are visible
+  without reproducing the client session
 - real multi-worker `RemoteAppServerClient` scope coverage now also verifies
   that hidden-thread downstream server requests are rejected before they reach
   a cross-scope northbound client, while that shared client session remains
@@ -1509,14 +1516,15 @@ Recent progress:
   disconnect-driven cleanup is visible without reconstructing the session from
   downstream errors alone
 - multi-worker `thread/list` dedupe now also emits a structured log with scope,
-  thread id, selected worker, discarded worker, and snapshot timestamps when
-  the gateway chooses one visible thread copy over another, so cross-worker
-  snapshot selection is observable without reproducing the merged response path
+  thread id, selected worker, discarded worker, their websocket URLs, and
+  snapshot timestamps when the gateway chooses one visible thread copy over
+  another, so cross-worker snapshot selection is observable without
+  reproducing the merged response path
 - missing multi-worker thread routes now also emit structured success/failure
   logs when the gateway probes downstream `thread/read` to recover ownership,
-  including scope, thread id, and recovered or attempted worker ids, so lazy
-  route recovery no longer depends on inferring behavior from later request
-  routing alone
+  including scope, thread id, recovered or attempted worker ids, and recovered
+  or attempted worker websocket URLs, so lazy route recovery no longer depends
+  on inferring behavior from later request routing alone
 - missing multi-worker visible-thread routes now also fail closed while a
   required worker remains unavailable during reconnect backoff, so lazy
   `thread/read` ownership probes cannot accidentally treat the surviving
@@ -1524,8 +1532,9 @@ Recent progress:
   thread
 - degraded multi-worker `thread/list` and `thread/loaded/list` discovery now
   emits structured warning logs with scope, available worker ids, unavailable
-  worker ids, and reconnect-backoff worker ids when the shared session serves
-  the surviving workers' partial thread view
+  worker ids, unavailable worker websocket URLs, and reconnect-backoff worker
+  ids when the shared session serves the surviving workers' partial thread
+  view
 - multi-worker thread routing now also deduplicates repeated `thread/list`
   entries, backfills sticky ownership from the selected visible winner, probes
   downstream ownership to recover missing routes for already-visible threads,
@@ -1746,7 +1755,8 @@ Operational notes:
   after teardown
 - saturated and hidden-thread downstream server-request rejections also
   increment the `gateway_v2_server_request_rejections` counter with `method`
-  and `reason` tags; current reasons are `pending_limit` and `hidden_thread`
+  and `reason` tags; current reasons are `pending_limit` and `hidden_thread`.
+  The matching rejection logs include the affected worker websocket URL.
 - multi-worker remote reconnect loops increment
   `gateway_v2_worker_reconnects` with `worker_id` and `outcome` tags; current
   outcomes are `attempt`, `success`, `connect_failure`, `replay_failure`, and
@@ -1763,7 +1773,8 @@ Operational notes:
   increment `gateway_v2_degraded_thread_discovery` with `method` and
   `reconnect_backoff_active` tags, matching the structured warning log emitted
   when the gateway intentionally serves the surviving workers' partial visible
-  thread set
+  thread set; the same warning log includes unavailable worker websocket URLs
+  so operators can identify the affected downstream sessions directly
 - primary-worker-only multi-worker requests now also have method-family
   reconnect-backoff coverage for config requirements, managed login, login
   cancellation, add-credits nudge email, feedback upload, standalone command

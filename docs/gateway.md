@@ -829,7 +829,8 @@ Recent progress:
   server-request routes in those warning logs, and a northbound regression now
   pins the fail-closed close frame plus translated gateway/downstream request
   ids after the client has already answered but downstream
-  `serverRequest/resolved` never arrives before lag closes the session
+  `serverRequest/resolved` never arrives before lag closes the session; the
+  warning log now also includes the affected worker websocket URL
 - slow-client send timeouts now also emit a structured warning log with scope,
   terminal timeout detail, and any still-pending gateway server-request ids
   before pending downstream prompts are rejected, so `client_send_timed_out`
@@ -850,17 +851,17 @@ Recent progress:
   warning log
 - duplicate downstream `serverRequest/resolved` replays that are dropped after
   request-id translation now also emit structured warning logs with scope,
-  worker id, the replayed downstream request id, and any still-buffered
-  translated gateway ids, downstream ids, and worker ids
+  worker id, worker websocket URL, the replayed downstream request id, and any
+  still-buffered translated gateway ids, downstream ids, and worker ids
 - that duplicate-replay path now also has direct northbound regression
   coverage, pinning the warning log fields emitted when a multi-worker
   downstream session replays `serverRequest/resolved` after the translated
   route has already been drained
 - suppressed multi-worker notification dedupe paths now also emit structured
   warning logs: duplicate `skills/changed` invalidations include scope,
-  worker id, and params until the client refreshes `skills/list`, and exact-
-  duplicate connection-state notifications include the same context when they
-  are dropped
+  worker id, worker websocket URL, and params until the client refreshes
+  `skills/list`, and exact-duplicate connection-state notifications include
+  the same context when they are dropped
 - that same exact-duplicate connection-state suppression now also covers
   `mcpServer/oauthLogin/completed`, so one shared northbound session does not
   surface duplicate MCP OAuth completion notifications when more than one
@@ -872,9 +873,9 @@ Recent progress:
   northbound regressions
 - hidden-thread downstream server requests that are rejected by gateway scope
   policy now also emit structured warning logs with scope, worker id, the
-  translated gateway request id, method, and hidden thread id, so approval
-  prompts dropped at the transport boundary are visible without reproducing the
-  client session
+  worker websocket URL, translated gateway request id, method, and hidden
+  thread id, so approval prompts dropped at the transport boundary are visible
+  without reproducing the client session
 - real multi-worker `RemoteAppServerClient` scope coverage now also verifies
   that hidden-thread downstream server requests are rejected before they reach
   a cross-scope northbound client, while that shared client session remains
@@ -923,22 +924,23 @@ Recent progress:
   the legacy approval round-trip transport for both methods
 - fail-closed handling for a downstream session that reuses a still-pending
   server-request id now also emits a structured warning log with scope, worker
-  id, the colliding request id/method, and the gateway request ids already
-  pending on the connection
+  id, worker websocket URL, the colliding request id/method, and the gateway
+  request ids already pending on the connection
 - gateway-owned teardown of still-pending downstream server requests now also
   emits structured warning logs with connection outcome, terminal detail,
-  pending gateway request ids, per-scope counts, and worker ids, so
-  disconnect-driven cleanup is visible without reconstructing the session from
-  downstream errors alone
+  pending gateway request ids, per-scope counts, worker ids, and worker
+  websocket URLs, so disconnect-driven cleanup is visible without
+  reconstructing the session from downstream errors alone
 - multi-worker `thread/list` dedupe now also emits a structured log with scope,
-  thread id, selected worker, discarded worker, and snapshot timestamps when
-  the gateway chooses one visible thread copy over another, so cross-worker
-  snapshot selection is observable without reproducing the merged response path
+  thread id, selected worker, discarded worker, their websocket URLs, and
+  snapshot timestamps when the gateway chooses one visible thread copy over
+  another, so cross-worker snapshot selection is observable without
+  reproducing the merged response path
 - missing multi-worker thread routes now also emit structured success/failure
   logs when the gateway probes downstream `thread/read` to recover ownership,
-  including scope, thread id, and recovered or attempted worker ids, so lazy
-  route recovery no longer depends on inferring behavior from later request
-  routing alone
+  including scope, thread id, recovered or attempted worker ids, and recovered
+  or attempted worker websocket URLs, so lazy route recovery no longer depends
+  on inferring behavior from later request routing alone
 - missing multi-worker visible-thread routes now also fail closed while a
   required worker remains unavailable during reconnect backoff, so lazy
   `thread/read` ownership probes cannot accidentally treat the surviving
@@ -946,8 +948,9 @@ Recent progress:
   thread
 - degraded multi-worker `thread/list` and `thread/loaded/list` discovery now
   emits structured warning logs with scope, available worker ids, unavailable
-  worker ids, and reconnect-backoff worker ids when the shared session serves
-  the surviving workers' partial thread view
+  worker ids, unavailable worker websocket URLs, and reconnect-backoff worker
+  ids when the shared session serves the surviving workers' partial thread
+  view
 - multi-worker thread routing now also deduplicates repeated `thread/list`
   entries, backfills sticky ownership from the selected visible winner, probes
   downstream ownership to recover missing routes for already-visible threads,
@@ -969,7 +972,10 @@ Recent progress:
 - dedicated northbound log regression coverage now also pins the structured
   multi-worker `thread/list` dedupe and visible-thread route recovery logs, so
   operator diagnostics for snapshot selection and downstream `thread/read`
-  ownership probes stay stable as Phase 6 transport hardening continues
+  ownership probes stay stable as Phase 6 transport hardening continues;
+  dedupe and route-recovery success/miss logs now also include worker
+  websocket URLs so operators can identify the affected downstream sessions
+  directly
 - multi-worker `thread/list` dedupe and visible-thread route recovery now also
   emit dedicated v2 metrics, so snapshot-selection churn and lazy ownership
   probe misses are observable from dashboards instead of only structured logs
@@ -1121,7 +1127,8 @@ Phase 6 is in progress with:
   dedicated rejection counter tagged by server-request method and reason
   (`pending_limit` or `hidden_thread`), so overload and policy dashboards can
   distinguish bounded prompt-state pressure or hidden-thread prompt drops from
-  ordinary connection outcomes
+  ordinary connection outcomes; the matching rejection logs now also include
+  the affected worker websocket URL
 - multi-worker v2 reconnect activity now also emits a
   `gateway_v2_worker_reconnects` counter tagged by worker id and outcome
   (`attempt`, `success`, `connect_failure`, `replay_failure`, or
@@ -1157,7 +1164,8 @@ Phase 6 is in progress with:
   and suppression reason (`duplicate`, `pending_refresh`, or
   `hidden_thread`), so rollout dashboards can distinguish healthy
   gateway-owned dedupe and scope filtering from missing worker events or
-  client-side notification loss
+  client-side notification loss; hidden-thread notification suppression logs
+  now also include the affected worker websocket URL
 - exact-duplicate suppression for multi-worker connection-state notifications
   now also covers `windows/worldWritableWarning` and
   `windowsSandbox/setupCompleted`, so one shared northbound session does not
@@ -1233,7 +1241,9 @@ Phase 6 is in progress with:
   `gateway_v2_degraded_thread_discovery` tagged by request method and active
   reconnect backoff, so the intentionally partial `thread/list` /
   `thread/loaded/list` survival path is visible in metrics as well as
-  structured warning logs
+  structured warning logs; those warning logs now also include unavailable
+  worker websocket URLs so operators can identify the affected downstream
+  sessions without cross-referencing deployment config
 - embedded and single-worker remote now have real `RemoteAppServerClient`
   drop-in harnesses that cover bootstrap and setup discovery, thread lifecycle
   and control, approvals and other server-request round trips,

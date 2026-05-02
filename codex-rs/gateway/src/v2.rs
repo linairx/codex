@@ -31,6 +31,7 @@ pub enum GatewayV2SessionFactory {
 
 pub struct GatewayV2ConnectedSession {
     pub worker_id: Option<usize>,
+    pub worker_websocket_url: Option<String>,
     pub app_server: AppServerClient,
 }
 
@@ -103,6 +104,7 @@ impl GatewayV2SessionFactory {
                     .map(|app_server| {
                         vec![GatewayV2ConnectedSession {
                             worker_id: None,
+                            worker_websocket_url: None,
                             app_server: AppServerClient::InProcess(app_server),
                         }]
                     })
@@ -173,6 +175,7 @@ async fn connect_remote_worker(
     initialize: &InitializeParams,
     request_context: &GatewayRequestContext,
 ) -> io::Result<GatewayV2ConnectedSession> {
+    let worker_websocket_url = connect_args.websocket_url.clone();
     apply_initialize_params(
         &mut connect_args.client_name,
         &mut connect_args.client_version,
@@ -187,6 +190,7 @@ async fn connect_remote_worker(
     .await?;
     Ok(GatewayV2ConnectedSession {
         worker_id: Some(worker_id),
+        worker_websocket_url: Some(worker_websocket_url),
         app_server: AppServerClient::Remote(app_server),
     })
 }

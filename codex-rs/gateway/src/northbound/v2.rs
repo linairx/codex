@@ -199,6 +199,7 @@ struct GatewayV2ReconnectState {
 #[derive(Clone)]
 struct DownstreamWorkerHandle {
     worker_id: Option<usize>,
+    worker_websocket_url: Option<String>,
     request_handle: AppServerRequestHandle,
 }
 
@@ -628,6 +629,25 @@ impl GatewayV2DownstreamRouter {
             .collect()
     }
 
+    fn websocket_url_for_worker_id(&self, worker_id: Option<usize>) -> &str {
+        if let Some(worker_websocket_url) = self
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == worker_id)
+            .and_then(|worker| worker.worker_websocket_url.as_deref())
+        {
+            return worker_websocket_url;
+        }
+
+        worker_id
+            .and_then(|worker_id| {
+                self.reconnect_state
+                    .as_ref()
+                    .and_then(|state| state.worker_websocket_urls.get(worker_id))
+            })
+            .map_or("<unknown>", String::as_str)
+    }
+
     async fn replay_connection_state(&self, session: &GatewayV2ConnectedSession) -> io::Result<()> {
         let request_handle = session.app_server.request_handle();
         if self.initialized_notification_sent {
@@ -660,6 +680,7 @@ fn spawn_downstream_worker_session(
     JoinHandle<io::Result<()>>,
 ) {
     let worker_id = session.worker_id;
+    let worker_websocket_url = session.worker_websocket_url;
     let request_handle = session.app_server.request_handle();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut app_server = session.app_server;
@@ -694,6 +715,7 @@ fn spawn_downstream_worker_session(
     (
         DownstreamWorkerHandle {
             worker_id,
+            worker_websocket_url,
             request_handle,
         },
         shutdown_tx,
@@ -1549,6 +1571,9 @@ async fn handle_app_server_event(
     if worker_id.is_some() && !downstream.has_worker(worker_id) && downstream.worker_count() > 0 {
         return Ok(None);
     }
+    let worker_websocket_url = downstream
+        .websocket_url_for_worker_id(worker_id)
+        .to_string();
     let Some(event) = downstream_event.event else {
         let mut cleanup = WorkerServerRequestCleanup::default();
         if !downstream.single_worker() && downstream.remove_worker(worker_id) {
@@ -1564,6 +1589,7 @@ async fn handle_app_server_event(
             if cleanup.has_cleaned_up_requests() {
                 log_worker_server_request_cleanup(
                     worker_id,
+                    worker_websocket_url.as_str(),
                     downstream.worker_count(),
                     None,
                     &cleanup,
@@ -1599,6 +1625,7 @@ async fn handle_app_server_event(
             if cleanup.has_cleaned_up_requests() {
                 log_worker_server_request_cleanup(
                     worker_id,
+                    worker_websocket_url.as_str(),
                     0,
                     None,
                     &cleanup,
@@ -1636,6 +1663,7 @@ async fn handle_app_server_event(
             log_downstream_backpressure_close(
                 connection.request_context,
                 worker_id,
+                worker_websocket_url.as_str(),
                 skipped,
                 &event_state.pending_server_requests,
                 &event_state.resolved_server_requests,
@@ -1661,6 +1689,7 @@ async fn handle_app_server_event(
                 connection.request_context,
                 connection.observability,
                 worker_id,
+                worker_websocket_url.as_str(),
                 &mut event_state.resolved_server_requests,
             )?
             else {
@@ -1673,6 +1702,7 @@ async fn handle_app_server_event(
                 log_suppressed_skills_changed_notification(
                     connection.request_context,
                     worker_id,
+                    worker_websocket_url.as_str(),
                     &notification,
                 );
                 connection
@@ -1691,6 +1721,7 @@ async fn handle_app_server_event(
                 log_suppressed_duplicate_connection_notification(
                     connection.request_context,
                     worker_id,
+                    worker_websocket_url.as_str(),
                     &notification,
                 );
                 connection
@@ -1725,6 +1756,7 @@ async fn handle_app_server_event(
                 log_suppressed_hidden_thread_notification(
                     connection.request_context,
                     worker_id,
+                    worker_websocket_url.as_str(),
                     &notification,
                 );
                 connection
@@ -1747,6 +1779,7 @@ async fn handle_app_server_event(
                 log_duplicate_downstream_server_request(
                     connection.request_context,
                     worker_id,
+                    worker_websocket_url.as_str(),
                     &request.id,
                     &request.method,
                     &event_state.pending_server_requests,
@@ -1781,6 +1814,7 @@ async fn handle_app_server_event(
                     log_rejected_saturated_server_request(
                         connection.request_context,
                         worker_id,
+                        worker_websocket_url.as_str(),
                         &request.id,
                         &request.method,
                         &event_state.pending_server_requests,
@@ -1813,6 +1847,7 @@ async fn handle_app_server_event(
                 log_rejected_hidden_downstream_server_request(
                     connection.request_context,
                     worker_id,
+                    worker_websocket_url.as_str(),
                     &request.id,
                     &request.method,
                     request_thread_id(&request),
@@ -1849,6 +1884,7 @@ async fn handle_app_server_event(
                 if cleanup.has_cleaned_up_requests() {
                     log_worker_server_request_cleanup(
                         worker_id,
+                        worker_websocket_url.as_str(),
                         downstream.worker_count(),
                         Some(message.as_str()),
                         &cleanup,
@@ -1884,6 +1920,7 @@ async fn handle_app_server_event(
                 if cleanup.has_cleaned_up_requests() {
                     log_worker_server_request_cleanup(
                         worker_id,
+                        worker_websocket_url.as_str(),
                         0,
                         Some(message.as_str()),
                         &cleanup,
@@ -2071,6 +2108,7 @@ fn collect_server_request_cleanup_for_worker(
 
 fn log_worker_server_request_cleanup(
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     remaining_worker_count: usize,
     disconnect_message: Option<&str>,
     cleanup: &WorkerServerRequestCleanup,
@@ -2092,6 +2130,7 @@ fn log_worker_server_request_cleanup(
 
     warn!(
         worker_id = ?worker_id,
+        worker_websocket_url,
         remaining_worker_count,
         resolved_thread_scoped_server_request_count = cleanup.resolved_thread_scoped_requests,
         resolved_thread_scoped_server_request_ids = ?resolved_thread_scoped_request_ids,
@@ -2135,6 +2174,7 @@ fn log_unexpected_client_server_request_response(
 fn log_rejected_saturated_server_request(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     request_id: &RequestId,
     method: &str,
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
@@ -2148,6 +2188,7 @@ fn log_rejected_saturated_server_request(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         pending_server_request_count = pending_server_requests.len(),
         limit,
         request_id = ?request_id,
@@ -2160,6 +2201,7 @@ fn log_rejected_saturated_server_request(
 fn log_rejected_hidden_downstream_server_request(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     request_id: &RequestId,
     method: &str,
     thread_id: Option<&str>,
@@ -2168,6 +2210,7 @@ fn log_rejected_hidden_downstream_server_request(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         request_id = ?request_id,
         method,
         thread_id,
@@ -2178,6 +2221,7 @@ fn log_rejected_hidden_downstream_server_request(
 fn log_downstream_backpressure_close(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     skipped: usize,
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
@@ -2191,6 +2235,7 @@ fn log_downstream_backpressure_close(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         skipped_event_count = skipped,
         pending_server_request_count = pending_server_request_ids.len(),
         pending_server_request_ids = ?pending_server_request_ids,
@@ -2230,6 +2275,7 @@ fn log_client_send_timeout(
 fn log_duplicate_downstream_server_request(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     request_id: &RequestId,
     method: &str,
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
@@ -2242,6 +2288,7 @@ fn log_duplicate_downstream_server_request(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         request_id = ?request_id,
         method,
         pending_server_request_count = pending_server_request_ids.len(),
@@ -2253,6 +2300,7 @@ fn log_duplicate_downstream_server_request(
 fn log_dropped_duplicate_resolved_server_request(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     downstream_request_id: &RequestId,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
@@ -2262,6 +2310,7 @@ fn log_dropped_duplicate_resolved_server_request(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         downstream_request_id = ?downstream_request_id,
         remaining_resolved_route_count = resolved_log_fields.gateway_request_ids.len(),
         remaining_resolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
@@ -2274,12 +2323,14 @@ fn log_dropped_duplicate_resolved_server_request(
 fn log_suppressed_skills_changed_notification(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     notification: &JSONRPCNotification,
 ) {
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         method = notification.method,
         params = ?notification.params,
         "suppressing duplicate multi-worker skills/changed notification until the client refreshes skills/list"
@@ -2289,12 +2340,14 @@ fn log_suppressed_skills_changed_notification(
 fn log_suppressed_duplicate_connection_notification(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     notification: &JSONRPCNotification,
 ) {
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         method = notification.method,
         params = ?notification.params,
         "suppressing exact-duplicate multi-worker connection notification"
@@ -2304,12 +2357,14 @@ fn log_suppressed_duplicate_connection_notification(
 fn log_suppressed_hidden_thread_notification(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     notification: &JSONRPCNotification,
 ) {
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
+        worker_websocket_url,
         method = notification.method,
         thread_id = notification
             .params
@@ -2749,6 +2804,11 @@ async fn recover_visible_thread_worker_route(
         .iter()
         .map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    let attempted_worker_websocket_urls = downstream
+        .workers
+        .iter()
+        .map(|worker| downstream.websocket_url_for_worker_id(worker.worker_id))
+        .collect::<Vec<_>>();
     for worker in &downstream.workers {
         let response = worker
             .request_handle
@@ -2768,14 +2828,24 @@ async fn recover_visible_thread_worker_route(
                 context.clone(),
                 worker.worker_id,
             );
-            log_recovered_visible_thread_worker_route(context, thread_id, worker.worker_id);
+            log_recovered_visible_thread_worker_route(
+                context,
+                thread_id,
+                worker.worker_id,
+                downstream.websocket_url_for_worker_id(worker.worker_id),
+            );
             observability.record_v2_thread_route_recovery("success");
             break;
         }
     }
 
     if scope_registry.thread_worker_id(thread_id).is_none() {
-        log_failed_visible_thread_worker_route_recovery(context, thread_id, &attempted_worker_ids);
+        log_failed_visible_thread_worker_route_recovery(
+            context,
+            thread_id,
+            &attempted_worker_ids,
+            &attempted_worker_websocket_urls,
+        );
         observability.record_v2_thread_route_recovery("miss");
     }
 
@@ -3255,6 +3325,10 @@ fn log_degraded_multi_worker_thread_discovery(
         .iter()
         .map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    let unavailable_worker_websocket_urls = unavailable_workers
+        .iter()
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
     let reconnect_backoff_worker_ids = unavailable_workers
         .iter()
         .filter(|worker| worker.reconnect_backoff_active)
@@ -3269,6 +3343,7 @@ fn log_degraded_multi_worker_thread_discovery(
         project_id = request_context.project_id.as_deref(),
         available_worker_ids = ?available_worker_ids,
         unavailable_worker_ids = ?unavailable_worker_ids,
+        unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
         reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
         "serving degraded multi-worker thread discovery from available workers"
     );
@@ -3277,7 +3352,9 @@ fn log_degraded_multi_worker_thread_discovery(
 struct DeduplicatedThreadListEntryLog<'a> {
     thread_id: &'a str,
     selected_worker_id: Option<usize>,
+    selected_worker_websocket_url: &'a str,
     discarded_worker_id: Option<usize>,
+    discarded_worker_websocket_url: &'a str,
     selected_updated_at: i64,
     discarded_updated_at: i64,
     selected_created_at: i64,
@@ -3293,7 +3370,9 @@ fn log_deduplicated_thread_list_entry(
         project_id = request_context.project_id.as_deref(),
         thread_id = entry.thread_id,
         selected_worker_id = ?entry.selected_worker_id,
+        selected_worker_websocket_url = entry.selected_worker_websocket_url,
         discarded_worker_id = ?entry.discarded_worker_id,
+        discarded_worker_websocket_url = entry.discarded_worker_websocket_url,
         selected_updated_at = entry.selected_updated_at,
         discarded_updated_at = entry.discarded_updated_at,
         selected_created_at = entry.selected_created_at,
@@ -3306,12 +3385,14 @@ fn log_recovered_visible_thread_worker_route(
     request_context: &GatewayRequestContext,
     thread_id: &str,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
 ) {
     info!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         thread_id,
         worker_id = ?worker_id,
+        worker_websocket_url,
         "recovered missing visible thread route via downstream thread/read probe"
     );
 }
@@ -3320,12 +3401,14 @@ fn log_failed_visible_thread_worker_route_recovery(
     request_context: &GatewayRequestContext,
     thread_id: &str,
     attempted_worker_ids: &[Option<usize>],
+    attempted_worker_websocket_urls: &[&str],
 ) {
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         thread_id,
         attempted_worker_ids = ?attempted_worker_ids,
+        attempted_worker_websocket_urls = ?attempted_worker_websocket_urls,
         "failed to recover visible thread route via downstream thread/read probe"
     );
 }
@@ -3455,7 +3538,11 @@ async fn aggregate_thread_list_response(
                         DeduplicatedThreadListEntryLog {
                             thread_id: thread.id.as_str(),
                             selected_worker_id,
+                            selected_worker_websocket_url: downstream
+                                .websocket_url_for_worker_id(selected_worker_id),
                             discarded_worker_id,
+                            discarded_worker_websocket_url: downstream
+                                .websocket_url_for_worker_id(discarded_worker_id),
                             selected_updated_at,
                             discarded_updated_at,
                             selected_created_at,
@@ -4708,6 +4795,7 @@ fn server_notification_to_jsonrpc(
     request_context: &GatewayRequestContext,
     observability: &GatewayObservability,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) -> io::Result<Option<JSONRPCNotification>> {
     let mut notification = tagged_type_to_notification(notification)?;
@@ -4727,6 +4815,7 @@ fn server_notification_to_jsonrpc(
             log_dropped_duplicate_resolved_server_request(
                 request_context,
                 worker_id,
+                worker_websocket_url,
                 &downstream_request_id,
                 resolved_server_requests,
             );
@@ -6449,6 +6538,7 @@ mod tests {
             &request_context,
             &observability,
             worker_id,
+            "ws://worker-b.invalid",
             &mut resolved_server_requests,
         )
         .expect("translated resolved notification should succeed");
@@ -6469,6 +6559,7 @@ mod tests {
             &request_context,
             &observability,
             worker_id,
+            "ws://worker-b.invalid",
             &mut resolved_server_requests,
         )
         .expect("duplicate resolved notification should succeed");
@@ -6722,6 +6813,7 @@ mod tests {
         let router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -14181,6 +14273,8 @@ mod tests {
         assert!(logs.contains("thread-shared"));
         assert!(logs.contains("selected_worker_id=Some(1)"));
         assert!(logs.contains("discarded_worker_id=Some(0)"));
+        assert!(logs.contains("selected_worker_websocket_url="));
+        assert!(logs.contains("discarded_worker_websocket_url="));
         assert!(logs.contains("selected_updated_at=5"));
         assert!(logs.contains("discarded_updated_at=1"));
     }
@@ -15798,6 +15892,7 @@ mod tests {
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("thread-missing"));
         assert!(logs.contains("attempted_worker_ids=[Some(0), Some(1)]"));
+        assert!(logs.contains("attempted_worker_websocket_urls=["));
     }
 
     #[tokio::test]
@@ -20660,6 +20755,7 @@ mod tests {
             assert!(logs.contains(&format!("method=\"{method}\"")));
             assert!(logs.contains("available_worker_ids=[0]"));
             assert!(logs.contains("unavailable_worker_ids=[1]"));
+            assert!(logs.contains("unavailable_worker_websocket_urls=["));
             assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
         }
     }
@@ -26616,6 +26712,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -26707,6 +26804,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -26796,6 +26894,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -26896,6 +26995,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -26977,6 +27077,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -27063,6 +27164,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -27187,6 +27289,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -27284,6 +27387,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(1),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -27371,6 +27475,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(1),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -29949,6 +30054,7 @@ mod tests {
         assert!(logs.contains(
             "rejecting downstream server request for a thread outside the gateway request scope"
         ));
+        assert!(logs.contains("worker_websocket_url=\"ws://"), "{logs}");
         assert!(
             logs.contains("request_id=String(\"hidden-server-request\")"),
             "{logs}"
@@ -32024,6 +32130,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -32117,6 +32224,7 @@ mod tests {
         assert!(logs.contains("project-a"));
         assert!(logs.contains("available_worker_ids=[0]"));
         assert!(logs.contains("unavailable_worker_ids=[1]"));
+        assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[]"));
         assert_v2_degraded_thread_discovery_metric(&metrics, "thread/list", false);
 
@@ -32132,6 +32240,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -32239,6 +32348,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
+                worker_websocket_url: None,
                 request_handle,
             }],
             event_tx,
@@ -32459,6 +32569,7 @@ mod tests {
         let logs = capture_logs(|| {
             super::log_worker_server_request_cleanup(
                 Some(1),
+                "ws://worker-b.invalid",
                 1,
                 Some("worker-b lost"),
                 &super::WorkerServerRequestCleanup {
@@ -32487,6 +32598,7 @@ mod tests {
 
         assert!(logs.contains("downstream worker disconnected within shared gateway v2 session"));
         assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
         assert!(logs.contains("remaining_worker_count=1"));
         assert!(logs.contains("disconnect_message"));
         assert!(logs.contains("worker-b lost"));
@@ -32653,6 +32765,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(1),
+                "ws://worker-b.invalid",
                 &RequestId::String("gateway-incoming".to_string()),
                 "item/tool/requestUserInput",
                 &HashMap::from([
@@ -32687,6 +32800,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains("limit=2"));
         assert!(logs.contains("request_id=String(\"gateway-incoming\")"));
@@ -32705,6 +32819,7 @@ mod tests {
                     project_id: Some("project-hidden".to_string()),
                 },
                 Some(3),
+                "ws://worker-d.invalid",
                 &RequestId::String("gateway-hidden".to_string()),
                 "item/commandExecution/requestApproval",
                 Some("thread-hidden"),
@@ -32717,6 +32832,7 @@ mod tests {
         assert!(logs.contains("tenant-hidden"));
         assert!(logs.contains("project-hidden"));
         assert!(logs.contains("worker_id=Some(3)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-d.invalid\""));
         assert!(logs.contains("request_id=String(\"gateway-hidden\")"));
         assert!(logs.contains("item/commandExecution/requestApproval"));
         assert!(logs.contains("thread-hidden"));
@@ -32731,6 +32847,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(2),
+                "ws://worker-c.invalid",
                 3,
                 &HashMap::from([
                     (
@@ -32773,6 +32890,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
         assert!(logs.contains("skipped_event_count=3"));
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains(
@@ -32940,6 +33058,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(1),
+                "ws://worker-b.invalid",
                 &RequestId::String("gateway-duplicate".to_string()),
                 "item/tool/requestUserInput",
                 &HashMap::from([
@@ -32973,6 +33092,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
         assert!(logs.contains("request_id=String(\"gateway-duplicate\")"));
         assert!(logs.contains("item/tool/requestUserInput"));
         assert!(logs.contains("pending_server_request_count=2"));
@@ -32990,6 +33110,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(1),
+                "ws://worker-b.invalid",
                 &RequestId::String("downstream-duplicate".to_string()),
                 &HashMap::from([(
                     super::DownstreamServerRequestKey {
@@ -33010,6 +33131,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
         assert!(logs.contains("downstream_request_id=String(\"downstream-duplicate\")"));
         assert!(logs.contains("remaining_resolved_route_count=1"));
         assert!(
@@ -33030,6 +33152,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(1),
+                "ws://worker-b.invalid",
                 &JSONRPCNotification {
                     method: "skills/changed".to_string(),
                     params: Some(serde_json::json!({"source":"worker-b"})),
@@ -33043,6 +33166,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
         assert!(logs.contains("method=\"skills/changed\""));
         assert!(logs.contains("source"));
         assert!(logs.contains("worker-b"));
@@ -33057,6 +33181,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(2),
+                "ws://worker-c.invalid",
                 &JSONRPCNotification {
                     method: "account/updated".to_string(),
                     params: Some(serde_json::json!({"requiresOpenaiAuth":true})),
@@ -33068,6 +33193,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
         assert!(logs.contains("method=\"account/updated\""));
         assert!(logs.contains("requiresOpenaiAuth"));
         assert!(logs.contains("true"));
@@ -33082,6 +33208,7 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 Some(3),
+                "ws://worker-d.invalid",
                 &JSONRPCNotification {
                     method: "item/agentMessage/delta".to_string(),
                     params: Some(serde_json::json!({
@@ -33100,6 +33227,7 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(3)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-d.invalid\""));
         assert!(logs.contains("method=\"item/agentMessage/delta\""));
         assert!(logs.contains("thread-hidden"));
         assert!(logs.contains("hidden text"));
@@ -33116,7 +33244,9 @@ mod tests {
                 super::DeduplicatedThreadListEntryLog {
                     thread_id: "thread-visible",
                     selected_worker_id: Some(2),
+                    selected_worker_websocket_url: "ws://worker-c.invalid",
                     discarded_worker_id: Some(7),
+                    discarded_worker_websocket_url: "ws://worker-h.invalid",
                     selected_updated_at: 40,
                     discarded_updated_at: 32,
                     selected_created_at: 12,
@@ -33132,7 +33262,9 @@ mod tests {
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("thread_id=\"thread-visible\""));
         assert!(logs.contains("selected_worker_id=Some(2)"));
+        assert!(logs.contains("selected_worker_websocket_url=\"ws://worker-c.invalid\""));
         assert!(logs.contains("discarded_worker_id=Some(7)"));
+        assert!(logs.contains("discarded_worker_websocket_url=\"ws://worker-h.invalid\""));
         assert!(logs.contains("selected_updated_at=40"));
         assert!(logs.contains("discarded_updated_at=32"));
         assert!(logs.contains("selected_created_at=12"));
@@ -33149,6 +33281,7 @@ mod tests {
                 },
                 "thread-visible",
                 Some(3),
+                "ws://worker-d.invalid",
             );
         });
 
@@ -33161,6 +33294,7 @@ mod tests {
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("thread_id=\"thread-visible\""));
         assert!(logs.contains("worker_id=Some(3)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-d.invalid\""));
     }
 
     #[test]
@@ -33173,6 +33307,11 @@ mod tests {
                 },
                 "thread-visible",
                 &[Some(1), Some(4), None],
+                &[
+                    "ws://worker-b.invalid",
+                    "ws://worker-e.invalid",
+                    "<unknown>",
+                ],
             );
         });
 
@@ -33185,6 +33324,9 @@ mod tests {
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("thread_id=\"thread-visible\""));
         assert!(logs.contains("attempted_worker_ids=[Some(1), Some(4), None]"));
+        assert!(logs.contains(
+            "attempted_worker_websocket_urls=[\"ws://worker-b.invalid\", \"ws://worker-e.invalid\", \"<unknown>\"]"
+        ));
     }
 
     async fn spawn_test_server(
