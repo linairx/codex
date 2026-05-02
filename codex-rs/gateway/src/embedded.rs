@@ -1090,6 +1090,38 @@ mod tests {
         saw_turn_completed: bool,
     }
 
+    fn expected_turn_streaming_coverage() -> TurnStreamingCoverage {
+        TurnStreamingCoverage {
+            saw_thread_active: true,
+            saw_turn_started: true,
+            saw_hook_started: false,
+            saw_item_started: false,
+            saw_agent_delta: true,
+            saw_reasoning_summary_delta: true,
+            saw_reasoning_text_delta: true,
+            saw_command_output_delta: true,
+            saw_file_change_delta: true,
+            saw_hook_completed: false,
+            saw_item_completed: false,
+            saw_turn_completed: true,
+        }
+    }
+
+    fn expected_extended_turn_notifications() -> HashSet<&'static str> {
+        HashSet::from([
+            "context_compacted",
+            "mcp_tool_call_progress",
+            "model_rerouted",
+            "plan_delta",
+            "raw_response_item_completed",
+            "reasoning_summary_part_added",
+            "terminal_interaction",
+            "thread_token_usage_updated",
+            "turn_diff_updated",
+            "turn_plan_updated",
+        ])
+    }
+
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     struct RealtimeStreamingCoverage {
         saw_started: bool,
@@ -1624,7 +1656,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to embedded gateway");
@@ -2212,9 +2244,90 @@ mod tests {
             FuzzyFileSearchMatchType::File
         );
 
+        let fuzzy_root_path = fuzzy_root.path().display().to_string();
+        let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearchSessionStart {
+                request_id: RequestId::Integer(37),
+                params: FuzzyFileSearchSessionStartParams {
+                    session_id: "embedded-fuzzy-session".to_string(),
+                    roots: vec![fuzzy_root_path.clone()],
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch/sessionStart should succeed through embedded gateway");
+        assert_eq!(fuzzy_session_start, FuzzyFileSearchSessionStartResponse {});
+
+        let fuzzy_session_update: FuzzyFileSearchSessionUpdateResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearchSessionUpdate {
+                request_id: RequestId::Integer(38),
+                params: FuzzyFileSearchSessionUpdateParams {
+                    session_id: "embedded-fuzzy-session".to_string(),
+                    query: "gate".to_string(),
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch/sessionUpdate should succeed through embedded gateway");
+        assert_eq!(
+            fuzzy_session_update,
+            FuzzyFileSearchSessionUpdateResponse {}
+        );
+
+        let fuzzy_session_updated = timeout(Duration::from_secs(10), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionUpdated(notification),
+                ) = event
+                    && notification.session_id == "embedded-fuzzy-session"
+                    && notification.query == "gate"
+                    && !notification.files.is_empty()
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionUpdated notification should arrive");
+        assert_eq!(fuzzy_session_updated.files.len(), 1);
+        assert_eq!(fuzzy_session_updated.files[0].root, fuzzy_root_path);
+        assert_eq!(fuzzy_session_updated.files[0].path, "gateway-alpha.txt");
+
+        let fuzzy_session_completed = timeout(Duration::from_secs(10), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionCompleted(notification),
+                ) = event
+                    && notification.session_id == "embedded-fuzzy-session"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionCompleted notification should arrive");
+        assert_eq!(fuzzy_session_completed.session_id, "embedded-fuzzy-session");
+
+        let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = client
+            .request_typed(ClientRequest::FuzzyFileSearchSessionStop {
+                request_id: RequestId::Integer(39),
+                params: FuzzyFileSearchSessionStopParams {
+                    session_id: "embedded-fuzzy-session".to_string(),
+                },
+            })
+            .await
+            .expect("fuzzyFileSearch/sessionStop should succeed through embedded gateway");
+        assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
+
         let windows_setup: WindowsSandboxSetupStartResponse = client
             .request_typed(ClientRequest::WindowsSandboxSetupStart {
-                request_id: RequestId::Integer(37),
+                request_id: RequestId::Integer(40),
                 params: WindowsSandboxSetupStartParams {
                     mode: WindowsSandboxSetupMode::Unelevated,
                     cwd: Some(
@@ -7703,6 +7816,28 @@ stream_max_retries = 0
             FuzzyFileSearchSessionUpdateResponse {}
         );
 
+        let fuzzy_session_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionUpdated(notification),
+                ) = event
+                    && notification.session_id == "remote-fuzzy-session"
+                    && notification.query == "gate"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionUpdated notification should arrive");
+        assert_eq!(fuzzy_session_updated.files.len(), 1);
+        assert_eq!(fuzzy_session_updated.files[0].root, "/tmp/remote-project");
+        assert_eq!(fuzzy_session_updated.files[0].path, "docs/gateway.md");
+
         let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = client
             .request_typed(ClientRequest::FuzzyFileSearchSessionStop {
                 request_id: RequestId::Integer(32),
@@ -7713,6 +7848,25 @@ stream_max_retries = 0
             .await
             .expect("fuzzyFileSearch/sessionStop should succeed through remote gateway");
         assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
+
+        let fuzzy_session_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionCompleted(notification),
+                ) = event
+                    && notification.session_id == "remote-fuzzy-session"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionCompleted notification should arrive");
+        assert_eq!(fuzzy_session_completed.session_id, "remote-fuzzy-session");
 
         let windows_setup: WindowsSandboxSetupStartResponse = client
             .request_typed(ClientRequest::WindowsSandboxSetupStart {
@@ -8139,13 +8293,21 @@ stream_max_retries = 0
         let mut saw_login_completed = false;
         let mut saw_mcp_oauth_login_completed = false;
         let mut saw_mcp_startup_status = false;
+        let mut saw_warning = false;
+        let mut saw_config_warning = false;
+        let mut saw_deprecation_notice = false;
+        let mut saw_windows_world_writable_warning = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
                 && saw_app_list
                 && saw_login_completed
                 && saw_mcp_oauth_login_completed
-                && saw_mcp_startup_status)
+                && saw_mcp_startup_status
+                && saw_warning
+                && saw_config_warning
+                && saw_deprecation_notice
+                && saw_windows_world_writable_warning)
             {
                 let event = client
                     .next_event()
@@ -8194,6 +8356,41 @@ stream_max_retries = 0
                         assert_eq!(notification.status, McpServerStartupState::Ready);
                         assert_eq!(notification.error, None);
                         saw_mcp_startup_status = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::Warning(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.thread_id, None);
+                        assert_eq!(notification.message, "shared warning");
+                        saw_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ConfigWarning(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.summary, "shared config warning");
+                        assert_eq!(
+                            notification.details.as_deref(),
+                            Some("check your shared config")
+                        );
+                        saw_config_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::DeprecationNotice(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.summary, "shared deprecation notice");
+                        assert_eq!(
+                            notification.details.as_deref(),
+                            Some("update the shared workflow")
+                        );
+                        saw_deprecation_notice = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsWorldWritableWarning(notification),
+                    ) => {
+                        assert_eq!(notification.sample_paths, vec!["C:\\shared-temp"]);
+                        assert_eq!(notification.extra_count, 2);
+                        assert_eq!(notification.failed_scan, false);
+                        saw_windows_world_writable_warning = true;
                     }
                     other => panic!("unexpected notification: {other:?}"),
                 }
@@ -9083,7 +9280,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -10173,7 +10370,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -10184,13 +10381,21 @@ stream_max_retries = 0
         let mut saw_login_completed = false;
         let mut saw_mcp_oauth_login_completed = false;
         let mut saw_mcp_startup_status = false;
+        let mut saw_warning = false;
+        let mut saw_config_warning = false;
+        let mut saw_deprecation_notice = false;
+        let mut saw_windows_world_writable_warning = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
                 && saw_app_list
                 && saw_login_completed
                 && saw_mcp_oauth_login_completed
-                && saw_mcp_startup_status)
+                && saw_mcp_startup_status
+                && saw_warning
+                && saw_config_warning
+                && saw_deprecation_notice
+                && saw_windows_world_writable_warning)
             {
                 let event = v2_client
                     .next_event()
@@ -10239,6 +10444,41 @@ stream_max_retries = 0
                         assert_eq!(notification.status, McpServerStartupState::Ready);
                         assert_eq!(notification.error, None);
                         saw_mcp_startup_status = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::Warning(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.thread_id, None);
+                        assert_eq!(notification.message, "shared warning");
+                        saw_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ConfigWarning(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.summary, "shared config warning");
+                        assert_eq!(
+                            notification.details.as_deref(),
+                            Some("check your shared config")
+                        );
+                        saw_config_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::DeprecationNotice(
+                        notification,
+                    )) => {
+                        assert_eq!(notification.summary, "shared deprecation notice");
+                        assert_eq!(
+                            notification.details.as_deref(),
+                            Some("update the shared workflow")
+                        );
+                        saw_deprecation_notice = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsWorldWritableWarning(notification),
+                    ) => {
+                        assert_eq!(notification.sample_paths, vec!["C:\\shared-temp"]);
+                        assert_eq!(notification.extra_count, 2);
+                        assert_eq!(notification.failed_scan, false);
+                        saw_windows_world_writable_warning = true;
                     }
                     other => panic!("unexpected notification after worker reconnect: {other:?}"),
                 }
@@ -10311,7 +10551,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -11712,7 +11952,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("v2 client should connect after worker reconnect");
@@ -11726,6 +11966,7 @@ stream_max_retries = 0
         let mut saw_warning = false;
         let mut saw_config_warning = false;
         let mut saw_deprecation_notice = false;
+        let mut saw_windows_world_writable_warning = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
@@ -11735,7 +11976,8 @@ stream_max_retries = 0
                 && saw_mcp_startup
                 && saw_warning
                 && saw_config_warning
-                && saw_deprecation_notice)
+                && saw_deprecation_notice
+                && saw_windows_world_writable_warning)
             {
                 let event = v2_client
                     .next_event()
@@ -11812,6 +12054,14 @@ stream_max_retries = 0
                         );
                         saw_deprecation_notice = true;
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsWorldWritableWarning(notification),
+                    ) => {
+                        assert_eq!(notification.sample_paths, vec!["C:\\shared-temp"]);
+                        assert_eq!(notification.extra_count, 2);
+                        assert_eq!(notification.failed_scan, false);
+                        saw_windows_world_writable_warning = true;
+                    }
                     other => panic!("unexpected notification after worker reconnect: {other:?}"),
                 }
             }
@@ -11827,6 +12077,7 @@ stream_max_retries = 0
         assert!(saw_warning);
         assert!(saw_config_warning);
         assert!(saw_deprecation_notice);
+        assert!(saw_windows_world_writable_warning);
         assert!(
             timeout(Duration::from_millis(200), v2_client.next_event())
                 .await
@@ -12702,7 +12953,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -12878,6 +13129,84 @@ stream_max_retries = 0
                 .collect::<Vec<_>>(),
             vec!["thread-worker-b-app"]
         );
+
+        let first_mcp_resource: McpResourceReadResponse = client
+            .request_typed(ClientRequest::McpResourceRead {
+                request_id: RequestId::Integer(9),
+                params: McpResourceReadParams {
+                    thread_id: first_started.thread.id.clone(),
+                    server: "thread-mcp".to_string(),
+                    uri: "file:///tmp/worker-a/context.md".to_string(),
+                },
+            })
+            .await
+            .expect("mcpServer/resource/read should route to worker A");
+        assert_eq!(
+            serde_json::to_value(&first_mcp_resource.contents).expect("contents should serialize"),
+            serde_json::json!([{
+                "uri": "file:///tmp/worker-a/context.md",
+                "mimeType": "text/markdown",
+                "text": "thread-worker-a resource",
+            }])
+        );
+
+        let second_mcp_resource: McpResourceReadResponse = client
+            .request_typed(ClientRequest::McpResourceRead {
+                request_id: RequestId::Integer(10),
+                params: McpResourceReadParams {
+                    thread_id: second_started.thread.id.clone(),
+                    server: "thread-mcp".to_string(),
+                    uri: "file:///tmp/worker-b/context.md".to_string(),
+                },
+            })
+            .await
+            .expect("mcpServer/resource/read should route to worker B");
+        assert_eq!(
+            serde_json::to_value(&second_mcp_resource.contents).expect("contents should serialize"),
+            serde_json::json!([{
+                "uri": "file:///tmp/worker-b/context.md",
+                "mimeType": "text/markdown",
+                "text": "thread-worker-b resource",
+            }])
+        );
+
+        let first_mcp_tool: McpServerToolCallResponse = client
+            .request_typed(ClientRequest::McpServerToolCall {
+                request_id: RequestId::Integer(11),
+                params: McpServerToolCallParams {
+                    thread_id: first_started.thread.id.clone(),
+                    server: "thread-mcp".to_string(),
+                    tool: "lookup".to_string(),
+                    arguments: Some(serde_json::json!({ "query": "worker-a" })),
+                    meta: None,
+                },
+            })
+            .await
+            .expect("mcpServer/tool/call should route to worker A");
+        assert_eq!(
+            first_mcp_tool.structured_content,
+            Some(serde_json::json!({ "threadId": "thread-worker-a" }))
+        );
+        assert_eq!(first_mcp_tool.is_error, Some(false));
+
+        let second_mcp_tool: McpServerToolCallResponse = client
+            .request_typed(ClientRequest::McpServerToolCall {
+                request_id: RequestId::Integer(12),
+                params: McpServerToolCallParams {
+                    thread_id: second_started.thread.id.clone(),
+                    server: "thread-mcp".to_string(),
+                    tool: "lookup".to_string(),
+                    arguments: Some(serde_json::json!({ "query": "worker-b" })),
+                    meta: None,
+                },
+            })
+            .await
+            .expect("mcpServer/tool/call should route to worker B");
+        assert_eq!(
+            second_mcp_tool.structured_content,
+            Some(serde_json::json!({ "threadId": "thread-worker-b" }))
+        );
+        assert_eq!(second_mcp_tool.is_error, Some(false));
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -14048,6 +14377,45 @@ stream_max_retries = 0
             vec!["thread-worker-a-3-app"]
         );
 
+        let mcp_resource: McpResourceReadResponse = client
+            .request_typed(ClientRequest::McpResourceRead {
+                request_id: RequestId::Integer(107),
+                params: McpResourceReadParams {
+                    thread_id: first_started.thread.id.clone(),
+                    server: "thread-mcp".to_string(),
+                    uri: "file:///tmp/worker-a-3/context.md".to_string(),
+                },
+            })
+            .await
+            .expect("mcpServer/resource/read should route to the re-added worker");
+        assert_eq!(
+            serde_json::to_value(&mcp_resource.contents).expect("contents should serialize"),
+            serde_json::json!([{
+                "uri": "file:///tmp/worker-a-3/context.md",
+                "mimeType": "text/markdown",
+                "text": "thread-worker-a-3 recovered resource",
+            }])
+        );
+
+        let mcp_tool: McpServerToolCallResponse = client
+            .request_typed(ClientRequest::McpServerToolCall {
+                request_id: RequestId::Integer(108),
+                params: McpServerToolCallParams {
+                    thread_id: first_started.thread.id.clone(),
+                    server: "thread-mcp".to_string(),
+                    tool: "lookup".to_string(),
+                    arguments: Some(serde_json::json!({ "query": "worker-a-3" })),
+                    meta: None,
+                },
+            })
+            .await
+            .expect("mcpServer/tool/call should route to the re-added worker");
+        assert_eq!(
+            mcp_tool.structured_content,
+            Some(serde_json::json!({ "threadId": "thread-worker-a-3" }))
+        );
+        assert_eq!(mcp_tool.is_error, Some(false));
+
         let renamed_thread_name = "Recovered Worker Thread".to_string();
         let rename_response: ThreadSetNameResponse = client
             .request_typed(ClientRequest::ThreadSetName {
@@ -14769,7 +15137,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -15264,7 +15632,7 @@ stream_max_retries = 0
         .await
         .expect("worker should reconnect before same-session setup mutation test starts");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -15320,9 +15688,65 @@ stream_max_retries = 0
             .expect("config/value/write should reconnect and fan out");
         assert_eq!(config_value_write.version, "worker-a");
 
+        let marketplace: MarketplaceAddResponse = client
+            .request_typed(ClientRequest::MarketplaceAdd {
+                request_id: RequestId::Integer(4),
+                params: MarketplaceAddParams {
+                    source: "https://example.com/shared-marketplace.git".to_string(),
+                    ref_name: Some("main".to_string()),
+                    sparse_paths: Some(vec!["plugins/shared-plugin".to_string()]),
+                },
+            })
+            .await
+            .expect("marketplace/add should reconnect and fan out");
+        assert_eq!(marketplace.marketplace_name, "shared-marketplace");
+
+        let skills_config: SkillsConfigWriteResponse = client
+            .request_typed(ClientRequest::SkillsConfigWrite {
+                request_id: RequestId::Integer(5),
+                params: SkillsConfigWriteParams {
+                    path: Some(
+                        PathBuf::from("/tmp/shared/skills/shared-skill")
+                            .try_into()
+                            .expect("skills/config/write path should be absolute"),
+                    ),
+                    name: None,
+                    enabled: true,
+                },
+            })
+            .await
+            .expect("skills/config/write should reconnect and fan out");
+        assert_eq!(skills_config.effective_enabled, true);
+
+        let feature_enablement: ExperimentalFeatureEnablementSetResponse = client
+            .request_typed(ClientRequest::ExperimentalFeatureEnablementSet {
+                request_id: RequestId::Integer(6),
+                params: ExperimentalFeatureEnablementSetParams {
+                    enablement: std::collections::BTreeMap::from([(
+                        "gateway-test-feature".to_string(),
+                        true,
+                    )]),
+                },
+            })
+            .await
+            .expect("experimentalFeature/enablement/set should reconnect and fan out");
+        assert_eq!(
+            feature_enablement.enablement,
+            std::collections::BTreeMap::from([("gateway-test-feature".to_string(), true)])
+        );
+
+        let mcp_refresh: McpServerRefreshResponse = client
+            .request_typed(ClientRequest::McpServerRefresh {
+                request_id: RequestId::Integer(7),
+                params: None,
+            })
+            .await
+            .expect("config/mcpServer/reload should reconnect and fan out");
+        assert_eq!(mcp_refresh, McpServerRefreshResponse {});
+
         let reset: MemoryResetResponse = client
             .request_typed(ClientRequest::MemoryReset {
-                request_id: RequestId::Integer(4),
+                request_id: RequestId::Integer(8),
                 params: None,
             })
             .await
@@ -15331,7 +15755,7 @@ stream_max_retries = 0
 
         let logout: LogoutAccountResponse = client
             .request_typed(ClientRequest::LogoutAccount {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(9),
                 params: None,
             })
             .await
@@ -15340,7 +15764,7 @@ stream_max_retries = 0
 
         let watch: FsWatchResponse = client
             .request_typed(ClientRequest::FsWatch {
-                request_id: RequestId::Integer(6),
+                request_id: RequestId::Integer(10),
                 params: FsWatchParams {
                     watch_id: "watch-shared".to_string(),
                     path: PathBuf::from("/tmp/shared-repo/.git/HEAD")
@@ -15355,9 +15779,45 @@ stream_max_retries = 0
             "/tmp/shared-repo/.git/HEAD"
         );
 
+        let fs_changed_paths = timeout(Duration::from_secs(5), async {
+            let mut changed_paths = HashSet::new();
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after fs/watch");
+                if let AppServerEvent::ServerNotification(ServerNotification::FsChanged(
+                    notification,
+                )) = event
+                {
+                    if notification.watch_id != "watch-shared" {
+                        continue;
+                    }
+                    changed_paths.extend(
+                        notification
+                            .changed_paths
+                            .into_iter()
+                            .map(|path| path.as_ref().to_string_lossy().into_owned()),
+                    );
+                    if changed_paths.len() == 2 {
+                        break changed_paths;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("fs/changed notifications should arrive after recovered fs/watch");
+        assert_eq!(
+            fs_changed_paths,
+            HashSet::from([
+                "/tmp/worker-a/shared-repo/.git/HEAD".to_string(),
+                "/tmp/worker-b/shared-repo/.git/HEAD".to_string(),
+            ])
+        );
+
         let unwatch: FsUnwatchResponse = client
             .request_typed(ClientRequest::FsUnwatch {
-                request_id: RequestId::Integer(7),
+                request_id: RequestId::Integer(11),
                 params: FsUnwatchParams {
                     watch_id: "watch-shared".to_string(),
                 },
@@ -15370,6 +15830,10 @@ stream_max_retries = 0
             "externalAgentConfig/import".to_string(),
             "config/batchWrite".to_string(),
             "config/value/write".to_string(),
+            "marketplace/add".to_string(),
+            "skills/config/write".to_string(),
+            "experimentalFeature/enablement/set".to_string(),
+            "config/mcpServer/reload".to_string(),
             "memory/reset".to_string(),
             "account/logout".to_string(),
             "fs/watch".to_string(),
@@ -15914,6 +16378,299 @@ stream_max_retries = 0
         .expect("feedback/upload should succeed through recovered primary worker");
         assert_eq!(feedback.thread_id, "feedback-thread-worker-a");
 
+        let add_credits: SendAddCreditsNudgeEmailResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::SendAddCreditsNudgeEmail {
+                request_id: RequestId::Integer(10),
+                params: SendAddCreditsNudgeEmailParams {
+                    credit_type: AddCreditsNudgeCreditType::Credits,
+                },
+            }),
+        )
+        .await
+        .expect("account/sendAddCreditsNudgeEmail should finish in time")
+        .expect("account/sendAddCreditsNudgeEmail should succeed through recovered primary worker");
+        assert_eq!(add_credits.status, AddCreditsNudgeEmailStatus::Sent);
+
+        let windows_setup: WindowsSandboxSetupStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::WindowsSandboxSetupStart {
+                request_id: RequestId::Integer(11),
+                params: WindowsSandboxSetupStartParams {
+                    mode: WindowsSandboxSetupMode::Unelevated,
+                    cwd: Some(
+                        PathBuf::from("/tmp/worker-a-primary")
+                            .try_into()
+                            .expect("windowsSandbox/setupStart cwd should be absolute"),
+                    ),
+                },
+            }),
+        )
+        .await
+        .expect("windowsSandbox/setupStart should finish in time")
+        .expect("windowsSandbox/setupStart should succeed through recovered primary worker");
+        assert_eq!(windows_setup.started, true);
+
+        let windows_setup_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::WindowsSandboxSetupCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("windowsSandbox/setupCompleted notification should arrive");
+        assert_eq!(
+            windows_setup_completed.mode,
+            WindowsSandboxSetupMode::Unelevated
+        );
+        assert_eq!(windows_setup_completed.success, true);
+        assert_eq!(windows_setup_completed.error, None);
+
+        let read_file: FsReadFileResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsReadFile {
+                request_id: RequestId::Integer(12),
+                params: FsReadFileParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/readFile path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/readFile should finish in time")
+        .expect("fs/readFile should succeed through recovered primary worker");
+        assert_eq!(read_file.data_base64, "d29ya2VyLWEtZmlsZQ==");
+
+        let create_directory: FsCreateDirectoryResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsCreateDirectory {
+                request_id: RequestId::Integer(17),
+                params: FsCreateDirectoryParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested")
+                        .try_into()
+                        .expect("fs/createDirectory path should be absolute"),
+                    recursive: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("fs/createDirectory should finish in time")
+        .expect("fs/createDirectory should succeed through recovered primary worker");
+        assert_eq!(create_directory, FsCreateDirectoryResponse {});
+
+        let write_file: FsWriteFileResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsWriteFile {
+                request_id: RequestId::Integer(18),
+                params: FsWriteFileParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/writeFile path should be absolute"),
+                    data_base64: "cmVjb3ZlcmVkLXByaW1hcnktZmlsZQ==".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fs/writeFile should finish in time")
+        .expect("fs/writeFile should succeed through recovered primary worker");
+        assert_eq!(write_file, FsWriteFileResponse {});
+
+        let metadata: FsGetMetadataResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsGetMetadata {
+                request_id: RequestId::Integer(19),
+                params: FsGetMetadataParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/getMetadata path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/getMetadata should finish in time")
+        .expect("fs/getMetadata should succeed through recovered primary worker");
+        assert_eq!(metadata.is_file, true);
+        assert_eq!(metadata.is_directory, false);
+
+        let directory: FsReadDirectoryResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsReadDirectory {
+                request_id: RequestId::Integer(20),
+                params: FsReadDirectoryParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested")
+                        .try_into()
+                        .expect("fs/readDirectory path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/readDirectory should finish in time")
+        .expect("fs/readDirectory should succeed through recovered primary worker");
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.entries[0].file_name, "worker-a-gateway.txt");
+
+        let copy: FsCopyResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsCopy {
+                request_id: RequestId::Integer(21),
+                params: FsCopyParams {
+                    source_path: PathBuf::from("/tmp/worker-a-primary/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/copy source path should be absolute"),
+                    destination_path: PathBuf::from("/tmp/worker-a-primary/nested/copy.txt")
+                        .try_into()
+                        .expect("fs/copy destination path should be absolute"),
+                    recursive: false,
+                },
+            }),
+        )
+        .await
+        .expect("fs/copy should finish in time")
+        .expect("fs/copy should succeed through recovered primary worker");
+        assert_eq!(copy, FsCopyResponse {});
+
+        let remove: FsRemoveResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FsRemove {
+                request_id: RequestId::Integer(22),
+                params: FsRemoveParams {
+                    path: PathBuf::from("/tmp/worker-a-primary/nested/copy.txt")
+                        .try_into()
+                        .expect("fs/remove path should be absolute"),
+                    recursive: Some(false),
+                    force: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("fs/remove should finish in time")
+        .expect("fs/remove should succeed through recovered primary worker");
+        assert_eq!(remove, FsRemoveResponse {});
+
+        let fuzzy_search: FuzzyFileSearchResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearch {
+                request_id: RequestId::Integer(13),
+                params: FuzzyFileSearchParams {
+                    query: "gate".to_string(),
+                    roots: vec!["/tmp/worker-a-primary".to_string()],
+                    cancellation_token: Some("same-session-recovered-primary-fuzzy".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch should finish in time")
+        .expect("fuzzyFileSearch should succeed through recovered primary worker");
+        assert_eq!(fuzzy_search.files.len(), 1);
+        assert_eq!(fuzzy_search.files[0].root, "/tmp/worker-a-primary");
+        assert_eq!(fuzzy_search.files[0].path, "docs/gateway.md");
+        assert_eq!(
+            fuzzy_search.files[0].match_type,
+            FuzzyFileSearchMatchType::File
+        );
+
+        let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearchSessionStart {
+                request_id: RequestId::Integer(14),
+                params: FuzzyFileSearchSessionStartParams {
+                    session_id: "same-session-recovered-primary-fuzzy-session".to_string(),
+                    roots: vec!["/tmp/worker-a-primary".to_string()],
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionStart should finish in time")
+        .expect("fuzzyFileSearch/sessionStart should succeed through recovered primary worker");
+        assert_eq!(fuzzy_session_start, FuzzyFileSearchSessionStartResponse {});
+
+        let fuzzy_session_update: FuzzyFileSearchSessionUpdateResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearchSessionUpdate {
+                request_id: RequestId::Integer(15),
+                params: FuzzyFileSearchSessionUpdateParams {
+                    session_id: "same-session-recovered-primary-fuzzy-session".to_string(),
+                    query: "gate".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionUpdate should finish in time")
+        .expect("fuzzyFileSearch/sessionUpdate should succeed through recovered primary worker");
+        assert_eq!(
+            fuzzy_session_update,
+            FuzzyFileSearchSessionUpdateResponse {}
+        );
+
+        let fuzzy_session_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionUpdated(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionUpdated notification should arrive");
+        assert_eq!(
+            fuzzy_session_updated.session_id,
+            "same-session-recovered-primary-fuzzy-session"
+        );
+        assert_eq!(fuzzy_session_updated.query, "gate");
+        assert_eq!(fuzzy_session_updated.files.len(), 1);
+        assert_eq!(fuzzy_session_updated.files[0].root, "/tmp/worker-a-primary");
+        assert_eq!(fuzzy_session_updated.files[0].path, "docs/gateway.md");
+
+        let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::FuzzyFileSearchSessionStop {
+                request_id: RequestId::Integer(16),
+                params: FuzzyFileSearchSessionStopParams {
+                    session_id: "same-session-recovered-primary-fuzzy-session".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionStop should finish in time")
+        .expect("fuzzyFileSearch/sessionStop should succeed through recovered primary worker");
+        assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
+
+        let fuzzy_session_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionCompleted notification should arrive");
+        assert_eq!(
+            fuzzy_session_completed.session_id,
+            "same-session-recovered-primary-fuzzy-session"
+        );
+
         let command_exec: CommandExecResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::OneOffCommandExec {
@@ -16326,6 +17083,26 @@ stream_max_retries = 0
                 .collect::<Vec<_>>(),
             vec!["shared-mcp", "worker-a-mcp", "worker-b-mcp"]
         );
+
+        let mcp_startup_status = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::McpServerStatusUpdated(notification),
+                ) = event
+                    && notification.name == "worker-a-mcp"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("mcpServer/startupStatus/updated notification should arrive");
+        assert_eq!(mcp_startup_status.status, McpServerStartupState::Ready);
+        assert_eq!(mcp_startup_status.error, None);
 
         let mcp_oauth_login: McpServerOauthLoginResponse = timeout(
             Duration::from_secs(5),
@@ -17809,6 +18586,28 @@ stream_max_retries = 0
             FuzzyFileSearchSessionUpdateResponse {}
         );
 
+        let fuzzy_session_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionUpdated(notification),
+                ) = event
+                    && notification.session_id == "multi-worker-fuzzy-session"
+                    && notification.query == "gate"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionUpdated notification should arrive");
+        assert_eq!(fuzzy_session_updated.files.len(), 1);
+        assert_eq!(fuzzy_session_updated.files[0].root, "/tmp/worker-a-primary");
+        assert_eq!(fuzzy_session_updated.files[0].path, "docs/gateway.md");
+
         let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::FuzzyFileSearchSessionStop {
@@ -17822,6 +18621,28 @@ stream_max_retries = 0
         .expect("fuzzyFileSearch/sessionStop should finish in time")
         .expect("fuzzyFileSearch/sessionStop should route through multi-worker gateway");
         assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
+
+        let fuzzy_session_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionCompleted(notification),
+                ) = event
+                    && notification.session_id == "multi-worker-fuzzy-session"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionCompleted notification should arrive");
+        assert_eq!(
+            fuzzy_session_completed.session_id,
+            "multi-worker-fuzzy-session"
+        );
 
         let windows_setup: WindowsSandboxSetupStartResponse = timeout(
             Duration::from_secs(5),
@@ -19889,7 +20710,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -19903,6 +20724,7 @@ stream_max_retries = 0
         let mut saw_warning = false;
         let mut saw_config_warning = false;
         let mut saw_deprecation_notice = false;
+        let mut saw_windows_world_writable_warning = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
@@ -19912,7 +20734,8 @@ stream_max_retries = 0
                 && saw_mcp_startup
                 && saw_warning
                 && saw_config_warning
-                && saw_deprecation_notice)
+                && saw_deprecation_notice
+                && saw_windows_world_writable_warning)
             {
                 let event = client
                     .next_event()
@@ -19989,6 +20812,14 @@ stream_max_retries = 0
                         );
                         saw_deprecation_notice = true;
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsWorldWritableWarning(notification),
+                    ) => {
+                        assert_eq!(notification.sample_paths, vec!["C:\\shared-temp"]);
+                        assert_eq!(notification.extra_count, 2);
+                        assert_eq!(notification.failed_scan, false);
+                        saw_windows_world_writable_warning = true;
+                    }
                     other => panic!("unexpected notification: {other:?}"),
                 }
             }
@@ -20004,6 +20835,7 @@ stream_max_retries = 0
         assert!(saw_warning);
         assert!(saw_config_warning);
         assert!(saw_deprecation_notice);
+        assert!(saw_windows_world_writable_warning);
         assert!(
             timeout(Duration::from_millis(200), client.next_event())
                 .await
@@ -20390,25 +21222,20 @@ stream_max_retries = 0
                 ("turn-thread-worker-b", "hello from worker b"),
             ),
         ]);
+        let mut extended_notifications_by_thread: HashMap<String, HashSet<&'static str>> =
+            HashMap::from([
+                (first_started.thread.id.clone(), HashSet::new()),
+                (second_started.thread.id.clone(), HashSet::new()),
+            ]);
 
         let turn_fan_in_result = timeout(Duration::from_secs(5), async {
-            while lifecycle_by_thread.values().any(|coverage| {
-                *coverage
-                    != (TurnStreamingCoverage {
-                        saw_thread_active: true,
-                        saw_turn_started: true,
-                        saw_hook_started: false,
-                        saw_item_started: false,
-                        saw_agent_delta: true,
-                        saw_reasoning_summary_delta: true,
-                        saw_reasoning_text_delta: true,
-                        saw_command_output_delta: true,
-                        saw_file_change_delta: true,
-                        saw_hook_completed: false,
-                        saw_item_completed: false,
-                        saw_turn_completed: true,
-                    })
-            }) {
+            while lifecycle_by_thread
+                .values()
+                .any(|coverage| *coverage != expected_turn_streaming_coverage())
+                || extended_notifications_by_thread
+                    .values()
+                    .any(|notifications| notifications.len() != 10)
+            {
                 let event = client
                     .next_event()
                     .await
@@ -20485,6 +21312,19 @@ stream_max_retries = 0
                             coverage.saw_agent_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::PlanDelta(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.delta == format!("plan {}", notification.thread_id)
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("plan_delta");
+                        }
+                    }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryTextDelta(notification),
                     ) => {
@@ -20499,6 +21339,19 @@ stream_max_retries = 0
                             coverage.saw_reasoning_summary_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ReasoningSummaryPartAdded(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.summary_index == 0
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("reasoning_summary_part_added");
+                        }
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
                         notification,
                     )) => {
@@ -20511,6 +21364,20 @@ stream_max_retries = 0
                             && notification.content_index == 0
                         {
                             coverage.saw_reasoning_text_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::TerminalInteraction(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.process_id == format!("proc-{}", notification.thread_id)
+                            && notification.stdin == "y\n"
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("terminal_interaction");
                         }
                     }
                     AppServerEvent::ServerNotification(
@@ -20537,6 +21404,101 @@ stream_max_retries = 0
                             && notification.delta == format!("patch {}", notification.thread_id)
                         {
                             coverage.saw_file_change_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnDiffUpdated(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.diff == format!("diff {}", notification.thread_id)
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("turn_diff_updated");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnPlanUpdated(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.explanation.as_deref()
+                                == Some("gateway multi-worker plan")
+                            && notification.plan.len() == 1
+                            && notification.plan[0].step
+                                == format!("plan {}", notification.thread_id)
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("turn_plan_updated");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadTokenUsageUpdated(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.token_usage.total.total_tokens == 42
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("thread_token_usage_updated");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpToolCallProgress(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.message
+                                == format!("mcp progress {}", notification.thread_id)
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("mcp_tool_call_progress");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ContextCompacted(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("context_compacted");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ModelRerouted(
+                        notification,
+                    )) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.from_model == "gpt-5"
+                            && notification.to_model == "gpt-5-codex"
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("model_rerouted");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::RawResponseItemCompleted(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("raw_response_item_completed");
                         }
                     }
                     AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
@@ -20594,42 +21556,24 @@ stream_max_retries = 0
         assert_eq!(
             turn_fan_in_result.is_ok(),
             true,
-            "turn notifications should fan in from both workers: {lifecycle_by_thread:?}"
+            "turn notifications should fan in from both workers: lifecycle={lifecycle_by_thread:?} extended={extended_notifications_by_thread:?}"
         );
 
         assert_eq!(
             lifecycle_by_thread.get(&first_started.thread.id),
-            Some(&TurnStreamingCoverage {
-                saw_thread_active: true,
-                saw_turn_started: true,
-                saw_hook_started: false,
-                saw_item_started: false,
-                saw_agent_delta: true,
-                saw_reasoning_summary_delta: true,
-                saw_reasoning_text_delta: true,
-                saw_command_output_delta: true,
-                saw_file_change_delta: true,
-                saw_hook_completed: false,
-                saw_item_completed: false,
-                saw_turn_completed: true,
-            })
+            Some(&expected_turn_streaming_coverage())
         );
         assert_eq!(
             lifecycle_by_thread.get(&second_started.thread.id),
-            Some(&TurnStreamingCoverage {
-                saw_thread_active: true,
-                saw_turn_started: true,
-                saw_hook_started: false,
-                saw_item_started: false,
-                saw_agent_delta: true,
-                saw_reasoning_summary_delta: true,
-                saw_reasoning_text_delta: true,
-                saw_command_output_delta: true,
-                saw_file_change_delta: true,
-                saw_hook_completed: false,
-                saw_item_completed: false,
-                saw_turn_completed: true,
-            })
+            Some(&expected_turn_streaming_coverage())
+        );
+        assert_eq!(
+            extended_notifications_by_thread.get(&first_started.thread.id),
+            Some(&expected_extended_turn_notifications())
+        );
+        assert_eq!(
+            extended_notifications_by_thread.get(&second_started.thread.id),
+            Some(&expected_extended_turn_notifications())
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -26043,182 +26987,6 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookCompleted".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": "hook-remote-workflow",
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": "/tmp/remote-hooks.json",
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "completed",
-                                                    "statusMessage": "remote hook completed",
-                                                    "startedAt": 1,
-                                                    "completedAt": 2,
-                                                    "durationMs": 1,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/completed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": "msg-remote-workflow",
-                                                    "text": "streaming answer completed",
-                                                    "phase": "final_answer",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookCompleted".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": format!("hook-{thread_id}"),
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "completed",
-                                                    "statusMessage": format!("hook completed {thread_id}"),
-                                                    "startedAt": 1,
-                                                    "completedAt": 2,
-                                                    "durationMs": 1,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/completed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": format!("msg-{thread_id}"),
-                                                    "text": "streaming answer completed",
-                                                    "phase": "final_answer",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookCompleted".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": "hook-remote-workflow",
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": "/tmp/remote-hooks.json",
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "completed",
-                                                    "statusMessage": "remote hook completed",
-                                                    "startedAt": 1,
-                                                    "completedAt": 2,
-                                                    "durationMs": 1,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/completed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": "msg-remote-workflow",
-                                                    "text": "streaming answer completed",
-                                                    "phase": "final_answer",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookCompleted".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": format!("hook-{thread_id}"),
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "completed",
-                                                    "statusMessage": format!("hook completed {thread_id}"),
-                                                    "startedAt": 1,
-                                                    "completedAt": 2,
-                                                    "durationMs": 1,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
                                             method: "item/completed".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
@@ -27188,6 +27956,68 @@ stream_max_retries = 0
                                     )
                                     .await;
                                 }
+                                "mcpServer/resource/read" => {
+                                    let requested_thread_id = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("threadId"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("mcpServer/resource/read should include threadId");
+                                    assert_eq!(requested_thread_id, thread_id);
+                                    let uri = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("uri"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("mcpServer/resource/read should include uri");
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "contents": [{
+                                                    "uri": uri,
+                                                    "mimeType": "text/markdown",
+                                                    "text": format!("{thread_id} recovered resource"),
+                                                }],
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "mcpServer/tool/call" => {
+                                    let requested_thread_id = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("threadId"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("mcpServer/tool/call should include threadId");
+                                    assert_eq!(requested_thread_id, thread_id);
+                                    let tool = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("tool"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("mcpServer/tool/call should include tool");
+                                    assert_eq!(tool, "lookup");
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "content": [{
+                                                    "type": "text",
+                                                    "text": format!("{thread_id} recovered tool result"),
+                                                }],
+                                                "structuredContent": {
+                                                    "threadId": thread_id,
+                                                },
+                                                "isError": false,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
                                 "review/start" => {
                                     let requested_thread_id = request
                                         .params
@@ -27797,14 +28627,62 @@ stream_max_retries = 0
                                 "filePath": "/tmp/shared/config.toml",
                                 "overriddenMetadata": null,
                             }),
-                            "fs/watch" => serde_json::json!({
-                                "path": request
+                            "marketplace/add" => serde_json::json!({
+                                "marketplaceName": "shared-marketplace",
+                                "installedRoot": "/tmp/shared/marketplace",
+                                "alreadyAdded": false,
+                            }),
+                            "skills/config/write" => {
+                                assert_eq!(
+                                    request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("enabled"))
+                                        .and_then(serde_json::Value::as_bool),
+                                    Some(true)
+                                );
+                                serde_json::json!({
+                                    "effectiveEnabled": true,
+                                })
+                            }
+                            "experimentalFeature/enablement/set" => {
+                                let enablement = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("enablement"))
+                                    .cloned()
+                                    .expect("experimentalFeature/enablement/set should include enablement");
+                                serde_json::json!({
+                                    "enablement": enablement,
+                                })
+                            }
+                            "config/mcpServer/reload" => serde_json::json!({}),
+                            "fs/watch" => {
+                                let path = request
                                     .params
                                     .as_ref()
                                     .and_then(|params| params.get("path"))
                                     .cloned()
-                                    .expect("fs/watch should include path"),
-                            }),
+                                    .expect("fs/watch should include path");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fs/changed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "watchId": "watch-shared",
+                                                "changedPaths": [
+                                                    format!("/tmp/{worker_label}/shared-repo/.git/HEAD"),
+                                                ],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({
+                                    "path": path,
+                                })
+                            }
                             "fs/unwatch" => serde_json::json!({}),
                             "memory/reset" | "account/logout" => serde_json::json!({}),
                             method => panic!("unexpected request method: {method}"),
@@ -27934,6 +28812,14 @@ stream_max_retries = 0
                                 "params": {
                                     "summary": "shared deprecation notice",
                                     "details": "update the shared workflow",
+                                },
+                            }),
+                            serde_json::json!({
+                                "method": "windows/worldWritableWarning",
+                                "params": {
+                                    "samplePaths": ["C:\\shared-temp"],
+                                    "extraCount": 2,
+                                    "failedScan": false,
                                 },
                             }),
                         ] {
@@ -29403,9 +30289,46 @@ stream_max_retries = 0
                                     "indices": [5, 6, 7, 8],
                                 }],
                             }),
-                            "fuzzyFileSearch/sessionStart"
-                            | "fuzzyFileSearch/sessionUpdate"
-                            | "fuzzyFileSearch/sessionStop" => serde_json::json!({}),
+                            "fuzzyFileSearch/sessionStart" => serde_json::json!({}),
+                            "fuzzyFileSearch/sessionUpdate" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fuzzyFileSearch/sessionUpdated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "sessionId": "remote-fuzzy-session",
+                                                "query": "gate",
+                                                "files": [{
+                                                    "root": "/tmp/remote-project",
+                                                    "path": "docs/gateway.md",
+                                                    "match_type": "file",
+                                                    "file_name": "gateway.md",
+                                                    "score": 42,
+                                                    "indices": [5, 6, 7, 8],
+                                                }],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({})
+                            }
+                            "fuzzyFileSearch/sessionStop" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fuzzyFileSearch/sessionCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "sessionId": "remote-fuzzy-session",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({})
+                            }
                             "windowsSandbox/setupStart" => {
                                 write_websocket_message(
                                     &mut websocket,
@@ -30524,6 +31447,62 @@ stream_max_retries = 0
                                     "nextCursor": null,
                                 })
                             }
+                            "mcpServer/resource/read" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/resource/read should include threadId");
+                                assert!(
+                                    requested_thread_id == thread_id
+                                        || requested_thread_id == forked_thread_id,
+                                    "thread-scoped MCP resource reads should stay on the owning worker"
+                                );
+                                let uri = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("uri"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/resource/read should include uri");
+                                serde_json::json!({
+                                    "contents": [{
+                                        "uri": uri,
+                                        "mimeType": "text/markdown",
+                                        "text": format!("{thread_id} resource"),
+                                    }],
+                                })
+                            }
+                            "mcpServer/tool/call" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/tool/call should include threadId");
+                                assert!(
+                                    requested_thread_id == thread_id
+                                        || requested_thread_id == forked_thread_id,
+                                    "thread-scoped MCP tool calls should stay on the owning worker"
+                                );
+                                let tool = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("tool"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("mcpServer/tool/call should include tool");
+                                assert_eq!(tool, "lookup");
+                                serde_json::json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!("{thread_id} tool result"),
+                                    }],
+                                    "structuredContent": {
+                                        "threadId": thread_id,
+                                    },
+                                    "isError": false,
+                                })
+                            }
                             _ => panic!("unexpected request method: {}", request.method),
                         };
 
@@ -31155,14 +32134,32 @@ stream_max_retries = 0
                                 })
                             }
                             "config/mcpServer/reload" => serde_json::json!({}),
-                            "fs/watch" => serde_json::json!({
-                                "path": request
+                            "fs/watch" => {
+                                let path = request
                                     .params
                                     .as_ref()
                                     .and_then(|params| params.get("path"))
                                     .cloned()
-                                    .expect("fs/watch should include path"),
-                            }),
+                                    .expect("fs/watch should include path");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fs/changed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "watchId": "watch-shared",
+                                                "changedPaths": [
+                                                    format!("/tmp/{worker_label}/shared-repo/.git/HEAD"),
+                                                ],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({
+                                    "path": path,
+                                })
+                            }
                             "fs/unwatch" => serde_json::json!({}),
                             "memory/reset" | "account/logout" => serde_json::json!({}),
                             method => panic!("unexpected request method: {method}"),
@@ -32336,16 +33333,46 @@ stream_max_retries = 0
                                 "plugin/list" => {
                                     bootstrap_setup_plugin_list_json(worker_label, unique_cwd)
                                 }
-                                "mcpServerStatus/list" => serde_json::json!({
-                                    "data": mcp_status_names.iter().map(|name| serde_json::json!({
-                                        "name": name,
-                                        "tools": {},
-                                        "resources": [],
-                                        "resourceTemplates": [],
-                                        "authStatus": "bearerToken",
-                                    })).collect::<Vec<_>>(),
-                                    "nextCursor": null,
-                                }),
+                                "mcpServerStatus/list" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id.clone(),
+                                            result: serde_json::json!({
+                                                "data": mcp_status_names.iter().map(|name| serde_json::json!({
+                                                    "name": name,
+                                                    "tools": {},
+                                                    "resources": [],
+                                                    "resourceTemplates": [],
+                                                    "authStatus": "bearerToken",
+                                                })).collect::<Vec<_>>(),
+                                                "nextCursor": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    if let Some(worker_mcp_name) = mcp_status_names
+                                        .iter()
+                                        .find(|name| name.starts_with(worker_label))
+                                    {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "mcpServer/startupStatus/updated"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "name": worker_mcp_name,
+                                                        "status": "ready",
+                                                        "error": null,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    continue;
+                                }
                                 "mcpServer/oauth/login" => {
                                     let name = request
                                         .params
@@ -32406,6 +33433,113 @@ stream_max_retries = 0
                                 "feedback/upload" => serde_json::json!({
                                     "threadId": format!("feedback-thread-{worker_label}"),
                                 }),
+                                "account/sendAddCreditsNudgeEmail" => serde_json::json!({
+                                    "status": "sent",
+                                }),
+                                "fs/createDirectory" => serde_json::json!({}),
+                                "fs/writeFile" => serde_json::json!({}),
+                                "fs/readFile" => serde_json::json!({
+                                    "dataBase64": match worker_label {
+                                        "worker-a" => "d29ya2VyLWEtZmlsZQ==",
+                                        "worker-b" => "d29ya2VyLWItZmlsZQ==",
+                                        other => panic!("unexpected worker label: {other}"),
+                                    },
+                                }),
+                                "fs/getMetadata" => serde_json::json!({
+                                    "isDirectory": false,
+                                    "isFile": true,
+                                    "isSymlink": false,
+                                    "createdAtMs": 0,
+                                    "modifiedAtMs": 0,
+                                }),
+                                "fs/readDirectory" => serde_json::json!({
+                                    "entries": [{
+                                        "fileName": "worker-a-gateway.txt",
+                                        "isDirectory": false,
+                                        "isFile": true,
+                                    }],
+                                }),
+                                "fs/copy" => serde_json::json!({}),
+                                "fs/remove" => serde_json::json!({}),
+                                "fuzzyFileSearch" => serde_json::json!({
+                                    "files": [{
+                                        "root": "/tmp/worker-a-primary",
+                                        "path": "docs/gateway.md",
+                                        "match_type": "file",
+                                        "file_name": "gateway.md",
+                                        "score": 42,
+                                        "indices": [5, 6, 7, 8],
+                                    }],
+                                }),
+                                "fuzzyFileSearch/sessionStart" => serde_json::json!({}),
+                                "fuzzyFileSearch/sessionUpdate" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "fuzzyFileSearch/sessionUpdated"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "sessionId": "same-session-recovered-primary-fuzzy-session",
+                                                    "query": "gate",
+                                                    "files": [{
+                                                        "root": "/tmp/worker-a-primary",
+                                                        "path": "docs/gateway.md",
+                                                        "match_type": "file",
+                                                        "file_name": "gateway.md",
+                                                        "score": 42,
+                                                        "indices": [5, 6, 7, 8],
+                                                    }],
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    serde_json::json!({})
+                                }
+                                "fuzzyFileSearch/sessionStop" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "fuzzyFileSearch/sessionCompleted"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "sessionId": "same-session-recovered-primary-fuzzy-session",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    serde_json::json!({})
+                                }
+                                "windowsSandbox/setupStart" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id.clone(),
+                                            result: serde_json::json!({
+                                                "started": true,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "windowsSandbox/setupCompleted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "mode": "unelevated",
+                                                    "success": true,
+                                                    "error": null,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
                                 "command/exec" => {
                                     let process_id = request
                                         .params
@@ -32731,9 +33865,48 @@ stream_max_retries = 0
                                         "indices": [5, 6, 7, 8],
                                     }],
                                 }),
-                                "fuzzyFileSearch/sessionStart"
-                                | "fuzzyFileSearch/sessionUpdate"
-                                | "fuzzyFileSearch/sessionStop" => serde_json::json!({}),
+                                "fuzzyFileSearch/sessionStart" => serde_json::json!({}),
+                                "fuzzyFileSearch/sessionUpdate" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "fuzzyFileSearch/sessionUpdated"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "sessionId": "multi-worker-fuzzy-session",
+                                                    "query": "gate",
+                                                    "files": [{
+                                                        "root": "/tmp/worker-a-primary",
+                                                        "path": "docs/gateway.md",
+                                                        "match_type": "file",
+                                                        "file_name": "gateway.md",
+                                                        "score": 42,
+                                                        "indices": [5, 6, 7, 8],
+                                                    }],
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    serde_json::json!({})
+                                }
+                                "fuzzyFileSearch/sessionStop" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "fuzzyFileSearch/sessionCompleted"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "sessionId": "multi-worker-fuzzy-session",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    serde_json::json!({})
+                                }
                                 "windowsSandbox/setupStart" => {
                                     write_websocket_message(
                                         &mut websocket,
@@ -32936,6 +34109,14 @@ stream_max_retries = 0
                             "params": {
                                 "summary": "shared deprecation notice",
                                 "details": "update the shared workflow",
+                            },
+                        }),
+                        serde_json::json!({
+                            "method": "windows/worldWritableWarning",
+                            "params": {
+                                "samplePaths": ["C:\\shared-temp"],
+                                "extraCount": 2,
+                                "failedScan": false,
                             },
                         }),
                     ] {
@@ -33435,12 +34616,42 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/plan/delta".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": format!("plan-{thread_id}"),
+                                                "delta": format!("plan {thread_id}"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
                                             method: "item/reasoning/summaryTextDelta".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
                                                 "itemId": format!("reasoning-summary-{thread_id}"),
                                                 "delta": format!("summary {thread_id}"),
+                                                "summaryIndex": 0,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/reasoning/summaryPartAdded".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": format!("reasoning-summary-{thread_id}"),
                                                 "summaryIndex": 0,
                                             })),
                                         },
@@ -33458,6 +34669,23 @@ stream_max_retries = 0
                                                 "itemId": format!("reasoning-{thread_id}"),
                                                 "delta": format!("reasoning {thread_id}"),
                                                 "contentIndex": 0,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/commandExecution/terminalInteraction"
+                                                .to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": format!("terminal-{thread_id}"),
+                                                "processId": format!("proc-{thread_id}"),
+                                                "stdin": "y\n",
                                             })),
                                         },
                                     ),
@@ -33488,6 +34716,128 @@ stream_max_retries = 0
                                                 "turnId": turn_id,
                                                 "itemId": format!("patch-{thread_id}"),
                                                 "delta": format!("patch {thread_id}"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "turn/diff/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "diff": format!("diff {thread_id}"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "turn/plan/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "explanation": "gateway multi-worker plan",
+                                                "plan": [{
+                                                    "step": format!("plan {thread_id}"),
+                                                    "status": "completed",
+                                                }],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/tokenUsage/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "tokenUsage": {
+                                                    "total": {
+                                                        "totalTokens": 42,
+                                                        "inputTokens": 20,
+                                                        "cachedInputTokens": 3,
+                                                        "outputTokens": 22,
+                                                        "reasoningOutputTokens": 7,
+                                                    },
+                                                    "last": {
+                                                        "totalTokens": 10,
+                                                        "inputTokens": 4,
+                                                        "cachedInputTokens": 1,
+                                                        "outputTokens": 6,
+                                                        "reasoningOutputTokens": 2,
+                                                    },
+                                                    "modelContextWindow": 200000,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/mcpToolCall/progress".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": format!("mcp-{thread_id}"),
+                                                "message": format!("mcp progress {thread_id}"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/compacted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "model/rerouted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "fromModel": "gpt-5",
+                                                "toModel": "gpt-5-codex",
+                                                "reason": "highRiskCyberActivity",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "rawResponseItem/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "other",
+                                                },
                                             })),
                                         },
                                     ),

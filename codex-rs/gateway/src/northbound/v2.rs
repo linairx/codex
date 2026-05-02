@@ -2436,6 +2436,7 @@ async fn handle_client_request(
                 .thread_worker_id(thread_id)
                 .is_none()
         {
+            downstream.ensure_all_configured_workers_present_for(&request.method)?;
             recover_visible_thread_worker_route(
                 downstream,
                 connection.scope_registry,
@@ -2870,6 +2871,8 @@ async fn first_successful_visible_thread_read_request(
     context: &GatewayRequestContext,
     request: JSONRPCRequest,
 ) -> io::Result<Result<Value, JSONRPCErrorError>> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut first_error = None;
 
     for worker in &downstream.workers {
@@ -3094,6 +3097,46 @@ fn is_fail_closed_multi_worker_route_error(err: &io::Error) -> bool {
         .is_some()
 }
 
+fn log_degraded_multi_worker_thread_discovery(
+    downstream: &GatewayV2DownstreamRouter,
+    request_context: &GatewayRequestContext,
+    method: &str,
+) {
+    if !downstream.multi_worker_topology() {
+        return;
+    }
+
+    let unavailable_workers = downstream.unavailable_worker_route_diagnostics(Instant::now());
+    if unavailable_workers.is_empty() {
+        return;
+    }
+
+    let available_worker_ids = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let unavailable_worker_ids = unavailable_workers
+        .iter()
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_ids = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+
+    warn!(
+        method,
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        available_worker_ids = ?available_worker_ids,
+        unavailable_worker_ids = ?unavailable_worker_ids,
+        reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+        "serving degraded multi-worker thread discovery from available workers"
+    );
+}
+
 struct DeduplicatedThreadListEntryLog<'a> {
     thread_id: &'a str,
     selected_worker_id: Option<usize>,
@@ -3204,6 +3247,8 @@ async fn aggregate_thread_list_response(
     observability: &GatewayObservability,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    log_degraded_multi_worker_thread_discovery(downstream, context, &request.method);
+
     let params = request_params::<ThreadListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
         params.cursor.as_deref(),
@@ -3323,6 +3368,8 @@ async fn aggregate_loaded_thread_list_response(
     context: &GatewayRequestContext,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    log_degraded_multi_worker_thread_discovery(downstream, context, &request.method);
+
     let params = request_params::<codex_app_server_protocol::ThreadLoadedListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
         params.cursor.as_deref(),
@@ -3376,6 +3423,8 @@ async fn aggregate_apps_list_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let params = request_params::<AppsListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
         params.cursor.as_deref(),
@@ -3429,6 +3478,8 @@ async fn aggregate_mcp_server_status_list_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let params = request_params::<ListMcpServerStatusParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
         params.cursor.as_deref(),
@@ -3487,6 +3538,8 @@ async fn aggregate_external_agent_config_detect_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut items = Vec::new();
 
     for worker in &downstream.workers {
@@ -3509,6 +3562,8 @@ async fn aggregate_account_read_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut primary_response = None;
     let mut requires_openai_auth = false;
 
@@ -3535,6 +3590,8 @@ async fn aggregate_account_rate_limits_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut primary_response = None;
     let mut aggregated_rate_limits_by_limit_id = HashMap::new();
 
@@ -3568,6 +3625,8 @@ async fn aggregate_model_list_response_if_supported(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let params = request_params::<ModelListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
         params.cursor.as_deref(),
@@ -3620,6 +3679,8 @@ async fn aggregate_skills_list_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut entries = Vec::<SkillsListEntry>::new();
 
     for worker in &downstream.workers {
@@ -3653,6 +3714,8 @@ async fn aggregate_plugin_list_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut marketplaces = Vec::<PluginMarketplaceEntry>::new();
     let mut featured_plugin_ids = Vec::<String>::new();
     let mut marketplace_load_errors = Vec::new();
@@ -3690,6 +3753,8 @@ async fn aggregate_realtime_list_voices_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut primary_response = None;
     let mut merged_v1 = Vec::<RealtimeVoice>::new();
     let mut merged_v2 = Vec::<RealtimeVoice>::new();
@@ -3731,6 +3796,8 @@ async fn aggregate_experimental_feature_list_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let params = request_params::<ExperimentalFeatureListParams>(request)?;
     let offset = decode_aggregated_offset_cursor(
         params.cursor.as_deref(),
@@ -3794,6 +3861,8 @@ async fn aggregate_collaboration_mode_list_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
     let mut modes = Vec::<CollaborationModeMask>::new();
 
     for worker in &downstream.workers {
@@ -15154,6 +15223,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn visible_thread_route_recovery_fails_closed_during_reconnect_backoff() {
+        let (worker_a, worker_a_requests) =
+            start_mock_remote_server_for_reconnectable_request_with_recording(
+                "thread/read",
+                serde_json::json!({
+                    "thread": {
+                        "id": "thread-worker-b",
+                        "name": "Wrong worker thread",
+                        "cwd": "/tmp/worker-a",
+                    },
+                }),
+            )
+            .await;
+        let (worker_b, worker_b_requests) =
+            start_mock_remote_server_for_reconnectable_request_with_recording(
+                "thread/read",
+                serde_json::json!({
+                    "thread": {
+                        "id": "thread-worker-b",
+                        "name": "Worker B thread",
+                        "cwd": "/tmp/worker-b",
+                    },
+                }),
+            )
+            .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread("thread-worker-b".to_string(), context.clone());
+
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the owning worker before applying reconnect backoff"
+        );
+        router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+        let metrics = in_memory_metrics();
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+        };
+
+        let err = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-read".to_string()),
+                method: "thread/read".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "includeTurns": false,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("visible thread route recovery should fail closed during reconnect backoff");
+
+        assert_eq!(
+            err.to_string(),
+            "required worker routes are unavailable for thread/read: [1]"
+        );
+        assert_eq!(router.worker_count(), 1);
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), None);
+        assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+        assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        assert_v2_fail_closed_request_metric(&metrics, "thread/read", true);
+    }
+
+    #[tokio::test]
     async fn recover_visible_thread_worker_route_logs_when_probe_finds_no_owner() {
         let logs = capture_logs_async(async {
             let thread_read_params = serde_json::json!({
@@ -19187,6 +19366,15 @@ mod tests {
                 }),
             ),
             (
+                "account/sendAddCreditsNudgeEmail",
+                Some(serde_json::json!({
+                    "creditType": "credits",
+                })),
+                serde_json::json!({
+                    "status": "sent",
+                }),
+            ),
+            (
                 "feedback/upload",
                 Some(serde_json::json!({
                     "classification": "bug",
@@ -19747,6 +19935,357 @@ mod tests {
             assert_eq!(router.worker_count(), 1);
             assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
             assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregated_discovery_requests_fail_closed_during_reconnect_backoff() {
+        let cases = vec![
+            (
+                "account/read",
+                Some(serde_json::json!({
+                    "refreshToken": false,
+                })),
+                serde_json::json!({
+                    "account": null,
+                    "requiresOpenaiAuth": false,
+                }),
+            ),
+            (
+                "account/rateLimits/read",
+                None,
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": null,
+                        "limitName": null,
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    },
+                    "rateLimitsByLimitId": null,
+                }),
+            ),
+            (
+                "app/list",
+                Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": null,
+                    "threadId": null,
+                    "forceRefetch": false,
+                })),
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                }),
+            ),
+            (
+                "mcpServerStatus/list",
+                Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": null,
+                    "detail": "toolsAndAuthOnly",
+                })),
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                }),
+            ),
+            (
+                "externalAgentConfig/detect",
+                Some(serde_json::json!({})),
+                serde_json::json!({
+                    "items": [],
+                }),
+            ),
+            (
+                "model/list",
+                Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": null,
+                    "includeHidden": null,
+                })),
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                }),
+            ),
+            (
+                "skills/list",
+                Some(serde_json::json!({})),
+                serde_json::json!({
+                    "data": [],
+                }),
+            ),
+            (
+                "experimentalFeature/list",
+                Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": null,
+                })),
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                }),
+            ),
+            (
+                "collaborationMode/list",
+                Some(serde_json::json!({})),
+                serde_json::json!({
+                    "data": [],
+                }),
+            ),
+            (
+                "plugin/list",
+                Some(serde_json::json!({
+                    "cwds": null,
+                })),
+                serde_json::json!({
+                    "marketplaces": [],
+                    "marketplaceLoadErrors": [],
+                    "featuredPluginIds": [],
+                }),
+            ),
+            (
+                "thread/realtime/listVoices",
+                Some(serde_json::json!({})),
+                serde_json::json!({
+                    "voices": {
+                        "v1": ["juniper"],
+                        "v2": ["alloy"],
+                        "defaultV1": "juniper",
+                        "defaultV2": "alloy",
+                    },
+                }),
+            ),
+        ];
+
+        for (method, params, response) in cases {
+            let (worker_a, worker_a_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    response.clone(),
+                )
+                .await;
+            let (worker_b, worker_b_requests) =
+                start_mock_remote_server_for_reconnectable_request_with_recording(
+                    method,
+                    response.clone(),
+                )
+                .await;
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext::default();
+            let session_factory = GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            );
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            assert!(
+                router.remove_worker(Some(1)),
+                "test should drop a worker before applying reconnect backoff"
+            );
+            router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+            let metrics = in_memory_metrics();
+            let admission = GatewayAdmissionController::default();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false);
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+            };
+
+            let err = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(format!("{method}-request")),
+                    method: method.to_string(),
+                    params,
+                    trace: None,
+                },
+            )
+            .await
+            .expect_err("aggregated discovery should fail closed during reconnect backoff");
+
+            assert_eq!(
+                err.to_string(),
+                format!("required worker routes are unavailable for {method}: [1]")
+            );
+            assert_eq!(router.worker_count(), 1);
+            assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
+            assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+            assert_v2_fail_closed_request_metric(&metrics, method, true);
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_thread_discovery_logs_unavailable_worker_routes() {
+        let cases = vec![
+            (
+                "thread/list",
+                Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 10,
+                })),
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                    "backwardsCursor": null,
+                }),
+            ),
+            (
+                "thread/loaded/list",
+                Some(serde_json::json!({
+                    "cursor": null,
+                    "limit": 10,
+                })),
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                }),
+            ),
+        ];
+
+        for (method, params, response) in cases {
+            let logs = capture_logs_async(async {
+                let (worker_a, worker_a_requests) =
+                    start_mock_remote_server_for_reconnectable_request_with_recording(
+                        method,
+                        response.clone(),
+                    )
+                    .await;
+                let (worker_b, worker_b_requests) =
+                    start_mock_remote_server_for_reconnectable_request_with_recording(
+                        method,
+                        response.clone(),
+                    )
+                    .await;
+                let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                let context = GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                };
+                let session_factory = GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                );
+                let initialize_params = InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                };
+                let mut router = GatewayV2DownstreamRouter::connect(
+                    &session_factory,
+                    &initialize_params,
+                    &context,
+                )
+                .await
+                .expect("downstream router should connect");
+                assert!(
+                    router.remove_worker(Some(1)),
+                    "test should drop a worker before applying reconnect backoff"
+                );
+                router.record_worker_reconnect_failure(1, Instant::now(), Duration::from_secs(60));
+
+                let admission = GatewayAdmissionController::default();
+                let observability = GatewayObservability::default();
+                let connection = GatewayV2ConnectionContext {
+                    admission: &admission,
+                    observability: &observability,
+                    scope_registry: &scope_registry,
+                    request_context: &context,
+                    client_send_timeout: Duration::from_secs(10),
+                    max_pending_server_requests: 4,
+                };
+
+                let result = super::handle_client_request(
+                    &mut router,
+                    &connection,
+                    JSONRPCRequest {
+                        id: RequestId::String(format!("{method}-request")),
+                        method: method.to_string(),
+                        params,
+                        trace: None,
+                    },
+                )
+                .await
+                .expect("degraded thread discovery should reach available workers")
+                .expect("degraded thread discovery should succeed");
+
+                assert!(result.is_object());
+                assert_eq!(*worker_a_requests.lock().await, vec![method.to_string()]);
+                assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+            })
+            .await;
+
+            assert!(
+                logs.contains(
+                    "serving degraded multi-worker thread discovery from available workers"
+                )
+            );
+            assert!(logs.contains("tenant-visible"));
+            assert!(logs.contains("project-visible"));
+            assert!(logs.contains(&format!("method=\"{method}\"")));
+            assert!(logs.contains("available_worker_ids=[0]"));
+            assert!(logs.contains("unavailable_worker_ids=[1]"));
+            assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
         }
     }
 

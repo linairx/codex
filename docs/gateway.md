@@ -370,15 +370,20 @@ Recent progress:
 - the real embedded compatibility harness now also covers `configWarning`
   during startup, and the real single-worker remote compatibility harness now
   also covers `warning`, `configWarning`, `deprecationNotice`,
-  `account/login/completed`, `mcpServer/oauthLogin/completed`, and
-  `mcpServer/startupStatus/updated`, so those visible notification paths are
-  exercised through unmodified `RemoteAppServerClient` sessions in addition to
-  dedicated northbound coverage
+  `account/login/completed`, `mcpServer/oauthLogin/completed`,
+  `mcpServer/startupStatus/updated`, and `windows/worldWritableWarning` in
+  both steady state and after worker reconnect, so those visible notification
+  paths are exercised through unmodified `RemoteAppServerClient` sessions in
+  addition to dedicated northbound coverage
 - the real multi-worker connection-state notification regressions now also
   cover `account/login/completed`, `warning`, `configWarning`, and
   `deprecationNotice` dedupe in both steady state and after worker reconnect,
   so onboarding-complete and other visible connection-state notifications stay
   single-delivery on one shared northbound session
+- those same real multi-worker connection-state regressions now also cover
+  `windows/worldWritableWarning` dedupe in steady state and after worker
+  reconnect, so Windows sandbox visibility warnings stay single-delivery on
+  one shared northbound session
 - multi-worker remote runtime now also has a real northbound v2 client
   regression covering tenant/project scope enforcement across worker-owned
   threads, verifying that same-scope clients can re-enter aggregated
@@ -934,6 +939,15 @@ Recent progress:
   including scope, thread id, and recovered or attempted worker ids, so lazy
   route recovery no longer depends on inferring behavior from later request
   routing alone
+- missing multi-worker visible-thread routes now also fail closed while a
+  required worker remains unavailable during reconnect backoff, so lazy
+  `thread/read` ownership probes cannot accidentally treat the surviving
+  workers' incomplete thread set as authoritative for an already-visible
+  thread
+- degraded multi-worker `thread/list` and `thread/loaded/list` discovery now
+  emits structured warning logs with scope, available worker ids, unavailable
+  worker ids, and reconnect-backoff worker ids when the shared session serves
+  the surviving workers' partial thread view
 - multi-worker thread routing now also deduplicates repeated `thread/list`
   entries, backfills sticky ownership from the selected visible winner, probes
   downstream ownership to recover missing routes for already-visible threads,
@@ -1118,10 +1132,11 @@ Phase 6 is in progress with:
   `internal_error` request outcomes
 - primary-worker-only multi-worker requests now also have method-family
   reconnect-backoff regression coverage for config requirements, managed
-  login, login cancellation, feedback upload, and standalone command control,
-  basic filesystem operations, fuzzy file search, and Windows sandbox setup, so
-  degraded-session fail-closed behavior is pinned across the whole primary
-  route set instead of only a representative command request
+  login, login cancellation, add-credits nudge email, feedback upload,
+  standalone command control, basic filesystem operations, fuzzy file search,
+  and Windows sandbox setup, so degraded-session fail-closed behavior is pinned
+  across the whole primary route set instead of only a representative command
+  request
 - suppressed multi-worker connection notifications now also emit a
   `gateway_v2_suppressed_notifications` counter tagged by notification method
   and suppression reason (`duplicate`, `pending_refresh`, or
@@ -1216,6 +1231,12 @@ Phase 6 is in progress with:
   `fuzzyFileSearch` request family plus `fuzzyFileSearch/sessionUpdated` and
   `fuzzyFileSearch/sessionCompleted` notifications, so the file-picker search
   surface is explicit in the Stage A compatibility gate
+- the real embedded compatibility harness now also exercises the streaming
+  `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, and
+  `fuzzyFileSearch/sessionStop` request family against a real temporary
+  filesystem root, including the `fuzzyFileSearch/sessionUpdated` and
+  `fuzzyFileSearch/sessionCompleted` notifications through an unmodified
+  `RemoteAppServerClient` session
 - dedicated northbound passthrough coverage now also includes the basic
   filesystem operation family (`fs/readFile`, `fs/writeFile`,
   `fs/createDirectory`, `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and
@@ -1251,7 +1272,9 @@ Phase 6 is in progress with:
   exercise the fuzzy-file-search surface through unmodified
   `RemoteAppServerClient` sessions: embedded mode validates one-shot search
   against a real temporary filesystem root, and single-worker remote mode
-  validates the one-shot plus streaming session start/update/stop requests
+  validates the one-shot plus streaming session start/update/stop requests and
+  the resulting `fuzzyFileSearch/sessionUpdated` /
+  `fuzzyFileSearch/sessionCompleted` notifications
 - those same real embedded and single-worker remote compatibility harnesses
   now also exercise the basic filesystem operation family through unmodified
   `RemoteAppServerClient` sessions, with embedded mode validating real local
@@ -1303,6 +1326,14 @@ Phase 6 is in progress with:
   `skills/list` refresh followed by a later successful refresh on the same
   shared session, so the pending-refresh gate stays closed across the failure
   but still reopens after the client receives fresh aggregated skills state
+- multi-worker connection-scoped aggregated discovery requests now also fail
+  closed while a required worker is unavailable during reconnect backoff,
+  covering `account/read`, `account/rateLimits/read`, `model/list`,
+  threadless `app/list`, `mcpServerStatus/list`,
+  `externalAgentConfig/detect`, `skills/list`, `experimentalFeature/list`,
+  `collaborationMode/list`, threadless `plugin/list`, and
+  `thread/realtime/listVoices`, so clients cannot accidentally treat the
+  surviving workers' partial inventory as a complete connection-scoped view
 - multi-worker `model/list` aggregation now also supports gateway-owned
   pagination over merged worker inventories, draining worker-local model pages
   behind the gateway boundary and returning stable `model-offset:` cursors
@@ -1341,9 +1372,54 @@ Phase 6 is in progress with:
   northbound session keeps that platform setup helper primary-worker affine
 - the real multi-worker `RemoteAppServerClient` primary-worker harness now
   also exercises `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
-  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`, so
-  shared-session file-search helper state stays primary-worker affine in the
-  Stage B profile
+  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`, plus
+  the follow-up `fuzzyFileSearch/sessionUpdated` and
+  `fuzzyFileSearch/sessionCompleted` notifications, so shared-session
+  file-search helper state stays primary-worker affine in the Stage B profile
+- the real multi-worker same-session recovery harness now also verifies
+  `fs/changed` fan-in after `fs/watch` reconnects and fans back out to a
+  recovered worker, so worker-local watch events remain visible without a
+  northbound reconnect
+- the real multi-worker same-session bootstrap recovery harness now also
+  observes `mcpServer/startupStatus/updated` after `mcpServerStatus/list`
+  re-adds a recovered worker, so MCP startup-state notification fan-in is
+  exercised through an unmodified `RemoteAppServerClient` session
+- the real multi-worker `RemoteAppServerClient` thread-routing harness now
+  also exercises `mcpServer/resource/read` and `mcpServer/tool/call` against
+  worker-owned visible threads, so thread-scoped MCP resource and tool calls
+  stay sticky to the owning worker in the shared-session Stage B profile
+- that same multi-worker same-session recovery harness now also re-exercises
+  `mcpServer/resource/read` and `mcpServer/tool/call` after the owning worker
+  is lazily re-added, extending recovered-worker sticky routing coverage to
+  thread-scoped MCP requests
+- that same multi-worker same-session recovery harness now also re-exercises
+  `account/sendAddCreditsNudgeEmail` after the primary worker is re-added, so
+  the one-shot account nudge path stays primary-worker affine after recovery
+- that same primary-worker recovery harness now also re-exercises
+  `windowsSandbox/setupStart` plus the follow-up
+  `windowsSandbox/setupCompleted` notification after the primary worker is
+  re-added, so platform setup remains primary-worker affine on one shared
+  northbound session
+- that same primary-worker recovery harness now also re-exercises
+  `fs/createDirectory`, `fs/writeFile`, `fs/readFile`, `fs/getMetadata`,
+  `fs/readDirectory`, `fs/copy`, `fs/remove`, and one-shot `fuzzyFileSearch`
+  after the primary worker is re-added, so local filesystem helpers and
+  file-search requests route back to the recovered primary worker without a
+  northbound reconnect
+- that same primary-worker recovery harness now also re-exercises
+  `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, and
+  `fuzzyFileSearch/sessionStop` after the primary worker is re-added, so
+  streaming file-search helper sessions also stay primary-worker affine on one
+  shared northbound session
+- that same recovery path now also observes the follow-up
+  `fuzzyFileSearch/sessionUpdated` and `fuzzyFileSearch/sessionCompleted`
+  notifications from the recovered primary worker, so streaming file-search
+  notification fan-in is covered without requiring a northbound reconnect
+- the real multi-worker same-session recovery harness now also re-exercises
+  `marketplace/add`, `skills/config/write`,
+  `experimentalFeature/enablement/set`, and `config/mcpServer/reload` after a
+  recovered worker is re-added, so low-frequency setup mutations continue to
+  fan out across the full worker set without a northbound reconnect
 - multi-worker remote mode now has a broad real shared-session Stage B harness
   for aggregated bootstrap/setup discovery, sticky thread and turn routing,
   translated server-request ids, plugin-management fallback, primary-worker
@@ -1354,6 +1430,14 @@ Phase 6 is in progress with:
   `rawResponseItem/completed` across worker-owned visible threads, so raw
   response item replay uses the same shared-session forwarding path as the
   existing turn lifecycle and item-progress notifications
+- the real multi-worker turn-routing harness now also observes additional
+  lower-frequency visible turn notifications from both worker-owned threads,
+  including `item/plan/delta`, `item/reasoning/summaryPartAdded`,
+  `item/commandExecution/terminalInteraction`, `turn/diff/updated`,
+  `turn/plan/updated`, `thread/tokenUsage/updated`,
+  `item/mcpToolCall/progress`, `thread/compacted`, `model/rerouted`, and
+  `rawResponseItem/completed`, so those forwarding paths are exercised through
+  an unmodified `RemoteAppServerClient` on one shared multi-worker session
 - multi-worker reconnect hardening now includes route backfill,
   connection-state replay, reconnect retry backoff, fail-closed handling for
   degraded fanout / config / plugin / primary-worker requests, duplicate
