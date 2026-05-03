@@ -105,6 +105,7 @@ impl RemoteWorkerHealthRegistry {
     }
 
     pub fn snapshot(&self) -> Vec<GatewayRemoteWorkerHealth> {
+        let now = unix_timestamp_now();
         read_guard(&self.workers)
             .iter()
             .enumerate()
@@ -118,6 +119,9 @@ impl RemoteWorkerHealthRegistry {
                 last_state_change_at: worker.last_state_change_at,
                 last_error_at: worker.last_error_at,
                 next_reconnect_at: worker.next_reconnect_at,
+                reconnect_backoff_remaining_seconds: worker
+                    .next_reconnect_at
+                    .map(|next_reconnect_at| next_reconnect_at.saturating_sub(now)),
             })
             .collect()
     }
@@ -185,6 +189,7 @@ mod tests {
                 last_state_change_at: None,
                 last_error_at: None,
                 next_reconnect_at: None,
+                reconnect_backoff_remaining_seconds: None,
             }
         );
         assert_eq!(snapshot[1].worker_id, 1);
@@ -196,6 +201,7 @@ mod tests {
         assert_eq!(snapshot[1].last_state_change_at.is_some(), true);
         assert_eq!(snapshot[1].last_error_at.is_some(), true);
         assert_eq!(snapshot[1].next_reconnect_at, None);
+        assert_eq!(snapshot[1].reconnect_backoff_remaining_seconds, None);
     }
 
     #[test]
@@ -224,6 +230,10 @@ mod tests {
         assert_eq!(healthy_snapshot[0].last_state_change_at.is_some(), true);
         assert_eq!(healthy_snapshot[0].last_error_at.is_some(), true);
         assert_eq!(healthy_snapshot[0].next_reconnect_at, None);
+        assert_eq!(
+            healthy_snapshot[0].reconnect_backoff_remaining_seconds,
+            None
+        );
     }
 
     #[test]
@@ -243,6 +253,7 @@ mod tests {
         assert_eq!(snapshot[0].last_state_change_at.is_some(), true);
         assert_eq!(snapshot[0].last_error_at, None);
         assert_eq!(snapshot[0].next_reconnect_at, None);
+        assert_eq!(snapshot[0].reconnect_backoff_remaining_seconds, None);
     }
 
     #[test]
@@ -272,12 +283,22 @@ mod tests {
         );
         assert_eq!(reconnecting_snapshot[0].last_error_at.is_some(), true);
         assert_eq!(reconnecting_snapshot[0].next_reconnect_at.is_some(), true);
+        assert_eq!(
+            reconnecting_snapshot[0]
+                .reconnect_backoff_remaining_seconds
+                .is_some(),
+            true
+        );
 
         assert_eq!(recovered_snapshot.len(), 1);
         assert_eq!(recovered_snapshot[0].healthy, true);
         assert_eq!(recovered_snapshot[0].reconnecting, false);
         assert_eq!(recovered_snapshot[0].reconnect_attempt_count, 0);
         assert_eq!(recovered_snapshot[0].next_reconnect_at, None);
+        assert_eq!(
+            recovered_snapshot[0].reconnect_backoff_remaining_seconds,
+            None
+        );
     }
 
     #[test]
@@ -314,5 +335,11 @@ mod tests {
             first_snapshot[0].last_state_change_at
         );
         assert_eq!(second_snapshot[0].next_reconnect_at.is_some(), true);
+        assert_eq!(
+            second_snapshot[0]
+                .reconnect_backoff_remaining_seconds
+                .is_some(),
+            true
+        );
     }
 }

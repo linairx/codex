@@ -12855,6 +12855,12 @@ stream_max_retries = 0
             true
         );
         assert_eq!(remote_workers[0].next_reconnect_at.is_some(), true);
+        assert_eq!(
+            remote_workers[0]
+                .reconnect_backoff_remaining_seconds
+                .is_some_and(|remaining_seconds| remaining_seconds >= 0),
+            true
+        );
         assert_eq!(remote_workers[1].worker_id, 1);
         assert_eq!(remote_workers[1].websocket_url, worker_b);
         assert_eq!(remote_workers[1].healthy, true);
@@ -12862,6 +12868,7 @@ stream_max_retries = 0
         assert_eq!(remote_workers[1].reconnect_attempt_count, 0);
         assert_eq!(remote_workers[1].last_error, None);
         assert_eq!(remote_workers[1].next_reconnect_at, None);
+        assert_eq!(remote_workers[1].reconnect_backoff_remaining_seconds, None);
 
         server.shutdown().await.expect("shutdown");
     }

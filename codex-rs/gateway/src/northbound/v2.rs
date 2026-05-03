@@ -233,6 +233,7 @@ struct WorkerServerRequestCleanup {
     resolved_thread_scoped_requests: usize,
     resolved_thread_scoped_request_ids: Vec<RequestId>,
     resolved_thread_scoped_downstream_request_ids: Vec<RequestId>,
+    resolved_thread_scoped_thread_ids: Vec<String>,
     stranded_connection_scoped_requests: usize,
     stranded_connection_scoped_request_ids: Vec<RequestId>,
     stranded_connection_scoped_downstream_request_ids: Vec<RequestId>,
@@ -266,6 +267,7 @@ struct UnavailableWorkerRouteDiagnostics {
     worker_id: usize,
     websocket_url: String,
     reconnect_backoff_active: bool,
+    reconnect_backoff_remaining_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -449,14 +451,28 @@ impl GatewayV2DownstreamRouter {
             if self.has_worker(Some(worker_id)) {
                 continue;
             }
-            if !self.should_attempt_worker_reconnect(worker_id, now) {
-                observability.record_v2_worker_reconnect(worker_id, "backoff_suppressed");
-                continue;
-            }
             let websocket_url = reconnect_state
                 .worker_websocket_urls
                 .get(worker_id)
                 .map_or("<unknown>", String::as_str);
+            if !self.should_attempt_worker_reconnect(worker_id, now) {
+                observability.record_v2_worker_reconnect(worker_id, "backoff_suppressed");
+                let reconnect_backoff_remaining_seconds = self
+                    .reconnect_retry_after
+                    .get(&worker_id)
+                    .filter(|retry_after| **retry_after > now)
+                    .map(|retry_after| retry_after.duration_since(now).as_secs());
+                warn!(
+                    worker_id,
+                    websocket_url,
+                    initialized_notification_sent = self.initialized_notification_sent,
+                    active_fs_watch_count = self.active_fs_watches.len(),
+                    retry_backoff_seconds = reconnect_state.retry_backoff.as_secs(),
+                    reconnect_backoff_remaining_seconds,
+                    "suppressing missing downstream worker reconnect while retry backoff is active"
+                );
+                continue;
+            }
             observability.record_v2_worker_reconnect(worker_id, "attempt");
             info!(
                 worker_id,
@@ -614,17 +630,22 @@ impl GatewayV2DownstreamRouter {
             .iter()
             .copied()
             .filter(|worker_id| !self.has_worker(Some(*worker_id)))
-            .map(|worker_id| UnavailableWorkerRouteDiagnostics {
-                worker_id,
-                websocket_url: reconnect_state
-                    .worker_websocket_urls
-                    .get(worker_id)
-                    .cloned()
-                    .unwrap_or_else(|| "<unknown>".to_string()),
-                reconnect_backoff_active: self
+            .map(|worker_id| {
+                let reconnect_backoff_remaining_seconds = self
                     .reconnect_retry_after
                     .get(&worker_id)
-                    .is_some_and(|retry_after| *retry_after > now),
+                    .filter(|retry_after| **retry_after > now)
+                    .map(|retry_after| retry_after.duration_since(now).as_secs());
+                UnavailableWorkerRouteDiagnostics {
+                    worker_id,
+                    websocket_url: reconnect_state
+                        .worker_websocket_urls
+                        .get(worker_id)
+                        .cloned()
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    reconnect_backoff_active: reconnect_backoff_remaining_seconds.is_some(),
+                    reconnect_backoff_remaining_seconds,
+                }
             })
             .collect()
     }
@@ -1581,6 +1602,7 @@ async fn handle_app_server_event(
                 socket,
                 connection.client_send_timeout,
                 connection.observability,
+                worker_websocket_url.as_str(),
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
                 worker_id,
@@ -1617,6 +1639,7 @@ async fn handle_app_server_event(
                 socket,
                 connection.client_send_timeout,
                 connection.observability,
+                worker_websocket_url.as_str(),
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
                 worker_id,
@@ -1712,7 +1735,7 @@ async fn handle_app_server_event(
             }
             if downstream.multi_worker_topology()
                 && should_deduplicate_connection_notification(&notification)
-                && forwarded_connection_notification_seen(
+                && let Some(forwarded_notification) = forwarded_connection_notification_duplicate(
                     &event_state.forwarded_connection_notifications,
                     worker_id,
                     &notification,
@@ -1722,6 +1745,8 @@ async fn handle_app_server_event(
                     connection.request_context,
                     worker_id,
                     worker_websocket_url.as_str(),
+                    forwarded_notification.worker_id,
+                    downstream.websocket_url_for_worker_id(forwarded_notification.worker_id),
                     &notification,
                 );
                 connection
@@ -1876,6 +1901,7 @@ async fn handle_app_server_event(
                     socket,
                     connection.client_send_timeout,
                     connection.observability,
+                    worker_websocket_url.as_str(),
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
                     worker_id,
@@ -1912,6 +1938,7 @@ async fn handle_app_server_event(
                     socket,
                     connection.client_send_timeout,
                     connection.observability,
+                    worker_websocket_url.as_str(),
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
                     worker_id,
@@ -1962,6 +1989,7 @@ async fn resolve_server_requests_for_worker(
     socket: &mut WebSocket,
     client_send_timeout: Duration,
     observability: &GatewayObservability,
+    worker_websocket_url: &str,
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
     worker_id: Option<usize>,
@@ -1989,6 +2017,7 @@ async fn resolve_server_requests_for_worker(
             record_worker_cleanup_resolution_send_failure(
                 observability,
                 worker_id,
+                worker_websocket_url,
                 &thread_id,
                 &request_id,
                 &err,
@@ -2003,6 +2032,7 @@ async fn resolve_server_requests_for_worker(
 fn record_worker_cleanup_resolution_send_failure(
     observability: &GatewayObservability,
     worker_id: Option<usize>,
+    worker_websocket_url: &str,
     thread_id: &str,
     request_id: &RequestId,
     err: &io::Error,
@@ -2013,6 +2043,7 @@ fn record_worker_cleanup_resolution_send_failure(
     );
     warn!(
         worker_id = ?worker_id,
+        worker_websocket_url,
         thread_id,
         gateway_request_id = ?request_id,
         %err,
@@ -2051,7 +2082,7 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .resolved_notifications
                 .push(ServerRequestResolvedNotification {
-                    thread_id,
+                    thread_id: thread_id.clone(),
                     request_id: gateway_request_id.clone(),
                 });
             cleanup.resolved_thread_scoped_requests += 1;
@@ -2061,6 +2092,7 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .resolved_thread_scoped_downstream_request_ids
                 .push(route.downstream_request_id.clone());
+            cleanup.resolved_thread_scoped_thread_ids.push(thread_id);
         } else {
             cleanup.stranded_connection_scoped_requests += 1;
             cleanup
@@ -2081,7 +2113,7 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .resolved_notifications
                 .push(ServerRequestResolvedNotification {
-                    thread_id,
+                    thread_id: thread_id.clone(),
                     request_id: route.gateway_request_id.clone(),
                 });
             cleanup.resolved_thread_scoped_requests += 1;
@@ -2091,6 +2123,7 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .resolved_thread_scoped_downstream_request_ids
                 .push(key.request_id.clone());
+            cleanup.resolved_thread_scoped_thread_ids.push(thread_id);
         } else {
             cleanup.stranded_connection_scoped_requests += 1;
             cleanup
@@ -2120,6 +2153,9 @@ fn log_worker_server_request_cleanup(
         .resolved_thread_scoped_downstream_request_ids
         .clone();
     resolved_thread_scoped_downstream_request_ids.sort();
+    let mut resolved_thread_scoped_thread_ids = cleanup.resolved_thread_scoped_thread_ids.clone();
+    resolved_thread_scoped_thread_ids.sort();
+    resolved_thread_scoped_thread_ids.dedup();
     let mut stranded_connection_scoped_request_ids =
         cleanup.stranded_connection_scoped_request_ids.clone();
     stranded_connection_scoped_request_ids.sort();
@@ -2135,6 +2171,7 @@ fn log_worker_server_request_cleanup(
         resolved_thread_scoped_server_request_count = cleanup.resolved_thread_scoped_requests,
         resolved_thread_scoped_server_request_ids = ?resolved_thread_scoped_request_ids,
         resolved_thread_scoped_downstream_server_request_ids = ?resolved_thread_scoped_downstream_request_ids,
+        resolved_thread_scoped_thread_ids = ?resolved_thread_scoped_thread_ids,
         stranded_connection_scoped_server_request_count = cleanup
             .stranded_connection_scoped_requests,
         stranded_connection_scoped_server_request_ids = ?stranded_connection_scoped_request_ids,
@@ -2151,9 +2188,7 @@ fn log_unexpected_client_server_request_response(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
-    let mut pending_server_request_ids =
-        pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    pending_server_request_ids.sort();
+    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
 
     warn!(
@@ -2161,11 +2196,15 @@ fn log_unexpected_client_server_request_response(
         project_id = request_context.project_id.as_deref(),
         response_kind,
         unexpected_request_id = ?unexpected_request_id,
-        pending_server_request_count = pending_server_request_ids.len(),
-        pending_server_request_ids = ?pending_server_request_ids,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         "gateway v2 client replied to a server request that is no longer pending"
     );
@@ -2180,9 +2219,7 @@ fn log_rejected_saturated_server_request(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     limit: usize,
 ) {
-    let mut pending_server_request_ids =
-        pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    pending_server_request_ids.sort();
+    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -2193,7 +2230,10 @@ fn log_rejected_saturated_server_request(
         limit,
         request_id = ?request_id,
         method,
-        pending_server_request_ids = ?pending_server_request_ids,
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
         "rejecting downstream server request because the gateway websocket connection is saturated"
     );
 }
@@ -2226,9 +2266,7 @@ fn log_downstream_backpressure_close(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
-    let mut pending_server_request_ids =
-        pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    pending_server_request_ids.sort();
+    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
 
     warn!(
@@ -2237,11 +2275,15 @@ fn log_downstream_backpressure_close(
         worker_id = ?worker_id,
         worker_websocket_url,
         skipped_event_count = skipped,
-        pending_server_request_count = pending_server_request_ids.len(),
-        pending_server_request_ids = ?pending_server_request_ids,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         "closing gateway v2 connection because the downstream app-server event stream lagged"
     );
@@ -2253,20 +2295,22 @@ fn log_client_send_timeout(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
-    let mut pending_server_request_ids =
-        pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    pending_server_request_ids.sort();
+    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         connection_detail = detail,
-        pending_server_request_count = pending_server_request_ids.len(),
-        pending_server_request_ids = ?pending_server_request_ids,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         "closing gateway v2 connection because sending to the northbound client timed out"
     );
@@ -2280,9 +2324,7 @@ fn log_duplicate_downstream_server_request(
     method: &str,
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
 ) {
-    let mut pending_server_request_ids =
-        pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    pending_server_request_ids.sort();
+    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -2291,8 +2333,11 @@ fn log_duplicate_downstream_server_request(
         worker_websocket_url,
         request_id = ?request_id,
         method,
-        pending_server_request_count = pending_server_request_ids.len(),
-        pending_server_request_ids = ?pending_server_request_ids,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
         "closing gateway v2 connection because a downstream session reused a pending server-request id"
     );
 }
@@ -2315,6 +2360,7 @@ fn log_dropped_duplicate_resolved_server_request(
         remaining_resolved_route_count = resolved_log_fields.gateway_request_ids.len(),
         remaining_resolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         remaining_resolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        remaining_resolved_thread_ids = ?resolved_log_fields.thread_ids,
         remaining_resolved_worker_ids = ?resolved_log_fields.worker_ids,
         "dropping duplicate downstream serverRequest/resolved replay after request-id translation"
     );
@@ -2341,6 +2387,8 @@ fn log_suppressed_duplicate_connection_notification(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
     worker_websocket_url: &str,
+    original_worker_id: Option<usize>,
+    original_worker_websocket_url: &str,
     notification: &JSONRPCNotification,
 ) {
     warn!(
@@ -2348,6 +2396,8 @@ fn log_suppressed_duplicate_connection_notification(
         project_id = request_context.project_id.as_deref(),
         worker_id = ?worker_id,
         worker_websocket_url,
+        original_worker_id = ?original_worker_id,
+        original_worker_websocket_url,
         method = notification.method,
         params = ?notification.params,
         "suppressing exact-duplicate multi-worker connection notification"
@@ -2384,12 +2434,23 @@ async fn reject_pending_server_requests(
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) -> io::Result<()> {
+    let mut pending_worker_websocket_urls = pending_server_requests
+        .values()
+        .map(|route| {
+            downstream
+                .websocket_url_for_worker_id(route.worker_id)
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    pending_worker_websocket_urls.sort();
+    pending_worker_websocket_urls.dedup();
     log_rejected_pending_server_requests(
         request_context,
         connection_outcome,
         connection_detail,
         pending_server_requests,
         resolved_server_requests,
+        &pending_worker_websocket_urls,
     );
     record_client_server_request_cleanup_metrics(
         observability,
@@ -2403,16 +2464,22 @@ async fn reject_pending_server_requests(
     for (gateway_request_id, route) in pending_server_requests.drain() {
         let Ok(worker) = worker_for_server_request(downstream, route.worker_id) else {
             skipped_unavailable_worker_rejections += 1;
+            let worker_websocket_url = downstream.websocket_url_for_worker_id(route.worker_id);
             warn!(
                 tenant_id = request_context.tenant_id.as_str(),
                 project_id = request_context.project_id.as_deref(),
                 worker_id = ?route.worker_id,
+                worker_websocket_url,
                 gateway_request_id = ?gateway_request_id,
                 downstream_request_id = ?route.downstream_request_id,
                 "skipping pending server-request rejection because the downstream worker route is unavailable"
             );
             continue;
         };
+        let worker_websocket_url = worker
+            .worker_websocket_url
+            .as_deref()
+            .unwrap_or("<unknown>");
 
         if let Err(err) = worker
             .request_handle
@@ -2430,6 +2497,7 @@ async fn reject_pending_server_requests(
                 tenant_id = request_context.tenant_id.as_str(),
                 project_id = request_context.project_id.as_deref(),
                 worker_id = ?route.worker_id,
+                worker_websocket_url,
                 gateway_request_id = ?gateway_request_id,
                 downstream_request_id = ?route.downstream_request_id,
                 %err,
@@ -2499,14 +2567,60 @@ fn log_rejected_pending_server_requests(
     connection_detail: Option<&str>,
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+    pending_worker_websocket_urls: &[String],
 ) {
     if pending_server_requests.is_empty() && resolved_server_requests.is_empty() {
         return;
     }
 
-    let mut pending_server_request_ids =
-        pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    pending_server_request_ids.sort();
+    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
+    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        connection_outcome,
+        connection_detail,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        thread_scoped_pending_server_request_count = pending_log_fields.thread_scoped_request_ids.len(),
+        connection_scoped_pending_server_request_count = pending_log_fields.connection_scoped_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        thread_scoped_pending_server_request_ids = ?pending_log_fields.thread_scoped_request_ids,
+        connection_scoped_pending_server_request_ids = ?pending_log_fields.connection_scoped_request_ids,
+        thread_ids = ?pending_log_fields.thread_ids,
+        worker_ids = ?pending_log_fields.worker_ids,
+        worker_websocket_urls = ?pending_worker_websocket_urls,
+        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
+        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
+        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
+        "rejecting unresolved downstream server requests because the gateway v2 connection ended"
+    );
+}
+
+#[derive(Debug, Default)]
+struct PendingServerRequestLogFields {
+    gateway_request_ids: Vec<RequestId>,
+    downstream_request_ids: Vec<RequestId>,
+    thread_scoped_request_ids: Vec<RequestId>,
+    connection_scoped_request_ids: Vec<RequestId>,
+    thread_ids: Vec<String>,
+    worker_ids: Vec<usize>,
+}
+
+fn pending_server_request_log_fields(
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+) -> PendingServerRequestLogFields {
+    let mut gateway_request_ids = pending_server_requests.keys().cloned().collect::<Vec<_>>();
+    gateway_request_ids.sort();
+
+    let mut downstream_request_ids = pending_server_requests
+        .values()
+        .map(|route| route.downstream_request_id.clone())
+        .collect::<Vec<_>>();
+    downstream_request_ids.sort();
 
     let mut thread_scoped_request_ids = pending_server_requests
         .iter()
@@ -2522,38 +2636,35 @@ fn log_rejected_pending_server_requests(
         .collect::<Vec<_>>();
     connection_scoped_request_ids.sort();
 
+    let mut thread_ids = pending_server_requests
+        .values()
+        .filter_map(|route| route.thread_id.clone())
+        .collect::<Vec<_>>();
+    thread_ids.sort();
+    thread_ids.dedup();
+
     let mut worker_ids = pending_server_requests
         .values()
         .filter_map(|route| route.worker_id)
         .collect::<Vec<_>>();
     worker_ids.sort();
     worker_ids.dedup();
-    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
 
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        connection_outcome,
-        connection_detail,
-        pending_server_request_count = pending_server_request_ids.len(),
-        thread_scoped_pending_server_request_count = thread_scoped_request_ids.len(),
-        connection_scoped_pending_server_request_count = connection_scoped_request_ids.len(),
-        pending_server_request_ids = ?pending_server_request_ids,
-        thread_scoped_pending_server_request_ids = ?thread_scoped_request_ids,
-        connection_scoped_pending_server_request_ids = ?connection_scoped_request_ids,
-        worker_ids = ?worker_ids,
-        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
-        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
-        "rejecting unresolved downstream server requests because the gateway v2 connection ended"
-    );
+    PendingServerRequestLogFields {
+        gateway_request_ids,
+        downstream_request_ids,
+        thread_scoped_request_ids,
+        connection_scoped_request_ids,
+        thread_ids,
+        worker_ids,
+    }
 }
 
 #[derive(Debug, Default)]
 struct ResolvedServerRequestLogFields {
     gateway_request_ids: Vec<RequestId>,
     downstream_request_ids: Vec<RequestId>,
+    thread_ids: Vec<String>,
     worker_ids: Vec<usize>,
 }
 
@@ -2579,9 +2690,17 @@ fn resolved_server_request_log_fields(
     worker_ids.sort();
     worker_ids.dedup();
 
+    let mut thread_ids = resolved_server_requests
+        .values()
+        .filter_map(|route| route.thread_id.clone())
+        .collect::<Vec<_>>();
+    thread_ids.sort();
+    thread_ids.dedup();
+
     ResolvedServerRequestLogFields {
         gateway_request_ids,
         downstream_request_ids,
+        thread_ids,
         worker_ids,
     }
 }
@@ -3247,6 +3366,11 @@ fn log_fail_closed_multi_worker_request(
         .iter()
         .filter_map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    let available_worker_websocket_urls = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_websocket_url.as_deref())
+        .collect::<Vec<_>>();
     let unavailable_worker_ids = unavailable_workers
         .iter()
         .map(|worker| worker.worker_id)
@@ -3260,6 +3384,16 @@ fn log_fail_closed_multi_worker_request(
         .filter(|worker| worker.reconnect_backoff_active)
         .map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    let reconnect_backoff_worker_websocket_urls = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_remaining_seconds = unavailable_workers
+        .iter()
+        .filter_map(|worker| worker.reconnect_backoff_remaining_seconds)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_routes = reconnect_backoff_worker_routes(&unavailable_workers);
     if is_fail_closed_multi_worker_route_error(err) {
         connection
             .observability
@@ -3270,9 +3404,13 @@ fn log_fail_closed_multi_worker_request(
             tenant_id = connection.request_context.tenant_id.as_str(),
             project_id = connection.request_context.project_id.as_deref(),
             available_worker_ids = ?available_worker_ids,
+            available_worker_websocket_urls = ?available_worker_websocket_urls,
             unavailable_worker_ids = ?unavailable_worker_ids,
             unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
             reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+            reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
+            reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
+            reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
             %err,
             "gateway v2 request failed closed because required worker routes are unavailable"
         );
@@ -3286,9 +3424,13 @@ fn log_fail_closed_multi_worker_request(
             tenant_id = connection.request_context.tenant_id.as_str(),
             project_id = connection.request_context.project_id.as_deref(),
             available_worker_ids = ?available_worker_ids,
+            available_worker_websocket_urls = ?available_worker_websocket_urls,
             unavailable_worker_ids = ?unavailable_worker_ids,
             unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
             reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+            reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
+            reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
+            reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
             %err,
             "gateway v2 upstream request failed while worker routes are unavailable"
         );
@@ -3321,6 +3463,11 @@ fn log_degraded_multi_worker_thread_discovery(
         .iter()
         .filter_map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    let available_worker_websocket_urls = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_websocket_url.as_deref())
+        .collect::<Vec<_>>();
     let unavailable_worker_ids = unavailable_workers
         .iter()
         .map(|worker| worker.worker_id)
@@ -3334,6 +3481,16 @@ fn log_degraded_multi_worker_thread_discovery(
         .filter(|worker| worker.reconnect_backoff_active)
         .map(|worker| worker.worker_id)
         .collect::<Vec<_>>();
+    let reconnect_backoff_worker_websocket_urls = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_remaining_seconds = unavailable_workers
+        .iter()
+        .filter_map(|worker| worker.reconnect_backoff_remaining_seconds)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_routes = reconnect_backoff_worker_routes(&unavailable_workers);
     observability
         .record_v2_degraded_thread_discovery(method, !reconnect_backoff_worker_ids.is_empty());
 
@@ -3342,11 +3499,34 @@ fn log_degraded_multi_worker_thread_discovery(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         available_worker_ids = ?available_worker_ids,
+        available_worker_websocket_urls = ?available_worker_websocket_urls,
         unavailable_worker_ids = ?unavailable_worker_ids,
         unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
         reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+        reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
+        reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
+        reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
         "serving degraded multi-worker thread discovery from available workers"
     );
+}
+
+fn reconnect_backoff_worker_routes(
+    unavailable_workers: &[UnavailableWorkerRouteDiagnostics],
+) -> Vec<(usize, &str, u64)> {
+    unavailable_workers
+        .iter()
+        .filter_map(|worker| {
+            worker
+                .reconnect_backoff_remaining_seconds
+                .map(|remaining_seconds| {
+                    (
+                        worker.worker_id,
+                        worker.websocket_url.as_str(),
+                        remaining_seconds,
+                    )
+                })
+        })
+        .collect()
 }
 
 struct DeduplicatedThreadListEntryLog<'a> {
@@ -4521,15 +4701,18 @@ fn should_deduplicate_connection_notification(notification: &JSONRPCNotification
     )
 }
 
-fn forwarded_connection_notification_seen(
-    forwarded_connection_notifications: &HashMap<String, VecDeque<ForwardedConnectionNotification>>,
+fn forwarded_connection_notification_duplicate<'a>(
+    forwarded_connection_notifications: &'a HashMap<
+        String,
+        VecDeque<ForwardedConnectionNotification>,
+    >,
     worker_id: Option<usize>,
     notification: &JSONRPCNotification,
-) -> bool {
+) -> Option<&'a ForwardedConnectionNotification> {
     forwarded_connection_notifications
         .get(&notification.method)
-        .is_some_and(|notifications_by_method| {
-            notifications_by_method.iter().any(|forwarded| {
+        .and_then(|notifications_by_method| {
+            notifications_by_method.iter().find(|forwarded| {
                 forwarded.worker_id != worker_id && forwarded.params == notification.params
             })
         })
@@ -6658,6 +6841,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            cleanup.resolved_thread_scoped_thread_ids,
+            vec!["thread-owned".to_string(), "thread-owned".to_string()]
+        );
+        assert_eq!(
             cleanup.stranded_connection_scoped_request_ids,
             vec![
                 RequestId::String("gateway-connection-pending".to_string()),
@@ -6813,7 +7000,7 @@ mod tests {
         let router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
-                worker_websocket_url: None,
+                worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
                 request_handle,
             }],
             event_tx,
@@ -6824,7 +7011,46 @@ mod tests {
             initialized_notification_sent: false,
             active_fs_watches: HashMap::new(),
             reconnect_retry_after: HashMap::new(),
-            reconnect_state: None,
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-b.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
         };
 
         let metrics = in_memory_metrics();
@@ -6874,6 +7100,8 @@ mod tests {
             logs.contains("skipping pending server-request rejection because the downstream worker route is unavailable")
         );
         assert!(logs.contains("failed to reject pending downstream server request"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-a.invalid\""));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
         assert_v2_server_request_lifecycle_metrics(
             &metrics,
             &[
@@ -6912,6 +7140,7 @@ mod tests {
             super::record_worker_cleanup_resolution_send_failure(
                 &observability,
                 Some(2),
+                "ws://worker-c.invalid",
                 "thread-visible",
                 &request_id,
                 &err,
@@ -6922,6 +7151,7 @@ mod tests {
             "failed to deliver synthesized serverRequest/resolved during worker cleanup"
         ));
         assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
         assert!(logs.contains("thread_id=\"thread-visible\""));
         assert!(logs.contains("gateway_request_id=String(\"gateway-srv-1\")"));
         assert_v2_server_request_lifecycle_metrics(
@@ -19793,12 +20023,21 @@ mod tests {
         assert!(logs.contains("tenant-primary"));
         assert!(logs.contains("project-primary"));
         assert!(logs.contains("available_worker_ids=[1]"));
+        assert!(logs.contains(&format!(
+            "available_worker_websocket_urls=[\"{worker_b_url}\"]"
+        )));
         assert!(logs.contains("unavailable_worker_ids=[0]"));
         assert!(logs.contains(&format!(
             "unavailable_worker_websocket_urls=[\"{worker_a_url}\"]"
         )));
         assert!(logs.contains("reconnect_backoff_worker_ids=[0]"));
-        assert!(!logs.contains(&worker_b_url));
+        assert!(logs.contains(&format!(
+            "reconnect_backoff_worker_websocket_urls=[\"{worker_a_url}\"]"
+        )));
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=["));
+        assert!(logs.contains(&format!(
+            "reconnect_backoff_worker_routes=[(0, \"{worker_a_url}\", "
+        )));
     }
 
     #[tokio::test]
@@ -20754,9 +20993,13 @@ mod tests {
             assert!(logs.contains("project-visible"));
             assert!(logs.contains(&format!("method=\"{method}\"")));
             assert!(logs.contains("available_worker_ids=[0]"));
+            assert!(logs.contains("available_worker_websocket_urls=["));
             assert!(logs.contains("unavailable_worker_ids=[1]"));
             assert!(logs.contains("unavailable_worker_websocket_urls=["));
             assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
+            assert!(logs.contains("reconnect_backoff_worker_websocket_urls=["));
+            assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=["));
+            assert!(logs.contains("reconnect_backoff_worker_routes=["));
         }
     }
 
@@ -20980,12 +21223,21 @@ mod tests {
         assert!(logs.contains("tenant-config"));
         assert!(logs.contains("project-config"));
         assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains(&format!(
+            "available_worker_websocket_urls=[\"{worker_a_url}\"]"
+        )));
         assert!(logs.contains("unavailable_worker_ids=[1]"));
         assert!(logs.contains(&format!(
             "unavailable_worker_websocket_urls=[\"{worker_b_url}\"]"
         )));
         assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
-        assert!(!logs.contains(&worker_a_url));
+        assert!(logs.contains(&format!(
+            "reconnect_backoff_worker_websocket_urls=[\"{worker_b_url}\"]"
+        )));
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=["));
+        assert!(logs.contains(&format!(
+            "reconnect_backoff_worker_routes=[(1, \"{worker_b_url}\", "
+        )));
     }
 
     #[tokio::test]
@@ -21124,12 +21376,21 @@ mod tests {
         assert!(logs.contains("tenant-config"));
         assert!(logs.contains("project-config"));
         assert!(logs.contains("available_worker_ids=[1]"));
+        assert!(logs.contains(&format!(
+            "available_worker_websocket_urls=[\"{worker_b_url}\"]"
+        )));
         assert!(logs.contains("unavailable_worker_ids=[0]"));
         assert!(logs.contains(&format!(
             "unavailable_worker_websocket_urls=[\"{worker_a_url}\"]"
         )));
         assert!(logs.contains("reconnect_backoff_worker_ids=[0]"));
-        assert!(!logs.contains(&worker_b_url));
+        assert!(logs.contains(&format!(
+            "reconnect_backoff_worker_websocket_urls=[\"{worker_a_url}\"]"
+        )));
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=["));
+        assert!(logs.contains(&format!(
+            "reconnect_backoff_worker_routes=[(0, \"{worker_a_url}\", "
+        )));
     }
 
     #[tokio::test]
@@ -26712,7 +26973,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
-                worker_websocket_url: None,
+                worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
                 request_handle,
             }],
             event_tx,
@@ -26804,7 +27065,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
-                worker_websocket_url: None,
+                worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
                 request_handle,
             }],
             event_tx,
@@ -27343,16 +27604,28 @@ mod tests {
         };
         router.record_worker_reconnect_failure(1, now, Duration::from_secs(3));
 
-        router
-            .reconnect_missing_workers_at(now, &observability)
-            .await;
+        let logs = capture_logs_async(async {
+            router
+                .reconnect_missing_workers_at(now, &observability)
+                .await;
+
+            timeout(Duration::from_secs(2), router.shutdown())
+                .await
+                .expect("router shutdown should finish in time")
+                .expect("router should shut down");
+        })
+        .await;
 
         assert_v2_worker_reconnect_metric(&metrics, 1, "backoff_suppressed");
-
-        timeout(Duration::from_secs(2), router.shutdown())
-            .await
-            .expect("router shutdown should finish in time")
-            .expect("router should shut down");
+        assert!(logs.contains(
+            "suppressing missing downstream worker reconnect while retry backoff is active"
+        ));
+        assert!(logs.contains("worker_id=1"));
+        assert!(logs.contains("websocket_url=\"ws://worker-b.invalid\""));
+        assert!(logs.contains("initialized_notification_sent=false"));
+        assert!(logs.contains("active_fs_watch_count=0"));
+        assert!(logs.contains("retry_backoff_seconds=3"));
+        assert!(logs.contains("reconnect_backoff_remaining_seconds="));
         client.shutdown().await.expect("client should shut down");
     }
 
@@ -27897,6 +28170,13 @@ mod tests {
         assert!(logs.contains("item/tool/requestUserInput"));
         assert!(logs.contains("pending_server_request_count=1"));
         assert!(logs.contains("pending_server_request_ids=[String(\"downstream-request-1\")]"));
+        assert!(
+            logs.contains(
+                "pending_downstream_server_request_ids=[String(\"downstream-request-1\")]"
+            )
+        );
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0]"));
     }
 
     #[tokio::test]
@@ -29793,6 +30073,9 @@ mod tests {
 
         assert!(logs.contains(
             "dropping duplicate downstream serverRequest/resolved replay after request-id translation"
+        ));
+        assert!(!logs.contains(
+            "suppressing downstream notification for a thread outside the gateway request scope"
         ));
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
@@ -31971,11 +32254,14 @@ mod tests {
             })),
         };
 
-        assert!(!super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(1),
-            &first_notice,
-        ));
+        assert!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(1),
+                &first_notice,
+            )
+            .is_none()
+        );
         super::record_forwarded_connection_notification(
             &mut forwarded_connection_notifications,
             Some(1),
@@ -31987,21 +32273,32 @@ mod tests {
             &second_notice,
         );
 
-        assert!(super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(2),
-            &first_notice,
-        ));
-        assert!(super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(2),
-            &second_notice,
-        ));
-        assert!(!super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(1),
-            &first_notice,
-        ));
+        assert_eq!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(2),
+                &first_notice,
+            )
+            .map(|forwarded| forwarded.worker_id),
+            Some(Some(1))
+        );
+        assert_eq!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(2),
+                &second_notice,
+            )
+            .map(|forwarded| forwarded.worker_id),
+            Some(Some(1))
+        );
+        assert!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(1),
+                &first_notice,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -32037,16 +32334,23 @@ mod tests {
                 "threadId": null,
             })),
         };
-        assert!(!super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD + 1),
-            &oldest_notice,
-        ));
-        assert!(super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD + 1),
-            &newest_notice,
-        ));
+        assert!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD + 1),
+                &oldest_notice,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD + 1),
+                &newest_notice,
+            )
+            .map(|forwarded| forwarded.worker_id),
+            Some(Some(newest_index))
+        );
         assert_eq!(
             forwarded_connection_notifications
                 .get("warning")
@@ -32086,11 +32390,14 @@ mod tests {
             );
         }
 
-        assert!(!super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(2),
-            &repeated_notice,
-        ));
+        assert!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(2),
+                &repeated_notice,
+            )
+            .is_none()
+        );
         super::record_forwarded_connection_notification(
             &mut forwarded_connection_notifications,
             Some(1),
@@ -32108,11 +32415,15 @@ mod tests {
             },
         );
 
-        assert!(super::forwarded_connection_notification_seen(
-            &forwarded_connection_notifications,
-            Some(2),
-            &repeated_notice,
-        ));
+        assert_eq!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(2),
+                &repeated_notice,
+            )
+            .map(|forwarded| forwarded.worker_id),
+            Some(Some(1))
+        );
         assert_eq!(
             forwarded_connection_notifications
                 .get("warning")
@@ -32130,7 +32441,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
-                worker_websocket_url: None,
+                worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
                 request_handle,
             }],
             event_tx,
@@ -32189,6 +32500,7 @@ mod tests {
                 worker_id: 1,
                 websocket_url: "ws://worker-b.invalid".to_string(),
                 reconnect_backoff_active: true,
+                reconnect_backoff_remaining_seconds: Some(30),
             }]
         );
 
@@ -32199,6 +32511,7 @@ mod tests {
                 worker_id: 1,
                 websocket_url: "ws://worker-b.invalid".to_string(),
                 reconnect_backoff_active: false,
+                reconnect_backoff_remaining_seconds: None,
             }]
         );
 
@@ -32223,9 +32536,13 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("available_worker_websocket_urls=[\"ws://worker-a.invalid\"]"));
         assert!(logs.contains("unavailable_worker_ids=[1]"));
         assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[]"));
+        assert!(logs.contains("reconnect_backoff_worker_websocket_urls=[]"));
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=[]"));
+        assert!(logs.contains("reconnect_backoff_worker_routes=[]"));
         assert_v2_degraded_thread_discovery_metric(&metrics, "thread/list", false);
 
         client.shutdown().await.expect("client should shut down");
@@ -32240,7 +32557,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
-                worker_websocket_url: None,
+                worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
                 request_handle,
             }],
             event_tx,
@@ -32335,9 +32652,15 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("available_worker_websocket_urls=[\"ws://worker-a.invalid\"]"));
         assert!(logs.contains("unavailable_worker_ids=[1]"));
         assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
+        assert!(
+            logs.contains("reconnect_backoff_worker_websocket_urls=[\"ws://worker-b.invalid\"]")
+        );
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=["));
+        assert!(logs.contains("reconnect_backoff_worker_routes=[(1, \"ws://worker-b.invalid\", "));
         assert_v2_upstream_request_failure_metric(&metrics, "configRequirements/read", true);
     }
 
@@ -32348,7 +32671,7 @@ mod tests {
         let mut router = GatewayV2DownstreamRouter {
             workers: vec![DownstreamWorkerHandle {
                 worker_id: Some(0),
-                worker_websocket_url: None,
+                worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
                 request_handle,
             }],
             event_tx,
@@ -32447,9 +32770,15 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("available_worker_websocket_urls=[\"ws://worker-a.invalid\"]"));
         assert!(logs.contains("unavailable_worker_ids=[1]"));
         assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[1]"));
+        assert!(
+            logs.contains("reconnect_backoff_worker_websocket_urls=[\"ws://worker-b.invalid\"]")
+        );
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=["));
+        assert!(logs.contains("reconnect_backoff_worker_routes=[(1, \"ws://worker-b.invalid\", "));
         assert_v2_fail_closed_request_metric(&metrics, "config/read", true);
 
         router.clear_worker_reconnect_failure(1);
@@ -32483,9 +32812,13 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("available_worker_ids=[0]"));
+        assert!(logs.contains("available_worker_websocket_urls=[\"ws://worker-a.invalid\"]"));
         assert!(logs.contains("unavailable_worker_ids=[1]"));
         assert!(logs.contains("unavailable_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
         assert!(logs.contains("reconnect_backoff_worker_ids=[]"));
+        assert!(logs.contains("reconnect_backoff_worker_websocket_urls=[]"));
+        assert!(logs.contains("reconnect_backoff_worker_remaining_seconds=[]"));
+        assert!(logs.contains("reconnect_backoff_worker_routes=[]"));
         assert_v2_fail_closed_request_metric(&metrics, "config/read", false);
 
         let metrics = in_memory_metrics();
@@ -32584,6 +32917,7 @@ mod tests {
                     resolved_thread_scoped_downstream_request_ids: vec![RequestId::String(
                         "downstream-thread-1".to_string(),
                     )],
+                    resolved_thread_scoped_thread_ids: vec!["thread-visible".to_string()],
                     stranded_connection_scoped_requests: 1,
                     stranded_connection_scoped_request_ids: vec![RequestId::String(
                         "gateway-connection-1".to_string(),
@@ -32611,6 +32945,7 @@ mod tests {
         assert!(logs.contains(
             "resolved_thread_scoped_downstream_server_request_ids=[String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("resolved_thread_scoped_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("stranded_connection_scoped_server_request_count=1"));
         assert!(logs.contains(
             "stranded_connection_scoped_server_request_ids=[String(\"gateway-connection-1\")]"
@@ -32678,6 +33013,11 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
@@ -32685,6 +33025,7 @@ mod tests {
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
         ));
+        assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
     }
 
@@ -32746,6 +33087,11 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
@@ -32753,6 +33099,7 @@ mod tests {
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
         ));
+        assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
     }
 
@@ -32808,6 +33155,11 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0, 1]"));
     }
 
     #[test]
@@ -32896,6 +33248,11 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
@@ -32903,6 +33260,7 @@ mod tests {
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
         ));
+        assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[2]"));
     }
 
@@ -32960,6 +33318,11 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
@@ -32967,12 +33330,17 @@ mod tests {
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
         ));
+        assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
     }
 
     #[test]
     fn log_rejected_pending_server_requests_includes_scope_outcome_and_request_ids() {
         let logs = capture_logs(|| {
+            let worker_websocket_urls = [
+                "ws://worker-a.invalid".to_string(),
+                "ws://worker-b.invalid".to_string(),
+            ];
             super::log_rejected_pending_server_requests(
                 &GatewayRequestContext {
                     tenant_id: "tenant-visible".to_string(),
@@ -33012,6 +33380,7 @@ mod tests {
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
+                &worker_websocket_urls,
             );
         });
 
@@ -33030,6 +33399,9 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
         assert!(
             logs.contains(
                 "thread_scoped_pending_server_request_ids=[String(\"gateway-thread-1\")]"
@@ -33038,7 +33410,11 @@ mod tests {
         assert!(logs.contains(
             "connection_scoped_pending_server_request_ids=[String(\"gateway-connection-1\")]"
         ));
+        assert!(logs.contains("thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("worker_ids=[0, 1]"));
+        assert!(logs.contains(
+            "worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
+        ));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
@@ -33046,6 +33422,7 @@ mod tests {
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
         ));
+        assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
     }
 
@@ -33099,6 +33476,11 @@ mod tests {
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
+        ));
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[0, 1]"));
     }
 
     #[test]
@@ -33140,6 +33522,7 @@ mod tests {
         assert!(logs.contains(
             "remaining_resolved_downstream_request_ids=[String(\"downstream-remaining\")]"
         ));
+        assert!(logs.contains("remaining_resolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("remaining_resolved_worker_ids=[2]"));
     }
 
@@ -33182,6 +33565,8 @@ mod tests {
                 },
                 Some(2),
                 "ws://worker-c.invalid",
+                Some(0),
+                "ws://worker-a.invalid",
                 &JSONRPCNotification {
                     method: "account/updated".to_string(),
                     params: Some(serde_json::json!({"requiresOpenaiAuth":true})),
@@ -33194,6 +33579,8 @@ mod tests {
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(2)"));
         assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
+        assert!(logs.contains("original_worker_id=Some(0)"));
+        assert!(logs.contains("original_worker_websocket_url=\"ws://worker-a.invalid\""));
         assert!(logs.contains("method=\"account/updated\""));
         assert!(logs.contains("requiresOpenaiAuth"));
         assert!(logs.contains("true"));

@@ -69,6 +69,7 @@ pub struct GatewayRemoteWorkerHealth {
     pub last_state_change_at: Option<i64>,
     pub last_error_at: Option<i64>,
     pub next_reconnect_at: Option<i64>,
+    pub reconnect_backoff_remaining_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

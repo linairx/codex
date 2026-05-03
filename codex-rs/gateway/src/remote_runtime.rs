@@ -694,6 +694,7 @@ mod tests {
                 last_state_change_at: None,
                 last_error_at: None,
                 next_reconnect_at: None,
+                reconnect_backoff_remaining_seconds: None,
             }
         );
         assert_eq!(remote_workers[1].worker_id, 1);
@@ -758,5 +759,11 @@ mod tests {
         assert_eq!(remote_workers[0].last_state_change_at.is_some(), true);
         assert_eq!(remote_workers[0].last_error_at.is_some(), true);
         assert_eq!(remote_workers[0].next_reconnect_at.is_some(), true);
+        assert_eq!(
+            remote_workers[0]
+                .reconnect_backoff_remaining_seconds
+                .is_some_and(|remaining_seconds| remaining_seconds >= 0),
+            true
+        );
     }
 }

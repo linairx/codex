@@ -485,7 +485,8 @@ Recent progress:
   `gateway_v2_server_request_lifecycle_events` with
   `event=unexpected_client_server_request_response`, so protocol-violation
   prompt replies are visible in metrics before the gateway fails the v2
-  session closed
+  session closed; the matching warning logs include pending
+  gateway/downstream server-request ids and affected thread ids
 - malformed or out-of-order v2 client traffic now also emits
   `gateway_v2_protocol_violations` with `phase` and `reason` tags, covering
   pre-initialize ordering errors, invalid JSON-RPC payloads, invalid UTF-8
@@ -1386,19 +1387,22 @@ Recent progress:
   request id, and a real northbound regression now pins that ordering-sensitive
   path after one prior server request has already been answered
 - downstream app-server event-stream backpressure now also emits a structured
-  warning log with scope, worker id, skipped-event count, and any still-pending
-  gateway server-request ids before the gateway closes the northbound session,
-  so lag-driven teardown is visible without reconstructing the session from
+  warning log with scope, worker id, worker websocket URL, skipped-event count,
+  and any still-pending gateway/downstream server-request ids plus affected
+  thread and worker ids before the gateway closes the northbound session, so
+  lag-driven teardown is visible without reconstructing the session from
   connection outcomes alone
 - that same backpressure path now also includes any answered-but-unresolved
   server-request routes in those warning logs, and a northbound regression now
   pins the fail-closed close frame plus translated gateway/downstream request
-  ids after the client has already answered but downstream
-  `serverRequest/resolved` never arrives before lag closes the session
+  ids plus affected thread ids after the client has already answered but
+  downstream `serverRequest/resolved` never arrives before lag closes the
+  session
 - slow-client send timeouts now also emit a structured warning log with scope,
-  terminal timeout detail, and any still-pending gateway server-request ids
-  before pending downstream prompts are rejected, so `client_send_timed_out`
-  outcomes can be tied back to the stranded session state directly from logs
+  terminal timeout detail, any still-pending gateway/downstream server-request
+  ids, and affected thread and worker ids before pending downstream prompts are
+  rejected, so `client_send_timed_out` outcomes can be tied back to the
+  stranded session state directly from logs
 - v2 connection accounting now also records terminal outcome and decrements the
   active connection count even if an early handshake-time close frame or
   JSON-RPC error response cannot be delivered, so `/healthz` does not retain
@@ -1410,11 +1414,21 @@ Recent progress:
 - client-side cleanup now also emits server-request lifecycle metrics when
   pending prompt rejection delivery fails or must be skipped because the owning
   downstream worker route is already unavailable, and dedicated cleanup
-  coverage pins both the log messages and metric events
+  coverage pins both the log messages and metric events; the matching warning
+  logs include the affected worker websocket URL for both failed and skipped
+  rejection delivery, while the pre-cleanup warning includes pending
+  downstream server-request ids and affected thread ids for northbound /
+  downstream prompt correlation; answered-but-unresolved route logs now also
+  include affected thread ids
 - worker-loss cleanup now also emits a server-request lifecycle metric and
   structured warning when synthesized `serverRequest/resolved` delivery fails,
   so thread-scoped prompt cleanup failures are visible before the gateway
-  returns the terminal send error
+  returns the terminal send error; the send-failure warning includes the
+  affected worker websocket URL
+- worker-loss cleanup warning logs now also include affected thread ids for
+  thread-scoped prompts that the gateway resolves synthetically after a
+  downstream worker disappears, so cleanup diagnostics point back to the
+  visible thread state directly
 - if pending prompt rejection delivery fails during connection teardown, the
   gateway now still records the terminal connection health, metrics, and audit
   fields with the pre-cleanup pending and answered-but-unresolved prompt
@@ -1443,9 +1457,10 @@ Recent progress:
   route has already been drained
 - suppressed multi-worker notification dedupe paths now also emit structured
   warning logs: duplicate `skills/changed` invalidations include scope,
-  worker id, and params until the client refreshes `skills/list`, and exact-
-  duplicate connection-state notifications include the same context when they
-  are dropped
+  worker id, worker websocket URL, and params until the client refreshes
+  `skills/list`, and exact-duplicate connection-state notifications include
+  the same dropped-worker context plus the original worker id and websocket URL
+  for the already-forwarded payload
 - that same exact-duplicate connection-state suppression now also covers
   `mcpServer/oauthLogin/completed`, so one shared northbound session does not
   surface duplicate MCP OAuth completion notifications when more than one
@@ -1509,7 +1524,8 @@ Recent progress:
 - fail-closed handling for a downstream session that reuses a still-pending
   server-request id now also emits a structured warning log with scope, worker
   id, the colliding request id/method, and the gateway request ids already
-  pending on the connection
+  pending on the connection; that collision log now also includes pending
+  downstream request ids, affected thread ids, and pending worker ids
 - gateway-owned teardown of still-pending downstream server requests now also
   emits structured warning logs with connection outcome, terminal detail,
   pending gateway request ids, per-scope counts, and worker ids, so
@@ -1731,10 +1747,14 @@ Operational notes:
   flapping from one that is healthy again but still carries a historical
   `lastError`
 - `/healthz` remote-worker entries also expose `reconnecting`,
-  `reconnectAttemptCount`, and `nextReconnectAt`, so operators can tell
-  whether a remote worker is still in background reconnect backoff, how many
-  reconnect attempts have already failed in the current loop, and whether the
-  worker is only carrying a stale unhealthy flag
+  `reconnectAttemptCount`, `nextReconnectAt`, and
+  `reconnectBackoffRemainingSeconds`, so operators can tell whether a remote
+  worker is still in background reconnect backoff, how many reconnect attempts
+  have already failed in the current loop, how long the next retry is still
+  delayed, and whether the worker is only carrying a stale unhealthy flag
+- remote-worker reconnect-backoff health now has direct runtime and HTTP
+  health regression coverage, pinning `reconnectBackoffRemainingSeconds` for
+  reconnecting workers and `null` for healthy workers
 - remote worker disconnects, reconnect attempts, reconnect failures, and
   successful reconnects now also emit structured gateway logs with worker id,
   websocket URL, and retry timing so rollout debugging does not depend only on
@@ -1756,15 +1776,22 @@ Operational notes:
 - saturated and hidden-thread downstream server-request rejections also
   increment the `gateway_v2_server_request_rejections` counter with `method`
   and `reason` tags; current reasons are `pending_limit` and `hidden_thread`.
-  The matching rejection logs include the affected worker websocket URL.
+  The matching rejection logs include the affected worker websocket URL, and
+  saturated-connection logs include the pending gateway/downstream
+  server-request ids plus affected thread and worker ids.
 - multi-worker remote reconnect loops increment
   `gateway_v2_worker_reconnects` with `worker_id` and `outcome` tags; current
   outcomes are `attempt`, `success`, `connect_failure`, `replay_failure`, and
-  `backoff_suppressed`
+  `backoff_suppressed`. Retry-backoff suppression also emits a structured
+  warning log with worker id, worker websocket URL, replay-state context, and
+  both configured and remaining backoff seconds.
 - multi-worker remote requests that fail closed because required worker routes
   are unavailable increment `gateway_v2_fail_closed_requests` with `method`
   and `reconnect_backoff_active` tags, matching the structured warning log
-  emitted for the same event
+  emitted for the same event; the warning log includes available,
+  unavailable, and reconnect-backoff worker websocket URLs plus
+  reconnect-backoff remaining seconds, including paired worker id / URL /
+  remaining-second route diagnostics for each backoff worker
 - multi-worker remote upstream request failures that happen while worker routes
   are unavailable increment `gateway_v2_upstream_request_failures` with
   `method` and `reconnect_backoff_active` tags, so operators can separate
@@ -1773,8 +1800,11 @@ Operational notes:
   increment `gateway_v2_degraded_thread_discovery` with `method` and
   `reconnect_backoff_active` tags, matching the structured warning log emitted
   when the gateway intentionally serves the surviving workers' partial visible
-  thread set; the same warning log includes unavailable worker websocket URLs
-  so operators can identify the affected downstream sessions directly
+  thread set; the same warning log includes available, unavailable, and
+  reconnect-backoff worker websocket URLs plus reconnect-backoff remaining
+  seconds, including paired worker id / URL / remaining-second route
+  diagnostics, so operators can identify the affected downstream sessions
+  directly
 - primary-worker-only multi-worker requests now also have method-family
   reconnect-backoff coverage for config requirements, managed login, login
   cancellation, add-credits nudge email, feedback upload, standalone command
@@ -1785,7 +1815,8 @@ Operational notes:
   `gateway_v2_suppressed_notifications` with `method` and `reason` tags,
   matching the structured warning logs emitted when duplicate connection-state
   notifications, repeated `skills/changed` invalidations, or hidden-thread
-  notifications are dropped
+  notifications are dropped; exact-duplicate connection-state suppression logs
+  include both the dropped worker route and the original forwarded worker route
 - duplicate downstream `serverRequest/resolved` replays increment
   `gateway_v2_server_request_lifecycle_events` with `event` and `method`
   tags, matching the structured warning log emitted when the translated route
@@ -1794,7 +1825,8 @@ Operational notes:
   increment `gateway_v2_server_request_lifecycle_events` with
   `event=duplicate_pending_request` and the colliding server-request method,
   matching the structured warning log emitted before the gateway closes the
-  session
+  session; that warning log includes the pending gateway/downstream request ids,
+  affected thread ids, and pending worker ids present at collision time
 - worker-loss cleanup increments
   `gateway_v2_server_request_lifecycle_events` with
   `event=worker_cleanup_resolved_thread_scoped` /
@@ -1802,7 +1834,9 @@ Operational notes:
   `event=worker_cleanup_stranded_connection_scoped` /
   `method=connectionScopedServerRequest` for stranded connection-scoped
   prompts; the counters are emitted immediately after route cleanup, before
-  any synthetic resolution notification is sent to the client
+  any synthetic resolution notification is sent to the client, and the matching
+  warning logs include affected thread ids for the thread-scoped prompts plus
+  the affected worker websocket URL when synthesized-resolution delivery fails
 - client-side connection cleanup increments
   `gateway_v2_server_request_lifecycle_events` with
   `event=client_cleanup_rejected_thread_scoped` /
@@ -1810,11 +1844,17 @@ Operational notes:
   `event=client_cleanup_rejected_connection_scoped` /
   `method=serverRequest/pending`, and
   `event=client_cleanup_answered_but_unresolved` /
-  `method=serverRequest/resolved`
+  `method=serverRequest/resolved`; the matching cleanup warning includes
+  gateway request ids, downstream request ids, affected thread ids, worker ids,
+  and worker websocket URLs for the pending prompts being rejected, plus
+  affected thread ids for answered-but-unresolved routes
 - client replies for unknown server-request ids increment
   `gateway_v2_server_request_lifecycle_events` with
   `event=unexpected_client_server_request_response` and `method=response` or
-  `method=error`, matching the fail-closed protocol-violation path
+  `method=error`, matching the fail-closed protocol-violation path; the
+  matching warning logs include pending gateway/downstream server-request ids
+  plus affected pending and answered-but-unresolved thread ids plus pending
+  worker ids
 - malformed or out-of-order v2 client traffic increments
   `gateway_v2_protocol_violations` with `phase=pre_initialize` /
   `post_initialize` and reason tags such as `initialize_order`,
@@ -1822,10 +1862,16 @@ Operational notes:
   misuse can be tracked without inferring it from broad connection outcomes
 - downstream app-server event stream lag increments
   `gateway_v2_downstream_backpressure_events` with a `worker_id` tag before the
-  gateway attempts to send the policy close frame to the northbound client
+  gateway attempts to send the policy close frame to the northbound client; the
+  matching warning log includes pending gateway/downstream server-request ids
+  plus affected pending and answered-but-unresolved thread ids plus pending
+  worker ids for prompt correlation
 - slow-client northbound send timeouts increment
   `gateway_v2_client_send_timeouts` in addition to the terminal
-  `client_send_timed_out` connection outcome
+  `client_send_timed_out` connection outcome; the matching warning log
+  includes pending gateway/downstream server-request ids plus affected pending
+  and answered-but-unresolved thread ids plus pending worker ids before cleanup
+  rejection is attempted
 - repeated multi-worker `thread/list` snapshots increment
   `gateway_v2_thread_list_deduplications` with the selected worker id, and
   lazy visible-thread ownership probes increment
