@@ -209,10 +209,10 @@ Current status:
   test for active-turn streaming notifications
 - `item/started` and `item/completed` are now covered by dedicated gateway
   compatibility tests for longer-running turn item lifecycle notifications
-- `hookStarted` and `hookCompleted` are now covered by dedicated gateway
+- `hook/started` and `hook/completed` are now covered by dedicated gateway
   compatibility tests for hook lifecycle notifications
 - the real single-worker remote compatibility harness now also covers
-  `item/started`, `item/completed`, `hookStarted`, and `hookCompleted`
+  `item/started`, `item/completed`, `hook/started`, and `hook/completed`
   during a full `turn/start` workflow
 - `item/autoApprovalReview/started` and `item/autoApprovalReview/completed`
   are now covered by dedicated gateway
@@ -230,6 +230,19 @@ Current status:
   `fileChange/outputDelta`, `turn/diffUpdated`, `turn/planUpdated`,
   `thread/name/updated`, `thread/tokenUsage/updated`,
   `mcpToolCall/progress`, `contextCompacted`, and `model/rerouted`
+- real multi-worker thread-control coverage now also observes
+  `thread/closed`, `thread/archived`, and `thread/unarchived` from both
+  worker-owned visible threads on one shared `RemoteAppServerClient` session,
+  so those lifecycle notifications are covered by Stage B client traffic as
+  well as targeted gateway notification fixtures
+- real multi-worker same-session recovery coverage now also observes those
+  thread lifecycle notifications from a lazily re-added worker on the shared
+  client session, so recovered-worker thread state fan-in is covered by the
+  broad Stage B harness too
+- that same same-session recovery coverage now also observes
+  `thread/name/updated` after sticky `thread/name/set` routing back to the
+  lazily re-added worker, so recovered-worker rename fan-in is covered by real
+  client traffic
 - dedicated gateway connection-notification coverage now also includes
   `fuzzyFileSearch/sessionUpdated` and `fuzzyFileSearch/sessionCompleted`, so
   streaming file-search sessions are pinned alongside their request surface;
@@ -262,7 +275,7 @@ Current status:
   `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`,
   `thread/realtime/error`, and `thread/realtime/closed`
 - the real multi-worker remote compatibility harness now also covers
-  `item/started`, `item/completed`, `hookStarted`, and `hookCompleted`
+  `item/started`, `item/completed`, `hook/started`, and `hook/completed`
   fan-in during worker-owned `turn/start` workflows
 - lower-frequency user-visible notifications now also have dedicated gateway
   compatibility coverage for `warning`, `configWarning`,
@@ -351,9 +364,11 @@ Current status:
   through an unmodified `RemoteAppServerClient` session
 - the real multi-worker same-session bootstrap recovery harness now also
   observes recovered-worker `account/updated`, `account/rateLimits/updated`,
-  and `app/list/updated` delivery after the corresponding connection-scoped
-  discovery refreshes, so core connection-state notification fan-in is covered
-  by real Stage B client traffic as well as targeted northbound regressions
+  `app/list/updated`, `warning`, `configWarning`, `deprecationNotice`, and
+  `windows/worldWritableWarning` delivery after the corresponding
+  connection-scoped discovery refreshes, so core connection-state and visible
+  notice fan-in are covered by real Stage B client traffic as well as targeted
+  northbound regressions
 - real connection-state notification harnesses now also observe
   `windowsSandbox/setupCompleted` through unmodified `RemoteAppServerClient`
   sessions across steady-state, reconnect, duplicate-suppression, and
@@ -616,8 +631,8 @@ The current gateway compatibility tests cover this required subset:
 - `thread/closed` notification forwarding
 - `turn/started` notification forwarding
 - `turn/completed` notification forwarding
-- `hookStarted` notification forwarding
-- `hookCompleted` notification forwarding
+- `hook/started` notification forwarding
+- `hook/completed` notification forwarding
 - `item/autoApprovalReview/started` notification forwarding
 - `item/autoApprovalReview/completed` notification forwarding
 - `item/started` notification forwarding
@@ -888,7 +903,7 @@ Single-worker remote coverage notes:
 - that same single-worker remote harness now also covers streamed reasoning
   notifications `item/reasoning/summaryTextDelta` and
   `item/reasoning/textDelta`, plus longer-running lifecycle notifications
-  `hookStarted` and `hookCompleted`
+  `hook/started` and `hook/completed`
 - that single-worker remote harness now also covers realtime workflow parity
   for `thread/realtime/start`, `thread/realtime/appendText`,
   `thread/realtime/appendAudio`, `thread/realtime/stop`, and
@@ -1013,7 +1028,7 @@ Multi-worker remote coverage notes:
   `item/started`, `item/agentMessage/delta`,
   `item/reasoning/summaryTextDelta`, `item/reasoning/textDelta`,
   `item/commandExecution/outputDelta`, `item/fileChange/outputDelta`,
-  `hookStarted`, `hookCompleted`, `item/completed`, and
+  `hook/started`, `hook/completed`, `item/completed`, and
   `turn/completed` notifications
 - dedicated northbound multi-worker notification coverage now also verifies
   `rawResponseItem/completed` fan-in from multiple worker-owned visible

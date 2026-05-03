@@ -1115,15 +1115,15 @@ mod tests {
         TurnStreamingCoverage {
             saw_thread_active: true,
             saw_turn_started: true,
-            saw_hook_started: false,
-            saw_item_started: false,
+            saw_hook_started: true,
+            saw_item_started: true,
             saw_agent_delta: true,
             saw_reasoning_summary_delta: true,
             saw_reasoning_text_delta: true,
             saw_command_output_delta: true,
             saw_file_change_delta: true,
-            saw_hook_completed: false,
-            saw_item_completed: false,
+            saw_hook_completed: true,
+            saw_item_completed: true,
             saw_turn_completed: true,
         }
     }
@@ -6246,14 +6246,14 @@ stream_max_retries = 0
                 != (TurnStreamingCoverage {
                     saw_thread_active: true,
                     saw_turn_started: true,
-                    saw_hook_started: false,
+                    saw_hook_started: true,
                     saw_item_started: true,
                     saw_agent_delta: true,
                     saw_reasoning_summary_delta: true,
                     saw_reasoning_text_delta: true,
                     saw_command_output_delta: true,
                     saw_file_change_delta: true,
-                    saw_hook_completed: false,
+                    saw_hook_completed: true,
                     saw_item_completed: true,
                     saw_turn_completed: true,
                 })
@@ -10889,14 +10889,14 @@ stream_max_retries = 0
                 != (TurnStreamingCoverage {
                     saw_thread_active: true,
                     saw_turn_started: true,
-                    saw_hook_started: false,
+                    saw_hook_started: true,
                     saw_item_started: true,
                     saw_agent_delta: true,
                     saw_reasoning_summary_delta: true,
                     saw_reasoning_text_delta: true,
                     saw_command_output_delta: true,
                     saw_file_change_delta: true,
-                    saw_hook_completed: false,
+                    saw_hook_completed: true,
                     saw_item_completed: true,
                     saw_turn_completed: true,
                 })
@@ -15213,6 +15213,25 @@ stream_max_retries = 0
         assert_eq!(renamed_read.thread.preview, "/tmp/worker-a-3");
         assert_eq!(renamed_read.thread.name, Some(renamed_thread_name));
 
+        let rename_notification = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after same-session recovery");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                    notification,
+                )) = event
+                    && notification.thread_id == first_started.thread.id
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("thread/name/updated should fan in after same-session recovery");
+        assert_eq!(rename_notification.thread_name, renamed_read.thread.name);
+
         let memory_mode_response: ThreadMemoryModeSetResponse = client
             .request_typed(ClientRequest::ThreadMemoryModeSet {
                 request_id: RequestId::Integer(10),
@@ -15263,6 +15282,45 @@ stream_max_retries = 0
             .expect("thread/unarchive should route to the re-added worker");
         assert_eq!(unarchive_response.thread.id, first_started.thread.id);
         assert_eq!(unarchive_response.thread.preview, "/tmp/worker-a-3");
+
+        let expected_thread_lifecycle_notifications = HashSet::from([
+            (first_started.thread.id.clone(), "closed"),
+            (first_started.thread.id.clone(), "archived"),
+            (first_started.thread.id.clone(), "unarchived"),
+        ]);
+        let mut thread_lifecycle_notifications = HashSet::new();
+        let lifecycle_result = timeout(Duration::from_secs(5), async {
+            while thread_lifecycle_notifications != expected_thread_lifecycle_notifications {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after same-session recovery");
+                match event {
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id => {
+                        thread_lifecycle_notifications.insert((notification.thread_id, "closed"));
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id => {
+                        thread_lifecycle_notifications.insert((notification.thread_id, "archived"));
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id => {
+                        thread_lifecycle_notifications
+                            .insert((notification.thread_id, "unarchived"));
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            lifecycle_result.is_ok(),
+            "thread lifecycle notifications should fan in after same-session recovery: {thread_lifecycle_notifications:?}"
+        );
 
         let metadata_update_response: ThreadMetadataUpdateResponse = client
             .request_typed(ClientRequest::ThreadMetadataUpdate {
@@ -15453,14 +15511,14 @@ stream_max_retries = 0
                 != (TurnStreamingCoverage {
                     saw_thread_active: true,
                     saw_turn_started: true,
-                    saw_hook_started: false,
+                    saw_hook_started: true,
                     saw_item_started: true,
                     saw_agent_delta: true,
                     saw_reasoning_summary_delta: true,
                     saw_reasoning_text_delta: true,
                     saw_command_output_delta: true,
                     saw_file_change_delta: true,
-                    saw_hook_completed: false,
+                    saw_hook_completed: true,
                     saw_item_completed: true,
                     saw_turn_completed: true,
                 })
@@ -17815,7 +17873,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 8,
+            channel_capacity: 16,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -17937,11 +17995,19 @@ stream_max_retries = 0
         let mut saw_account_updated = false;
         let mut saw_rate_limits_updated = false;
         let mut saw_app_list_updated = false;
+        let mut saw_warning = false;
+        let mut saw_config_warning = false;
+        let mut saw_deprecation_notice = false;
+        let mut saw_windows_world_writable_warning = false;
         let mut saw_windows_sandbox_setup_completed = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits_updated
                 && saw_app_list_updated
+                && saw_warning
+                && saw_config_warning
+                && saw_deprecation_notice
+                && saw_windows_world_writable_warning
                 && saw_windows_sandbox_setup_completed)
             {
                 let event = client
@@ -17969,6 +18035,37 @@ stream_max_retries = 0
                         .any(|app| app.id == "worker-a-notification-app") =>
                     {
                         saw_app_list_updated = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::Warning(
+                        notification,
+                    )) if notification.message == "worker-a recovered warning" => {
+                        saw_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ConfigWarning(
+                        notification,
+                    )) if notification.summary == "worker-a recovered config warning" => {
+                        assert_eq!(
+                            notification.details.as_deref(),
+                            Some("check recovered worker config")
+                        );
+                        saw_config_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::DeprecationNotice(
+                        notification,
+                    )) if notification.summary == "worker-a recovered deprecation notice" => {
+                        assert_eq!(
+                            notification.details.as_deref(),
+                            Some("update recovered worker workflow")
+                        );
+                        saw_deprecation_notice = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsWorldWritableWarning(notification),
+                    ) if notification.sample_paths == vec!["C:\\worker-a-recovered"]
+                        && notification.extra_count == 1
+                        && !notification.failed_scan =>
+                    {
+                        saw_windows_world_writable_warning = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::WindowsSandboxSetupCompleted(notification),
@@ -23035,7 +23132,7 @@ stream_max_retries = 0
         .await
         .expect("server");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -23177,6 +23274,54 @@ stream_max_retries = 0
             .expect("second thread/unarchive should route to worker B");
         assert_eq!(second_unarchive.thread.id, second_started.thread.id);
         assert_eq!(second_unarchive.thread.preview, "/tmp/worker-b");
+
+        let expected_thread_lifecycle_notifications = HashSet::from([
+            (first_started.thread.id.clone(), "closed"),
+            (second_started.thread.id.clone(), "closed"),
+            (first_started.thread.id.clone(), "archived"),
+            (second_started.thread.id.clone(), "archived"),
+            (first_started.thread.id.clone(), "unarchived"),
+            (second_started.thread.id.clone(), "unarchived"),
+        ]);
+        let mut thread_lifecycle_notifications = HashSet::new();
+        let lifecycle_result = timeout(Duration::from_secs(5), async {
+            while thread_lifecycle_notifications != expected_thread_lifecycle_notifications {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        || notification.thread_id == second_started.thread.id =>
+                    {
+                        thread_lifecycle_notifications.insert((notification.thread_id, "closed"));
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadArchived(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        || notification.thread_id == second_started.thread.id =>
+                    {
+                        thread_lifecycle_notifications.insert((notification.thread_id, "archived"));
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ThreadUnarchived(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        || notification.thread_id == second_started.thread.id =>
+                    {
+                        thread_lifecycle_notifications
+                            .insert((notification.thread_id, "unarchived"));
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            lifecycle_result.is_ok(),
+            "thread lifecycle notifications should fan in from both workers: {thread_lifecycle_notifications:?}"
+        );
 
         let first_metadata_update: ThreadMetadataUpdateResponse = client
             .request_typed(ClientRequest::ThreadMetadataUpdate {
@@ -27910,7 +28055,7 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookStarted".to_string(),
+                                            method: "hook/started".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
@@ -27959,105 +28104,7 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookStarted".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": format!("hook-{thread_id}"),
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "running",
-                                                    "statusMessage": format!("hook started {thread_id}"),
-                                                    "startedAt": 1,
-                                                    "completedAt": null,
-                                                    "durationMs": null,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": format!("msg-{thread_id}"),
-                                                    "text": "streaming answer in progress",
-                                                    "phase": "commentary",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookStarted".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": "hook-remote-workflow",
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": "/tmp/remote-hooks.json",
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "running",
-                                                    "statusMessage": "remote hook started",
-                                                    "startedAt": 1,
-                                                    "completedAt": null,
-                                                    "durationMs": null,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": "msg-remote-workflow",
-                                                    "text": "streaming answer in progress",
-                                                    "phase": "commentary",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookStarted".to_string(),
+                                            method: "hook/started".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
@@ -28174,6 +28221,35 @@ stream_max_retries = 0
                                                 "turnId": turn_id,
                                                 "itemId": format!("patch-{thread_id}"),
                                                 "delta": format!("patch {thread_id}"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hook/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": format!("hook completed {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
                                             })),
                                         },
                                     ),
@@ -28860,6 +28936,19 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/name/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "threadName": name,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 "thread/memoryMode/set" => {
                                     let requested_thread_id = request
@@ -28896,6 +28985,18 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/closed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 "thread/archive" => {
                                     let requested_thread_id = request
@@ -28911,6 +29012,18 @@ stream_max_retries = 0
                                             id: request.id,
                                             result: serde_json::json!({}),
                                         }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/archived".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                })),
+                                            },
+                                        ),
                                     )
                                     .await;
                                 }
@@ -28934,6 +29047,18 @@ stream_max_retries = 0
                                                 ),
                                             }),
                                         }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/unarchived".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                })),
+                                            },
+                                        ),
                                     )
                                     .await;
                                 }
@@ -29285,7 +29410,7 @@ stream_max_retries = 0
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
-                                                method: "hookStarted".to_string(),
+                                                method: "hook/started".to_string(),
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
                                                     "turnId": turn_id,
@@ -29658,7 +29783,7 @@ stream_max_retries = 0
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
-                                                method: "hookCompleted".to_string(),
+                                                method: "hook/completed".to_string(),
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
                                                     "turnId": turn_id,
@@ -32855,7 +32980,7 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookStarted".to_string(),
+                                            method: "hook/started".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
@@ -33105,7 +33230,7 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hookCompleted".to_string(),
+                                            method: "hook/completed".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
@@ -35708,6 +35833,59 @@ stream_max_retries = 0
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
+                                                method: "warning".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": null,
+                                                    "message": format!("{worker_label} recovered warning"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "configWarning".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "summary": format!("{worker_label} recovered config warning"),
+                                                    "details": "check recovered worker config",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "deprecationNotice".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "summary": format!("{worker_label} recovered deprecation notice"),
+                                                    "details": "update recovered worker workflow",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "windows/worldWritableWarning".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "samplePaths": [format!("C:\\{worker_label}-recovered")],
+                                                    "extraCount": 1,
+                                                    "failedScan": false,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
                                                 method: "windowsSandbox/setupCompleted".to_string(),
                                                 params: Some(serde_json::json!({
                                                     "mode": "unelevated",
@@ -36478,6 +36656,18 @@ stream_max_retries = 0
                                     }),
                                 )
                                 .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/closed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
                             }
                             "thread/archive" => {
                                 let requested_thread_id = request
@@ -36493,6 +36683,18 @@ stream_max_retries = 0
                                         id: request.id,
                                         result: serde_json::json!({}),
                                     }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/archived".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                            })),
+                                        },
+                                    ),
                                 )
                                 .await;
                             }
@@ -36512,6 +36714,18 @@ stream_max_retries = 0
                                             "thread": mock_thread(thread_id, preview),
                                         }),
                                     }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/unarchived".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                            })),
+                                        },
+                                    ),
                                 )
                                 .await;
                             }
@@ -36713,6 +36927,55 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turn": mock_turn(turn_id, "inProgress"),
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hook/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "running",
+                                                    "statusMessage": format!("hook started {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": null,
+                                                    "durationMs": null,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer in progress",
+                                                    "phase": "commentary",
+                                                    "memoryCitation": null,
+                                                },
                                             })),
                                         },
                                     ),
@@ -37032,6 +37295,55 @@ stream_max_retries = 0
                                                     "source": "shell",
                                                     "command": "cat docs/gateway.md",
                                                     "cwd": "/tmp",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "hook/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "run": {
+                                                    "id": format!("hook-{thread_id}"),
+                                                    "eventName": "userPromptSubmit",
+                                                    "handlerType": "command",
+                                                    "executionMode": "sync",
+                                                    "scope": "turn",
+                                                    "sourcePath": format!("/tmp/{thread_id}/hooks.json"),
+                                                    "source": "user",
+                                                    "displayOrder": 0,
+                                                    "status": "completed",
+                                                    "statusMessage": format!("hook completed {thread_id}"),
+                                                    "startedAt": 1,
+                                                    "completedAt": 2,
+                                                    "durationMs": 1,
+                                                    "entries": [],
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
+                                                    "memoryCitation": null,
                                                 },
                                             })),
                                         },

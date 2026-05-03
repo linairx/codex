@@ -335,7 +335,7 @@ Recent progress:
   `item/commandExecution/outputDelta`, and `item/fileChange/outputDelta`
 - that same multi-worker turn-routing regression now also verifies fan-in for
   longer-running turn lifecycle notifications, including `item/started`,
-  `item/completed`, `hookStarted`, and `hookCompleted`, so one shared client
+  `item/completed`, `hook/started`, and `hook/completed`, so one shared client
   session still sees item and hook progress from the owning worker
 - multi-worker remote runtime now also has a real northbound v2 client
   regression covering thread mutation routing across two workers, verifying
@@ -704,9 +704,9 @@ Recent progress:
   leaking stale worker-local request ids
 - that same recovery surface now also keeps notification fan-in intact after a
   worker returns, covering recovered-worker turn lifecycle notifications
-  (`thread/status/changed`, `turn/started`, `hookStarted`, `item/started`,
+  (`thread/status/changed`, `turn/started`, `hook/started`, `item/started`,
   `item/agentMessage/delta`, reasoning / command / file-change deltas,
-  `hookCompleted`, `item/completed`, and `turn/completed`) plus the current
+  `hook/completed`, `item/completed`, and `turn/completed`) plus the current
   full realtime notification set, and dedicated regressions now also verify
   reconnect-on-demand for both a thread-scoped `item/tool/requestUserInput`
   round trip and a connection-scoped
@@ -1331,6 +1331,11 @@ Phase 6 is in progress with:
   and `thread/closed`, so archive and teardown state changes are pinned at the
   same v2 compatibility boundary as the existing thread and turn lifecycle
   streams
+- the real multi-worker thread-control harness now also observes
+  `thread/closed`, `thread/archived`, and `thread/unarchived` from both
+  worker-owned threads on one shared `RemoteAppServerClient` session, so these
+  lifecycle notifications are covered by Stage B client traffic as well as
+  targeted northbound fixtures
 - dedicated northbound notification coverage now also includes streamed item
   deltas for reasoning summaries, reasoning text, command output, and file
   changes, pinning `item/reasoning/summaryTextDelta`,
@@ -1585,6 +1590,18 @@ Phase 6 is in progress with:
   `item/mcpToolCall/progress`, `thread/compacted`, `model/rerouted`, and
   `rawResponseItem/completed`, so those forwarding paths are exercised through
   an unmodified `RemoteAppServerClient` on one shared multi-worker session
+- the real multi-worker thread-control harness now also observes
+  `thread/closed`, `thread/archived`, and `thread/unarchived` from both
+  worker-owned threads, extending broad Stage B notification fan-in beyond
+  turn-scoped streams into thread lifecycle state changes
+- the real multi-worker same-session recovery harness now also observes
+  `thread/closed`, `thread/archived`, and `thread/unarchived` from a lazily
+  re-added worker, so recovered-worker thread lifecycle notification fan-in is
+  covered alongside the existing recovered turn and realtime streams
+- that same recovery harness now also observes `thread/name/updated` after
+  routing `thread/name/set` back to the lazily re-added worker, so recovered
+  thread rename notification fan-in is covered through an unmodified client
+  session
 - the real multi-worker same-session recovery harness now also verifies that
   those lower-frequency turn notifications still fan in from a lazily re-added
   worker after reconnect, so recovered-worker turn replay no longer relies
@@ -1600,10 +1617,12 @@ Phase 6 is in progress with:
   opportunistic model/tool warning surfaces are exercised through the broad
   Stage B client harness
 - the real multi-worker same-session bootstrap recovery harness now also
-  observes `account/updated`, `account/rateLimits/updated`, and
-  `app/list/updated` from the lazily re-added worker after the corresponding
-  discovery refreshes, so core connection-state fan-in is covered through an
-  unmodified `RemoteAppServerClient` session
+  observes `account/updated`, `account/rateLimits/updated`,
+  `app/list/updated`, `warning`, `configWarning`, `deprecationNotice`, and
+  `windows/worldWritableWarning` from the lazily re-added worker after the
+  corresponding discovery refreshes, so core connection-state and visible
+  notice fan-in are covered through an unmodified `RemoteAppServerClient`
+  session
 - the real connection-state notification harnesses now also exercise
   `windowsSandbox/setupCompleted` alongside
   `windows/worldWritableWarning` through unmodified `RemoteAppServerClient`
