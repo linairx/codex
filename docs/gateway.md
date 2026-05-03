@@ -464,6 +464,28 @@ Recent progress:
   `experimentalFeature/list`, and `collaborationMode/list`, so the broader
   bootstrap/setup discovery surface used by real clients survives worker
   recovery too
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still apply low-frequency setup mutations:
+  `externalAgentConfig/import`, `marketplace/add`, `skills/config/write`,
+  `experimentalFeature/enablement/set`, `config/mcpServer/reload`,
+  `config/batchWrite`, `config/value/write`, `memory/reset`, and
+  `account/logout`, so Stage A release-gate traffic covers both discovery
+  refresh and post-reconnect setup writes
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still complete `account/sendAddCreditsNudgeEmail`, so the
+  one-shot account quota nudge path survives ordinary worker recovery too
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still complete `feedback/upload`, so in-product feedback
+  submission stays usable after ordinary worker recovery
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still complete the basic filesystem operation family:
+  `fs/createDirectory`, `fs/writeFile`, `fs/readFile`, `fs/getMetadata`,
+  `fs/readDirectory`, `fs/copy`, and `fs/remove`
+- that same single-worker reconnect coverage now also verifies the recovered
+  v2 session can still complete the standalone command-execution control
+  plane: `command/exec`, `command/exec/outputDelta`,
+  `command/exec/write`, `command/exec/resize`, and
+  `command/exec/terminate`
 - that same single-worker reconnect coverage now also re-exercises the broader
   typed server-request surface after worker recovery:
   `item/commandExecution/requestApproval`,
@@ -1116,8 +1138,8 @@ Phase 6 is in progress with:
 - that operator-facing `v2Connections` health snapshot now also has direct
   embedded, single-worker remote, and multi-worker remote regression coverage,
   pinning active, peak, and total connection counts plus the last-started and
-  last-outcome fields across live and settled client sessions; multi-worker
-  remote `/healthz` coverage now also pins the gateway-owned
+  last-outcome fields across live and settled client sessions; single-worker
+  and multi-worker remote `/healthz` coverage now also pin the gateway-owned
   `client_send_timed_out` outcome/detail, duration, plus the last completed
   connection's pending and answered-but-unresolved server-request counts after
   a slow-client teardown via a real northbound WebSocket session
@@ -1321,6 +1343,18 @@ Phase 6 is in progress with:
   scoped filesystem change delivery for `fs/changed`, so the watch setup /
   teardown surface has a pinned notification path in addition to the existing
   `fs/watch` and `fs/unwatch` request coverage
+- the real single-worker remote compatibility harness now also observes
+  `fs/changed` after `fs/watch`, so filesystem watch notification delivery is
+  part of the release-quality remote baseline instead of only targeted
+  northbound fixtures and multi-worker Stage B coverage
+- the real single-worker remote reconnect harness now also re-exercises
+  `fs/watch` and observes recovered-worker `fs/changed` delivery after the
+  worker is back online, so filesystem watch notifications remain covered
+  across ordinary remote worker recovery
+- that same single-worker remote reconnect harness now also exercises
+  `windowsSandbox/setupStart` and observes the recovered worker's
+  `windowsSandbox/setupCompleted` notification, so the Windows sandbox setup
+  surface is covered across ordinary remote worker recovery as well
 - dedicated northbound passthrough coverage now also includes the
   `fuzzyFileSearch` request family plus `fuzzyFileSearch/sessionUpdated` and
   `fuzzyFileSearch/sessionCompleted` notifications, so the file-picker search
@@ -1331,6 +1365,12 @@ Phase 6 is in progress with:
   filesystem root, including the `fuzzyFileSearch/sessionUpdated` and
   `fuzzyFileSearch/sessionCompleted` notifications through an unmodified
   `RemoteAppServerClient` session
+- the real single-worker remote reconnect harness now also exercises
+  `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
+  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop` after
+  worker recovery, including the follow-up
+  `fuzzyFileSearch/sessionUpdated` and `fuzzyFileSearch/sessionCompleted`
+  notifications on the recovered northbound client session
 - dedicated northbound passthrough coverage now also includes the basic
   filesystem operation family (`fs/readFile`, `fs/writeFile`,
   `fs/createDirectory`, `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and
@@ -1514,6 +1554,19 @@ Phase 6 is in progress with:
   `experimentalFeature/enablement/set`, and `config/mcpServer/reload` after a
   recovered worker is re-added, so low-frequency setup mutations continue to
   fan out across the full worker set without a northbound reconnect
+- the steady-state multi-worker setup-mutation harness now also observes the
+  `skills/changed` invalidation emitted after `skills/config/write` fanout and
+  verifies duplicate worker emissions stay suppressed on the shared
+  `RemoteAppServerClient` session
+- that same recovered setup-mutation harness now also observes the
+  `skills/changed` invalidation emitted after recovered-worker
+  `skills/config/write` fanout and verifies the duplicate worker emission is
+  still suppressed on the shared `RemoteAppServerClient` session
+- that same recovered setup-mutation harness now also observes the
+  `externalAgentConfig/import/completed` notification emitted after
+  recovered-worker `externalAgentConfig/import` fanout and verifies duplicate
+  worker completions stay suppressed on the shared `RemoteAppServerClient`
+  session
 - multi-worker remote mode now has a broad real shared-session Stage B harness
   for aggregated bootstrap/setup discovery, sticky thread and turn routing,
   translated server-request ids, plugin-management fallback, primary-worker
@@ -1532,6 +1585,30 @@ Phase 6 is in progress with:
   `item/mcpToolCall/progress`, `thread/compacted`, `model/rerouted`, and
   `rawResponseItem/completed`, so those forwarding paths are exercised through
   an unmodified `RemoteAppServerClient` on one shared multi-worker session
+- the real multi-worker same-session recovery harness now also verifies that
+  those lower-frequency turn notifications still fan in from a lazily re-added
+  worker after reconnect, so recovered-worker turn replay no longer relies
+  only on the basic lifecycle and streaming-delta notification set
+- that same real multi-worker turn coverage now also observes
+  `item/autoApprovalReview/started` and
+  `item/autoApprovalReview/completed` through unmodified
+  `RemoteAppServerClient` sessions in both steady state and after lazy worker
+  re-add, so guardian approval auto-review UX notifications are covered by the
+  broad Stage B client harness instead of only targeted northbound fixtures
+- that same real multi-worker turn coverage now also observes turn-scoped
+  `error` notifications in both steady state and after lazy worker re-add, so
+  opportunistic model/tool warning surfaces are exercised through the broad
+  Stage B client harness
+- the real multi-worker same-session bootstrap recovery harness now also
+  observes `account/updated`, `account/rateLimits/updated`, and
+  `app/list/updated` from the lazily re-added worker after the corresponding
+  discovery refreshes, so core connection-state fan-in is covered through an
+  unmodified `RemoteAppServerClient` session
+- the real connection-state notification harnesses now also exercise
+  `windowsSandbox/setupCompleted` alongside
+  `windows/worldWritableWarning` through unmodified `RemoteAppServerClient`
+  sessions, including multi-worker duplicate suppression and recovered-worker
+  same-session delivery
 - multi-worker reconnect hardening now includes route backfill,
   connection-state replay, reconnect retry backoff, fail-closed handling for
   degraded fanout / config / plugin / primary-worker requests, duplicate

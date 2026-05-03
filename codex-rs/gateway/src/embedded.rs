@@ -1131,6 +1131,9 @@ mod tests {
     fn expected_extended_turn_notifications() -> HashSet<&'static str> {
         HashSet::from([
             "context_compacted",
+            "error",
+            "guardian_review_completed",
+            "guardian_review_started",
             "mcp_tool_call_progress",
             "model_rerouted",
             "plan_delta",
@@ -7735,6 +7738,32 @@ stream_max_retries = 0
             PathBuf::from("/tmp/remote-project/config.toml").as_path()
         );
 
+        let fs_changed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after fs/watch");
+                if let AppServerEvent::ServerNotification(ServerNotification::FsChanged(
+                    notification,
+                )) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fs/changed notification should arrive after fs/watch");
+        assert_eq!(fs_changed.watch_id, "remote-watch");
+        assert_eq!(
+            fs_changed
+                .changed_paths
+                .iter()
+                .map(|path| path.as_ref().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/remote-project/config.toml".to_string()]
+        );
+
         let unwatch: FsUnwatchResponse = client
             .request_typed(ClientRequest::FsUnwatch {
                 request_id: RequestId::Integer(21),
@@ -8375,6 +8404,7 @@ stream_max_retries = 0
         let mut saw_config_warning = false;
         let mut saw_deprecation_notice = false;
         let mut saw_windows_world_writable_warning = false;
+        let mut saw_windows_sandbox_setup_completed = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
@@ -8385,7 +8415,8 @@ stream_max_retries = 0
                 && saw_warning
                 && saw_config_warning
                 && saw_deprecation_notice
-                && saw_windows_world_writable_warning)
+                && saw_windows_world_writable_warning
+                && saw_windows_sandbox_setup_completed)
             {
                 let event = client
                     .next_event()
@@ -8469,6 +8500,14 @@ stream_max_retries = 0
                         assert_eq!(notification.extra_count, 2);
                         assert_eq!(notification.failed_scan, false);
                         saw_windows_world_writable_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsSandboxSetupCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.mode, WindowsSandboxSetupMode::Unelevated);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_windows_sandbox_setup_completed = true;
                     }
                     other => panic!("unexpected notification: {other:?}"),
                 }
@@ -10463,6 +10502,7 @@ stream_max_retries = 0
         let mut saw_config_warning = false;
         let mut saw_deprecation_notice = false;
         let mut saw_windows_world_writable_warning = false;
+        let mut saw_windows_sandbox_setup_completed = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
@@ -10473,7 +10513,8 @@ stream_max_retries = 0
                 && saw_warning
                 && saw_config_warning
                 && saw_deprecation_notice
-                && saw_windows_world_writable_warning)
+                && saw_windows_world_writable_warning
+                && saw_windows_sandbox_setup_completed)
             {
                 let event = v2_client
                     .next_event()
@@ -10557,6 +10598,14 @@ stream_max_retries = 0
                         assert_eq!(notification.extra_count, 2);
                         assert_eq!(notification.failed_scan, false);
                         saw_windows_world_writable_warning = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsSandboxSetupCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.mode, WindowsSandboxSetupMode::Unelevated);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_windows_sandbox_setup_completed = true;
                     }
                     other => panic!("unexpected notification after worker reconnect: {other:?}"),
                 }
@@ -11444,10 +11493,635 @@ stream_max_retries = 0
         assert_eq!(mcp_statuses.data.len(), 1);
         assert_eq!(mcp_statuses.data[0].name, "reconnected-mcp");
 
+        let imported: ExternalAgentConfigImportResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::ExternalAgentConfigImport {
+                request_id: RequestId::Integer(18),
+                params: ExternalAgentConfigImportParams {
+                    migration_items: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("externalAgentConfig/import should finish in time after worker reconnect")
+        .expect("externalAgentConfig/import should succeed after worker reconnect");
+        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+
+        let marketplace: MarketplaceAddResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::MarketplaceAdd {
+                request_id: RequestId::Integer(19),
+                params: MarketplaceAddParams {
+                    source: "https://example.com/reconnected-marketplace.git".to_string(),
+                    ref_name: Some("main".to_string()),
+                    sparse_paths: Some(vec!["plugins/reconnected-plugin".to_string()]),
+                },
+            }),
+        )
+        .await
+        .expect("marketplace/add should finish in time after worker reconnect")
+        .expect("marketplace/add should succeed after worker reconnect");
+        assert_eq!(marketplace.marketplace_name, "reconnected-marketplace");
+        assert_eq!(marketplace.already_added, false);
+        assert_eq!(
+            marketplace.installed_root.as_path(),
+            PathBuf::from("/tmp/reconnected-project/marketplace").as_path()
+        );
+
+        let skills_config: SkillsConfigWriteResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::SkillsConfigWrite {
+                request_id: RequestId::Integer(20),
+                params: SkillsConfigWriteParams {
+                    path: Some(
+                        PathBuf::from("/tmp/reconnected-project/.codex/skills/reconnected-skill")
+                            .try_into()
+                            .expect("skills/config/write path should be absolute"),
+                    ),
+                    name: None,
+                    enabled: true,
+                },
+            }),
+        )
+        .await
+        .expect("skills/config/write should finish in time after worker reconnect")
+        .expect("skills/config/write should succeed after worker reconnect");
+        assert_eq!(skills_config.effective_enabled, true);
+
+        let feature_enablement: ExperimentalFeatureEnablementSetResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::ExperimentalFeatureEnablementSet {
+                request_id: RequestId::Integer(21),
+                params: ExperimentalFeatureEnablementSetParams {
+                    enablement: std::collections::BTreeMap::from([(
+                        "gateway-test-feature".to_string(),
+                        true,
+                    )]),
+                },
+            }),
+        )
+        .await
+        .expect("experimentalFeature/enablement/set should finish in time after worker reconnect")
+        .expect("experimentalFeature/enablement/set should succeed after worker reconnect");
+        assert_eq!(
+            feature_enablement.enablement,
+            std::collections::BTreeMap::from([("gateway-test-feature".to_string(), true)])
+        );
+
+        let mcp_refresh: McpServerRefreshResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::McpServerRefresh {
+                request_id: RequestId::Integer(22),
+                params: None,
+            }),
+        )
+        .await
+        .expect("config/mcpServer/reload should finish in time after worker reconnect")
+        .expect("config/mcpServer/reload should succeed after worker reconnect");
+        assert_eq!(mcp_refresh, McpServerRefreshResponse {});
+
+        let batch_write: ConfigWriteResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::ConfigBatchWrite {
+                request_id: RequestId::Integer(23),
+                params: ConfigBatchWriteParams {
+                    edits: Vec::new(),
+                    file_path: Some("/tmp/reconnected-project/config.toml".to_string()),
+                    expected_version: None,
+                    reload_user_config: true,
+                },
+            }),
+        )
+        .await
+        .expect("config/batchWrite should finish in time after worker reconnect")
+        .expect("config/batchWrite should succeed after worker reconnect");
+        assert_eq!(batch_write.status, WriteStatus::Ok);
+        assert_eq!(batch_write.version, "reconnected-version-1");
+        assert_eq!(
+            batch_write.file_path.as_path(),
+            PathBuf::from("/tmp/reconnected-project/config.toml").as_path()
+        );
+        assert_eq!(batch_write.overridden_metadata, None);
+
+        let config_value_write: ConfigWriteResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::ConfigValueWrite {
+                request_id: RequestId::Integer(24),
+                params: ConfigValueWriteParams {
+                    key_path: "plugins.reconnected-plugin".to_string(),
+                    value: serde_json::json!({
+                        "enabled": true,
+                    }),
+                    merge_strategy: MergeStrategy::Upsert,
+                    file_path: None,
+                    expected_version: None,
+                },
+            }),
+        )
+        .await
+        .expect("config/value/write should finish in time after worker reconnect")
+        .expect("config/value/write should succeed after worker reconnect");
+        assert_eq!(config_value_write.status, WriteStatus::Ok);
+        assert_eq!(config_value_write.version, "reconnected-version-1");
+        assert_eq!(
+            config_value_write.file_path.as_path(),
+            PathBuf::from("/tmp/reconnected-project/config.toml").as_path()
+        );
+        assert_eq!(config_value_write.overridden_metadata, None);
+
+        let reset: MemoryResetResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::MemoryReset {
+                request_id: RequestId::Integer(25),
+                params: None,
+            }),
+        )
+        .await
+        .expect("memory/reset should finish in time after worker reconnect")
+        .expect("memory/reset should succeed after worker reconnect");
+        assert_eq!(reset, MemoryResetResponse {});
+
+        let logout: LogoutAccountResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::LogoutAccount {
+                request_id: RequestId::Integer(26),
+                params: None,
+            }),
+        )
+        .await
+        .expect("account/logout should finish in time after worker reconnect")
+        .expect("account/logout should succeed after worker reconnect");
+        assert_eq!(logout, LogoutAccountResponse {});
+
+        let feedback: FeedbackUploadResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FeedbackUpload {
+                request_id: RequestId::Integer(27),
+                params: FeedbackUploadParams {
+                    classification: "bug".to_string(),
+                    reason: Some("gateway single-worker recovery".to_string()),
+                    thread_id: None,
+                    include_logs: false,
+                    extra_log_files: None,
+                    tags: None,
+                },
+            }),
+        )
+        .await
+        .expect("feedback/upload should finish in time after worker reconnect")
+        .expect("feedback/upload should succeed after worker reconnect");
+        assert_eq!(feedback.thread_id, "feedback-thread-reconnected");
+
+        let add_credits: SendAddCreditsNudgeEmailResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::SendAddCreditsNudgeEmail {
+                request_id: RequestId::Integer(28),
+                params: SendAddCreditsNudgeEmailParams {
+                    credit_type: AddCreditsNudgeCreditType::Credits,
+                },
+            }),
+        )
+        .await
+        .expect("account/sendAddCreditsNudgeEmail should finish in time after worker reconnect")
+        .expect("account/sendAddCreditsNudgeEmail should succeed after worker reconnect");
+        assert_eq!(add_credits.status, AddCreditsNudgeEmailStatus::Sent);
+
+        let create_directory: FsCreateDirectoryResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsCreateDirectory {
+                request_id: RequestId::Integer(29),
+                params: FsCreateDirectoryParams {
+                    path: PathBuf::from("/tmp/reconnected-project/nested")
+                        .try_into()
+                        .expect("fs/createDirectory path should be absolute"),
+                    recursive: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("fs/createDirectory should finish in time after worker reconnect")
+        .expect("fs/createDirectory should succeed after worker reconnect");
+        assert_eq!(create_directory, FsCreateDirectoryResponse {});
+
+        let write_file: FsWriteFileResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsWriteFile {
+                request_id: RequestId::Integer(30),
+                params: FsWriteFileParams {
+                    path: PathBuf::from("/tmp/reconnected-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/writeFile path should be absolute"),
+                    data_base64: "cmVjb25uZWN0ZWQtZmlsZQ==".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fs/writeFile should finish in time after worker reconnect")
+        .expect("fs/writeFile should succeed after worker reconnect");
+        assert_eq!(write_file, FsWriteFileResponse {});
+
+        let read_file: FsReadFileResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsReadFile {
+                request_id: RequestId::Integer(31),
+                params: FsReadFileParams {
+                    path: PathBuf::from("/tmp/reconnected-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/readFile path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/readFile should finish in time after worker reconnect")
+        .expect("fs/readFile should succeed after worker reconnect");
+        assert_eq!(read_file.data_base64, "cmVjb25uZWN0ZWQtZmlsZQ==");
+
+        let metadata: FsGetMetadataResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsGetMetadata {
+                request_id: RequestId::Integer(32),
+                params: FsGetMetadataParams {
+                    path: PathBuf::from("/tmp/reconnected-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/getMetadata path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/getMetadata should finish in time after worker reconnect")
+        .expect("fs/getMetadata should succeed after worker reconnect");
+        assert_eq!(metadata.is_file, true);
+        assert_eq!(metadata.is_directory, false);
+
+        let directory: FsReadDirectoryResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsReadDirectory {
+                request_id: RequestId::Integer(33),
+                params: FsReadDirectoryParams {
+                    path: PathBuf::from("/tmp/reconnected-project/nested")
+                        .try_into()
+                        .expect("fs/readDirectory path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/readDirectory should finish in time after worker reconnect")
+        .expect("fs/readDirectory should succeed after worker reconnect");
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.entries[0].file_name, "gateway.txt");
+
+        let copy: FsCopyResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsCopy {
+                request_id: RequestId::Integer(34),
+                params: FsCopyParams {
+                    source_path: PathBuf::from("/tmp/reconnected-project/nested/gateway.txt")
+                        .try_into()
+                        .expect("fs/copy source path should be absolute"),
+                    destination_path: PathBuf::from("/tmp/reconnected-project/nested/copy.txt")
+                        .try_into()
+                        .expect("fs/copy destination path should be absolute"),
+                    recursive: false,
+                },
+            }),
+        )
+        .await
+        .expect("fs/copy should finish in time after worker reconnect")
+        .expect("fs/copy should succeed after worker reconnect");
+        assert_eq!(copy, FsCopyResponse {});
+
+        let remove: FsRemoveResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsRemove {
+                request_id: RequestId::Integer(35),
+                params: FsRemoveParams {
+                    path: PathBuf::from("/tmp/reconnected-project/nested/copy.txt")
+                        .try_into()
+                        .expect("fs/remove path should be absolute"),
+                    recursive: Some(false),
+                    force: Some(true),
+                },
+            }),
+        )
+        .await
+        .expect("fs/remove should finish in time after worker reconnect")
+        .expect("fs/remove should succeed after worker reconnect");
+        assert_eq!(remove, FsRemoveResponse {});
+
+        let watch: FsWatchResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FsWatch {
+                request_id: RequestId::Integer(36),
+                params: FsWatchParams {
+                    watch_id: "reconnected-watch".to_string(),
+                    path: PathBuf::from("/tmp/reconnected-project/config.toml")
+                        .try_into()
+                        .expect("fs/watch path should be absolute"),
+                },
+            }),
+        )
+        .await
+        .expect("fs/watch should finish in time after worker reconnect")
+        .expect("fs/watch should succeed after worker reconnect");
+        assert_eq!(
+            watch.path.as_ref().to_string_lossy(),
+            "/tmp/reconnected-project/config.toml"
+        );
+
+        let fs_changed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = v2_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after recovered fs/watch");
+                if let AppServerEvent::ServerNotification(ServerNotification::FsChanged(
+                    notification,
+                )) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fs/changed should arrive after recovered fs/watch");
+        assert_eq!(fs_changed.watch_id, "reconnected-watch");
+        assert_eq!(
+            fs_changed
+                .changed_paths
+                .iter()
+                .map(|path| path.as_ref().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/reconnected-project/config.toml".to_string()]
+        );
+
+        let fuzzy_search: FuzzyFileSearchResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FuzzyFileSearch {
+                request_id: RequestId::Integer(37),
+                params: FuzzyFileSearchParams {
+                    query: "reconnect".to_string(),
+                    roots: vec!["/tmp/reconnected-project".to_string()],
+                    cancellation_token: Some("reconnected-fuzzy-search".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch should finish in time after worker reconnect")
+        .expect("fuzzyFileSearch should succeed after worker reconnect");
+        assert_eq!(fuzzy_search.files.len(), 1);
+        assert_eq!(fuzzy_search.files[0].root, "/tmp/reconnected-project");
+        assert_eq!(fuzzy_search.files[0].path, "docs/reconnected.md");
+        assert_eq!(
+            fuzzy_search.files[0].match_type,
+            FuzzyFileSearchMatchType::File
+        );
+
+        let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FuzzyFileSearchSessionStart {
+                request_id: RequestId::Integer(38),
+                params: FuzzyFileSearchSessionStartParams {
+                    session_id: "reconnected-fuzzy-session".to_string(),
+                    roots: vec!["/tmp/reconnected-project".to_string()],
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionStart should finish in time after worker reconnect")
+        .expect("fuzzyFileSearch/sessionStart should succeed after worker reconnect");
+        assert_eq!(fuzzy_session_start, FuzzyFileSearchSessionStartResponse {});
+
+        let fuzzy_session_update: FuzzyFileSearchSessionUpdateResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FuzzyFileSearchSessionUpdate {
+                request_id: RequestId::Integer(39),
+                params: FuzzyFileSearchSessionUpdateParams {
+                    session_id: "reconnected-fuzzy-session".to_string(),
+                    query: "reconnect".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionUpdate should finish in time after worker reconnect")
+        .expect("fuzzyFileSearch/sessionUpdate should succeed after worker reconnect");
+        assert_eq!(
+            fuzzy_session_update,
+            FuzzyFileSearchSessionUpdateResponse {}
+        );
+
+        let fuzzy_session_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = v2_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after recovered fuzzy update");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionUpdated(notification),
+                ) = event
+                    && notification.session_id == "reconnected-fuzzy-session"
+                    && notification.query == "reconnect"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionUpdated should arrive after worker reconnect");
+        assert_eq!(fuzzy_session_updated.files.len(), 1);
+        assert_eq!(
+            fuzzy_session_updated.files[0].root,
+            "/tmp/reconnected-project"
+        );
+        assert_eq!(fuzzy_session_updated.files[0].path, "docs/reconnected.md");
+
+        let fuzzy_session_stop: FuzzyFileSearchSessionStopResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::FuzzyFileSearchSessionStop {
+                request_id: RequestId::Integer(40),
+                params: FuzzyFileSearchSessionStopParams {
+                    session_id: "reconnected-fuzzy-session".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("fuzzyFileSearch/sessionStop should finish in time after worker reconnect")
+        .expect("fuzzyFileSearch/sessionStop should succeed after worker reconnect");
+        assert_eq!(fuzzy_session_stop, FuzzyFileSearchSessionStopResponse {});
+
+        let fuzzy_session_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = v2_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after recovered fuzzy stop");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::FuzzyFileSearchSessionCompleted(notification),
+                ) = event
+                    && notification.session_id == "reconnected-fuzzy-session"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fuzzyFileSearch/sessionCompleted should arrive after worker reconnect");
+        assert_eq!(
+            fuzzy_session_completed.session_id,
+            "reconnected-fuzzy-session"
+        );
+
+        let windows_setup: WindowsSandboxSetupStartResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::WindowsSandboxSetupStart {
+                request_id: RequestId::Integer(41),
+                params: WindowsSandboxSetupStartParams {
+                    mode: WindowsSandboxSetupMode::Unelevated,
+                    cwd: Some(
+                        PathBuf::from("/tmp/reconnected-project")
+                            .try_into()
+                            .expect("windowsSandbox/setupStart cwd should be absolute"),
+                    ),
+                },
+            }),
+        )
+        .await
+        .expect("windowsSandbox/setupStart should finish in time after worker reconnect")
+        .expect("windowsSandbox/setupStart should succeed after worker reconnect");
+        assert_eq!(windows_setup.started, true);
+
+        let windows_setup_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = v2_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after recovered windows setup");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::WindowsSandboxSetupCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("windowsSandbox/setupCompleted should arrive after worker reconnect");
+        assert_eq!(
+            windows_setup_completed.mode,
+            WindowsSandboxSetupMode::Unelevated
+        );
+        assert_eq!(windows_setup_completed.success, true);
+        assert_eq!(windows_setup_completed.error, None);
+
+        let command_exec: CommandExecResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::OneOffCommandExec {
+                request_id: RequestId::Integer(42),
+                params: CommandExecParams {
+                    command: vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        "printf remote-command".to_string(),
+                    ],
+                    process_id: Some("proc-remote".to_string()),
+                    tty: true,
+                    stream_stdin: true,
+                    stream_stdout_stderr: true,
+                    output_bytes_cap: None,
+                    disable_output_cap: false,
+                    disable_timeout: false,
+                    timeout_ms: None,
+                    cwd: None,
+                    env: None,
+                    size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
+                    sandbox_policy: None,
+                },
+            }),
+        )
+        .await
+        .expect("command/exec should finish in time after worker reconnect")
+        .expect("command/exec should succeed after worker reconnect");
+        assert_eq!(
+            command_exec,
+            CommandExecResponse {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        );
+
+        let command_output = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = v2_client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after recovered command/exec");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::CommandExecOutputDelta(notification),
+                ) = event
+                    && notification.process_id == "proc-remote"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("command/exec/outputDelta should arrive after worker reconnect");
+        assert_eq!(command_output.stream, CommandExecOutputStream::Stdout);
+        assert_eq!(command_output.delta_base64, "cmVtb3RlLWNvbW1hbmQ=");
+        assert_eq!(command_output.cap_reached, false);
+
+        let command_write: CommandExecWriteResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::CommandExecWrite {
+                request_id: RequestId::Integer(43),
+                params: CommandExecWriteParams {
+                    process_id: "proc-remote".to_string(),
+                    delta_base64: Some("AQID".to_string()),
+                    close_stdin: false,
+                },
+            }),
+        )
+        .await
+        .expect("command/exec/write should finish in time after worker reconnect")
+        .expect("command/exec/write should succeed after worker reconnect");
+        assert_eq!(command_write, CommandExecWriteResponse {});
+
+        let command_resize: CommandExecResizeResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::CommandExecResize {
+                request_id: RequestId::Integer(44),
+                params: CommandExecResizeParams {
+                    process_id: "proc-remote".to_string(),
+                    size: CommandExecTerminalSize {
+                        rows: 40,
+                        cols: 120,
+                    },
+                },
+            }),
+        )
+        .await
+        .expect("command/exec/resize should finish in time after worker reconnect")
+        .expect("command/exec/resize should succeed after worker reconnect");
+        assert_eq!(command_resize, CommandExecResizeResponse {});
+
+        let command_terminate: CommandExecTerminateResponse = timeout(
+            Duration::from_secs(5),
+            v2_client.request_typed(ClientRequest::CommandExecTerminate {
+                request_id: RequestId::Integer(45),
+                params: CommandExecTerminateParams {
+                    process_id: "proc-remote".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("command/exec/terminate should finish in time after worker reconnect")
+        .expect("command/exec/terminate should succeed after worker reconnect");
+        assert_eq!(command_terminate, CommandExecTerminateResponse {});
+
         let mcp_oauth_login: McpServerOauthLoginResponse = timeout(
             Duration::from_secs(5),
             v2_client.request_typed(ClientRequest::McpServerOauthLogin {
-                request_id: RequestId::Integer(18),
+                request_id: RequestId::Integer(46),
                 params: McpServerOauthLoginParams {
                     name: "reconnected-mcp".to_string(),
                     scopes: Some(vec!["calendar.read".to_string()]),
@@ -12045,6 +12719,7 @@ stream_max_retries = 0
         let mut saw_config_warning = false;
         let mut saw_deprecation_notice = false;
         let mut saw_windows_world_writable_warning = false;
+        let mut saw_windows_sandbox_setup_completed = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
@@ -12055,7 +12730,8 @@ stream_max_retries = 0
                 && saw_warning
                 && saw_config_warning
                 && saw_deprecation_notice
-                && saw_windows_world_writable_warning)
+                && saw_windows_world_writable_warning
+                && saw_windows_sandbox_setup_completed)
             {
                 let event = v2_client
                     .next_event()
@@ -12140,6 +12816,14 @@ stream_max_retries = 0
                         assert_eq!(notification.failed_scan, false);
                         saw_windows_world_writable_warning = true;
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsSandboxSetupCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.mode, WindowsSandboxSetupMode::Unelevated);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_windows_sandbox_setup_completed = true;
+                    }
                     other => panic!("unexpected notification after worker reconnect: {other:?}"),
                 }
             }
@@ -12156,6 +12840,7 @@ stream_max_retries = 0
         assert!(saw_config_warning);
         assert!(saw_deprecation_notice);
         assert!(saw_windows_world_writable_warning);
+        assert!(saw_windows_sandbox_setup_completed);
         assert!(
             timeout(Duration::from_millis(200), v2_client.next_event())
                 .await
@@ -14239,7 +14924,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to multi-worker gateway");
@@ -14762,6 +15447,7 @@ stream_max_retries = 0
         assert_eq!(turn_started.turn.id, "turn-thread-worker-a-3");
 
         let mut recovered_turn_coverage = TurnStreamingCoverage::default();
+        let mut recovered_extended_turn_notifications = HashSet::new();
         let recovered_turn_result = timeout(Duration::from_secs(5), async {
             while recovered_turn_coverage
                 != (TurnStreamingCoverage {
@@ -14778,6 +15464,7 @@ stream_max_retries = 0
                     saw_item_completed: true,
                     saw_turn_completed: true,
                 })
+                || recovered_extended_turn_notifications != expected_extended_turn_notifications()
             {
                 let event = client
                     .next_event()
@@ -14834,6 +15521,14 @@ stream_max_retries = 0
                     {
                         recovered_turn_coverage.saw_agent_delta = true;
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::PlanDelta(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta == format!("plan {}", first_started.thread.id) =>
+                    {
+                        recovered_extended_turn_notifications.insert("plan_delta");
+                    }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryTextDelta(notification),
                     ) if notification.thread_id == first_started.thread.id
@@ -14842,6 +15537,15 @@ stream_max_retries = 0
                         && notification.summary_index == 0 =>
                     {
                         recovered_turn_coverage.saw_reasoning_summary_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ReasoningSummaryPartAdded(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.summary_index == 0 =>
+                    {
+                        recovered_extended_turn_notifications
+                            .insert("reasoning_summary_part_added");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
                         notification,
@@ -14852,6 +15556,16 @@ stream_max_retries = 0
                         && notification.content_index == 0 =>
                     {
                         recovered_turn_coverage.saw_reasoning_text_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::TerminalInteraction(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.process_id
+                            == format!("proc-{}", first_started.thread.id)
+                        && notification.stdin == "y\n" =>
+                    {
+                        recovered_extended_turn_notifications.insert("terminal_interaction");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::CommandExecutionOutputDelta(notification),
@@ -14868,6 +15582,97 @@ stream_max_retries = 0
                         && notification.delta == format!("patch {}", first_started.thread.id) =>
                     {
                         recovered_turn_coverage.saw_file_change_delta = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnDiffUpdated(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.diff == format!("diff {}", first_started.thread.id) =>
+                    {
+                        recovered_extended_turn_notifications.insert("turn_diff_updated");
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnPlanUpdated(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.explanation.as_deref()
+                            == Some("gateway multi-worker plan")
+                        && notification.plan.len() == 1
+                        && notification.plan[0].step
+                            == format!("plan {}", first_started.thread.id) =>
+                    {
+                        recovered_extended_turn_notifications.insert("turn_plan_updated");
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadTokenUsageUpdated(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.token_usage.total.total_tokens == 42 =>
+                    {
+                        recovered_extended_turn_notifications.insert("thread_token_usage_updated");
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpToolCallProgress(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.message
+                            == format!("mcp progress {}", first_started.thread.id) =>
+                    {
+                        recovered_extended_turn_notifications.insert("mcp_tool_call_progress");
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ContextCompacted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id =>
+                    {
+                        recovered_extended_turn_notifications.insert("context_compacted");
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ModelRerouted(
+                        notification,
+                    )) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.from_model == "gpt-5"
+                        && notification.to_model == "gpt-5-codex" =>
+                    {
+                        recovered_extended_turn_notifications.insert("model_rerouted");
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::RawResponseItemCompleted(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id =>
+                    {
+                        recovered_extended_turn_notifications.insert("raw_response_item_completed");
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::Error(notification))
+                        if notification.thread_id == first_started.thread.id
+                            && notification.turn_id == turn_started.turn.id
+                            && !notification.will_retry
+                            && notification.error.message
+                                == format!("recoverable warning {}", first_started.thread.id) =>
+                    {
+                        recovered_extended_turn_notifications.insert("error");
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ItemGuardianApprovalReviewStarted(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.review_id
+                            == format!("guardian-{}", first_started.thread.id)
+                        && notification.target_item_id.as_deref()
+                            == Some(&format!("cmd-{}", first_started.thread.id)) =>
+                    {
+                        recovered_extended_turn_notifications.insert("guardian_review_started");
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ItemGuardianApprovalReviewCompleted(notification),
+                    ) if notification.thread_id == first_started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.review_id
+                            == format!("guardian-{}", first_started.thread.id)
+                        && notification.target_item_id.as_deref()
+                            == Some(&format!("cmd-{}", first_started.thread.id)) =>
+                    {
+                        recovered_extended_turn_notifications.insert("guardian_review_completed");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
                         notification,
@@ -14909,7 +15714,7 @@ stream_max_retries = 0
         assert_eq!(
             recovered_turn_result.is_ok(),
             true,
-            "turn notifications should fan in after same-session recovery: {recovered_turn_coverage:?}"
+            "turn notifications should fan in after same-session recovery: lifecycle={recovered_turn_coverage:?} extended={recovered_extended_turn_notifications:?}"
         );
 
         let turn_steer_response: TurnSteerResponse = client
@@ -15742,6 +16547,23 @@ stream_max_retries = 0
             .expect("externalAgentConfig/import should reconnect and fan out");
         assert_eq!(imported, ExternalAgentConfigImportResponse {});
 
+        let import_completed = timeout(Duration::from_secs(5), client.next_event())
+            .await
+            .expect("externalAgentConfig/import/completed should finish in time")
+            .expect("event stream should stay open after externalAgentConfig/import");
+        assert!(matches!(
+            import_completed,
+            AppServerEvent::ServerNotification(
+                ServerNotification::ExternalAgentConfigImportCompleted(_)
+            )
+        ));
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate externalAgentConfig/import/completed should be suppressed after recovered import fanout"
+        );
+
         let batch_write: ConfigWriteResponse = client
             .request_typed(ClientRequest::ConfigBatchWrite {
                 request_id: RequestId::Integer(2),
@@ -15802,6 +16624,29 @@ stream_max_retries = 0
             .await
             .expect("skills/config/write should reconnect and fan out");
         assert_eq!(skills_config.effective_enabled, true);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after skills/config/write");
+                if matches!(
+                    event,
+                    AppServerEvent::ServerNotification(ServerNotification::SkillsChanged(_))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("skills/changed should arrive after recovered skills/config/write");
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate skills/changed should be suppressed after recovered skills/config/write"
+        );
 
         let feature_enablement: ExperimentalFeatureEnablementSetResponse = client
             .request_typed(ClientRequest::ExperimentalFeatureEnablementSet {
@@ -17089,6 +17934,56 @@ stream_max_retries = 0
             vec!["shared-app", "worker-a-app", "worker-b-app"]
         );
 
+        let mut saw_account_updated = false;
+        let mut saw_rate_limits_updated = false;
+        let mut saw_app_list_updated = false;
+        let mut saw_windows_sandbox_setup_completed = false;
+        timeout(Duration::from_secs(5), async {
+            while !(saw_account_updated
+                && saw_rate_limits_updated
+                && saw_app_list_updated
+                && saw_windows_sandbox_setup_completed)
+            {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                        notification,
+                    )) if notification.auth_mode.is_none() && notification.plan_type.is_none() => {
+                        saw_account_updated = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::AccountRateLimitsUpdated(notification),
+                    ) if notification.rate_limits.limit_id.as_deref()
+                        == Some("worker-a-notification") =>
+                    {
+                        saw_rate_limits_updated = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::AppListUpdated(
+                        notification,
+                    )) if notification
+                        .data
+                        .iter()
+                        .any(|app| app.id == "worker-a-notification-app") =>
+                    {
+                        saw_app_list_updated = true;
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsSandboxSetupCompleted(notification),
+                    ) if notification.mode == WindowsSandboxSetupMode::Unelevated
+                        && notification.success =>
+                    {
+                        saw_windows_sandbox_setup_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("connection-state notifications should fan in after worker recovery");
+
         let skills: SkillsListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::SkillsList {
@@ -17959,7 +18854,7 @@ stream_max_retries = 0
         .await
         .expect("server");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -18057,6 +18952,29 @@ stream_max_retries = 0
         .expect("skills/config/write should finish in time")
         .expect("skills/config/write should fan out through multi-worker gateway");
         assert_eq!(skills_config.effective_enabled, true);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after skills/config/write");
+                if matches!(
+                    event,
+                    AppServerEvent::ServerNotification(ServerNotification::SkillsChanged(_))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("skills/changed should arrive after skills/config/write fanout");
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate skills/changed should be suppressed after skills/config/write fanout"
+        );
 
         let feature_enablement: ExperimentalFeatureEnablementSetResponse = timeout(
             Duration::from_secs(5),
@@ -20810,6 +21728,7 @@ stream_max_retries = 0
         let mut saw_config_warning = false;
         let mut saw_deprecation_notice = false;
         let mut saw_windows_world_writable_warning = false;
+        let mut saw_windows_sandbox_setup_completed = false;
         timeout(Duration::from_secs(5), async {
             while !(saw_account_updated
                 && saw_rate_limits
@@ -20820,7 +21739,8 @@ stream_max_retries = 0
                 && saw_warning
                 && saw_config_warning
                 && saw_deprecation_notice
-                && saw_windows_world_writable_warning)
+                && saw_windows_world_writable_warning
+                && saw_windows_sandbox_setup_completed)
             {
                 let event = client
                     .next_event()
@@ -20905,6 +21825,14 @@ stream_max_retries = 0
                         assert_eq!(notification.failed_scan, false);
                         saw_windows_world_writable_warning = true;
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::WindowsSandboxSetupCompleted(notification),
+                    ) => {
+                        assert_eq!(notification.mode, WindowsSandboxSetupMode::Unelevated);
+                        assert_eq!(notification.success, true);
+                        assert_eq!(notification.error, None);
+                        saw_windows_sandbox_setup_completed = true;
+                    }
                     other => panic!("unexpected notification: {other:?}"),
                 }
             }
@@ -20921,6 +21849,7 @@ stream_max_retries = 0
         assert!(saw_config_warning);
         assert!(saw_deprecation_notice);
         assert!(saw_windows_world_writable_warning);
+        assert!(saw_windows_sandbox_setup_completed);
         assert!(
             timeout(Duration::from_millis(200), client.next_event())
                 .await
@@ -21319,7 +22248,7 @@ stream_max_retries = 0
                 .any(|coverage| *coverage != expected_turn_streaming_coverage())
                 || extended_notifications_by_thread
                     .values()
-                    .any(|notifications| notifications.len() != 10)
+                    .any(|notifications| *notifications != expected_extended_turn_notifications())
             {
                 let event = client
                     .next_event()
@@ -21584,6 +22513,51 @@ stream_max_retries = 0
                                 extended_notifications_by_thread.get_mut(&notification.thread_id)
                         {
                             notifications.insert("raw_response_item_completed");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::Error(notification)) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && !notification.will_retry
+                            && notification.error.message
+                                == format!("recoverable warning {}", notification.thread_id)
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("error");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ItemGuardianApprovalReviewStarted(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.review_id
+                                == format!("guardian-{}", notification.thread_id)
+                            && notification.target_item_id.as_deref()
+                                == Some(&format!("cmd-{}", notification.thread_id))
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("guardian_review_started");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ItemGuardianApprovalReviewCompleted(notification),
+                    ) => {
+                        if let Some((expected_turn_id, _)) =
+                            expected_turn_by_thread.get(&notification.thread_id)
+                            && notification.turn_id == *expected_turn_id
+                            && notification.review_id
+                                == format!("guardian-{}", notification.thread_id)
+                            && notification.target_item_id.as_deref()
+                                == Some(&format!("cmd-{}", notification.thread_id))
+                            && let Some(notifications) =
+                                extended_notifications_by_thread.get_mut(&notification.thread_id)
+                        {
+                            notifications.insert("guardian_review_completed");
                         }
                     }
                     AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
@@ -25677,6 +26651,143 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn remote_single_worker_healthz_reports_slow_client_timeout_outcome() {
+        let worker = start_mock_remote_server_for_slow_client_timeout().await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url: worker,
+                        auth_token: None,
+                    }],
+                }),
+                v2_client_send_timeout: Duration::from_millis(1),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let health_client = reqwest::Client::new();
+        let mut request = format!("ws://{}/", server.local_addr())
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-visible".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-visible".parse().expect("project header"),
+        );
+        let (mut websocket, response) = connect_async(request)
+            .await
+            .expect("websocket should connect");
+        assert_eq!(response.status(), reqwest::StatusCode::SWITCHING_PROTOCOLS);
+
+        write_websocket_message(
+            &mut websocket,
+            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                id: RequestId::Integer(1),
+                method: "initialize".to_string(),
+                params: Some(serde_json::json!({
+                    "clientInfo": {
+                        "name": "codex-gateway-test",
+                        "version": "0.0.0-test",
+                    },
+                    "capabilities": null,
+                })),
+                trace: None,
+            }),
+        )
+        .await;
+
+        let JSONRPCMessage::Response(_) = read_websocket_message(&mut websocket).await else {
+            panic!("expected initialize response");
+        };
+        let JSONRPCMessage::Request(server_request) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected forwarded server request before slow-client timeout");
+        };
+        assert_eq!(server_request.method, "account/chatgptAuthTokens/refresh");
+
+        let settled_health = timeout(Duration::from_secs(60), async {
+            loop {
+                let response = health_client
+                    .get(format!("http://{}/healthz", server.local_addr()))
+                    .send()
+                    .await
+                    .expect("healthz response");
+                let health: GatewayHealthResponse = response.json().await.expect("health body");
+                if health.v2_connections.active_connection_count == 0
+                    && health.v2_connections.last_connection_outcome.is_some()
+                {
+                    break health;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("connection health should settle");
+        assert_eq!(settled_health.runtime_mode, "remote");
+        assert_eq!(
+            settled_health.v2_compatibility,
+            GatewayV2CompatibilityMode::RemoteSingleWorker
+        );
+        assert_eq!(
+            settled_health.v2_connections.last_connection_outcome,
+            Some("client_send_timed_out".to_string())
+        );
+        assert_eq!(
+            settled_health.v2_connections.peak_active_connection_count,
+            1
+        );
+        assert_eq!(settled_health.v2_connections.total_connection_count, 1);
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health.v2_connections.last_connection_detail,
+            Some("gateway websocket send timed out".to_string())
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_pending_server_request_count,
+            1
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_answered_but_unresolved_server_request_count,
+            0
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_completed_at
+                .is_some(),
+            true
+        );
+
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn remote_multi_worker_healthz_reports_slow_client_timeout_outcome() {
         let worker_a = start_mock_remote_server_for_idle_v2_sessions(None).await;
         let worker_b = start_mock_remote_server_for_slow_client_timeout().await;
@@ -28238,12 +29349,43 @@ stream_max_retries = 0
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/plan/delta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("plan-{thread_id}"),
+                                                    "delta": format!("plan {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
                                                 method: "item/reasoning/summaryTextDelta".to_string(),
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
                                                     "turnId": turn_id,
                                                     "itemId": format!("reasoning-summary-{thread_id}"),
                                                     "delta": format!("summary {thread_id}"),
+                                                    "summaryIndex": 0,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/reasoning/summaryPartAdded"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("reasoning-summary-{thread_id}"),
                                                     "summaryIndex": 0,
                                                 })),
                                             },
@@ -28261,6 +29403,23 @@ stream_max_retries = 0
                                                     "itemId": format!("reasoning-{thread_id}"),
                                                     "delta": format!("reasoning {thread_id}"),
                                                     "contentIndex": 0,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/commandExecution/terminalInteraction"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("terminal-{thread_id}"),
+                                                    "processId": format!("proc-{thread_id}"),
+                                                    "stdin": "y\n",
                                                 })),
                                             },
                                         ),
@@ -28292,6 +29451,204 @@ stream_max_retries = 0
                                                     "turnId": turn_id,
                                                     "itemId": format!("patch-{thread_id}"),
                                                     "delta": format!("patch {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "turn/diff/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "diff": format!("diff {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "turn/plan/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "explanation": "gateway multi-worker plan",
+                                                    "plan": [{
+                                                        "step": format!("plan {thread_id}"),
+                                                        "status": "completed",
+                                                    }],
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/tokenUsage/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "tokenUsage": {
+                                                        "total": {
+                                                            "totalTokens": 42,
+                                                            "inputTokens": 20,
+                                                            "cachedInputTokens": 3,
+                                                            "outputTokens": 22,
+                                                            "reasoningOutputTokens": 7,
+                                                        },
+                                                        "last": {
+                                                            "totalTokens": 10,
+                                                            "inputTokens": 4,
+                                                            "cachedInputTokens": 1,
+                                                            "outputTokens": 6,
+                                                            "reasoningOutputTokens": 2,
+                                                        },
+                                                        "modelContextWindow": 200000,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/mcpToolCall/progress".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("mcp-{thread_id}"),
+                                                    "message": format!("mcp progress {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/compacted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "model/rerouted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "fromModel": "gpt-5",
+                                                    "toModel": "gpt-5-codex",
+                                                    "reason": "highRiskCyberActivity",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "rawResponseItem/completed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "item": {
+                                                        "type": "other",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "error".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "willRetry": false,
+                                                    "error": {
+                                                        "message": format!("recoverable warning {thread_id}"),
+                                                        "codexErrorInfo": null,
+                                                        "additionalDetails": "gateway multi-worker warning",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/autoApprovalReview/started"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "reviewId": format!("guardian-{thread_id}"),
+                                                    "targetItemId": format!("cmd-{thread_id}"),
+                                                    "review": {
+                                                        "status": "inProgress",
+                                                        "riskLevel": null,
+                                                        "userAuthorization": null,
+                                                        "rationale": null,
+                                                    },
+                                                    "action": {
+                                                        "type": "command",
+                                                        "source": "shell",
+                                                        "command": "cat docs/gateway.md",
+                                                        "cwd": "/tmp",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/autoApprovalReview/completed"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "reviewId": format!("guardian-{thread_id}"),
+                                                    "targetItemId": format!("cmd-{thread_id}"),
+                                                    "decisionSource": "agent",
+                                                    "review": {
+                                                        "status": "approved",
+                                                        "riskLevel": "low",
+                                                        "userAuthorization": "low",
+                                                        "rationale": "Read-only command.",
+                                                    },
+                                                    "action": {
+                                                        "type": "command",
+                                                        "source": "shell",
+                                                        "command": "cat docs/gateway.md",
+                                                        "cwd": "/tmp",
+                                                    },
                                                 })),
                                             },
                                         ),
@@ -28726,6 +30083,16 @@ stream_max_retries = 0
                                         .and_then(serde_json::Value::as_bool),
                                     Some(true)
                                 );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "skills/changed".to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
                                 serde_json::json!({
                                     "effectiveEnabled": true,
                                 })
@@ -28905,6 +30272,14 @@ stream_max_retries = 0
                                     "samplePaths": ["C:\\shared-temp"],
                                     "extraCount": 2,
                                     "failedScan": false,
+                                },
+                            }),
+                            serde_json::json!({
+                                "method": "windowsSandbox/setupCompleted",
+                                "params": {
+                                    "mode": "unelevated",
+                                    "success": true,
+                                    "error": null,
                                 },
                             }),
                         ] {
@@ -29740,6 +31115,539 @@ stream_max_retries = 0
                                 )
                                 .await;
                             }
+                            "externalAgentConfig/import" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "migrationItems": [],
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "externalAgentConfig/import/completed"
+                                                .to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            "marketplace/add" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "source": "https://example.com/reconnected-marketplace.git",
+                                        "refName": "main",
+                                        "sparsePaths": ["plugins/reconnected-plugin"],
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "marketplaceName": "reconnected-marketplace",
+                                            "installedRoot": "/tmp/reconnected-project/marketplace",
+                                            "alreadyAdded": false,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "skills/config/write" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "path": "/tmp/reconnected-project/.codex/skills/reconnected-skill",
+                                        "name": null,
+                                        "enabled": true,
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({
+                                            "effectiveEnabled": true,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "skills/changed".to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            "experimentalFeature/enablement/set" => {
+                                let enablement = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("enablement"))
+                                    .cloned()
+                                    .expect(
+                                        "experimentalFeature/enablement/set should include enablement",
+                                    );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "enablement": enablement,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "config/mcpServer/reload" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "config/batchWrite" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "edits": [],
+                                        "filePath": "/tmp/reconnected-project/config.toml",
+                                        "expectedVersion": null,
+                                        "reloadUserConfig": true,
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "status": "ok",
+                                            "version": "reconnected-version-1",
+                                            "filePath": "/tmp/reconnected-project/config.toml",
+                                            "overriddenMetadata": null,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "config/value/write" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "keyPath": "plugins.reconnected-plugin",
+                                        "value": {
+                                            "enabled": true,
+                                        },
+                                        "mergeStrategy": "upsert",
+                                        "filePath": null,
+                                        "expectedVersion": null,
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "status": "ok",
+                                            "version": "reconnected-version-1",
+                                            "filePath": "/tmp/reconnected-project/config.toml",
+                                            "overriddenMetadata": null,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "memory/reset" | "account/logout" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "feedback/upload" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "classification": "bug",
+                                        "reason": "gateway single-worker recovery",
+                                        "threadId": null,
+                                        "includeLogs": false,
+                                        "extraLogFiles": null,
+                                        "tags": null,
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "threadId": "feedback-thread-reconnected",
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "account/sendAddCreditsNudgeEmail" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "creditType": "credits",
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "status": "sent",
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fs/createDirectory" | "fs/writeFile" | "fs/copy" | "fs/remove" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fs/readFile" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "dataBase64": "cmVjb25uZWN0ZWQtZmlsZQ==",
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fs/getMetadata" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "isDirectory": false,
+                                            "isFile": true,
+                                            "isSymlink": false,
+                                            "createdAtMs": 0,
+                                            "modifiedAtMs": 0,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fs/readDirectory" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "entries": [{
+                                                "fileName": "gateway.txt",
+                                                "isDirectory": false,
+                                                "isFile": true,
+                                            }],
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fs/watch" => {
+                                let watch_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("watchId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("fs/watch should include watchId");
+                                assert_eq!(watch_id, "reconnected-watch");
+                                let path = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("path"))
+                                    .cloned()
+                                    .expect("fs/watch should include path");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "path": path,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fs/changed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "watchId": watch_id,
+                                                "changedPaths": [path],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            "fuzzyFileSearch" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "query": "reconnect",
+                                        "roots": ["/tmp/reconnected-project"],
+                                        "cancellationToken": "reconnected-fuzzy-search",
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "files": [{
+                                                "root": "/tmp/reconnected-project",
+                                                "path": "docs/reconnected.md",
+                                                "match_type": "file",
+                                                "file_name": "reconnected.md",
+                                                "score": 42,
+                                                "indices": [0, 1, 2],
+                                            }],
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fuzzyFileSearch/sessionStart" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "sessionId": "reconnected-fuzzy-session",
+                                        "roots": ["/tmp/reconnected-project"],
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "fuzzyFileSearch/sessionUpdate" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "sessionId": "reconnected-fuzzy-session",
+                                        "query": "reconnect",
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fuzzyFileSearch/sessionUpdated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "sessionId": "reconnected-fuzzy-session",
+                                                "query": "reconnect",
+                                                "files": [{
+                                                    "root": "/tmp/reconnected-project",
+                                                    "path": "docs/reconnected.md",
+                                                    "match_type": "file",
+                                                    "file_name": "reconnected.md",
+                                                    "score": 42,
+                                                    "indices": [0, 1, 2],
+                                                }],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            "fuzzyFileSearch/sessionStop" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "sessionId": "reconnected-fuzzy-session",
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fuzzyFileSearch/sessionCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "sessionId": "reconnected-fuzzy-session",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            "windowsSandbox/setupStart" => {
+                                assert_eq!(
+                                    request.params,
+                                    Some(serde_json::json!({
+                                        "mode": "unelevated",
+                                        "cwd": "/tmp/reconnected-project",
+                                    })),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "started": true,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "windowsSandbox/setupCompleted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "mode": "unelevated",
+                                                "success": true,
+                                                "error": null,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                            }
+                            "command/exec" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec should include processId");
+                                assert_eq!(process_id, "proc-remote");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "command/exec/outputDelta".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "processId": process_id,
+                                                "stream": "stdout",
+                                                "deltaBase64": "cmVtb3RlLWNvbW1hbmQ=",
+                                                "capReached": false,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "exitCode": 0,
+                                            "stdout": "",
+                                            "stderr": "",
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "command/exec/write" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec/write should include processId");
+                                assert_eq!(process_id, "proc-remote");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "command/exec/resize" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec/resize should include processId");
+                                assert_eq!(process_id, "proc-remote");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "command/exec/terminate" => {
+                                let process_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("processId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("command/exec/terminate should include processId");
+                                assert_eq!(process_id, "proc-remote");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                            }
                             "mcpServer/oauth/login" => {
                                 assert_eq!(
                                     request.params,
@@ -30355,14 +32263,37 @@ stream_max_retries = 0
                                 }],
                             }),
                             "fs/remove" | "fs/copy" => serde_json::json!({}),
-                            "fs/watch" => serde_json::json!({
-                                "path": request
+                            "fs/watch" => {
+                                let watch_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("watchId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("fs/watch should include watchId");
+                                assert_eq!(watch_id, "remote-watch");
+                                let path = request
                                     .params
                                     .as_ref()
                                     .and_then(|params| params.get("path"))
                                     .cloned()
-                                    .expect("fs/watch should include path"),
-                            }),
+                                    .expect("fs/watch should include path");
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "fs/changed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "watchId": watch_id,
+                                                "changedPaths": [path.clone()],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({
+                                    "path": path,
+                                })
+                            }
                             "fs/unwatch" => serde_json::json!({}),
                             "fuzzyFileSearch" => serde_json::json!({
                                 "files": [{
@@ -32203,6 +34134,16 @@ stream_max_retries = 0
                                         .and_then(serde_json::Value::as_bool),
                                     Some(true)
                                 );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "skills/changed".to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
                                 serde_json::json!({
                                     "effectiveEnabled": true,
                                 })
@@ -33074,6 +35015,7 @@ stream_max_retries = 0
 
                         loop {
                             let request = read_websocket_request(&mut websocket).await;
+                            let method = request.method.clone();
                             let result = match request.method.as_str() {
                                 "account/read" => serde_json::json!({
                                     "account": account,
@@ -33693,6 +35635,92 @@ stream_max_retries = 0
                                 }),
                             )
                             .await;
+                            match method.as_str() {
+                                "account/read" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "account/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "authMode": null,
+                                                    "planType": null,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                "account/rateLimits/read" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "account/rateLimits/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "rateLimits": {
+                                                        "limitId": format!("{worker_label}-notification"),
+                                                        "limitName": format!("{worker_label} Notification"),
+                                                        "primary": {
+                                                            "usedPercent": 77,
+                                                            "windowMinutes": 300,
+                                                            "resetsAt": 1_700_000_000,
+                                                        },
+                                                        "secondary": null,
+                                                        "credits": null,
+                                                        "planType": null,
+                                                        "rateLimitReachedType": null,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                "app/list" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "app/list/updated".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "data": [{
+                                                        "id": format!("{worker_label}-notification-app"),
+                                                        "name": format!("{worker_label} Notification App"),
+                                                        "description": "Recovered worker app update",
+                                                        "logoUrl": null,
+                                                        "logoUrlDark": null,
+                                                        "distributionChannel": null,
+                                                        "branding": null,
+                                                        "appMetadata": null,
+                                                        "labels": null,
+                                                        "installUrl": null,
+                                                        "isAccessible": false,
+                                                        "isEnabled": true,
+                                                        "pluginDisplayNames": [],
+                                                    }],
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "windowsSandbox/setupCompleted".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "mode": "unelevated",
+                                                    "success": true,
+                                                    "error": null,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     _ => unreachable!("unexpected connection index"),
@@ -34202,6 +36230,14 @@ stream_max_retries = 0
                                 "samplePaths": ["C:\\shared-temp"],
                                 "extraCount": 2,
                                 "failedScan": false,
+                            },
+                        }),
+                        serde_json::json!({
+                            "method": "windowsSandbox/setupCompleted",
+                            "params": {
+                                "mode": "unelevated",
+                                "success": true,
+                                "error": null,
                             },
                         }),
                     ] {
@@ -34922,6 +36958,80 @@ stream_max_retries = 0
                                                 "turnId": turn_id,
                                                 "item": {
                                                     "type": "other",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "error".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "willRetry": false,
+                                                "error": {
+                                                    "message": format!("recoverable warning {thread_id}"),
+                                                    "codexErrorInfo": null,
+                                                    "additionalDetails": "gateway multi-worker warning",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/autoApprovalReview/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "reviewId": format!("guardian-{thread_id}"),
+                                                "targetItemId": format!("cmd-{thread_id}"),
+                                                "review": {
+                                                    "status": "inProgress",
+                                                    "riskLevel": null,
+                                                    "userAuthorization": null,
+                                                    "rationale": null,
+                                                },
+                                                "action": {
+                                                    "type": "command",
+                                                    "source": "shell",
+                                                    "command": "cat docs/gateway.md",
+                                                    "cwd": "/tmp",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/autoApprovalReview/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "reviewId": format!("guardian-{thread_id}"),
+                                                "targetItemId": format!("cmd-{thread_id}"),
+                                                "decisionSource": "agent",
+                                                "review": {
+                                                    "status": "approved",
+                                                    "riskLevel": "low",
+                                                    "userAuthorization": "low",
+                                                    "rationale": "Read-only command.",
+                                                },
+                                                "action": {
+                                                    "type": "command",
+                                                    "source": "shell",
+                                                    "command": "cat docs/gateway.md",
+                                                    "cwd": "/tmp",
                                                 },
                                             })),
                                         },

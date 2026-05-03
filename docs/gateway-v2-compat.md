@@ -343,8 +343,8 @@ Recent progress:
   `hookStarted` and `hookCompleted`
 - dedicated northbound gateway coverage now also exercises guardian review
   lifecycle notifications for approval auto-review UX, covering
-  `item/guardianApprovalReviewStarted` and
-  `item/guardianApprovalReviewCompleted`
+  `item/autoApprovalReview/started` and
+  `item/autoApprovalReview/completed`
 - dedicated northbound gateway coverage now also exercises richer turn
   notifications that the TUI consumes opportunistically, including
   `error`, `plan/delta`, `reasoning/summaryTextDelta`,
@@ -529,7 +529,8 @@ Recent progress:
   discovery, including `externalAgentConfig/detect`,
   `externalAgentConfig/import`, `app/list`, `skills/list`,
   `mcpServerStatus/list`, `mcpServer/oauth/login`, `plugin/list`,
-  `plugin/read`, `config/batchWrite`, `memory/reset`, and `account/logout`
+  `plugin/read`, `config/batchWrite`, `memory/reset`, `account/logout`, and
+  `account/sendAddCreditsNudgeEmail`
 - that same real single-worker remote harness now also covers the
   supporting/configuration methods that some clients and test tools use
   outside the main TUI flow: `config/read`, `configRequirements/read`,
@@ -540,6 +541,9 @@ Recent progress:
   `experimentalFeature/enablement/set`, `config/mcpServer/reload`,
   `mcpServer/resource/read`, `mcpServer/tool/call`, and
   `account/sendAddCreditsNudgeEmail`
+- that same real single-worker reconnect harness now also verifies that
+  `feedback/upload` still succeeds after worker recovery, so feedback
+  submission remains part of the recovered single-worker release-gate path
 - that same real single-worker remote harness now also covers plugin
   management flows current clients use after bootstrap, including
   `plugin/install` and `plugin/uninstall`, and verifies the resulting
@@ -1073,6 +1077,22 @@ Recent progress:
   v2 session can still satisfy `account/read` and `account/rateLimits/read`,
   so bootstrap account state and background rate-limit refresh survive worker
   recovery too
+- that same single-worker reconnect regression now also verifies the recovered
+  v2 session can still apply low-frequency setup mutations:
+  `externalAgentConfig/import`, `marketplace/add`, `skills/config/write`,
+  `experimentalFeature/enablement/set`, `config/mcpServer/reload`,
+  `config/batchWrite`, `config/value/write`, `memory/reset`, and
+  `account/logout`, so the single-worker release-quality baseline covers
+  post-reconnect setup writes as well as discovery refreshes
+- that same single-worker reconnect regression now also verifies the recovered
+  v2 session can still complete the basic filesystem operation family:
+  `fs/createDirectory`, `fs/writeFile`, `fs/readFile`, `fs/getMetadata`,
+  `fs/readDirectory`, `fs/copy`, and `fs/remove`
+- that same single-worker reconnect regression now also verifies the recovered
+  v2 session can still complete the standalone command-execution control
+  plane: `command/exec`, `command/exec/outputDelta`,
+  `command/exec/write`, `command/exec/resize`, and
+  `command/exec/terminate`
 - that same single-worker reconnect regression now also verifies the recovered
   v2 session can still complete the post-bootstrap plugin-management path:
   `plugin/read`, `plugin/install`, and `plugin/uninstall`, including the
@@ -1896,11 +1916,28 @@ Operational notes:
 - dedicated northbound notification coverage now also pins `fs/changed`, so
   filesystem watch change delivery is validated at the gateway v2 compatibility
   boundary alongside `fs/watch` and `fs/unwatch`
+- the real single-worker remote compatibility harness now also observes
+  `fs/changed` after `fs/watch`, so filesystem watch notification delivery is
+  covered by the release-quality remote baseline as well as targeted
+  northbound and multi-worker Stage B coverage
+- the real single-worker remote reconnect harness now also replays `fs/watch`
+  after worker recovery and observes the recovered worker's `fs/changed`
+  notification on the same northbound client session
+- that same single-worker remote reconnect harness now also replays
+  `windowsSandbox/setupStart` after worker recovery and observes the recovered
+  worker's `windowsSandbox/setupCompleted` notification on the same northbound
+  client session
 - dedicated northbound passthrough coverage now also pins
   `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
   `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`, plus the
   `fuzzyFileSearch/sessionUpdated` and `fuzzyFileSearch/sessionCompleted`
   notifications used by streaming file-picker sessions
+- the real single-worker remote reconnect harness now also replays
+  `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
+  `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop` after
+  worker recovery, plus the resulting `fuzzyFileSearch/sessionUpdated` and
+  `fuzzyFileSearch/sessionCompleted` notifications on the same northbound
+  client session
 - dedicated northbound passthrough coverage now also pins the basic filesystem
   operation family: `fs/readFile`, `fs/writeFile`, `fs/createDirectory`,
   `fs/getMetadata`, `fs/readDirectory`, `fs/remove`, and `fs/copy`
@@ -1930,12 +1967,24 @@ Operational notes:
   fanout setup mutations, while the primary-worker harness covers
   `account/sendAddCreditsNudgeEmail` without duplicating the one-shot email
   side effect across workers
+- that same steady-state setup mutation harness now also observes the
+  `skills/changed` invalidation emitted after `skills/config/write` fanout and
+  verifies duplicate worker emissions remain suppressed on the shared
+  `RemoteAppServerClient` session
 - the real multi-worker same-session recovery harness now also re-exercises
   `marketplace/add`, `skills/config/write`,
   `experimentalFeature/enablement/set`, and `config/mcpServer/reload` after a
   recovered worker is re-added, so these low-frequency setup mutations continue
   to fan out across the full worker set without requiring a northbound
   reconnect
+- that same recovered setup-mutation harness now also observes the
+  `skills/changed` invalidation emitted after `skills/config/write` fanout and
+  verifies duplicate worker emissions remain suppressed on the shared
+  `RemoteAppServerClient` session after worker re-add
+- that same recovered setup-mutation harness now also observes
+  `externalAgentConfig/import/completed` after `externalAgentConfig/import`
+  fanout and verifies duplicate worker completions remain suppressed on the
+  shared `RemoteAppServerClient` session after worker re-add
 - the real multi-worker same-session recovery harness now also re-exercises
   `account/sendAddCreditsNudgeEmail` after the primary worker is re-added, so
   recovered sessions keep that one-shot account side effect on the primary
@@ -2033,6 +2082,16 @@ Operational notes:
   visible on the shared northbound v2 session; the real multi-worker
   same-session bootstrap recovery harness now also observes that notification
   through an unmodified `RemoteAppServerClient` session
+- that same real multi-worker bootstrap recovery harness now also observes
+  recovered-worker `account/updated`, `account/rateLimits/updated`, and
+  `app/list/updated` delivery after the corresponding discovery refreshes, so
+  the core connection-state notification set is exercised through one shared
+  `RemoteAppServerClient` session after worker re-add
+- the real connection-state notification harnesses now also observe
+  `windowsSandbox/setupCompleted` through unmodified `RemoteAppServerClient`
+  sessions in steady state, after reconnect, and in the multi-worker duplicate
+  suppression path; the same-session bootstrap recovery harness also observes
+  that notification after a worker is lazily re-added
 - dedicated reconnect-backoff coverage now also pins
   `mcpServer/oauth/login` fail-closed behavior while a worker-discovery route
   is unavailable, so gateway routing does not continue from an incomplete MCP
@@ -2124,6 +2183,20 @@ Current Stage A compatibility caveats:
   `RemoteAppServerClient` session, so lower-frequency turn notification
   forwarding no longer relies only on targeted northbound fixtures in the
   multi-worker Stage B profile
+- the real multi-worker same-session recovery harness now also observes that
+  same lower-frequency turn notification set after a worker is lazily
+  re-added, so recovered-worker turn replay is covered beyond the basic
+  lifecycle and streaming-delta notifications
+- that real multi-worker turn coverage now also observes
+  `item/autoApprovalReview/started` and
+  `item/autoApprovalReview/completed` through unmodified
+  `RemoteAppServerClient` sessions in steady state and after worker re-add, so
+  guardian approval auto-review notification forwarding no longer relies only
+  on targeted northbound fixtures in the bounded Stage B profile
+- that real multi-worker turn coverage now also observes turn-scoped `error`
+  notifications in steady state and after worker re-add, so opportunistic
+  warning/error notification forwarding is covered by broad Stage B client
+  traffic as well as targeted gateway regressions
 - multi-worker remote runtime should still be treated as a bounded Stage B
   profile with explicit rollout guardrails, not as the default drop-in
   compatibility target
