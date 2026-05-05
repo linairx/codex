@@ -851,6 +851,7 @@ mod tests {
     use codex_app_server_protocol::ExperimentalFeatureListResponse;
     use codex_app_server_protocol::ExternalAgentConfigDetectParams;
     use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
+    use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
     use codex_app_server_protocol::ExternalAgentConfigImportParams;
     use codex_app_server_protocol::ExternalAgentConfigImportResponse;
     use codex_app_server_protocol::FeedbackUploadParams;
@@ -4631,6 +4632,508 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn embedded_server_supports_drop_in_v2_client_plan_item_workflow() {
+        let full_message = "Intro\n<proposed_plan>\n- Step 1\n</proposed_plan>\nOutro";
+        let model_server = start_mock_responses_server_sequence(vec![responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_message_item_added("msg-1", ""),
+            responses::ev_output_text_delta(full_message),
+            responses::ev_assistant_message("msg-1", full_message),
+            responses::ev_completed("resp-1"),
+        ])])
+        .await;
+        let codex_home = tempdir().expect("tempdir");
+        write_mock_responses_config_toml(codex_home.path(), &model_server.uri)
+            .expect("config.toml should be written");
+        let config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .expect("config");
+        let server = start_embedded_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                enable_codex_api_key_env: false,
+                session_source: SessionSource::Cli,
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 64,
+        })
+        .await
+        .expect("remote client should connect to embedded gateway");
+
+        let started: AppServerThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some(codex_home.path().display().to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(false),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect("thread/start should succeed through embedded gateway");
+
+        let turn_started_response: TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(2),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "make a plan".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    responsesapi_client_metadata: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_policy: None,
+                    model: None,
+                    service_tier: None,
+                    effort: None,
+                    summary: None,
+                    personality: None,
+                    output_schema: None,
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Plan,
+                        settings: Settings {
+                            model: "mock-model".to_string(),
+                            reasoning_effort: None,
+                            developer_instructions: None,
+                        },
+                    }),
+                },
+            })
+            .await
+            .expect("turn/start should succeed through embedded gateway");
+        let turn_id = turn_started_response.turn.id.clone();
+        let expected_plan_item_id = format!("{turn_id}-plan");
+        let mut saw_plan_started = false;
+        let mut saw_plan_completed = false;
+        let mut saw_turn_completed = false;
+
+        timeout(Duration::from_secs(10), async {
+            while !(saw_plan_started && saw_plan_completed && saw_turn_completed) {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::Plan { id, text } if id == &expected_plan_item_id
+                                && text.is_empty()
+                        ) =>
+                    {
+                        saw_plan_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::Plan { id, text } if id == &expected_plan_item_id
+                                && text == "- Step 1\n"
+                        ) =>
+                    {
+                        saw_plan_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == turn_id
+                        && notification.turn.status == TurnStatus::Completed =>
+                    {
+                        assert_eq!(
+                            saw_plan_started, true,
+                            "plan item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_plan_completed, true,
+                            "plan item should complete before turn completion"
+                        );
+                        saw_turn_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("plan item notifications should arrive");
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+        model_server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn remote_single_worker_supports_drop_in_v2_client_plan_item_workflow() {
+        let websocket_url = start_mock_remote_workflow_server().await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url,
+                        auth_token: None,
+                    }],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 64,
+        })
+        .await
+        .expect("remote client should connect to remote gateway");
+
+        let started: AppServerThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/remote-project".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect("thread/start should succeed through remote gateway");
+
+        let turn_started_response: TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(2),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "make a remote plan".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    responsesapi_client_metadata: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_policy: None,
+                    model: None,
+                    service_tier: None,
+                    effort: None,
+                    summary: None,
+                    personality: None,
+                    output_schema: None,
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Plan,
+                        settings: Settings {
+                            model: "mock-model".to_string(),
+                            reasoning_effort: None,
+                            developer_instructions: None,
+                        },
+                    }),
+                },
+            })
+            .await
+            .expect("turn/start should succeed through remote gateway");
+        let turn_id = turn_started_response.turn.id.clone();
+        let mut saw_plan_started = false;
+        let mut saw_plan_completed = false;
+        let mut saw_turn_completed = false;
+
+        timeout(Duration::from_secs(5), async {
+            while !(saw_plan_started && saw_plan_completed && saw_turn_completed) {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::Plan { id, text } if id == "plan-remote-workflow"
+                                && text.is_empty()
+                        ) =>
+                    {
+                        saw_plan_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::Plan { id, text } if id == "plan-remote-workflow"
+                                && text == "- Remote step\n"
+                        ) =>
+                    {
+                        saw_plan_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == turn_id
+                        && notification.turn.status == TurnStatus::Completed =>
+                    {
+                        assert_eq!(
+                            saw_plan_started, true,
+                            "plan item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_plan_completed, true,
+                            "plan item should complete before turn completion"
+                        );
+                        saw_turn_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("remote plan item notifications should arrive");
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_supports_drop_in_v2_client_plan_item_workflow() {
+        let worker_a = start_mock_remote_workflow_server().await;
+        let worker_b =
+            start_mock_remote_multi_connection_thread_server("thread-worker-b", "/tmp/worker-b")
+                .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 64,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let started: AppServerThreadStartResponse = client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/remote-project".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect("thread/start should succeed through multi-worker gateway");
+
+        let turn_started_response: TurnStartResponse = client
+            .request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(2),
+                params: TurnStartParams {
+                    thread_id: started.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "make a multi-worker plan".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    responsesapi_client_metadata: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_policy: None,
+                    model: None,
+                    service_tier: None,
+                    effort: None,
+                    summary: None,
+                    personality: None,
+                    output_schema: None,
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Plan,
+                        settings: Settings {
+                            model: "mock-model".to_string(),
+                            reasoning_effort: None,
+                            developer_instructions: None,
+                        },
+                    }),
+                },
+            })
+            .await
+            .expect("turn/start should route to the owning worker through multi-worker gateway");
+        let turn_id = turn_started_response.turn.id.clone();
+        let mut saw_plan_started = false;
+        let mut saw_plan_completed = false;
+        let mut saw_turn_completed = false;
+
+        timeout(Duration::from_secs(5), async {
+            while !(saw_plan_started && saw_plan_completed && saw_turn_completed) {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::Plan { id, text } if id == "plan-remote-workflow"
+                                && text.is_empty()
+                        ) =>
+                    {
+                        saw_plan_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::Plan { id, text } if id == "plan-remote-workflow"
+                                && text == "- Remote step\n"
+                        ) =>
+                    {
+                        saw_plan_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == turn_id
+                        && notification.turn.status == TurnStatus::Completed =>
+                    {
+                        assert_eq!(
+                            saw_plan_started, true,
+                            "plan item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_plan_completed, true,
+                            "plan item should complete before turn completion"
+                        );
+                        saw_turn_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("multi-worker plan item notifications should arrive");
+
+        assert_remote_client_shutdown(client.shutdown().await);
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn embedded_server_supports_drop_in_v2_client_thread_control_workflow() {
         let model_server = start_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = tempdir().expect("tempdir");
@@ -6241,6 +6744,7 @@ stream_max_retries = 0
         assert_eq!(turn_started_response.turn.status, TurnStatus::InProgress);
 
         let mut coverage = TurnStreamingCoverage::default();
+        let mut extended_notifications = HashSet::new();
         let turn_lifecycle_result = timeout(Duration::from_secs(5), async {
             while coverage
                 != (TurnStreamingCoverage {
@@ -6257,6 +6761,7 @@ stream_max_retries = 0
                     saw_item_completed: true,
                     saw_turn_completed: true,
                 })
+                || extended_notifications != expected_extended_turn_notifications()
             {
                 let event = client
                     .next_event()
@@ -6322,6 +6827,16 @@ stream_max_retries = 0
                             coverage.saw_agent_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(ServerNotification::PlanDelta(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.delta == "remote plan"
+                        {
+                            extended_notifications.insert("plan_delta");
+                        }
+                    }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryTextDelta(notification),
                     ) => {
@@ -6333,6 +6848,16 @@ stream_max_retries = 0
                             coverage.saw_reasoning_summary_delta = true;
                         }
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ReasoningSummaryPartAdded(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.summary_index == 0
+                        {
+                            extended_notifications.insert("reasoning_summary_part_added");
+                        }
+                    }
                     AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
                         notification,
                     )) => {
@@ -6342,6 +6867,17 @@ stream_max_retries = 0
                             && notification.content_index == 0
                         {
                             coverage.saw_reasoning_text_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::TerminalInteraction(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.process_id == "proc-remote-workflow"
+                            && notification.stdin == "y\n"
+                        {
+                            extended_notifications.insert("terminal_interaction");
                         }
                     }
                     AppServerEvent::ServerNotification(
@@ -6363,6 +6899,110 @@ stream_max_retries = 0
                         {
                             coverage.saw_file_change_delta = true;
                         }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnDiffUpdated(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.diff == "remote diff"
+                        {
+                            extended_notifications.insert("turn_diff_updated");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::TurnPlanUpdated(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.explanation.as_deref()
+                                == Some("single-worker remote plan")
+                            && notification.plan.len() == 1
+                            && notification.plan[0].step == "remote plan step"
+                        {
+                            extended_notifications.insert("turn_plan_updated");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadTokenUsageUpdated(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.token_usage.total.total_tokens == 42
+                        {
+                            extended_notifications.insert("thread_token_usage_updated");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::McpToolCallProgress(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.message == "remote mcp progress"
+                        {
+                            extended_notifications.insert("mcp_tool_call_progress");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ContextCompacted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                        {
+                            extended_notifications.insert("context_compacted");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ModelRerouted(
+                        notification,
+                    )) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.from_model == "gpt-5"
+                            && notification.to_model == "gpt-5-codex"
+                        {
+                            extended_notifications.insert("model_rerouted");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::RawResponseItemCompleted(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                        {
+                            extended_notifications.insert("raw_response_item_completed");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ItemGuardianApprovalReviewStarted(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.review_id == "guardian-thread-remote-workflow"
+                            && notification.target_item_id.as_deref()
+                                == Some("cmd-thread-remote-workflow")
+                        {
+                            extended_notifications.insert("guardian_review_started");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ItemGuardianApprovalReviewCompleted(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && notification.review_id == "guardian-thread-remote-workflow"
+                            && notification.target_item_id.as_deref()
+                                == Some("cmd-thread-remote-workflow")
+                        {
+                            extended_notifications.insert("guardian_review_completed");
+                        }
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::Error(notification))
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == "turn-remote-workflow"
+                            && !notification.will_retry
+                            && notification.error.message == "remote workflow warning" =>
+                    {
+                        extended_notifications.insert("error");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
                         notification,
@@ -6410,7 +7050,7 @@ stream_max_retries = 0
         assert_eq!(
             turn_lifecycle_result.is_ok(),
             true,
-            "turn lifecycle notifications should arrive: {coverage:?}"
+            "turn lifecycle notifications should arrive: {coverage:?} extended={extended_notifications:?}"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -7315,6 +7955,27 @@ stream_max_retries = 0
             .await
             .expect("externalAgentConfig/import should succeed through remote gateway");
         assert_eq!(imported, ExternalAgentConfigImportResponse {});
+
+        let import_completed = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(
+                    ServerNotification::ExternalAgentConfigImportCompleted(notification),
+                ) = event
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("externalAgentConfig/import/completed notification should arrive");
+        assert_eq!(
+            import_completed,
+            ExternalAgentConfigImportCompletedNotification {}
+        );
 
         let config_read: ConfigReadResponse = client
             .request_typed(ClientRequest::ConfigRead {
@@ -16750,6 +17411,33 @@ stream_max_retries = 0
             .expect("account/logout should reconnect and fan out");
         assert_eq!(logout, LogoutAccountResponse {});
 
+        let logout_account_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after account/logout");
+                if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                    notification,
+                )) = event
+                    && notification.auth_mode.is_none()
+                    && notification.plan_type.is_none()
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("account/updated should arrive after recovered account/logout fanout");
+        assert_eq!(logout_account_updated.auth_mode, None);
+        assert_eq!(logout_account_updated.plan_type, None);
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate account/updated should be suppressed after recovered account/logout fanout"
+        );
+
         let watch: FsWatchResponse = client
             .request_typed(ClientRequest::FsWatch {
                 request_id: RequestId::Integer(10),
@@ -18080,6 +18768,121 @@ stream_max_retries = 0
         })
         .await
         .expect("connection-state notifications should fan in after worker recovery");
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate connection-state notifications should be suppressed after worker recovery"
+        );
+
+        let token_login: LoginAccountResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::LoginAccount {
+                request_id: RequestId::Integer(15),
+                params: LoginAccountParams::ChatgptAuthTokens {
+                    access_token: "same-session-recovered-token".to_string(),
+                    chatgpt_account_id: "same-session-recovered-account".to_string(),
+                    chatgpt_plan_type: Some("pro".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("external account/login/start should finish in time")
+        .expect("external account/login/start should fan out through recovered worker");
+        assert_eq!(token_login, LoginAccountResponse::ChatgptAuthTokens {});
+
+        let mut saw_login_completed = false;
+        let mut saw_token_account_updated = false;
+        timeout(Duration::from_secs(5), async {
+            while !(saw_login_completed && saw_token_account_updated) {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::AccountLoginCompleted(notification),
+                    ) if notification.login_id.is_none()
+                        && notification.success
+                        && notification.error.is_none() =>
+                    {
+                        saw_login_completed = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                        notification,
+                    )) if notification.auth_mode == Some(AuthMode::ChatgptAuthTokens)
+                        && notification.plan_type == Some(AccountPlanType::Pro) =>
+                    {
+                        saw_token_account_updated = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("external login notifications should fan in after worker recovery");
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate external login notifications should be suppressed after worker recovery"
+        );
+
+        let api_key_login: LoginAccountResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::LoginAccount {
+                request_id: RequestId::Integer(16),
+                params: LoginAccountParams::ApiKey {
+                    api_key: "sk-same-session-recovered".to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("api-key account/login/start should finish in time")
+        .expect("api-key account/login/start should fan out through recovered worker");
+        assert_eq!(api_key_login, LoginAccountResponse::ApiKey {});
+
+        let api_key_account_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                    notification,
+                )) = event
+                    && notification.auth_mode == Some(AuthMode::ApiKey)
+                    && notification.plan_type.is_none()
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("api-key account/updated notification should fan in after worker recovery");
+        assert_eq!(api_key_account_updated.auth_mode, Some(AuthMode::ApiKey));
+        assert_eq!(api_key_account_updated.plan_type, None);
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate api-key account/updated should be suppressed after worker recovery"
+        );
+
+        let api_key_account: GetAccountResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(17),
+                params: GetAccountParams {
+                    refresh_token: false,
+                },
+            }),
+        )
+        .await
+        .expect("account/read after api-key login should finish in time")
+        .expect("account/read should reflect recovered-worker api-key fanout");
+        assert_eq!(api_key_account.account, Some(Account::ApiKey {}));
+        assert_eq!(api_key_account.requires_openai_auth, false);
 
         let skills: SkillsListResponse = timeout(
             Duration::from_secs(5),
@@ -19128,6 +19931,33 @@ stream_max_retries = 0
         .expect("account/logout should finish in time")
         .expect("account/logout should fan out through multi-worker gateway");
         assert_eq!(logout, LogoutAccountResponse {});
+
+        let account_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after account/logout");
+                if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                    notification,
+                )) = event
+                    && notification.auth_mode.is_none()
+                    && notification.plan_type.is_none()
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("account/updated should arrive after account/logout fanout");
+        assert_eq!(account_updated.auth_mode, None);
+        assert_eq!(account_updated.plan_type, None);
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate account/updated should be suppressed after account/logout fanout"
+        );
 
         let expected_methods = vec![
             "externalAgentConfig/import".to_string(),
@@ -21375,6 +22205,12 @@ stream_max_retries = 0
         .expect("account/updated notification should arrive");
         assert_eq!(account_updated.auth_mode, Some(AuthMode::ChatgptAuthTokens));
         assert_eq!(account_updated.plan_type, Some(AccountPlanType::Pro));
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate external-auth notifications should be suppressed after token login fanout"
+        );
 
         let cancel_login: CancelLoginAccountResponse = timeout(
             Duration::from_secs(5),
@@ -21597,7 +22433,7 @@ stream_max_retries = 0
         .await
         .expect("server");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -21637,6 +22473,33 @@ stream_max_retries = 0
         .expect("account/login/start should finish in time")
         .expect("account/login/start should succeed through multi-worker gateway");
         assert_eq!(login, LoginAccountResponse::ApiKey {});
+
+        let account_updated = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after api-key login");
+                if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                    notification,
+                )) = event
+                    && notification.auth_mode == Some(AuthMode::ApiKey)
+                    && notification.plan_type.is_none()
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("account/updated notification should arrive after api-key login fanout");
+        assert_eq!(account_updated.auth_mode, Some(AuthMode::ApiKey));
+        assert_eq!(account_updated.plan_type, None);
+        assert!(
+            timeout(Duration::from_millis(200), client.next_event())
+                .await
+                .is_err(),
+            "duplicate account/updated should be suppressed after api-key login fanout"
+        );
 
         let account_after: GetAccountResponse = timeout(
             Duration::from_secs(5),
@@ -28230,6 +29093,61 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/autoApprovalReview/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "reviewId": format!("guardian-{thread_id}"),
+                                                "targetItemId": format!("cmd-{thread_id}"),
+                                                "review": {
+                                                    "status": "inProgress",
+                                                    "riskLevel": null,
+                                                    "userAuthorization": null,
+                                                    "rationale": null,
+                                                },
+                                                "action": {
+                                                    "type": "command",
+                                                    "source": "shell",
+                                                    "command": "cat docs/gateway.md",
+                                                    "cwd": "/tmp",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/autoApprovalReview/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "reviewId": format!("guardian-{thread_id}"),
+                                                "targetItemId": format!("cmd-{thread_id}"),
+                                                "decisionSource": "agent",
+                                                "review": {
+                                                    "status": "approved",
+                                                    "riskLevel": "low",
+                                                    "userAuthorization": "low",
+                                                    "rationale": "Read-only command.",
+                                                },
+                                                "action": {
+                                                    "type": "command",
+                                                    "source": "shell",
+                                                    "command": "cat docs/gateway.md",
+                                                    "cwd": "/tmp",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
                                             method: "hook/completed".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
@@ -30261,7 +31179,23 @@ stream_max_retries = 0
                                 })
                             }
                             "fs/unwatch" => serde_json::json!({}),
-                            "memory/reset" | "account/logout" => serde_json::json!({}),
+                            "memory/reset" => serde_json::json!({}),
+                            "account/logout" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "account/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "authMode": null,
+                                                "planType": null,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({})
+                            }
                             method => panic!("unexpected request method: {method}"),
                         };
                         write_websocket_message(
@@ -31981,7 +32915,28 @@ stream_max_retries = 0
                             "externalAgentConfig/detect" => serde_json::json!({
                                 "items": [],
                             }),
-                            "externalAgentConfig/import" => serde_json::json!({}),
+                            "externalAgentConfig/import" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({}),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "externalAgentConfig/import/completed"
+                                                .to_string(),
+                                            params: Some(serde_json::json!({})),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
                             "config/read" => serde_json::json!({
                                 "config": {
                                     "model": "gpt-5",
@@ -32875,6 +33830,13 @@ stream_max_retries = 0
                                 "reviewThreadId": review_thread_id,
                             }),
                             "turn/start" => {
+                                let is_plan_mode = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("collaborationMode"))
+                                    .and_then(|collaboration_mode| collaboration_mode.get("mode"))
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("plan");
                                 write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Response(JSONRPCResponse {
@@ -32885,6 +33847,44 @@ stream_max_retries = 0
                                     }),
                                 )
                                 .await;
+                                if is_plan_mode {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "item": {
+                                                        "type": "plan",
+                                                        "id": "plan-remote-workflow",
+                                                        "text": "",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/completed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "item": {
+                                                        "type": "plan",
+                                                        "id": "plan-remote-workflow",
+                                                        "text": "- Remote step\n",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
                                 write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
@@ -32958,6 +33958,249 @@ stream_max_retries = 0
                                                 "turnId": turn_id,
                                                 "itemId": "patch-remote-workflow",
                                                 "delta": "remote patch",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/plan/delta".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": "plan-remote-workflow",
+                                                "delta": "remote plan",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/reasoning/summaryPartAdded".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": "reasoning-summary-remote-workflow",
+                                                "summaryIndex": 0,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/commandExecution/terminalInteraction"
+                                                .to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": "terminal-remote-workflow",
+                                                "processId": "proc-remote-workflow",
+                                                "stdin": "y\n",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "turn/diff/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "diff": "remote diff",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "turn/plan/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "explanation": "single-worker remote plan",
+                                                "plan": [{
+                                                    "step": "remote plan step",
+                                                    "status": "completed",
+                                                }],
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/tokenUsage/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "tokenUsage": {
+                                                    "total": {
+                                                        "totalTokens": 42,
+                                                        "inputTokens": 20,
+                                                        "cachedInputTokens": 3,
+                                                        "outputTokens": 22,
+                                                        "reasoningOutputTokens": 7,
+                                                    },
+                                                    "last": {
+                                                        "totalTokens": 10,
+                                                        "inputTokens": 4,
+                                                        "cachedInputTokens": 1,
+                                                        "outputTokens": 6,
+                                                        "reasoningOutputTokens": 2,
+                                                    },
+                                                    "modelContextWindow": 200000,
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/mcpToolCall/progress".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "itemId": "mcp-remote-workflow",
+                                                "message": "remote mcp progress",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/compacted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "model/rerouted".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "fromModel": "gpt-5",
+                                                "toModel": "gpt-5-codex",
+                                                "reason": "highRiskCyberActivity",
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "rawResponseItem/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "item": {
+                                                    "type": "other",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/autoApprovalReview/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "reviewId": format!("guardian-{thread_id}"),
+                                                "targetItemId": format!("cmd-{thread_id}"),
+                                                "review": {
+                                                    "status": "inProgress",
+                                                    "riskLevel": null,
+                                                    "userAuthorization": null,
+                                                    "rationale": null,
+                                                },
+                                                "action": {
+                                                    "type": "command",
+                                                    "source": "shell",
+                                                    "command": "cat docs/gateway.md",
+                                                    "cwd": "/tmp",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "item/autoApprovalReview/completed".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "reviewId": format!("guardian-{thread_id}"),
+                                                "targetItemId": format!("cmd-{thread_id}"),
+                                                "decisionSource": "agent",
+                                                "review": {
+                                                    "status": "approved",
+                                                    "riskLevel": "low",
+                                                    "userAuthorization": "low",
+                                                    "rationale": "Read-only command.",
+                                                },
+                                                "action": {
+                                                    "type": "command",
+                                                    "source": "shell",
+                                                    "command": "cat docs/gateway.md",
+                                                    "cwd": "/tmp",
+                                                },
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "error".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "willRetry": false,
+                                                "error": {
+                                                    "message": "remote workflow warning",
+                                                    "codexErrorInfo": null,
+                                                    "additionalDetails": "single-worker remote warning",
+                                                },
                                             })),
                                         },
                                     ),
@@ -34312,7 +35555,23 @@ stream_max_retries = 0
                                 })
                             }
                             "fs/unwatch" => serde_json::json!({}),
-                            "memory/reset" | "account/logout" => serde_json::json!({}),
+                            "memory/reset" => serde_json::json!({}),
+                            "account/logout" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "account/updated".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "authMode": null,
+                                                "planType": null,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                serde_json::json!({})
+                            }
                             method => panic!("unexpected request method: {method}"),
                         };
                         write_websocket_message(
@@ -34774,7 +36033,7 @@ stream_max_retries = 0
                                                 codex_app_server_protocol::JSONRPCNotification {
                                                     method: "account/updated".to_string(),
                                                     params: Some(serde_json::json!({
-                                                        "authMode": "apiKey",
+                                                        "authMode": "apikey",
                                                         "planType": null,
                                                     })),
                                                 },
@@ -35318,7 +36577,7 @@ stream_max_retries = 0
                                                     codex_app_server_protocol::JSONRPCNotification {
                                                         method: "account/updated".to_string(),
                                                         params: Some(serde_json::json!({
-                                                            "authMode": "apiKey",
+                                                            "authMode": "apikey",
                                                             "planType": null,
                                                         })),
                                                     },

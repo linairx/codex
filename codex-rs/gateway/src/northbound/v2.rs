@@ -7627,6 +7627,101 @@ mod tests {
         assert!(saw_degraded_thread_discovery_count);
     }
 
+    fn assert_v2_thread_list_deduplication_metric(
+        metrics: &codex_otel::MetricsClient,
+        selected_worker_id: Option<usize>,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let selected_worker_id = selected_worker_id
+            .map_or_else(|| "none".to_string(), |worker_id| worker_id.to_string());
+        let mut saw_thread_list_deduplication_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_thread_list_deduplications" {
+                saw_thread_list_deduplication_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([(
+                                    "selected_worker_id".to_string(),
+                                    selected_worker_id.clone(),
+                                )])
+                            );
+                        }
+                        _ => panic!("unexpected thread-list deduplication count aggregation"),
+                    },
+                    _ => panic!("unexpected thread-list deduplication count type"),
+                }
+            }
+        }
+        assert!(saw_thread_list_deduplication_count);
+    }
+
+    fn assert_v2_thread_route_recovery_metric(metrics: &codex_otel::MetricsClient, outcome: &str) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_thread_route_recovery_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_thread_route_recoveries" {
+                saw_thread_route_recovery_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([("outcome".to_string(), outcome.to_string())])
+                            );
+                        }
+                        _ => panic!("unexpected thread route recovery count aggregation"),
+                    },
+                    _ => panic!("unexpected thread route recovery count type"),
+                }
+            }
+        }
+        assert!(saw_thread_route_recovery_count);
+    }
+
+    fn assert_no_v2_metric(metrics: &codex_otel::MetricsClient, metric_name: &str) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        for metric in metrics {
+            assert_ne!(metric.name(), metric_name);
+        }
+    }
+
     fn assert_v2_upstream_request_failure_metric(
         metrics: &codex_otel::MetricsClient,
         method: &str,
@@ -7719,6 +7814,10 @@ mod tests {
             }
         }
         assert!(saw_suppressed_notification_count);
+    }
+
+    fn assert_no_v2_suppressed_notification_metric(metrics: &codex_otel::MetricsClient) {
+        assert_no_v2_metric(metrics, "gateway_v2_suppressed_notifications");
     }
 
     fn assert_v2_server_request_lifecycle_metric(
@@ -14430,6 +14529,8 @@ mod tests {
                 project_id: Some("project-visible".to_string()),
             };
             scope_registry.register_thread("thread-shared".to_string(), context.clone());
+            let metrics = in_memory_metrics();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false);
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
@@ -14469,7 +14570,7 @@ mod tests {
                 &router,
                 &scope_registry,
                 &context,
-                &GatewayObservability::default(),
+                &observability,
                 &JSONRPCRequest {
                     id: RequestId::String("thread-list".to_string()),
                     method: "thread/list".to_string(),
@@ -14492,6 +14593,7 @@ mod tests {
                 "/tmp/worker-b"
             );
             assert_eq!(scope_registry.thread_worker_id("thread-shared"), Some(1));
+            assert_v2_thread_list_deduplication_metric(&metrics, Some(1));
         })
         .await;
 
@@ -15806,6 +15908,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_client_request_probes_visible_thread_read_across_workers_when_route_missing() {
+        let metrics = in_memory_metrics();
         let logs = capture_logs_async(async {
             let thread_read_params = serde_json::json!({
                 "threadId": "thread-worker-b",
@@ -15870,7 +15973,7 @@ mod tests {
                     .await
                     .expect("downstream router should connect");
             let admission = GatewayAdmissionController::default();
-            let observability = GatewayObservability::default();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false);
             let connection = GatewayV2ConnectionContext {
                 admission: &admission,
                 observability: &observability,
@@ -15917,6 +16020,9 @@ mod tests {
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("thread-worker-b"));
         assert!(logs.contains("worker_id=Some(1)"));
+        assert_v2_thread_route_recovery_metric(&metrics, "success");
+        assert_no_v2_metric(&metrics, "gateway_v2_fail_closed_requests");
+        assert_no_v2_metric(&metrics, "gateway_v2_upstream_request_failures");
     }
 
     #[tokio::test]
@@ -16031,6 +16137,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_visible_thread_worker_route_logs_when_probe_finds_no_owner() {
+        let metrics = in_memory_metrics();
         let logs = capture_logs_async(async {
             let thread_read_params = serde_json::json!({
                 "threadId": "thread-missing",
@@ -16103,7 +16210,7 @@ mod tests {
                 &router,
                 &scope_registry,
                 &context,
-                &GatewayObservability::default(),
+                &GatewayObservability::new(Some(metrics.clone()), false),
                 "thread-missing",
             )
             .await
@@ -16123,6 +16230,9 @@ mod tests {
         assert!(logs.contains("thread-missing"));
         assert!(logs.contains("attempted_worker_ids=[Some(0), Some(1)]"));
         assert!(logs.contains("attempted_worker_websocket_urls=["));
+        assert_v2_thread_route_recovery_metric(&metrics, "miss");
+        assert_no_v2_metric(&metrics, "gateway_v2_fail_closed_requests");
+        assert_no_v2_metric(&metrics, "gateway_v2_upstream_request_failures");
     }
 
     #[tokio::test]
@@ -20989,6 +21099,13 @@ mod tests {
                     "serving degraded multi-worker thread discovery from available workers"
                 )
             );
+            assert_eq!(
+                logs.matches(
+                    "serving degraded multi-worker thread discovery from available workers"
+                )
+                .count(),
+                1
+            );
             assert!(logs.contains("tenant-visible"));
             assert!(logs.contains("project-visible"));
             assert!(logs.contains(&format!("method=\"{method}\"")));
@@ -21795,10 +21912,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -21841,6 +21959,11 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert!(duplicate.is_err());
+        assert_v2_suppressed_notification_metric(
+            &metrics,
+            "mcpServer/startupStatus/updated",
+            "duplicate",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -21864,10 +21987,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -21910,6 +22034,7 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "account/login/completed", "duplicate");
 
         server_task.abort();
         let _ = server_task.await;
@@ -21932,10 +22057,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -21978,6 +22104,11 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(
+            &metrics,
+            "mcpServer/oauthLogin/completed",
+            "duplicate",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -21999,10 +22130,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -22045,9 +22177,676 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "warning", "duplicate");
 
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_mcp_oauth_notifications() {
+        let first_params = serde_json::json!({
+            "name": "shared-mcp",
+            "success": true,
+        });
+        let second_params = serde_json::json!({
+            "name": "other-mcp",
+            "success": true,
+        });
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            ("mcpServer/oauthLogin/completed", first_params.clone()),
+            ("mcpServer/oauthLogin/completed", second_params.clone()),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+            vec![("mcpServer/oauthLogin/completed", first_params.clone())],
+            Duration::from_millis(50),
+        )
+        .await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "mcpServer/oauthLogin/completed",
+            first_params.clone(),
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "mcpServer/oauthLogin/completed",
+            second_params,
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+            else {
+                break;
+            };
+            let message =
+                serde_json::from_str::<JSONRPCMessage>(&text).expect("text frame should decode");
+            if let JSONRPCMessage::Notification(notification) = message {
+                assert!(
+                    notification.method != "mcpServer/oauthLogin/completed"
+                        || notification.params.as_ref() != Some(&first_params),
+                    "interleaved duplicate mcpServer/oauthLogin/completed notification should be suppressed"
+                );
+            }
+        }
+        assert_v2_suppressed_notification_metric(
+            &metrics,
+            "mcpServer/oauthLogin/completed",
+            "duplicate",
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_mcp_startup_notifications() {
+        let first_params = serde_json::json!({
+            "name": "shared-mcp",
+            "status": "ready",
+            "error": null,
+        });
+        let second_params = serde_json::json!({
+            "name": "other-mcp",
+            "status": "failed",
+            "error": "startup failed",
+        });
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            ("mcpServer/startupStatus/updated", first_params.clone()),
+            ("mcpServer/startupStatus/updated", second_params.clone()),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+            vec![("mcpServer/startupStatus/updated", first_params.clone())],
+            Duration::from_millis(50),
+        )
+        .await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "mcpServer/startupStatus/updated",
+            first_params.clone(),
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "mcpServer/startupStatus/updated",
+            second_params,
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+            else {
+                break;
+            };
+            let message =
+                serde_json::from_str::<JSONRPCMessage>(&text).expect("text frame should decode");
+            if let JSONRPCMessage::Notification(notification) = message {
+                assert!(
+                    notification.method != "mcpServer/startupStatus/updated"
+                        || notification.params.as_ref() != Some(&first_params),
+                    "interleaved duplicate mcpServer/startupStatus/updated notification should be suppressed"
+                );
+            }
+        }
+        assert_v2_suppressed_notification_metric(
+            &metrics,
+            "mcpServer/startupStatus/updated",
+            "duplicate",
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_account_updates() {
+        let first_params = serde_json::json!({
+            "authMode": null,
+            "planType": null,
+        });
+        let second_params = serde_json::json!({
+            "authMode": "apikey",
+            "planType": null,
+        });
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            ("account/updated", first_params.clone()),
+            ("account/updated", second_params.clone()),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+            vec![("account/updated", first_params.clone())],
+            Duration::from_millis(50),
+        )
+        .await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "account/updated",
+            first_params.clone(),
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "account/updated",
+            second_params,
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+            else {
+                break;
+            };
+            let message =
+                serde_json::from_str::<JSONRPCMessage>(&text).expect("text frame should decode");
+            if let JSONRPCMessage::Notification(notification) = message {
+                assert!(
+                    notification.method != "account/updated"
+                        || notification.params.as_ref() != Some(&first_params),
+                    "interleaved duplicate account/updated notification should be suppressed"
+                );
+            }
+        }
+        assert_v2_suppressed_notification_metric(&metrics, "account/updated", "duplicate");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_login_completed_notifications()
+    {
+        let first_params = serde_json::json!({
+            "loginId": null,
+            "success": true,
+            "error": null,
+        });
+        let second_params = serde_json::json!({
+            "loginId": "other-login",
+            "success": false,
+            "error": "cancelled",
+        });
+        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+            ("account/login/completed", first_params.clone()),
+            ("account/login/completed", second_params.clone()),
+        ])
+        .await;
+        let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+            vec![("account/login/completed", first_params.clone())],
+            Duration::from_millis(50),
+        )
+        .await;
+        let metrics = in_memory_metrics();
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "account/login/completed",
+            first_params.clone(),
+        );
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "account/login/completed",
+            second_params,
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+            else {
+                break;
+            };
+            let message =
+                serde_json::from_str::<JSONRPCMessage>(&text).expect("text frame should decode");
+            if let JSONRPCMessage::Notification(notification) = message {
+                assert!(
+                    notification.method != "account/login/completed"
+                        || notification.params.as_ref() != Some(&first_params),
+                    "interleaved duplicate account/login/completed notification should be suppressed"
+                );
+            }
+        }
+        assert_v2_suppressed_notification_metric(&metrics, "account/login/completed", "duplicate");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_discovery_state_notifications()
+    {
+        let cases = vec![
+            (
+                "account/rateLimits/updated",
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "shared",
+                        "limitName": "Shared",
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    },
+                }),
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "other",
+                        "limitName": "Other",
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
+                    },
+                }),
+            ),
+            (
+                "app/list/updated",
+                serde_json::json!({
+                    "data": [{
+                        "id": "shared-app",
+                        "name": "Shared App",
+                        "description": null,
+                        "logoUrl": null,
+                        "logoUrlDark": null,
+                        "distributionChannel": null,
+                        "branding": null,
+                        "appMetadata": null,
+                        "labels": null,
+                        "installUrl": null,
+                        "isAccessible": false,
+                        "isEnabled": true,
+                        "pluginDisplayNames": [],
+                    }],
+                }),
+                serde_json::json!({
+                    "data": [{
+                        "id": "other-app",
+                        "name": "Other App",
+                        "description": null,
+                        "logoUrl": null,
+                        "logoUrlDark": null,
+                        "distributionChannel": null,
+                        "branding": null,
+                        "appMetadata": null,
+                        "labels": null,
+                        "installUrl": null,
+                        "isAccessible": false,
+                        "isEnabled": true,
+                        "pluginDisplayNames": [],
+                    }],
+                }),
+            ),
+        ];
+
+        for (method, first_params, second_params) in cases {
+            let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+                (method, first_params.clone()),
+                (method, second_params.clone()),
+            ])
+            .await;
+            let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+                vec![(method, first_params.clone())],
+                Duration::from_millis(50),
+            )
+            .await;
+            let metrics = in_memory_metrics();
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::new(Some(metrics.clone()), false),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                first_params.clone(),
+            );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                second_params,
+            );
+
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+                else {
+                    break;
+                };
+                let message = serde_json::from_str::<JSONRPCMessage>(&text)
+                    .expect("text frame should decode");
+                if let JSONRPCMessage::Notification(notification) = message {
+                    assert!(
+                        notification.method != method
+                            || notification.params.as_ref() != Some(&first_params),
+                        "interleaved duplicate {method} notification should be suppressed"
+                    );
+                }
+            }
+            assert_v2_suppressed_notification_metric(&metrics, method, "duplicate");
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_windows_setup_notifications() {
+        let cases = vec![
+            (
+                "windows/worldWritableWarning",
+                serde_json::json!({
+                    "samplePaths": ["/tmp/shared-world-writable"],
+                    "extraCount": 1,
+                    "failedScan": false,
+                }),
+                serde_json::json!({
+                    "samplePaths": ["/tmp/other-world-writable"],
+                    "extraCount": 2,
+                    "failedScan": false,
+                }),
+            ),
+            (
+                "windowsSandbox/setupCompleted",
+                serde_json::json!({
+                    "mode": "unelevated",
+                    "success": true,
+                    "error": null,
+                }),
+                serde_json::json!({
+                    "mode": "elevated",
+                    "success": false,
+                    "error": "setup failed",
+                }),
+            ),
+        ];
+
+        for (method, first_params, second_params) in cases {
+            let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+                (method, first_params.clone()),
+                (method, second_params.clone()),
+            ])
+            .await;
+            let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+                vec![(method, first_params.clone())],
+                Duration::from_millis(50),
+            )
+            .await;
+            let metrics = in_memory_metrics();
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::new(Some(metrics.clone()), false),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                first_params.clone(),
+            );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                second_params,
+            );
+
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+                else {
+                    break;
+                };
+                let message = serde_json::from_str::<JSONRPCMessage>(&text)
+                    .expect("text frame should decode");
+                if let JSONRPCMessage::Notification(notification) = message {
+                    assert!(
+                        notification.method != method
+                            || notification.params.as_ref() != Some(&first_params),
+                        "interleaved duplicate {method} notification should be suppressed"
+                    );
+                }
+            }
+            assert_v2_suppressed_notification_metric(&metrics, method, "duplicate");
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
     }
 
     #[tokio::test]
@@ -22146,78 +22945,353 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_upgrade_preserves_same_worker_repeated_warning_notifications() {
-        let repeated_params = serde_json::json!({
-            "message": "repeated worker warning",
-            "threadId": null,
-        });
-        let other_params = serde_json::json!({
-            "message": "other worker warning",
-            "threadId": null,
-        });
-        let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
-            ("warning", repeated_params.clone()),
-            ("warning", other_params.clone()),
-            ("warning", repeated_params.clone()),
-        ])
-        .await;
-        let worker_b = start_mock_remote_server_for_realtime_notifications(Vec::new()).await;
-        let (addr, server_task) = spawn_test_server(GatewayV2State {
-            auth: GatewayAuth::Disabled,
-            admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
-            scope_registry: Arc::new(GatewayScopeRegistry::default()),
-            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
-                vec![
-                    RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
-                        client_name: "codex-gateway".to_string(),
-                        client_version: "0.0.0-test".to_string(),
-                        experimental_api: false,
-                        opt_out_notification_methods: Vec::new(),
-                        channel_capacity: 4,
+    async fn websocket_upgrade_deduplicates_interleaved_multi_worker_visible_notice_notifications()
+    {
+        let cases = vec![
+            (
+                "configWarning",
+                serde_json::json!({
+                    "summary": "first shared config warning",
+                    "details": null,
+                }),
+                serde_json::json!({
+                    "summary": "second shared config warning",
+                    "details": "different config warning detail",
+                }),
+            ),
+            (
+                "deprecationNotice",
+                serde_json::json!({
+                    "summary": "first shared deprecation notice",
+                    "details": null,
+                }),
+                serde_json::json!({
+                    "summary": "second shared deprecation notice",
+                    "details": "different deprecation detail",
+                }),
+            ),
+        ];
+
+        for (method, first_params, second_params) in cases {
+            let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+                (method, first_params.clone()),
+                (method, second_params.clone()),
+            ])
+            .await;
+            let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+                vec![(method, first_params.clone())],
+                Duration::from_millis(50),
+            )
+            .await;
+            let metrics = in_memory_metrics();
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::new(Some(metrics.clone()), false),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+
+            send_initialize(&mut websocket).await;
+
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                first_params.clone(),
+            );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                second_params,
+            );
+
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, websocket.next()).await
+                else {
+                    break;
+                };
+                let message = serde_json::from_str::<JSONRPCMessage>(&text)
+                    .expect("text frame should decode");
+                if let JSONRPCMessage::Notification(notification) = message {
+                    assert!(
+                        notification.method != method
+                            || notification.params.as_ref() != Some(&first_params),
+                        "interleaved duplicate {method} notification should be suppressed"
+                    );
+                }
+            }
+            assert_v2_suppressed_notification_metric(&metrics, method, "duplicate");
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_preserves_same_worker_repeated_connection_notifications() {
+        let cases = vec![
+            (
+                "account/updated",
+                serde_json::json!({
+                    "authMode": null,
+                    "planType": null,
+                }),
+                serde_json::json!({
+                    "authMode": "apikey",
+                    "planType": null,
+                }),
+            ),
+            (
+                "account/rateLimits/updated",
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "shared",
+                        "limitName": "Shared",
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
                     },
-                    RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
-                        client_name: "codex-gateway".to_string(),
-                        client_version: "0.0.0-test".to_string(),
-                        experimental_api: false,
-                        opt_out_notification_methods: Vec::new(),
-                        channel_capacity: 4,
+                }),
+                serde_json::json!({
+                    "rateLimits": {
+                        "limitId": "other",
+                        "limitName": "Other",
+                        "primary": null,
+                        "secondary": null,
+                        "credits": null,
+                        "planType": null,
+                        "rateLimitReachedType": null,
                     },
-                ],
-                test_initialize_response().await,
-            ))),
-            timeouts: GatewayV2Timeouts::default(),
-        })
-        .await;
+                }),
+            ),
+            (
+                "account/login/completed",
+                serde_json::json!({
+                    "loginId": null,
+                    "success": true,
+                    "error": null,
+                }),
+                serde_json::json!({
+                    "loginId": "other-login",
+                    "success": false,
+                    "error": "cancelled",
+                }),
+            ),
+            (
+                "app/list/updated",
+                serde_json::json!({
+                    "data": [],
+                }),
+                serde_json::json!({
+                    "data": [{
+                        "id": "other-app",
+                        "name": "Other App",
+                        "description": null,
+                        "logoUrl": null,
+                        "logoUrlDark": null,
+                        "distributionChannel": null,
+                        "branding": null,
+                        "appMetadata": null,
+                        "labels": null,
+                        "installUrl": null,
+                        "isAccessible": false,
+                        "isEnabled": true,
+                        "pluginDisplayNames": [],
+                    }],
+                }),
+            ),
+            (
+                "configWarning",
+                serde_json::json!({
+                    "summary": "repeated worker config warning",
+                    "details": null,
+                }),
+                serde_json::json!({
+                    "summary": "other worker config warning",
+                    "details": "different detail",
+                }),
+            ),
+            (
+                "deprecationNotice",
+                serde_json::json!({
+                    "summary": "repeated worker deprecation notice",
+                    "details": null,
+                }),
+                serde_json::json!({
+                    "summary": "other worker deprecation notice",
+                    "details": "different detail",
+                }),
+            ),
+            (
+                "externalAgentConfig/import/completed",
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+            (
+                "mcpServer/oauthLogin/completed",
+                serde_json::json!({
+                    "name": "shared-mcp",
+                    "success": true,
+                }),
+                serde_json::json!({
+                    "name": "other-mcp",
+                    "success": false,
+                    "error": "cancelled",
+                }),
+            ),
+            (
+                "mcpServer/startupStatus/updated",
+                serde_json::json!({
+                    "name": "shared-mcp",
+                    "status": "ready",
+                    "error": null,
+                }),
+                serde_json::json!({
+                    "name": "other-mcp",
+                    "status": "failed",
+                    "error": "startup failed",
+                }),
+            ),
+            (
+                "warning",
+                serde_json::json!({
+                    "message": "repeated worker warning",
+                    "threadId": null,
+                }),
+                serde_json::json!({
+                    "message": "other worker warning",
+                    "threadId": null,
+                }),
+            ),
+            (
+                "windows/worldWritableWarning",
+                serde_json::json!({
+                    "samplePaths": ["/tmp/repeated-world-writable"],
+                    "extraCount": 1,
+                    "failedScan": false,
+                }),
+                serde_json::json!({
+                    "samplePaths": ["/tmp/other-world-writable"],
+                    "extraCount": 2,
+                    "failedScan": false,
+                }),
+            ),
+            (
+                "windowsSandbox/setupCompleted",
+                serde_json::json!({
+                    "mode": "unelevated",
+                    "success": true,
+                    "error": null,
+                }),
+                serde_json::json!({
+                    "mode": "elevated",
+                    "success": false,
+                    "error": "setup failed",
+                }),
+            ),
+        ];
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        for (method, repeated_params, other_params) in cases {
+            let worker_a = start_mock_remote_server_for_realtime_notifications(vec![
+                (method, repeated_params.clone()),
+                (method, other_params.clone()),
+                (method, repeated_params.clone()),
+            ])
+            .await;
+            let worker_b = start_mock_remote_server_for_realtime_notifications(Vec::new()).await;
+            let metrics = in_memory_metrics();
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::new(Some(metrics.clone()), false),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ))),
+                timeouts: GatewayV2Timeouts::default(),
+            })
+            .await;
 
-        send_initialize(&mut websocket).await;
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
 
-        assert_jsonrpc_notification(
-            read_websocket_message(&mut websocket).await,
-            "warning",
-            repeated_params.clone(),
-        );
-        assert_jsonrpc_notification(
-            read_websocket_message(&mut websocket).await,
-            "warning",
-            other_params,
-        );
-        assert_jsonrpc_notification(
-            read_websocket_message(&mut websocket).await,
-            "warning",
-            repeated_params,
-        );
+            send_initialize(&mut websocket).await;
 
-        server_task.abort();
-        let _ = server_task.await;
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                repeated_params.clone(),
+            );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                other_params,
+            );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                method,
+                repeated_params,
+            );
+            assert_no_v2_suppressed_notification_metric(&metrics);
+
+            server_task.abort();
+            let _ = server_task.await;
+        }
     }
 
     #[tokio::test]
@@ -22237,10 +23311,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -22283,6 +23358,7 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "configWarning", "duplicate");
 
         server_task.abort();
         let _ = server_task.await;
@@ -22305,10 +23381,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -22351,6 +23428,7 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(&metrics, "deprecationNotice", "duplicate");
 
         server_task.abort();
         let _ = server_task.await;
@@ -22370,10 +23448,11 @@ mod tests {
             notification_params.clone(),
         )
         .await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -22416,6 +23495,11 @@ mod tests {
 
         let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
         assert_eq!(duplicate.is_err(), true);
+        assert_v2_suppressed_notification_metric(
+            &metrics,
+            "externalAgentConfig/import/completed",
+            "duplicate",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -32178,6 +33262,59 @@ mod tests {
     }
 
     #[test]
+    fn external_agent_import_completed_notifications_are_treated_as_deduplicated_connection_state()
+    {
+        let notification = JSONRPCNotification {
+            method: "externalAgentConfig/import/completed".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+
+        assert_eq!(
+            super::should_deduplicate_connection_notification(&notification),
+            true
+        );
+    }
+
+    #[test]
+    fn account_discovery_notifications_are_treated_as_deduplicated_connection_state() {
+        for method in [
+            "account/updated",
+            "account/rateLimits/updated",
+            "app/list/updated",
+        ] {
+            let notification = JSONRPCNotification {
+                method: method.to_string(),
+                params: Some(match method {
+                    "account/updated" => serde_json::json!({
+                        "authMode": null,
+                        "planType": null,
+                    }),
+                    "account/rateLimits/updated" => serde_json::json!({
+                        "rateLimits": {
+                            "limitId": "shared",
+                            "limitName": "Shared",
+                            "primary": null,
+                            "secondary": null,
+                            "credits": null,
+                            "planType": null,
+                            "rateLimitReachedType": null,
+                        },
+                    }),
+                    "app/list/updated" => serde_json::json!({
+                        "data": [],
+                    }),
+                    _ => unreachable!("method list should stay exhaustive"),
+                }),
+            };
+
+            assert_eq!(
+                super::should_deduplicate_connection_notification(&notification),
+                true
+            );
+        }
+    }
+
+    #[test]
     fn visible_connection_warning_notifications_are_treated_as_deduplicated_connection_state() {
         for method in ["warning", "configWarning", "deprecationNotice"] {
             let notification = JSONRPCNotification {
@@ -32430,6 +33567,51 @@ mod tests {
                 .expect("warning history should exist")
                 .len(),
             super::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD
+        );
+    }
+
+    #[test]
+    fn forwarded_connection_notification_dedupe_preserves_same_worker_empty_payload_repeats() {
+        let mut forwarded_connection_notifications = HashMap::new();
+        let repeated_notice = JSONRPCNotification {
+            method: "externalAgentConfig/import/completed".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(1),
+            &repeated_notice,
+        );
+        assert!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(1),
+                &repeated_notice,
+            )
+            .is_none()
+        );
+
+        super::record_forwarded_connection_notification(
+            &mut forwarded_connection_notifications,
+            Some(1),
+            &repeated_notice,
+        );
+        assert_eq!(
+            forwarded_connection_notifications
+                .get("externalAgentConfig/import/completed")
+                .expect("import-completed history should exist")
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::forwarded_connection_notification_duplicate(
+                &forwarded_connection_notifications,
+                Some(2),
+                &repeated_notice,
+            )
+            .map(|forwarded| forwarded.worker_id),
+            Some(Some(1))
         );
     }
 

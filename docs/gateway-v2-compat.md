@@ -506,9 +506,15 @@ Recent progress:
   emit `gateway_v2_thread_list_deduplications` and
   `gateway_v2_thread_route_recoveries`, so duplicate thread snapshots and
   lazy route probe misses are visible in metrics alongside the existing
-  structured routing logs; dedupe and route-recovery success/miss logs now
-  also include worker websocket URLs so operators can identify the affected
+  structured routing logs; the aggregate `thread/list` dedupe regression now
+  also asserts the selected-worker metric on the real route-selection path, and
+  dedupe plus route-recovery success/miss logs include worker websocket URLs so
+  operators can identify the affected
   downstream sessions directly
+- lazy visible-thread route recovery regressions now also assert the
+  `gateway_v2_thread_route_recoveries` success and miss metrics while pinning
+  that ordinary probe success/miss outcomes do not emit fail-closed or upstream
+  failure metrics
 - the v2 transport now applies thread scope enforcement to downstream
   server-request forwarding, rejecting hidden-thread requests at the gateway
   boundary instead of leaking them to the northbound client
@@ -531,6 +537,11 @@ Recent progress:
   `mcpServerStatus/list`, `mcpServer/oauth/login`, `plugin/list`,
   `plugin/read`, `config/batchWrite`, `memory/reset`, `account/logout`, and
   `account/sendAddCreditsNudgeEmail`
+- the real single-worker remote setup harness now also observes the
+  `externalAgentConfig/import/completed` notification after
+  `externalAgentConfig/import`, so import completion delivery is covered by the
+  release-quality remote client path before multi-worker duplicate-suppression
+  routing is involved
 - that same real single-worker remote harness now also covers the
   supporting/configuration methods that some clients and test tools use
   outside the main TUI flow: `config/read`, `configRequirements/read`,
@@ -645,6 +656,18 @@ Recent progress:
   client-supplied `chatgptAuthTokens` are carried through to the downstream
   model request path after onboarding, instead of stopping at account-state
   notifications alone
+- that same real embedded compatibility harness now also covers a plan-mode
+  turn, verifying proposed-plan `item/started` and `item/completed`
+  notifications through the in-process gateway transport with an unmodified
+  `RemoteAppServerClient` session
+- the real single-worker remote compatibility harness now also covers that same
+  plan-mode turn path, verifying proposed-plan `item/started` and
+  `item/completed` notifications through a gateway-backed remote worker session
+  with an unmodified `RemoteAppServerClient`
+- the real multi-worker remote compatibility harness now also covers that same
+  plan-mode turn path on a worker-owned thread, verifying proposed-plan
+  `item/started` and `item/completed` notification fan-in on one shared
+  `RemoteAppServerClient` session
 - the real single-worker remote `RemoteAppServerClient` harness now also covers
   the same external-auth onboarding path for `account/login/start`,
   `account/login/cancel`, and `account/login/completed`, validating that the
@@ -664,10 +687,18 @@ Recent progress:
   gateway preserves the immediate `chatgptAuthTokens` login completion and the
   resulting `account/updated` notification through the current Stage B
   multi-worker transport
+- that same external-auth onboarding harness now also verifies duplicate
+  `account/login/completed` / `account/updated` emissions from token-login
+  fanout are suppressed on the shared `RemoteAppServerClient` session before
+  the follow-up aggregated `account/read`
 - dedicated northbound multi-worker regression coverage now also verifies that
   `account/login/start` with external-auth `apiKey` and
   `chatgptAuthTokens` is fanned out to every downstream worker session
   instead of updating only the primary worker
+- the real multi-worker remote `RemoteAppServerClient` API-key onboarding
+  harness now also observes the resulting `account/updated` notification and
+  verifies duplicate worker emissions remain suppressed before the follow-up
+  aggregated `account/read`
 - dedicated northbound v2 regression coverage now also verifies that if a
   downstream app-server session reuses a still-pending server-request id, the
   gateway fails closed instead of silently overwriting the original pending
@@ -1398,7 +1429,8 @@ Recent progress:
   including `warning`, `configWarning`, `deprecationNotice`,
   `externalAgentConfig/import/completed`, and `skills/changed`; dropping
   duplicate downstream `serverRequest/resolved` replays after request-id
-  translation; fail-closed handling when a client replies to a server request
+  translation; metric coverage for duplicate external-agent import completion
+  suppression; fail-closed handling when a client replies to a server request
   that is no longer pending, including rejection of any still-pending
   downstream prompts; and structured warning logs for both
   protocol-violation cleanup and unresolved server-request saturation
@@ -1837,6 +1869,11 @@ Operational notes:
   notifications, repeated `skills/changed` invalidations, or hidden-thread
   notifications are dropped; exact-duplicate connection-state suppression logs
   include both the dropped worker route and the original forwarded worker route
+- degraded multi-worker thread discovery now has regression coverage asserting
+  that each `thread/list` or `thread/loaded/list` request emits only one
+  gateway-owned degraded-route warning and one
+  `gateway_v2_degraded_thread_discovery` metric point, keeping reconnect
+  backoff dashboards tied to request volume rather than duplicate log paths
 - duplicate downstream `serverRequest/resolved` replays increment
   `gateway_v2_server_request_lifecycle_events` with `event` and `method`
   tags, matching the structured warning log emitted when the translated route
@@ -1976,6 +2013,10 @@ Operational notes:
   `skills/changed` invalidation emitted after `skills/config/write` fanout and
   verifies duplicate worker emissions remain suppressed on the shared
   `RemoteAppServerClient` session
+- that same steady-state setup mutation harness now also observes
+  `account/updated` after `account/logout` fanout and verifies duplicate
+  worker emissions remain suppressed on the shared `RemoteAppServerClient`
+  session
 - the real multi-worker same-session recovery harness now also re-exercises
   `marketplace/add`, `skills/config/write`,
   `experimentalFeature/enablement/set`, and `config/mcpServer/reload` after a
@@ -1990,6 +2031,10 @@ Operational notes:
   `externalAgentConfig/import/completed` after `externalAgentConfig/import`
   fanout and verifies duplicate worker completions remain suppressed on the
   shared `RemoteAppServerClient` session after worker re-add
+- that same recovered setup-mutation harness now also observes
+  `account/updated` after recovered-worker `account/logout` fanout and
+  verifies duplicate worker emissions remain suppressed on the shared
+  `RemoteAppServerClient` session after worker re-add
 - the real multi-worker same-session recovery harness now also re-exercises
   `account/sendAddCreditsNudgeEmail` after the primary worker is re-added, so
   recovered sessions keep that one-shot account side effect on the primary
@@ -2094,6 +2139,21 @@ Operational notes:
   refreshes, so the core connection-state notification and visible notice sets
   are exercised through one shared `RemoteAppServerClient` session after worker
   re-add
+- that same real multi-worker bootstrap recovery harness now also re-exercises
+  external-auth `account/login/start` with `chatgptAuthTokens` and `apiKey`
+  after worker re-add, verifying that the fanout paths still reach the
+  recovered worker and that the shared session receives deduplicated
+  `account/login/completed` / `account/updated` notifications for the token
+  flow plus deduplicated `account/updated` delivery and aggregated
+  `account/read` state for the API-key flow
+- that same bootstrap recovery harness now also verifies duplicate recovered
+  connection-state notifications stay suppressed before follow-up login
+  traffic, so stale duplicate account, rate-limit, app, warning, and sandbox
+  setup state does not leak after a worker is lazily re-added
+- the steady-state multi-worker external-auth harness now also explicitly
+  verifies duplicate `account/login/completed` / `account/updated` emissions
+  from token-login fanout are suppressed on the shared
+  `RemoteAppServerClient` session
 - the real connection-state notification harnesses now also observe
   `windowsSandbox/setupCompleted` through unmodified `RemoteAppServerClient`
   sessions in steady state, after reconnect, and in the multi-worker duplicate
@@ -2111,8 +2171,17 @@ Operational notes:
   or setup-state payload on the shared session while same-worker repeats remain
   deliverable and refresh their history position, and long-lived sessions keep
   capped dedupe memory; dedicated regressions pin that interleaved-payload
-  behavior for `warning` notifications, same-worker repeat refreshes, and the
-  per-method history bound
+  behavior for `account/updated`, `account/rateLimits/updated`,
+  `account/login/completed`, `app/list/updated`, `warning`, `configWarning`,
+  `deprecationNotice`, `mcpServer/oauthLogin/completed`,
+  `mcpServer/startupStatus/updated`, `windows/worldWritableWarning`, and
+  `windowsSandbox/setupCompleted` notifications, same-worker repeat refreshes
+  across the same broader connection-state notification set, and the
+  per-method history bound; empty-payload
+  `externalAgentConfig/import/completed` repeats from the same worker are also
+  pinned so repeated imports do not look like cross-worker duplicates, and
+  legitimate same-worker repeats are verified not to emit
+  `gateway_v2_suppressed_notifications`
 - multi-worker `skills/changed` invalidation suppression now only clears after
   a successful `skills/list` refresh has been returned to the northbound
   client, so failed aggregated refresh attempts do not reopen duplicate
@@ -2158,9 +2227,9 @@ Operational notes:
 - `docs/gateway-v2-method-matrix.md` now explicitly records the current real
   multi-worker steady-state compatibility coverage for `thread/start`,
   aggregated `thread/list` / `thread/loaded/list`, sticky `thread/read` /
-  `thread/name/set` / `thread/memoryMode/set`, detached `review/start`, and steady-state
-  `turn/start` / `turn/steer` / `turn/interrupt`, so the rollout matrix no
-  longer understates the existing Stage B validation surface
+  `thread/name/set` / `thread/memoryMode/set`, detached `review/start`, and
+  steady-state `turn/start` / `turn/steer` / `turn/interrupt`, so the rollout
+  matrix no longer understates the existing Stage B validation surface
 
 ## Caveats
 
@@ -2212,10 +2281,32 @@ Current Stage A compatibility caveats:
   `RemoteAppServerClient` sessions in steady state and after worker re-add, so
   guardian approval auto-review notification forwarding no longer relies only
   on targeted northbound fixtures in the bounded Stage B profile
+- the real single-worker remote turn workflow harness now also observes
+  `item/autoApprovalReview/started` and
+  `item/autoApprovalReview/completed`, so guardian approval auto-review
+  notification forwarding is covered by the release-quality remote baseline
+  as well as targeted gateway fixtures and the multi-worker Stage B harness
 - that real multi-worker turn coverage now also observes turn-scoped `error`
   notifications in steady state and after worker re-add, so opportunistic
   warning/error notification forwarding is covered by broad Stage B client
   traffic as well as targeted gateway regressions
+- the real single-worker remote turn workflow harness now also observes
+  turn-scoped `error` notifications, so opportunistic warning/error forwarding
+  is covered by the release-quality remote baseline as well as targeted gateway
+  regressions and the multi-worker Stage B harness
+- the real multi-worker remote harness now also exercises plan-mode
+  proposed-plan `item/started` and `item/completed` notifications on a worker-owned
+  thread, so proposed-plan lifecycle fan-in is covered by broad Stage B client
+  traffic as well as the embedded and single-worker release-quality baselines
+- that same real single-worker remote turn workflow harness now also observes
+  the lower-frequency turn notification set already covered by the multi-worker
+  Stage B harness: `item/plan/delta`,
+  `item/reasoning/summaryPartAdded`,
+  `item/commandExecution/terminalInteraction`, `turn/diff/updated`,
+  `turn/plan/updated`, `thread/tokenUsage/updated`,
+  `item/mcpToolCall/progress`, `thread/compacted`, `model/rerouted`, and
+  `rawResponseItem/completed`, so the release-quality remote baseline covers
+  those forwarding paths through an unmodified `RemoteAppServerClient` session
 - multi-worker remote runtime should still be treated as a bounded Stage B
   profile with explicit rollout guardrails, not as the default drop-in
   compatibility target
