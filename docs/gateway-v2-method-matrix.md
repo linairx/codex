@@ -36,9 +36,9 @@ Status legend:
 
 | Method / flow | Why current clients use it | Gateway status | Notes |
 | --- | --- | --- | --- |
-| `initialize` | Required by every v2 client session | `policy interception` | Gateway authenticates the WebSocket upgrade, enforces an explicit initialize handshake timeout, connects a downstream app-server session, propagates client identity/capabilities downstream, and returns a gateway-owned `InitializeResponse`. |
+| `initialize` | Required by every v2 client session | `policy interception` | Gateway authenticates the WebSocket upgrade, enforces an explicit initialize handshake timeout, connects a downstream app-server session, propagates client identity/capabilities downstream, enforces exact `optOutNotificationMethods` suppression at the northbound boundary, and returns a gateway-owned `InitializeResponse`. |
 | `initialized` | Required handshake completion notification | `transparent passthrough` | Gateway accepts the northbound notification and downstream session setup already sends `initialized` as part of the app-server client transport. |
-| connection close / downstream disconnect | Required for normal session teardown | `transparent passthrough` | Downstream disconnect currently terminates the northbound connection. |
+| connection close / downstream disconnect | Required for normal session teardown | `transparent passthrough` | Downstream disconnect terminates the northbound connection. Malformed downstream JSON-RPC is now reported separately as `downstream_protocol_violation` and records a downstream protocol-violation metric, including invalid text JSON-RPC after initialization or during the downstream initialize handshake, unsupported binary data frames after initialization, non-text frames during the downstream initialize handshake, and post-initialize JSON-RPC responses or errors with unknown request ids. |
 
 ## Bootstrap and Session Setup Requests
 
@@ -992,6 +992,67 @@ Multi-worker remote coverage notes:
   WebSocket transport, covering worker-affine `thread/start`, aggregated
   `thread/list` / `thread/loaded/list` / `thread/read`, and tenant/project
   scope filtering across worker-owned threads
+- dedicated northbound multi-worker coverage now also verifies that
+  `initialize` client identity, experimental capability, and
+  `optOutNotificationMethods` are propagated to every downstream worker
+  session, and that lazy reconnect reuses those same initialized capability
+  parameters when a missing worker is re-added, so shared-session capability
+  negotiation does not diverge from the embedded and single-worker release
+  baselines
+- dedicated northbound coverage now also verifies that the gateway itself
+  suppresses exact opted-out notification methods before forwarding downstream
+  notifications, preserving the v2 client-visible initialize capability
+  contract even when a worker emits an opted-out notification; that suppression
+  also emits a structured gateway log with scope, worker, method, and payload
+  context for operator diagnostics
+- dedicated multi-worker fan-in coverage now also verifies that an opted-out
+  worker notification is dropped without blocking a different non-opted-out
+  notification from another worker on the same northbound session
+- dedicated northbound coverage now also verifies that malformed downstream
+  JSON-RPC fails closed with an explicit `downstream_protocol_violation`
+  connection outcome and downstream protocol-violation metric instead of being
+  reported as ordinary session termination; malformed downstream frames also
+  emit a structured gateway log with scope, worker, reason, downstream message,
+  active worker count, and server-request route context for operator
+  diagnostics
+- downstream non-text JSON-RPC data frames now also fail closed as
+  `invalid_binary` protocol violations instead of being silently ignored by the
+  remote app-server transport, with dedicated app-server-client and gateway
+  northbound regression coverage
+- downstream non-text frames during the app-server initialize handshake now
+  also record the same downstream `invalid_binary` protocol-violation metric
+  and terminal connection outcome, with dedicated northbound regression
+  coverage plus direct remote app-server client transport coverage for failing
+  connection setup on those frames
+- downstream invalid JSON-RPC during the app-server initialize handshake now
+  also records the downstream `invalid_jsonrpc` protocol-violation metric and
+  terminal connection outcome, with dedicated northbound regression coverage
+  plus direct remote app-server client transport coverage for failing
+  connection setup on invalid initialize text frames
+- downstream initialize responses or errors with a valid JSON-RPC envelope but
+  the wrong request id now also fail immediately as malformed initialize
+  responses instead of waiting for the initialize timeout, with dedicated
+  northbound and remote app-server client transport coverage for the
+  downstream `invalid_jsonrpc` protocol-violation classification
+- downstream server requests received during the app-server initialize
+  handshake now also have direct remote transport coverage for the unsupported
+  request path, verifying the setup-time request is rejected with a JSON-RPC
+  method-not-found error while the initialize handshake can still complete
+- downstream JSON-RPC responses or errors with unknown request ids after
+  initialization now also fail closed as downstream `invalid_jsonrpc` protocol
+  violations instead of being silently ignored, with direct remote
+  app-server-client transport coverage and gateway northbound regression
+  coverage
+- setup-time downstream protocol violations now also emit a structured gateway
+  warning log with tenant/project scope, violation reason, and downstream
+  transport detail before the initialize request returns an error, so malformed
+  worker handshakes are visible without relying only on metrics or terminal
+  connection health
+- lazy multi-worker reconnect now also classifies malformed downstream
+  initialize traffic as a downstream protocol violation, records the
+  protocol-violation metric, and emits a structured warning with tenant/project
+  scope plus worker id / URL, so recovered-worker handshake failures remain
+  distinct from ordinary reconnect failures
 - that multi-worker harness now also covers one shared bootstrap/setup session
   through aggregated `account/read`, `account/rateLimits/read`, `model/list`,
   `externalAgentConfig/detect`, `app/list`, `skills/list`,

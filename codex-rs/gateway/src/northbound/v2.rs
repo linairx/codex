@@ -144,6 +144,7 @@ struct GatewayV2ConnectionContext<'a> {
     request_context: &'a GatewayRequestContext,
     client_send_timeout: Duration,
     max_pending_server_requests: usize,
+    opt_out_notification_methods: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -527,6 +528,17 @@ impl GatewayV2DownstreamRouter {
                         now,
                         reconnect_state.retry_backoff,
                     );
+                    let detail = err.to_string();
+                    if let Some(reason) = downstream_protocol_violation_reason(&detail) {
+                        log_downstream_reconnect_protocol_violation(
+                            &reconnect_state.request_context,
+                            worker_id,
+                            websocket_url,
+                            reason,
+                            &detail,
+                        );
+                        observability.record_v2_protocol_violation("downstream", reason);
+                    }
                     observability.record_v2_worker_reconnect(worker_id, "connect_failure");
                     warn!(
                         worker_id,
@@ -534,7 +546,7 @@ impl GatewayV2DownstreamRouter {
                         initialized_notification_sent = self.initialized_notification_sent,
                         active_fs_watch_count = self.active_fs_watches.len(),
                         retry_backoff_seconds = reconnect_state.retry_backoff.as_secs(),
-                        %err,
+                        err = %detail,
                         "failed to reconnect missing downstream worker session"
                     );
                 }
@@ -898,6 +910,12 @@ async fn run_websocket_connection(
             Ok(downstream) => downstream,
             Err(err) => {
                 let detail = err.to_string();
+                let downstream_protocol_violation_reason =
+                    downstream_protocol_violation_reason(&detail);
+                if let Some(reason) = downstream_protocol_violation_reason {
+                    log_downstream_connect_protocol_violation(&context, reason, &detail);
+                    observability.record_v2_protocol_violation("downstream", reason);
+                }
                 send_jsonrpc_error(
                     &mut socket,
                     initialize_request_id,
@@ -917,7 +935,11 @@ async fn run_websocket_connection(
                     initialize_started_at.elapsed(),
                 );
                 return Ok(GatewayV2ConnectionRunResult {
-                    outcome: "downstream_connect_error",
+                    outcome: if downstream_protocol_violation_reason.is_some() {
+                        "downstream_protocol_violation"
+                    } else {
+                        "downstream_connect_error"
+                    },
                     detail: Some(detail),
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
@@ -958,6 +980,13 @@ async fn run_websocket_connection(
             request_context: &context,
             client_send_timeout: timeouts.client_send,
             max_pending_server_requests: timeouts.max_pending_server_requests,
+            opt_out_notification_methods: initialize_params
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.opt_out_notification_methods.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
         };
         let (mut loop_result, mut connection_outcome): (io::Result<()>, &'static str) = loop {
             tokio::select! {
@@ -1308,6 +1337,22 @@ fn protocol_violation_reason_from_invalid_payload(err: &io::Error) -> &'static s
         "invalid_utf8"
     } else {
         "invalid_jsonrpc"
+    }
+}
+
+fn downstream_protocol_violation_reason(message: &str) -> Option<&'static str> {
+    if message.contains("sent invalid JSON-RPC")
+        || message.contains("sent invalid initialize response")
+        || message.contains("sent unexpected JSON-RPC response id")
+        || message.contains("sent unexpected JSON-RPC error id")
+    {
+        Some("invalid_jsonrpc")
+    } else if message.contains("sent non-text JSON-RPC frame")
+        || message.contains("sent non-text initialize frame")
+    {
+        Some("invalid_binary")
+    } else {
+        None
     }
 }
 
@@ -1718,6 +1763,21 @@ async fn handle_app_server_event(
             else {
                 return Ok(None);
             };
+            if connection
+                .opt_out_notification_methods
+                .contains(notification.method.as_str())
+            {
+                log_suppressed_opted_out_notification(
+                    connection.request_context,
+                    worker_id,
+                    worker_websocket_url.as_str(),
+                    &notification,
+                );
+                connection
+                    .observability
+                    .record_v2_suppressed_notification(&notification.method, "opted_out");
+                return Ok(None);
+            }
             if downstream.multi_worker_topology()
                 && notification.method == "skills/changed"
                 && event_state.skills_changed_pending_refresh
@@ -1895,6 +1955,21 @@ async fn handle_app_server_event(
             }
         }
         AppServerEvent::Disconnected { message } => {
+            let protocol_violation_reason = downstream_protocol_violation_reason(message.as_str());
+            if let Some(reason) = protocol_violation_reason {
+                log_downstream_protocol_violation(
+                    connection.request_context,
+                    worker_id,
+                    worker_websocket_url.as_str(),
+                    reason,
+                    message.as_str(),
+                    downstream.worker_count(),
+                    event_state,
+                );
+                connection
+                    .observability
+                    .record_v2_protocol_violation("downstream", reason);
+            }
             let mut cleanup = WorkerServerRequestCleanup::default();
             if !downstream.single_worker() && downstream.remove_worker(worker_id) {
                 cleanup = resolve_server_requests_for_worker(
@@ -1976,7 +2051,11 @@ async fn handle_app_server_event(
             )
             .await?;
             return Ok(Some(GatewayV2ConnectionClose {
-                outcome: "downstream_session_ended",
+                outcome: if protocol_violation_reason.is_some() {
+                    "downstream_protocol_violation"
+                } else {
+                    "downstream_session_ended"
+                },
                 reject_pending_server_requests: false,
             }));
         }
@@ -2380,6 +2459,91 @@ fn log_suppressed_skills_changed_notification(
         method = notification.method,
         params = ?notification.params,
         "suppressing duplicate multi-worker skills/changed notification until the client refreshes skills/list"
+    );
+}
+
+fn log_suppressed_opted_out_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method = notification.method,
+        params = ?notification.params,
+        "suppressing downstream notification opted out by northbound v2 client"
+    );
+}
+
+fn log_downstream_connect_protocol_violation(
+    request_context: &GatewayRequestContext,
+    reason: &str,
+    message: &str,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        reason,
+        downstream_message = message,
+        "downstream app-server sent a malformed v2 protocol frame during initialize"
+    );
+}
+
+fn log_downstream_reconnect_protocol_violation(
+    request_context: &GatewayRequestContext,
+    worker_id: usize,
+    worker_websocket_url: &str,
+    reason: &str,
+    message: &str,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id,
+        worker_websocket_url,
+        reason,
+        downstream_message = message,
+        "downstream app-server sent a malformed v2 protocol frame during worker reconnect"
+    );
+}
+
+fn log_downstream_protocol_violation(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    reason: &str,
+    message: &str,
+    active_worker_count: usize,
+    event_state: &GatewayV2EventState,
+) {
+    let pending_log_fields =
+        pending_server_request_log_fields(&event_state.pending_server_requests);
+    let resolved_log_fields =
+        resolved_server_request_log_fields(&event_state.resolved_server_requests);
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        reason,
+        downstream_message = message,
+        active_worker_count,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
+        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
+        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
+        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
+        "downstream app-server sent a malformed v2 protocol frame"
     );
 }
 
@@ -5284,6 +5448,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::io;
     use std::io::Write;
     use std::path::PathBuf;
@@ -5626,6 +5791,414 @@ mod tests {
                 .message
                 .contains("gateway failed to connect downstream app-server"),
             true
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn initialize_reports_downstream_binary_initialize_frame_as_protocol_violation() {
+        let websocket_url = start_mock_remote_server_that_sends_binary_during_initialize().await;
+        let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("initialize".to_string()),
+                    method: "initialize".to_string(),
+                    params: Some(
+                        serde_json::to_value(InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        })
+                        .expect("initialize params should serialize"),
+                    ),
+                    trace: None,
+                }))
+                .expect("request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("initialize request should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("initialize".to_string()));
+        assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+        assert!(
+            error
+                .error
+                .message
+                .contains("sent non-text initialize frame")
+        );
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_binary");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn initialize_reports_downstream_invalid_initialize_response_as_protocol_violation() {
+        let websocket_url =
+            start_mock_remote_server_that_sends_invalid_jsonrpc_during_initialize().await;
+        let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("initialize".to_string()),
+                    method: "initialize".to_string(),
+                    params: Some(
+                        serde_json::to_value(InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        })
+                        .expect("initialize params should serialize"),
+                    ),
+                    trace: None,
+                }))
+                .expect("request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("initialize request should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("initialize".to_string()));
+        assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+        assert!(
+            error
+                .error
+                .message
+                .contains("sent invalid initialize response")
+        );
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn initialize_reports_downstream_wrong_id_initialize_response_as_protocol_violation() {
+        let websocket_url =
+            start_mock_remote_server_that_sends_wrong_id_response_during_initialize().await;
+        let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("initialize".to_string()),
+                    method: "initialize".to_string(),
+                    params: Some(
+                        serde_json::to_value(InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        })
+                        .expect("initialize params should serialize"),
+                    ),
+                    trace: None,
+                }))
+                .expect("request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("initialize request should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("initialize".to_string()));
+        assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+        assert!(
+            error
+                .error
+                .message
+                .contains("sent invalid initialize response")
+        );
+        assert!(error.error.message.contains("not-initialize"));
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn initialize_reports_downstream_wrong_id_initialize_error_as_protocol_violation() {
+        let websocket_url =
+            start_mock_remote_server_that_sends_wrong_id_error_during_initialize().await;
+        let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("initialize".to_string()),
+                    method: "initialize".to_string(),
+                    params: Some(
+                        serde_json::to_value(InitializeParams {
+                            client_info: ClientInfo {
+                                name: "codex-tui".to_string(),
+                                title: None,
+                                version: "0.0.0-test".to_string(),
+                            },
+                            capabilities: None,
+                        })
+                        .expect("initialize params should serialize"),
+                    ),
+                    trace: None,
+                }))
+                .expect("request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("initialize request should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected initialize error response");
+        };
+        assert_eq!(error.id, RequestId::String("initialize".to_string()));
+        assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+        assert!(
+            error
+                .error
+                .message
+                .contains("sent invalid initialize response")
+        );
+        assert!(error.error.message.contains("not-initialize"));
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_initialize_capabilities_to_all_multi_worker_sessions() {
+        let recorded_initialize_params = Arc::new(Mutex::new(Vec::new()));
+        let worker_a =
+            start_mock_remote_server_recording_initialize(recorded_initialize_params.clone()).await;
+        let worker_b =
+            start_mock_remote_server_recording_initialize(recorded_initialize_params.clone()).await;
+        let initialize_response = test_initialize_response().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 8,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 8,
+                    },
+                ],
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize_with_capabilities(
+            &mut websocket,
+            Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: Some(vec![
+                    "thread/started".to_string(),
+                    "item/agentMessage/delta".to_string(),
+                ]),
+            }),
+        )
+        .await;
+
+        let expected_initialize = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: Some(vec![
+                    "thread/started".to_string(),
+                    "item/agentMessage/delta".to_string(),
+                ]),
+            }),
+        };
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let recorded = recorded_initialize_params.lock().await;
+                if recorded.len() == 2 {
+                    break;
+                }
+                drop(recorded);
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both workers should receive initialize params");
+        assert_eq!(
+            *recorded_initialize_params.lock().await,
+            vec![expected_initialize.clone(), expected_initialize]
         );
 
         server_task.abort();
@@ -9098,6 +9671,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_reports_downstream_protocol_violations() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_that_sends_invalid_jsonrpc_after_initialize().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::ERROR
+        );
+        assert_eq!(
+            close_frame
+                .reason
+                .starts_with("downstream app-server disconnected:"),
+            true
+        );
+        assert!(close_frame.reason.contains("sent invalid JSON-RPC"));
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_reports_downstream_binary_protocol_violations() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url = start_mock_remote_server_that_sends_binary_after_initialize().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::ERROR
+        );
+        assert_eq!(
+            close_frame
+                .reason
+                .starts_with("downstream app-server disconnected:"),
+            true
+        );
+        assert!(close_frame.reason.contains("sent non-text JSON-RPC frame"));
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_binary");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_reports_downstream_unexpected_response_id_as_protocol_violation() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_that_sends_unexpected_response_after_initialize().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::ERROR
+        );
+        assert!(
+            close_frame
+                .reason
+                .contains("sent unexpected JSON-RPC response id")
+        );
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_reports_downstream_unexpected_error_id_as_protocol_violation() {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_that_sends_unexpected_error_after_initialize().await;
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: observability.clone(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let frame = wait_for_close_frame(&mut websocket).await;
+        let Message::Close(Some(close_frame)) = frame else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(
+            u16::from(close_frame.code),
+            axum::extract::ws::close_code::ERROR
+        );
+        assert!(
+            close_frame
+                .reason
+                .contains("sent unexpected JSON-RPC error id")
+        );
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .last_connection_outcome,
+            Some("downstream_protocol_violation".to_string())
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_truncates_close_reason_when_downstream_disconnect_reason_is_long() {
         let initialize_response = test_initialize_response().await;
         let websocket_url =
@@ -9243,6 +10059,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
                         let mut router = GatewayV2DownstreamRouter {
@@ -9349,6 +10166,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
                         let mut router = GatewayV2DownstreamRouter {
@@ -15981,6 +16799,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let result = super::handle_client_request(
@@ -16106,6 +16925,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let err = super::handle_client_request(
@@ -16317,6 +17137,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -16449,6 +17270,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -16576,6 +17398,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let result = super::handle_client_request(
@@ -16821,6 +17644,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let result = super::handle_client_request(
@@ -16907,6 +17731,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let fork_result = super::handle_client_request(
@@ -17051,6 +17876,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let review_result = super::handle_client_request(
@@ -17188,6 +18014,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -17283,6 +18110,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -17378,6 +18206,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -17556,6 +18385,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -17680,6 +18510,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -17836,6 +18667,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -17943,6 +18775,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -18065,6 +18898,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let first_page = super::handle_client_request(
@@ -18196,6 +19030,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let error = super::handle_client_request(
@@ -18302,6 +19137,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -18432,6 +19268,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -18544,6 +19381,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -18652,6 +19490,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -18782,6 +19621,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -18925,6 +19765,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -19036,6 +19877,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -19145,6 +19987,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -19314,6 +20157,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let result = super::handle_client_request(
@@ -19411,6 +20255,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let result = super::handle_client_request(
@@ -19601,6 +20446,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let result = super::handle_client_request(
@@ -19683,6 +20529,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let watch_result = super::handle_client_request(
@@ -19982,6 +20829,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let result = super::handle_client_request(
@@ -20085,6 +20933,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs_async(async {
@@ -20404,6 +21253,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let err = super::handle_client_request(
@@ -20542,6 +21392,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let err = super::handle_client_request(
@@ -20730,6 +21581,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let err = super::handle_client_request(
@@ -20944,6 +21796,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let err = super::handle_client_request(
@@ -21071,6 +21924,7 @@ mod tests {
                     request_context: &context,
                     client_send_timeout: Duration::from_secs(10),
                     max_pending_server_requests: 4,
+                    opt_out_notification_methods: HashSet::new(),
                 };
 
                 let result = super::handle_client_request(
@@ -21178,6 +22032,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let err = super::handle_client_request(
@@ -21306,6 +22161,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs_async(async {
@@ -21459,6 +22315,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs_async(async {
@@ -21648,6 +22505,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
             };
 
             let err = super::handle_client_request(
@@ -21744,6 +22602,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let err = super::handle_client_request(
@@ -28405,6 +29264,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_missing_workers_reuses_initialize_capabilities() {
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let recorded_initialize_params = Arc::new(Mutex::new(Vec::new()));
+        let worker_b =
+            start_mock_remote_server_recording_initialize(recorded_initialize_params.clone()).await;
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: Some(vec![
+                    "thread/started".to_string(),
+                    "item/agentMessage/delta".to_string(),
+                ]),
+            }),
+        };
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                worker_websocket_url: None,
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: true,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec!["ws://worker-a.invalid".to_string(), worker_b.clone()],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: initialize_params.clone(),
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(3),
+            }),
+        };
+
+        router
+            .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default())
+            .await;
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            *recorded_initialize_params.lock().await,
+            vec![initialize_params]
+        );
+
+        timeout(Duration::from_secs(2), router.shutdown())
+            .await
+            .expect("router shutdown should finish in time")
+            .expect("router should shut down");
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
     async fn reconnect_missing_workers_records_attempt_and_connect_failure_metrics() {
         let metrics = codex_otel::MetricsClient::new(
             codex_otel::MetricsConfig::in_memory(
@@ -28486,6 +29429,94 @@ mod tests {
             .await
             .expect("router shutdown should finish in time")
             .expect("router should shut down");
+        client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn reconnect_missing_workers_records_downstream_protocol_violation_metrics() {
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let (client, request_handle) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let worker_b =
+            start_mock_remote_server_that_sends_invalid_jsonrpc_during_initialize().await;
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![DownstreamWorkerHandle {
+                worker_id: Some(0),
+                worker_websocket_url: None,
+                request_handle,
+            }],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec!["ws://worker-a.invalid".to_string(), worker_b.clone()],
+                session_factory: GatewayV2SessionFactory::remote_multi(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                ),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(3),
+            }),
+        };
+
+        let logs = capture_logs_async(async {
+            router
+                .reconnect_missing_workers_at(Instant::now(), &observability)
+                .await;
+            assert_eq!(router.worker_count(), 1);
+            timeout(Duration::from_secs(2), router.shutdown())
+                .await
+                .expect("router shutdown should finish in time")
+                .expect("router should shut down");
+        })
+        .await;
+
+        assert!(logs.contains("sent invalid initialize response"), "{logs}");
+        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+
         client.shutdown().await.expect("client should shut down");
     }
 
@@ -28998,6 +30029,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
                         let mut router = GatewayV2DownstreamRouter {
@@ -29136,6 +30168,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
                         let mut router = GatewayV2DownstreamRouter {
@@ -29290,6 +30323,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -29415,6 +30449,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -29555,6 +30590,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
@@ -29667,6 +30703,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
@@ -29777,6 +30814,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
@@ -29911,6 +30949,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
@@ -30032,6 +31071,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
@@ -30153,6 +31193,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -30282,6 +31323,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -30407,6 +31449,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -30534,6 +31577,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -30679,6 +31723,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -30817,6 +31862,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
@@ -32641,6 +33687,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_upgrade_suppresses_opted_out_notifications() {
+        let params = serde_json::json!({
+            "threadId": null,
+            "message": "Gateway opt-out test message",
+        });
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_for_connection_notification("warning", params).await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize_with_capabilities(
+            &mut websocket,
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                opt_out_notification_methods: Some(vec!["warning".to_string()]),
+            }),
+        )
+        .await;
+
+        let notification = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert!(notification.is_err());
+        assert_v2_suppressed_notification_metric(&metrics, "warning", "opted_out");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_suppresses_opted_out_multi_worker_notifications() {
+        let opted_out_params = serde_json::json!({
+            "threadId": null,
+            "message": "Gateway multi-worker opt-out test message",
+        });
+        let forwarded_params = serde_json::json!({
+            "summary": "Gateway multi-worker config warning",
+            "details": null,
+        });
+        let worker_a =
+            start_mock_remote_server_for_connection_notification("warning", opted_out_params).await;
+        let worker_b = start_mock_remote_server_for_connection_notification(
+            "configWarning",
+            forwarded_params.clone(),
+        )
+        .await;
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize_with_capabilities(
+            &mut websocket,
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                opt_out_notification_methods: Some(vec!["warning".to_string()]),
+            }),
+        )
+        .await;
+
+        assert_jsonrpc_notification(
+            read_websocket_message(&mut websocket).await,
+            "configWarning",
+            forwarded_params,
+        );
+        let notification = timeout(Duration::from_millis(200), websocket.next()).await;
+        assert!(notification.is_err());
+        assert_v2_suppressed_notification_metric(&metrics, "warning", "opted_out");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_forwards_filesystem_changed_notifications() {
         let params = serde_json::json!({
             "watchId": "watch-1",
@@ -33807,6 +34999,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs_async(async {
@@ -33931,6 +35124,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs(|| {
@@ -33973,6 +35167,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs(|| {
@@ -34012,6 +35207,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
         };
 
         let logs = capture_logs(|| {
@@ -34738,6 +35934,153 @@ mod tests {
     }
 
     #[test]
+    fn log_suppressed_opted_out_notification_includes_scope_worker_and_params() {
+        let logs = capture_logs(|| {
+            super::log_suppressed_opted_out_notification(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(1),
+                "ws://worker-b.invalid",
+                &JSONRPCNotification {
+                    method: "warning".to_string(),
+                    params: Some(serde_json::json!({
+                        "threadId": null,
+                        "message": "hidden by initialize capability",
+                    })),
+                },
+            );
+        });
+
+        assert!(
+            logs.contains("suppressing downstream notification opted out by northbound v2 client")
+        );
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
+        assert!(logs.contains("method=\"warning\""));
+        assert!(logs.contains("hidden by initialize capability"));
+    }
+
+    #[test]
+    fn log_downstream_connect_protocol_violation_includes_scope_reason_and_message() {
+        let logs = capture_logs(|| {
+            super::log_downstream_connect_protocol_violation(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                "invalid_binary",
+                "remote app server at `ws://worker-a.invalid` sent non-text initialize frame",
+            );
+        });
+
+        assert!(logs.contains(
+            "downstream app-server sent a malformed v2 protocol frame during initialize"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("reason=\"invalid_binary\""));
+        assert!(logs.contains("sent non-text initialize frame"));
+    }
+
+    #[test]
+    fn log_downstream_reconnect_protocol_violation_includes_scope_worker_reason_and_message() {
+        let logs = capture_logs(|| {
+            super::log_downstream_reconnect_protocol_violation(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                1,
+                "ws://worker-b.invalid",
+                "invalid_jsonrpc",
+                "remote app server at `ws://worker-b.invalid` sent invalid initialize response",
+            );
+        });
+
+        assert!(logs.contains(
+            "downstream app-server sent a malformed v2 protocol frame during worker reconnect"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=1"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
+        assert!(logs.contains("reason=\"invalid_jsonrpc\""));
+        assert!(logs.contains("sent invalid initialize response"));
+    }
+
+    #[test]
+    fn log_downstream_protocol_violation_includes_scope_worker_reason_and_routes() {
+        let logs = capture_logs(|| {
+            super::log_downstream_protocol_violation(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(2),
+                "ws://worker-c.invalid",
+                "invalid_jsonrpc",
+                "remote app server at `ws://worker-c.invalid` sent invalid JSON-RPC: expected value",
+                2,
+                &GatewayV2EventState {
+                    pending_server_requests: HashMap::from([(
+                        RequestId::String("gateway-pending-1".to_string()),
+                        PendingServerRequestRoute {
+                            worker_id: Some(2),
+                            downstream_request_id: RequestId::String(
+                                "downstream-pending-1".to_string(),
+                            ),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    )]),
+                    resolved_server_requests: HashMap::from([(
+                        super::DownstreamServerRequestKey {
+                            worker_id: Some(1),
+                            request_id: RequestId::String("downstream-resolved-1".to_string()),
+                        },
+                        super::ResolvedServerRequestRoute {
+                            gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
+                            thread_id: Some("thread-visible".to_string()),
+                        },
+                    )]),
+                    skills_changed_pending_refresh: false,
+                    forwarded_connection_notifications: HashMap::new(),
+                },
+            );
+        });
+
+        assert!(logs.contains("downstream app-server sent a malformed v2 protocol frame"));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
+        assert!(logs.contains("reason=\"invalid_jsonrpc\""));
+        assert!(logs.contains("sent invalid JSON-RPC"));
+        assert!(logs.contains("active_worker_count=2"));
+        assert!(logs.contains("pending_server_request_count=1"));
+        assert!(logs.contains("pending_server_request_ids=[String(\"gateway-pending-1\")]"));
+        assert!(
+            logs.contains(
+                "pending_downstream_server_request_ids=[String(\"downstream-pending-1\")]"
+            )
+        );
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("pending_worker_ids=[2]"));
+        assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains(
+            "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
+        ));
+        assert!(logs.contains(
+            "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
+        ));
+        assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
+        assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
+    }
+
+    #[test]
     fn log_suppressed_duplicate_connection_notification_includes_scope_worker_and_params() {
         let logs = capture_logs(|| {
             super::log_suppressed_duplicate_connection_notification(
@@ -35140,6 +36483,90 @@ mod tests {
                 panic!("expected initialize request");
             };
             assert_eq!(initialize_request.method, "initialize");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: initialize_request.id,
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("initialize response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("initialize response should send");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialized frame should exist")
+                .expect("initialized frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialized text frame");
+            };
+            let JSONRPCMessage::Notification(notification) =
+                serde_json::from_str(&text).expect("initialized should decode")
+            else {
+                panic!("expected initialized notification");
+            };
+            assert_eq!(notification.method, "initialized");
+
+            while let Some(frame) = websocket.next().await {
+                match frame.expect("follow-up frame should decode") {
+                    Message::Close(_) => break,
+                    Message::Ping(payload) => {
+                        websocket
+                            .send(Message::Pong(payload))
+                            .await
+                            .expect("pong should send");
+                    }
+                    Message::Text(_)
+                    | Message::Binary(_)
+                    | Message::Pong(_)
+                    | Message::Frame(_) => {}
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_recording_initialize(
+        recorded_initialize_params: Arc<Mutex<Vec<InitializeParams>>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(initialize_request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(initialize_request.method, "initialize");
+            let initialize_params: InitializeParams = serde_json::from_value(
+                initialize_request
+                    .params
+                    .clone()
+                    .expect("initialize params should exist"),
+            )
+            .expect("initialize params should decode");
+            recorded_initialize_params
+                .lock()
+                .await
+                .push(initialize_params);
             websocket
                 .send(Message::Text(
                     serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
@@ -37531,6 +38958,262 @@ mod tests {
 
     async fn start_mock_remote_server_that_disconnects_after_initialize() -> String {
         start_mock_remote_server_that_disconnects_after_initialize_with_reason(String::new()).await
+    }
+
+    async fn start_mock_remote_server_that_sends_invalid_jsonrpc_after_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            websocket
+                .send(Message::Text("not json".to_string().into()))
+                .await
+                .expect("invalid JSON-RPC should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_binary_during_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Binary(vec![0, 1, 2].into()))
+                .await
+                .expect("binary frame should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_invalid_jsonrpc_during_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Text("not json".to_string().into()))
+                .await
+                .expect("invalid JSON-RPC should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_wrong_id_response_during_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: RequestId::String("not-initialize".to_string()),
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("initialize response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("wrong-id initialize response should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_wrong_id_error_during_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                        id: RequestId::String("not-initialize".to_string()),
+                        error: JSONRPCErrorError {
+                            code: -32603,
+                            message: "unexpected initialize error".to_string(),
+                            data: None,
+                        },
+                    }))
+                    .expect("initialize error should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("wrong-id initialize error should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_binary_after_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            websocket
+                .send(Message::Binary(vec![0, 1, 2].into()))
+                .await
+                .expect("binary frame should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_unexpected_response_after_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: RequestId::String("unexpected-response".to_string()),
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("unexpected response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("unexpected response should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_unexpected_error_after_initialize() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                        id: RequestId::String("unexpected-error".to_string()),
+                        error: JSONRPCErrorError {
+                            code: -32603,
+                            message: "unexpected".to_string(),
+                            data: None,
+                        },
+                    }))
+                    .expect("unexpected error should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("unexpected error should send");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
     }
 
     async fn start_mock_remote_server_that_disconnects_after_initialize_with_reason(

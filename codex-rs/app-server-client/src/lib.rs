@@ -1049,6 +1049,7 @@ mod tests {
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::GetAccountResponse;
+    use codex_app_server_protocol::JSONRPCError;
     use codex_app_server_protocol::JSONRPCMessage;
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
@@ -1531,6 +1532,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_binary_frame_during_initialize_fails_connect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Binary(vec![0, 1, 2].into()))
+                .await
+                .expect("binary frame should send");
+        })
+        .await;
+
+        let err =
+            match RemoteAppServerClient::connect(test_remote_connect_args(websocket_url)).await {
+                Ok(_) => panic!("remote client connect should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("sent non-text initialize frame"));
+    }
+
+    #[tokio::test]
+    async fn remote_invalid_jsonrpc_during_initialize_fails_connect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Text("not json".to_string().into()))
+                .await
+                .expect("invalid JSON-RPC frame should send");
+        })
+        .await;
+
+        let err =
+            match RemoteAppServerClient::connect(test_remote_connect_args(websocket_url)).await {
+                Ok(_) => panic!("remote client connect should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("sent invalid initialize response"));
+    }
+
+    #[tokio::test]
+    async fn remote_wrong_initialize_response_id_fails_connect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: RequestId::String("not-initialize".to_string()),
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("wrong-id initialize response should send");
+        })
+        .await;
+
+        let err =
+            match RemoteAppServerClient::connect(test_remote_connect_args(websocket_url)).await {
+                Ok(_) => panic!("remote client connect should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("sent invalid initialize response"));
+        assert!(err.to_string().contains("not-initialize"));
+    }
+
+    #[tokio::test]
+    async fn remote_wrong_initialize_error_id_fails_connect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Error(JSONRPCError {
+                        id: RequestId::String("not-initialize".to_string()),
+                        error: JSONRPCErrorError {
+                            code: -32603,
+                            message: "unexpected initialize error".to_string(),
+                            data: None,
+                        },
+                    }))
+                    .expect("error should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("wrong-id initialize error should send");
+        })
+        .await;
+
+        let err =
+            match RemoteAppServerClient::connect(test_remote_connect_args(websocket_url)).await {
+                Ok(_) => panic!("remote client connect should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("sent invalid initialize response"));
+        assert!(err.to_string().contains("not-initialize"));
+    }
+
+    #[tokio::test]
     async fn remote_connect_includes_custom_headers_when_configured() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1965,6 +2078,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_unknown_server_request_during_initialize_is_rejected_and_connects() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            let JSONRPCMessage::Request(initialize_request) =
+                read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(initialize_request.method, "initialize");
+
+            let request_id = RequestId::String("srv-init-unknown".to_string());
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Request(JSONRPCRequest {
+                    id: request_id.clone(),
+                    method: "thread/unknown".to_string(),
+                    params: None,
+                    trace: None,
+                }),
+            )
+            .await;
+
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected JSON-RPC error response");
+            };
+            assert_eq!(error.id, request_id);
+            assert_eq!(error.error.code, -32601);
+            assert_eq!(
+                error.error.message,
+                "unsupported remote app-server request `thread/unknown`"
+            );
+
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: initialize_request.id,
+                    result: serde_json::json!({}),
+                }),
+            )
+            .await;
+
+            let JSONRPCMessage::Notification(notification) =
+                read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialized notification");
+            };
+            assert_eq!(notification.method, "initialized");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
     async fn remote_unknown_server_request_is_rejected() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
@@ -2015,6 +2184,92 @@ mod tests {
             .await
             .expect("disconnect event should arrive");
         assert!(matches!(event, AppServerEvent::Disconnected { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_binary_frame_after_initialize_surfaces_as_disconnect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            websocket
+                .send(Message::Binary(vec![0, 1, 2].into()))
+                .await
+                .expect("binary frame should send");
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client
+            .next_event()
+            .await
+            .expect("disconnect event should arrive");
+        let AppServerEvent::Disconnected { message } = event else {
+            panic!("expected disconnect event");
+        };
+        assert!(message.contains("sent non-text JSON-RPC frame"));
+    }
+
+    #[tokio::test]
+    async fn remote_unexpected_response_id_after_initialize_surfaces_as_disconnect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: RequestId::String("unknown-response".to_string()),
+                    result: serde_json::json!({}),
+                }),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client
+            .next_event()
+            .await
+            .expect("disconnect event should arrive");
+        let AppServerEvent::Disconnected { message } = event else {
+            panic!("expected disconnect event");
+        };
+        assert!(message.contains("sent unexpected JSON-RPC response id"));
+        assert!(message.contains("unknown-response"));
+    }
+
+    #[tokio::test]
+    async fn remote_unexpected_error_id_after_initialize_surfaces_as_disconnect() {
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Error(JSONRPCError {
+                    id: RequestId::String("unknown-error".to_string()),
+                    error: JSONRPCErrorError {
+                        code: -32603,
+                        message: "unexpected".to_string(),
+                        data: None,
+                    },
+                }),
+            )
+            .await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let event = client
+            .next_event()
+            .await
+            .expect("disconnect event should arrive");
+        let AppServerEvent::Disconnected { message } = event else {
+            panic!("expected disconnect event");
+        };
+        assert!(message.contains("sent unexpected JSON-RPC error id"));
+        assert!(message.contains("unknown-error"));
     }
 
     #[test]

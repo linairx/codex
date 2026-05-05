@@ -327,11 +327,39 @@ impl RemoteAppServerClient {
                                     Ok(JSONRPCMessage::Response(response)) => {
                                         if let Some(response_tx) = pending_requests.remove(&response.id) {
                                             let _ = response_tx.send(Ok(Ok(response.result)));
+                                        } else {
+                                            let _ = deliver_event(
+                                                &event_tx,
+                                                &mut skipped_events,
+                                                AppServerEvent::Disconnected {
+                                                    message: format!(
+                                                        "remote app server at `{websocket_url}` sent unexpected JSON-RPC response id {:?}",
+                                                        response.id
+                                                    ),
+                                                },
+                                                &mut stream,
+                                            )
+                                            .await;
+                                            break;
                                         }
                                     }
                                     Ok(JSONRPCMessage::Error(error)) => {
                                         if let Some(response_tx) = pending_requests.remove(&error.id) {
                                             let _ = response_tx.send(Ok(Err(error.error)));
+                                        } else {
+                                            let _ = deliver_event(
+                                                &event_tx,
+                                                &mut skipped_events,
+                                                AppServerEvent::Disconnected {
+                                                    message: format!(
+                                                        "remote app server at `{websocket_url}` sent unexpected JSON-RPC error id {:?}",
+                                                        error.id
+                                                    ),
+                                                },
+                                                &mut stream,
+                                            )
+                                            .await;
+                                            break;
                                         }
                                     }
                                     Ok(JSONRPCMessage::Notification(notification)) => {
@@ -436,10 +464,21 @@ impl RemoteAppServerClient {
                                 .await;
                                 break;
                             }
-                            Some(Ok(Message::Binary(_)))
-                            | Some(Ok(Message::Ping(_)))
-                            | Some(Ok(Message::Pong(_)))
-                            | Some(Ok(Message::Frame(_))) => {}
+                            Some(Ok(Message::Binary(_) | Message::Frame(_))) => {
+                                let _ = deliver_event(
+                                    &event_tx,
+                                    &mut skipped_events,
+                                    AppServerEvent::Disconnected {
+                                        message: format!(
+                                            "remote app server at `{websocket_url}` sent non-text JSON-RPC frame"
+                                        ),
+                                    },
+                                    &mut stream,
+                                )
+                                .await;
+                                break;
+                            }
+                            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                             Some(Err(err)) => {
                                 let _ = deliver_event(
                                     &event_tx,
@@ -844,13 +883,26 @@ async fn initialize_remote_connection(
                                 }
                             }
                         }
-                        JSONRPCMessage::Response(_) | JSONRPCMessage::Error(_) => {}
+                        JSONRPCMessage::Response(response) => {
+                            break Err(IoError::other(format!(
+                                "remote app server at `{websocket_url}` sent invalid initialize response: unexpected response id {:?}",
+                                response.id
+                            )));
+                        }
+                        JSONRPCMessage::Error(error) => {
+                            break Err(IoError::other(format!(
+                                "remote app server at `{websocket_url}` sent invalid initialize response: unexpected error id {:?}",
+                                error.id
+                            )));
+                        }
                     }
                 }
-                Some(Ok(Message::Binary(_)))
-                | Some(Ok(Message::Ping(_)))
-                | Some(Ok(Message::Pong(_)))
-                | Some(Ok(Message::Frame(_))) => {}
+                Some(Ok(Message::Binary(_) | Message::Frame(_))) => {
+                    break Err(IoError::other(format!(
+                        "remote app server at `{websocket_url}` sent non-text initialize frame"
+                    )));
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(frame))) => {
                     let reason = frame
                         .as_ref()

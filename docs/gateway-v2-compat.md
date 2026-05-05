@@ -1030,6 +1030,73 @@ Recent progress:
   `thread/inject_items`, `thread/compact/start`, `thread/shellCommand`,
   `thread/backgroundTerminals/clean`, `thread/rollback`, `review/start`, and
   `thread/name/set`
+- multi-worker northbound initialization now also verifies that client identity,
+  experimental capability, and `optOutNotificationMethods` are propagated to
+  every downstream worker session, and lazy reconnect now reuses those same
+  initialized capability parameters when a missing worker is re-added, keeping
+  shared-session capability negotiation aligned with the embedded and
+  single-worker release baselines
+- the gateway northbound v2 boundary now also enforces exact
+  `optOutNotificationMethods` suppression before forwarding downstream
+  notifications, so the client-visible compatibility contract is preserved
+  even if a downstream worker emits an opted-out notification
+- opted-out notification suppression now also emits a structured gateway log
+  with tenant/project scope, worker identity, method, and payload context, so
+  operators can identify client-requested notification drops separately from
+  duplicate suppression or hidden-thread filtering
+- that opt-out suppression now also has dedicated multi-worker fan-in coverage,
+  verifying that an opted-out notification from one worker is dropped while a
+  different, non-opted-out notification from another worker is still forwarded
+  on the shared northbound session
+- downstream malformed JSON-RPC frames now close the northbound v2 WebSocket
+  with explicit gateway-owned behavior, record a downstream protocol-violation
+  metric, and report the connection outcome as `downstream_protocol_violation`
+  instead of folding the case into ordinary downstream session termination
+- malformed downstream frame handling now also emits a structured gateway log
+  with tenant/project scope, worker identity, reason, downstream message, active
+  worker count, and pending / answered-but-unresolved server-request routes, so
+  surviving multi-worker sessions still expose the worker protocol violation to
+  operators
+- downstream non-text JSON-RPC data frames now also fail closed as explicit
+  `invalid_binary` protocol violations instead of being silently ignored by the
+  remote app-server transport, so malformed-frame hardening covers both invalid
+  text payloads and unsupported binary data frames
+- downstream non-text frames during the app-server initialize handshake are now
+  also classified as downstream `invalid_binary` protocol violations, so
+  setup-time malformed worker traffic is reported with the same gateway-owned
+  outcome and metric as post-handshake malformed frames; the underlying remote
+  app-server client transport now also has direct regression coverage for
+  failing connection setup on those non-text initialize frames
+- downstream invalid JSON-RPC during the app-server initialize handshake is now
+  also classified as a downstream `invalid_jsonrpc` protocol violation, closing
+  the setup-time malformed text response path alongside post-handshake invalid
+  JSON-RPC handling; the underlying remote app-server client transport now also
+  has direct regression coverage for failing connection setup on invalid
+  initialize JSON-RPC text frames
+- downstream initialize responses or errors with a valid JSON-RPC envelope but
+  the wrong request id now also fail immediately as malformed initialize
+  responses instead of waiting for the initialize timeout; gateway northbound
+  coverage verifies these setup-time protocol violations record the downstream
+  `invalid_jsonrpc` metric and terminal `downstream_protocol_violation`
+  outcome
+- downstream server requests received during the app-server initialize
+  handshake now also have direct remote transport coverage for the unsupported
+  request path: unsupported setup-time requests are rejected with a JSON-RPC
+  method-not-found error while the initialize handshake can still complete
+- downstream JSON-RPC responses or errors with unknown request ids after
+  initialization now also fail closed as downstream `invalid_jsonrpc` protocol
+  violations instead of being silently ignored, so out-of-order downstream
+  traffic is visible at the gateway boundary
+- setup-time downstream protocol violations now also emit a structured gateway
+  warning log with tenant/project scope, violation reason, and downstream
+  transport detail before the initialize request returns an error, so malformed
+  worker handshakes have the same operator-visible diagnostics as
+  post-handshake malformed frames
+- lazy multi-worker reconnect now also classifies malformed downstream
+  initialize traffic as a downstream protocol violation, records the
+  protocol-violation metric, and emits a structured warning with tenant/project
+  scope plus worker id / URL, so recovered-worker handshakes cannot disappear
+  into generic reconnect failures
 - that same steady-state Stage B surface now also keeps tenant/project scope
   enforcement and worker-local state coherent across one shared session:
   same-scope clients can re-enter aggregated
