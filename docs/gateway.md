@@ -888,6 +888,10 @@ Recent progress:
   downstream ids, and worker ids, and that same slow-client path now also has
   a real northbound regression where the client has already replied but
   downstream `serverRequest/resolved` never arrives before timeout
+- that answered-but-unresolved slow-client regression now also pins the
+  dedicated `gateway_v2_client_send_timeouts` counter on the same real
+  northbound WebSocket path, so timeout metrics cover both pending and
+  already-answered prompt lifecycle variants
 - that same connection-end teardown path now also has a real northbound
   regression for client disconnects after one server request has already been
   answered but before downstream `serverRequest/resolved` arrives, pinning the
@@ -1129,6 +1133,121 @@ Phase 6 is in progress with:
   propagation, auth and Origin guards, explicit fail-closed behavior when v2 is
   unavailable for the current runtime topology, and the same scope, admission,
   audit, and metrics policies that already apply to HTTP traffic
+- northbound v2 admission coverage now also pins the per-scope
+  `turn/start` quota path over WebSocket, verifying that the first turn can
+  pass through to the downstream app-server while the next turn in the same
+  quota window receives the gateway-owned rate-limit JSON-RPC error and emits
+  the expected v2 request metric and audit log with `outcome=rate_limited`
+- that same v2 admission coverage now also asserts the general per-scope
+  request-rate-limit metric path when scope enforcement rejects the first
+  request and the next request in the same quota window is rate-limited, so
+  policy and quota outcomes stay distinct in `gateway_v2_requests`
+- post-initialize protocol-violation coverage now also asserts request-level
+  metrics for repeated `initialize` requests, so operators can correlate the
+  `gateway_v2_protocol_violations` counter with the corresponding
+  `gateway_v2_requests{method="initialize", outcome="invalid_request"}` path
+- that repeated-`initialize` coverage now also pins the matching gateway v2
+  audit log with tenant/project scope and `outcome="invalid_request"`, so
+  post-handshake startup protocol mistakes are visible through metrics,
+  protocol-violation counters, and audit logs together
+- pre-initialize ordering-violation coverage now also asserts request-level
+  metrics for requests sent before `initialize`, so operators can correlate
+  `gateway_v2_protocol_violations{phase="pre_initialize",
+  reason="initialize_order"}` with the offending method's
+  `gateway_v2_requests{outcome="invalid_request"}` path
+- that pre-initialize ordering-violation coverage now also pins the matching
+  gateway v2 audit log with tenant/project scope and
+  `outcome="invalid_request"`, so startup ordering mistakes are visible
+  through metrics, protocol-violation counters, and audit logs together
+- pre-initialize malformed-payload coverage now also asserts the paired
+  connection-level metrics for text JSON-RPC parse failures and invalid UTF-8
+  binary frames, so malformed startup traffic is tied to the terminal
+  `invalid_client_payload` connection outcome before any downstream app-server
+  session is opened
+- pre-initialize malformed text-payload coverage now also pins the matching
+  gateway v2 connection audit record with tenant/project scope, terminal
+  detail, and `outcome="invalid_client_payload"`, so parse failures before
+  `initialize` are visible through both metrics and audit logs
+- pre-initialize invalid UTF-8 binary-frame coverage now also pins the matching
+  gateway v2 connection audit record with tenant/project scope, terminal
+  detail, and `outcome="invalid_client_payload"`, so binary startup payload
+  failures have the same audit visibility as malformed text payloads
+- post-initialize malformed-payload coverage now also asserts the paired
+  connection-level metrics for text JSON-RPC parse failures and invalid UTF-8
+  binary frames, so those protocol violations stay tied to the terminal
+  `invalid_client_payload` connection outcome
+- post-initialize malformed text-payload coverage now also pins the matching
+  gateway v2 connection audit record with tenant/project scope, terminal
+  detail, and `outcome="invalid_client_payload"`, so JSON-RPC parse failures
+  remain audit-visible after initialize completes
+- post-initialize invalid UTF-8 binary-frame coverage now also pins the
+  matching gateway v2 connection audit record with tenant/project scope,
+  terminal detail, and `outcome="invalid_client_payload"`, so malformed binary
+  frames stay audit-visible after the downstream app-server session is already
+  established
+- unknown server-request reply coverage now also asserts the paired connection
+  metrics for unexpected northbound `Response` and `Error` frames, so
+  `unexpected_client_server_request_response` lifecycle events stay tied to the
+  terminal `protocol_violation` connection outcome
+- the unknown server-request `Response` warning-log regression now also pins
+  the response kind plus pending downstream request and worker ids, matching
+  the existing `Error`-frame coverage so both unexpected reply forms keep
+  enough route context for production diagnosis
+- downstream protocol-violation coverage now also asserts the paired
+  connection-level metrics for malformed JSON-RPC frames, non-text frames, and
+  unexpected downstream response/error IDs after initialization, so
+  `gateway_v2_protocol_violations{phase="downstream"}` stays correlated with
+  the terminal `downstream_protocol_violation` connection outcome
+- the malformed downstream JSON-RPC regression now also pins the structured
+  warning log on the real northbound WebSocket path, including tenant/project
+  scope, worker route context, violation reason, downstream error text, and
+  active worker count
+- initialize-time downstream protocol-violation coverage now also asserts the
+  paired `gateway_v2_requests{method="initialize",
+  outcome="downstream_protocol_violation"}` metric for malformed initialize
+  responses, wrong initialize response/error IDs, and non-text initialize
+  frames, so startup compatibility failures are visible at the request,
+  protocol, connection, and health layers together
+- malformed downstream initialize-response coverage now also pins the matching
+  gateway v2 audit record with tenant/project scope and
+  `outcome="downstream_protocol_violation"`, so startup compatibility failures
+  are visible through metrics, protocol-violation counters, connection health,
+  and audit logs together
+- downstream connection-failure coverage now also asserts the paired
+  `gateway_v2_requests{method="initialize",
+  outcome="downstream_connect_error"}` metric when the gateway cannot open the
+  app-server session after a valid northbound initialize request, so ordinary
+  worker reachability failures stay distinguishable from downstream protocol
+  violations at the request-metrics layer
+- that downstream connection-failure coverage now also pins the gateway v2
+  audit record with tenant/project scope and
+  `outcome="downstream_connect_error"`, so worker reachability failures are
+  visible through both metrics and audit logs
+- initialize timeout coverage now also asserts the paired
+  `gateway_v2_requests{method="initialize", outcome="timed_out"}` metric
+  alongside the terminal `initialize_timed_out` connection metric, so startup
+  stalls are visible through both request-level and connection-level telemetry
+- that initialize timeout coverage now also pins the gateway v2 audit record
+  with tenant/project scope and `outcome="timed_out"`, so startup stalls are
+  visible through both metrics and audit logs
+- invalid initialize-params coverage now also asserts the paired
+  `gateway_v2_requests{method="initialize", outcome="invalid_request"}`
+  metric, so malformed but parseable startup requests are visible at the same
+  request-metrics boundary as ordering and repeated-initialize violations
+- that invalid initialize-params coverage now also pins the gateway v2 audit
+  record with tenant/project scope and `outcome="invalid_request"`, so
+  malformed startup requests stay visible through both metrics and audit logs
+- scope-policy coverage now also asserts the paired
+  `gateway_v2_requests{method="thread/resume",
+  outcome="invalid_params"}` metric for unknown path-based rollout re-entry,
+  so gateway-owned v2 path checks remain visible as request outcomes instead
+  of only JSON-RPC error payloads
+- that same scope-policy metric coverage now also covers unknown path-based
+  `thread/fork`, so both rollout-path entrypoints report
+  `outcome="invalid_params"` before any downstream routing attempt
+- path-based `thread/resume` / `thread/fork` scope-policy tests now also pin
+  that placeholder `threadId` values are ignored for route affinity while the
+  rollout `path` remains the scope-check key
 - rollout visibility is operator-facing instead of test-only:
   startup and `/healthz` distinguish embedded, single-worker remote, and the
   current partial multi-worker profile; `/healthz` exposes
@@ -1184,6 +1303,17 @@ Phase 6 is in progress with:
   the affected worker websocket URL, and saturated-connection logs include the
   pending gateway/downstream server-request ids plus affected thread and worker
   ids that caused the bounded prompt-state pressure
+- the real northbound WebSocket pending-limit regression now also pins that
+  saturated server-request warning log end to end, including the rejected
+  request id, tenant/project scope, configured pending limit, affected worker
+  URL, and still-pending gateway/downstream request and thread ids, while
+  verifying the connection can continue serving follow-up v2 requests after the
+  bounded prompt rejection
+- the hidden-thread server-request policy regression now also verifies the
+  rejection metric and structured warning log in the same real northbound
+  WebSocket flow, pinning tenant/project scope, affected worker URL, rejected
+  request id, method, and hidden thread id at the transport boundary instead
+  of only through helper-level log formatting coverage
 - multi-worker v2 reconnect activity now also emits a
   `gateway_v2_worker_reconnects` counter tagged by worker id and outcome
   (`attempt`, `success`, `connect_failure`, `replay_failure`, or
@@ -1229,6 +1359,15 @@ Phase 6 is in progress with:
   now also include the affected worker websocket URL, and exact-duplicate
   connection-state suppression logs include both the dropped worker route and
   the original forwarded worker route
+- the real northbound WebSocket exact-duplicate `warning` suppression
+  regression now also pins that structured suppression log end to end,
+  including tenant/project scope, dropped and original worker routes, worker
+  websocket URLs, notification method, and payload context alongside the
+  existing `duplicate` suppression metric
+- the real northbound WebSocket hidden-thread notification regression now also
+  pins that structured suppression log end to end, including tenant/project
+  scope, affected worker URL, notification method, hidden thread id, and
+  payload context alongside the existing `hidden_thread` suppression metric
 - exact-duplicate suppression for multi-worker connection-state notifications
   now also covers `windows/worldWritableWarning` and
   `windowsSandbox/setupCompleted`, so one shared northbound session does not
@@ -1658,6 +1797,10 @@ Phase 6 is in progress with:
   with tenant/project scope, worker identity, method, and payload context, so
   operators can distinguish client-requested notification drops from duplicate
   suppression or hidden-thread policy filtering
+- the real northbound WebSocket opt-out notification regression now also pins
+  that structured suppression log end to end, including tenant/project scope,
+  affected worker URL, notification method, and payload context alongside the
+  existing `opted_out` suppression metric
 - that opt-out suppression now also has dedicated multi-worker fan-in coverage,
   verifying that an opted-out notification from one worker is dropped while a
   different, non-opted-out notification from another worker is still forwarded
@@ -1697,6 +1840,15 @@ Phase 6 is in progress with:
   handshake now also have direct remote transport coverage for the unsupported
   request path: unsupported setup-time requests are rejected with a JSON-RPC
   method-not-found error while the initialize handshake can still complete
+- the gateway northbound WebSocket boundary now also has direct regression
+  coverage for a valid downstream server request received during the
+  app-server initialize handshake, verifying that it is forwarded after
+  northbound initialize completes and that the client response routes back to
+  the owning worker
+- that same northbound handshake boundary now also verifies unsupported
+  downstream server requests received during app-server initialize are rejected
+  with method-not-found at the worker transport while the gateway session still
+  completes initialize and serves a follow-up client request
 - downstream JSON-RPC responses or errors with unknown request ids after
   initialization now also fail closed as downstream `invalid_jsonrpc` protocol
   violations instead of being silently ignored, so out-of-order downstream
@@ -1711,6 +1863,10 @@ Phase 6 is in progress with:
   protocol-violation metric, and emits a structured warning with tenant/project
   scope plus worker id / URL, so recovered-worker handshakes cannot disappear
   into generic reconnect failures
+- that lazy-reconnect protocol-violation regression now also pins the paired
+  worker reconnect metrics, verifying malformed recovered-worker handshakes
+  record both the reconnect `attempt` and terminal `connect_failure` outcome
+  alongside the downstream `invalid_jsonrpc` protocol-violation metric
 - multi-worker notification fan-in coverage now also pins
   `rawResponseItem/completed` across worker-owned visible threads, so raw
   response item replay uses the same shared-session forwarding path as the

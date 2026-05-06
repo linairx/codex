@@ -831,7 +831,7 @@ async fn run_websocket_connection(
         .mark_connection_started();
     let run_result = match async {
         let initialize_request =
-            match recv_initialize_request(&mut socket, timeouts, &observability).await {
+            match recv_initialize_request(&mut socket, timeouts, &observability, &context).await {
             Ok(request) => request,
             Err(err) if err.kind() == ErrorKind::TimedOut => {
                 send_close_frame(
@@ -912,10 +912,22 @@ async fn run_websocket_connection(
                 let detail = err.to_string();
                 let downstream_protocol_violation_reason =
                     downstream_protocol_violation_reason(&detail);
+                let request_outcome = if downstream_protocol_violation_reason.is_some() {
+                    "downstream_protocol_violation"
+                } else {
+                    "downstream_connect_error"
+                };
                 if let Some(reason) = downstream_protocol_violation_reason {
                     log_downstream_connect_protocol_violation(&context, reason, &detail);
                     observability.record_v2_protocol_violation("downstream", reason);
                 }
+                observe_v2_request(
+                    &observability,
+                    &context,
+                    "initialize",
+                    request_outcome,
+                    initialize_started_at.elapsed(),
+                );
                 send_jsonrpc_error(
                     &mut socket,
                     initialize_request_id,
@@ -927,19 +939,8 @@ async fn run_websocket_connection(
                     timeouts.client_send,
                 )
                 .await?;
-                observe_v2_request(
-                    &observability,
-                    &context,
-                    "initialize",
-                    "internal_error",
-                    initialize_started_at.elapsed(),
-                );
                 return Ok(GatewayV2ConnectionRunResult {
-                    outcome: if downstream_protocol_violation_reason.is_some() {
-                        "downstream_protocol_violation"
-                    } else {
-                        "downstream_connect_error"
-                    },
+                    outcome: request_outcome,
                     detail: Some(detail),
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
@@ -999,6 +1000,7 @@ async fn run_websocket_connection(
                             let message = match parse_client_jsonrpc_text(&text) {
                                 Ok(message) => message,
                                 Err(err) => {
+                                    connection_detail = Some(err.to_string());
                                     connection.observability.record_v2_protocol_violation(
                                         "post_initialize",
                                         protocol_violation_reason_from_invalid_payload(&err),
@@ -1036,6 +1038,7 @@ async fn run_websocket_connection(
                             let message = match parse_client_jsonrpc_binary(&bytes) {
                                 Ok(message) => message,
                                 Err(err) => {
+                                    connection_detail = Some(err.to_string());
                                     connection.observability.record_v2_protocol_violation(
                                         "post_initialize",
                                         protocol_violation_reason_from_invalid_payload(&err),
@@ -1229,6 +1232,7 @@ async fn recv_initialize_request(
     socket: &mut WebSocket,
     timeouts: GatewayV2Timeouts,
     observability: &GatewayObservability,
+    context: &GatewayRequestContext,
 ) -> io::Result<JSONRPCRequest> {
     tokio::time::timeout(timeouts.initialize, async {
         loop {
@@ -1256,6 +1260,7 @@ async fn recv_initialize_request(
                         message,
                         timeouts.client_send,
                         observability,
+                        context,
                     )
                     .await?
                     {
@@ -1279,6 +1284,7 @@ async fn recv_initialize_request(
                         message,
                         timeouts.client_send,
                         observability,
+                        context,
                     )
                     .await?
                     {
@@ -1361,11 +1367,21 @@ async fn handle_pre_initialize_message(
     message: JSONRPCMessage,
     client_send_timeout: Duration,
     observability: &GatewayObservability,
+    context: &GatewayRequestContext,
 ) -> io::Result<Option<JSONRPCRequest>> {
     match message {
         JSONRPCMessage::Request(request) if request.method == "initialize" => Ok(Some(request)),
         JSONRPCMessage::Request(request) => {
+            let started_at = Instant::now();
+            let method = request.method.clone();
             observability.record_v2_protocol_violation("pre_initialize", "initialize_order");
+            observe_v2_request(
+                observability,
+                context,
+                &method,
+                "invalid_request",
+                started_at.elapsed(),
+            );
             send_jsonrpc_error(
                 socket,
                 request.id,
@@ -5512,10 +5528,11 @@ mod tests {
     #[tokio::test]
     async fn initialize_returns_jsonrpc_error_for_invalid_params() {
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5543,40 +5560,51 @@ mod tests {
             "x-codex-project-id",
             "project-visible".parse().expect("project header"),
         );
-        let (mut websocket, _response) = connect_async(request)
-            .await
-            .expect("websocket should connect");
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
-                    id: RequestId::String("initialize".to_string()),
-                    method: "initialize".to_string(),
-                    params: Some(serde_json::json!({
-                        "clientInfo": {
-                            "name": 1
-                        }
-                    })),
-                    trace: None,
-                }))
-                .expect("request should serialize")
-                .into(),
-            ))
-            .await
-            .expect("initialize request should send");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("initialize".to_string()),
+                        method: "initialize".to_string(),
+                        params: Some(serde_json::json!({
+                            "clientInfo": {
+                                "name": 1
+                            }
+                        })),
+                        trace: None,
+                    }))
+                    .expect("request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("initialize request should send");
 
-        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
-            panic!("expected initialize error response");
-        };
-        assert_eq!(error.id, RequestId::String("initialize".to_string()));
-        assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
-        assert_eq!(
-            error
-                .error
-                .message
-                .contains("invalid request params for `initialize`"),
-            true
-        );
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected initialize error response");
+            };
+            assert_eq!(error.id, RequestId::String("initialize".to_string()));
+            assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
+            assert_eq!(
+                error
+                    .error
+                    .message
+                    .contains("invalid request params for `initialize`"),
+                true
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 request completed"), "{logs}");
+        assert!(logs.contains("method=\"initialize\""), "{logs}");
+        assert!(logs.contains("outcome=\"invalid_request\""), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-visible\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-visible\""), "{logs}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_request_metrics(&metrics, &[("initialize", "invalid_request", 1)]);
 
         server_task.abort();
         let _ = server_task.await;
@@ -5590,7 +5618,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5636,7 +5664,14 @@ mod tests {
         assert_eq!(error.id, RequestId::String("model-list".to_string()));
         assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
         assert_eq!(error.error.message, "initialize must be the first request");
-        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "initialize_order");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_request_metrics(
+            &metrics,
+            "pre_initialize",
+            "initialize_order",
+            "model/list",
+            "invalid_request",
+        );
 
         send_initialize_with_capabilities(
             &mut websocket,
@@ -5655,20 +5690,11 @@ mod tests {
     async fn initialize_must_be_the_first_request_for_text_frames_too() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5690,40 +5716,67 @@ mod tests {
             },
         })
         .await;
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-preinit".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-preinit".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
-                    id: RequestId::String("model-list".to_string()),
-                    method: "model/list".to_string(),
-                    params: Some(serde_json::json!({})),
-                    trace: None,
-                }))
-                .expect("request should serialize")
-                .into(),
-            ))
-            .await
-            .expect("text request should send");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("model-list".to_string()),
+                        method: "model/list".to_string(),
+                        params: Some(serde_json::json!({})),
+                        trace: None,
+                    }))
+                    .expect("request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("text request should send");
 
-        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
-            panic!("expected pre-initialize error response");
-        };
-        assert_eq!(error.id, RequestId::String("model-list".to_string()));
-        assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
-        assert_eq!(error.error.message, "initialize must be the first request");
-        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "initialize_order");
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected pre-initialize error response");
+            };
+            assert_eq!(error.id, RequestId::String("model-list".to_string()));
+            assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
+            assert_eq!(error.error.message, "initialize must be the first request");
 
-        send_initialize_with_capabilities(
-            &mut websocket,
-            Some(InitializeCapabilities {
-                experimental_api: true,
-                opt_out_notification_methods: None,
-            }),
-        )
+            send_initialize_with_capabilities(
+                &mut websocket,
+                Some(InitializeCapabilities {
+                    experimental_api: true,
+                    opt_out_notification_methods: None,
+                }),
+            )
+            .await;
+        })
         .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 request completed"), "{logs}");
+        assert!(logs.contains("method=\"model/list\""), "{logs}");
+        assert!(logs.contains("outcome=\"invalid_request\""), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-preinit\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-preinit\""), "{logs}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_request_metrics(
+            &metrics,
+            "pre_initialize",
+            "initialize_order",
+            "model/list",
+            "invalid_request",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -5732,10 +5785,11 @@ mod tests {
     #[tokio::test]
     async fn initialize_returns_jsonrpc_error_when_downstream_connect_fails() {
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -5752,46 +5806,214 @@ mod tests {
             timeouts: GatewayV2Timeouts::default(),
         })
         .await;
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-downstream".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-downstream".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("initialize".to_string()),
+                        method: "initialize".to_string(),
+                        params: Some(
+                            serde_json::to_value(InitializeParams {
+                                client_info: ClientInfo {
+                                    name: "codex-tui".to_string(),
+                                    title: None,
+                                    version: "0.0.0-test".to_string(),
+                                },
+                                capabilities: None,
+                            })
+                            .expect("initialize params should serialize"),
+                        ),
+                        trace: None,
+                    }))
+                    .expect("request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("initialize request should send");
+
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected initialize error response");
+            };
+            assert_eq!(error.id, RequestId::String("initialize".to_string()));
+            assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+            assert_eq!(
+                error
+                    .error
+                    .message
+                    .contains("gateway failed to connect downstream app-server"),
+                true
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 request completed"), "{logs}");
+        assert!(logs.contains("method=\"initialize\""), "{logs}");
+        assert!(
+            logs.contains("outcome=\"downstream_connect_error\""),
+            "{logs}"
+        );
+        assert!(logs.contains("tenant_id=\"tenant-downstream\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-downstream\""), "{logs}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_request_metrics(&metrics, &[("initialize", "downstream_connect_error", 1)]);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_forwards_server_requests_received_during_downstream_initialize() {
+        let initialize_response = test_initialize_response().await;
+        let (websocket_url, response_rx) =
+            start_mock_remote_server_that_sends_server_request_during_initialize().await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-init".to_string(),
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-a".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-a".parse().expect("project header"),
+        );
+        let (mut websocket, _response) = connect_async(request)
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await else {
+            panic!("expected server request forwarded after initialize");
+        };
+        assert_eq!(request.method, "item/tool/requestUserInput");
+        assert_eq!(
+            request.params,
+            Some(serde_json::json!({
+                "threadId": "thread-init",
+                "turnId": "turn-init",
+                "itemId": "item-init",
+                "questions": [{
+                    "id": "question-init",
+                    "header": "Mode",
+                    "question": "Pick one",
+                    "isOther": false,
+                    "isSecret": false,
+                    "options": [],
+                }],
+            }))
+        );
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({ "answer": "accepted" }),
+                }))
+                .expect("response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("server request response should send");
+        let response = response_rx
+            .await
+            .expect("mock remote should report server request response");
+        assert_eq!(response.id, RequestId::String("srv-init".to_string()));
+        assert_eq!(response.result, serde_json::json!({ "answer": "accepted" }));
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_unknown_server_requests_received_during_downstream_initialize()
+     {
+        let initialize_response = test_initialize_response().await;
+        let websocket_url =
+            start_mock_remote_server_that_sends_unknown_server_request_during_initialize().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::default(),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
         let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
             .await
             .expect("websocket should connect");
 
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
-                    id: RequestId::String("initialize".to_string()),
-                    method: "initialize".to_string(),
-                    params: Some(
-                        serde_json::to_value(InitializeParams {
-                            client_info: ClientInfo {
-                                name: "codex-tui".to_string(),
-                                title: None,
-                                version: "0.0.0-test".to_string(),
-                            },
-                            capabilities: None,
-                        })
-                        .expect("initialize params should serialize"),
-                    ),
-                    trace: None,
-                }))
-                .expect("request should serialize")
-                .into(),
-            ))
-            .await
-            .expect("initialize request should send");
+        send_initialize(&mut websocket).await;
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("model-list".to_string()),
+            "model/list",
+            serde_json::json!({}),
+        )
+        .await;
 
-        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
-            panic!("expected initialize error response");
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected model/list response after rejected setup-time request");
         };
-        assert_eq!(error.id, RequestId::String("initialize".to_string()));
-        assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
-        assert_eq!(
-            error
-                .error
-                .message
-                .contains("gateway failed to connect downstream app-server"),
-            true
-        );
+        assert_eq!(response.id, RequestId::String("model-list".to_string()));
+        assert_eq!(response.result, serde_json::json!({ "models": [] }));
 
         server_task.abort();
         let _ = server_task.await;
@@ -5862,7 +6084,15 @@ mod tests {
                 .message
                 .contains("sent non-text initialize frame")
         );
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_binary");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_connection_and_request_metrics(
+            &metrics,
+            "downstream",
+            "invalid_binary",
+            "downstream_protocol_violation",
+            "initialize",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -5881,7 +6111,7 @@ mod tests {
             start_mock_remote_server_that_sends_invalid_jsonrpc_during_initialize().await;
         let initialize_response = test_initialize_response().await;
         let metrics = in_memory_metrics();
-        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let observability = GatewayObservability::new(Some(metrics.clone()), true);
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
@@ -5902,46 +6132,85 @@ mod tests {
             timeouts: GatewayV2Timeouts::default(),
         })
         .await;
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
-
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
-                    id: RequestId::String("initialize".to_string()),
-                    method: "initialize".to_string(),
-                    params: Some(
-                        serde_json::to_value(InitializeParams {
-                            client_info: ClientInfo {
-                                name: "codex-tui".to_string(),
-                                title: None,
-                                version: "0.0.0-test".to_string(),
-                            },
-                            capabilities: None,
-                        })
-                        .expect("initialize params should serialize"),
-                    ),
-                    trace: None,
-                }))
-                .expect("request should serialize")
-                .into(),
-            ))
-            .await
-            .expect("initialize request should send");
-
-        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
-            panic!("expected initialize error response");
-        };
-        assert_eq!(error.id, RequestId::String("initialize".to_string()));
-        assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
-        assert!(
-            error
-                .error
-                .message
-                .contains("sent invalid initialize response")
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-downstream-protocol".parse().expect("tenant header"),
         );
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-downstream-protocol"
+                .parse()
+                .expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("initialize".to_string()),
+                        method: "initialize".to_string(),
+                        params: Some(
+                            serde_json::to_value(InitializeParams {
+                                client_info: ClientInfo {
+                                    name: "codex-tui".to_string(),
+                                    title: None,
+                                    version: "0.0.0-test".to_string(),
+                                },
+                                capabilities: None,
+                            })
+                            .expect("initialize params should serialize"),
+                        ),
+                        trace: None,
+                    }))
+                    .expect("request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("initialize request should send");
+
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected initialize error response");
+            };
+            assert_eq!(error.id, RequestId::String("initialize".to_string()));
+            assert_eq!(error.error.code, super::INTERNAL_ERROR_CODE);
+            assert!(
+                error
+                    .error
+                    .message
+                    .contains("sent invalid initialize response")
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 request completed"), "{logs}");
+        assert!(logs.contains("method=\"initialize\""), "{logs}");
+        assert!(
+            logs.contains("outcome=\"downstream_protocol_violation\""),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("tenant_id=\"tenant-downstream-protocol\""),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("project_id=\"project-downstream-protocol\""),
+            "{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_connection_and_request_metrics(
+            &metrics,
+            "downstream",
+            "invalid_jsonrpc",
+            "downstream_protocol_violation",
+            "initialize",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -6021,7 +6290,15 @@ mod tests {
                 .contains("sent invalid initialize response")
         );
         assert!(error.error.message.contains("not-initialize"));
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_connection_and_request_metrics(
+            &metrics,
+            "downstream",
+            "invalid_jsonrpc",
+            "downstream_protocol_violation",
+            "initialize",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -6101,7 +6378,15 @@ mod tests {
                 .contains("sent invalid initialize response")
         );
         assert!(error.error.message.contains("not-initialize"));
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_connection_and_request_metrics(
+            &metrics,
+            "downstream",
+            "invalid_jsonrpc",
+            "downstream_protocol_violation",
+            "initialize",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -6325,10 +6610,11 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_closes_when_initialize_times_out() {
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -6351,23 +6637,45 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
-
-        let frame = timeout(Duration::from_secs(2), websocket.next())
-            .await
-            .expect("close frame should arrive")
-            .expect("websocket should yield frame")
-            .expect("close frame should decode");
-        let Message::Close(Some(close_frame)) = frame else {
-            panic!("expected websocket close frame");
-        };
-        assert_eq!(
-            u16::from(close_frame.code),
-            axum::extract::ws::close_code::POLICY
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-timeout".parse().expect("tenant header"),
         );
-        assert_eq!(close_frame.reason, super::INITIALIZE_TIMEOUT_CLOSE_REASON);
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-timeout".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+
+            let frame = timeout(Duration::from_secs(2), websocket.next())
+                .await
+                .expect("close frame should arrive")
+                .expect("websocket should yield frame")
+                .expect("close frame should decode");
+            let Message::Close(Some(close_frame)) = frame else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(
+                u16::from(close_frame.code),
+                axum::extract::ws::close_code::POLICY
+            );
+            assert_eq!(close_frame.reason, super::INITIALIZE_TIMEOUT_CLOSE_REASON);
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 request completed"), "{logs}");
+        assert!(logs.contains("method=\"initialize\""), "{logs}");
+        assert!(logs.contains("outcome=\"timed_out\""), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-timeout\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-timeout\""), "{logs}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_request_metrics(&metrics, &[("initialize", "timed_out", 1)]);
 
         server_task.abort();
         let _ = server_task.await;
@@ -6376,20 +6684,11 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_closes_when_pre_initialize_text_is_not_jsonrpc() {
         let initialize_response = test_initialize_response().await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -6407,27 +6706,66 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
-        websocket
-            .send(Message::Text("not json".to_string().into()))
-            .await
-            .expect("invalid payload should send");
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-invalid-payload".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-invalid-payload".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+            websocket
+                .send(Message::Text("not json".to_string().into()))
+                .await
+                .expect("invalid payload should send");
 
-        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
-            panic!("expected websocket close frame");
-        };
-        assert_eq!(
-            u16::from(close_frame.code),
-            axum::extract::ws::close_code::PROTOCOL
+            let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await
+            else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(
+                u16::from(close_frame.code),
+                axum::extract::ws::close_code::PROTOCOL
+            );
+            assert!(
+                close_frame
+                    .reason
+                    .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 connection completed"), "{logs}");
+        assert!(
+            logs.contains("outcome=\"invalid_client_payload\""),
+            "{logs}"
         );
         assert!(
-            close_frame
-                .reason
-                .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+            logs.contains(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON),
+            "{logs}"
         );
-        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "invalid_jsonrpc");
+        assert!(
+            logs.contains("tenant_id=\"tenant-invalid-payload\""),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("project_id=\"project-invalid-payload\""),
+            "{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "pre_initialize",
+            "invalid_jsonrpc",
+            "invalid_client_payload",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -6441,7 +6779,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -6459,29 +6797,61 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
-        send_initialize(&mut websocket).await;
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-post-text".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-post-text".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+            send_initialize(&mut websocket).await;
 
-        websocket
-            .send(Message::Text("not json".to_string().into()))
-            .await
-            .expect("invalid payload should send");
+            websocket
+                .send(Message::Text("not json".to_string().into()))
+                .await
+                .expect("invalid payload should send");
 
-        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
-            panic!("expected websocket close frame");
-        };
-        assert_eq!(
-            u16::from(close_frame.code),
-            axum::extract::ws::close_code::PROTOCOL
+            let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await
+            else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(
+                u16::from(close_frame.code),
+                axum::extract::ws::close_code::PROTOCOL
+            );
+            assert!(
+                close_frame
+                    .reason
+                    .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 connection completed"), "{logs}");
+        assert!(
+            logs.contains("outcome=\"invalid_client_payload\""),
+            "{logs}"
         );
         assert!(
-            close_frame
-                .reason
-                .starts_with(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON)
+            logs.contains(super::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON),
+            "{logs}"
         );
-        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "invalid_jsonrpc");
+        assert!(logs.contains("tenant_id=\"tenant-post-text\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-post-text\""), "{logs}");
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "post_initialize",
+            "invalid_jsonrpc",
+            "invalid_client_payload",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -6494,7 +6864,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -6512,28 +6882,67 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-invalid-binary".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-invalid-binary".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        websocket
-            .send(Message::Binary(vec![0xff, 0xfe, 0xfd].into()))
-            .await
-            .expect("invalid payload should send");
+            websocket
+                .send(Message::Binary(vec![0xff, 0xfe, 0xfd].into()))
+                .await
+                .expect("invalid payload should send");
 
-        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
-            panic!("expected websocket close frame");
-        };
-        assert_eq!(
-            u16::from(close_frame.code),
-            axum::extract::ws::close_code::INVALID
+            let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await
+            else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(
+                u16::from(close_frame.code),
+                axum::extract::ws::close_code::INVALID
+            );
+            assert!(
+                close_frame
+                    .reason
+                    .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 connection completed"), "{logs}");
+        assert!(
+            logs.contains("outcome=\"invalid_client_payload\""),
+            "{logs}"
         );
         assert!(
-            close_frame
-                .reason
-                .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
+            logs.contains(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON),
+            "{logs}"
         );
-        assert_v2_protocol_violation_metric(&metrics, "pre_initialize", "invalid_utf8");
+        assert!(
+            logs.contains("tenant_id=\"tenant-invalid-binary\""),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("project_id=\"project-invalid-binary\""),
+            "{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "pre_initialize",
+            "invalid_utf8",
+            "invalid_client_payload",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -6543,20 +6952,11 @@ mod tests {
     async fn websocket_upgrade_closes_when_post_initialize_binary_is_not_utf8() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -6574,29 +6974,64 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
-        send_initialize(&mut websocket).await;
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-post-binary".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-post-binary".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+            send_initialize(&mut websocket).await;
 
-        websocket
-            .send(Message::Binary(vec![0xff, 0xfe, 0xfd].into()))
-            .await
-            .expect("invalid binary payload should send");
+            websocket
+                .send(Message::Binary(vec![0xff, 0xfe, 0xfd].into()))
+                .await
+                .expect("invalid binary payload should send");
 
-        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
-            panic!("expected websocket close frame");
-        };
-        assert_eq!(
-            u16::from(close_frame.code),
-            axum::extract::ws::close_code::INVALID
+            let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await
+            else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(
+                u16::from(close_frame.code),
+                axum::extract::ws::close_code::INVALID
+            );
+            assert!(
+                close_frame
+                    .reason
+                    .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
+            );
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 connection completed"), "{logs}");
+        assert!(
+            logs.contains("outcome=\"invalid_client_payload\""),
+            "{logs}"
         );
         assert!(
-            close_frame
-                .reason
-                .starts_with(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
+            logs.contains(super::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON),
+            "{logs}"
         );
-        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "invalid_utf8");
+        assert!(logs.contains("tenant_id=\"tenant-post-binary\""), "{logs}");
+        assert!(
+            logs.contains("project_id=\"project-post-binary\""),
+            "{logs}"
+        );
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "post_initialize",
+            "invalid_utf8",
+            "invalid_client_payload",
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -7089,20 +7524,11 @@ mod tests {
     async fn websocket_upgrade_rejects_repeated_initialize_after_handshake() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -7120,43 +7546,63 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let mut request = format!("ws://{addr}/")
+            .into_client_request()
+            .expect("request should build");
+        request.headers_mut().insert(
+            "x-codex-tenant-id",
+            "tenant-repeat".parse().expect("tenant header"),
+        );
+        request.headers_mut().insert(
+            "x-codex-project-id",
+            "project-repeat".parse().expect("project header"),
+        );
+        let logs = capture_logs_async(async {
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        send_initialize(&mut websocket).await;
+            send_initialize(&mut websocket).await;
 
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
-                    id: RequestId::String("initialize-again".to_string()),
-                    method: "initialize".to_string(),
-                    params: Some(
-                        serde_json::to_value(InitializeParams {
-                            client_info: ClientInfo {
-                                name: "codex-tui".to_string(),
-                                title: None,
-                                version: "0.0.0-test".to_string(),
-                            },
-                            capabilities: None,
-                        })
-                        .expect("initialize params should serialize"),
-                    ),
-                    trace: None,
-                }))
-                .expect("initialize request should serialize")
-                .into(),
-            ))
-            .await
-            .expect("repeated initialize should send");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("initialize-again".to_string()),
+                        method: "initialize".to_string(),
+                        params: Some(
+                            serde_json::to_value(InitializeParams {
+                                client_info: ClientInfo {
+                                    name: "codex-tui".to_string(),
+                                    title: None,
+                                    version: "0.0.0-test".to_string(),
+                                },
+                                capabilities: None,
+                            })
+                            .expect("initialize params should serialize"),
+                        ),
+                        trace: None,
+                    }))
+                    .expect("initialize request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("repeated initialize should send");
 
-        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
-            panic!("expected repeated initialize error response");
-        };
-        assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
-        assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
-        assert_eq!(error.error.message, "connection is already initialized");
-        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "repeated_initialize");
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected repeated initialize error response");
+            };
+            assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
+            assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
+            assert_eq!(error.error.message, "connection is already initialized");
+        })
+        .await;
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 request completed"), "{logs}");
+        assert!(logs.contains("method=\"initialize\""), "{logs}");
+        assert!(logs.contains("outcome=\"invalid_request\""), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-repeat\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-repeat\""), "{logs}");
+        assert_repeated_initialize_metrics(&metrics);
 
         server_task.abort();
         let _ = server_task.await;
@@ -7224,7 +7670,7 @@ mod tests {
         assert_eq!(error.id, RequestId::String("initialize-again".to_string()));
         assert_eq!(error.error.code, super::INVALID_REQUEST_CODE);
         assert_eq!(error.error.message, "connection is already initialized");
-        assert_v2_protocol_violation_metric(&metrics, "post_initialize", "repeated_initialize");
+        assert_repeated_initialize_metrics(&metrics);
 
         server_task.abort();
         let _ = server_task.await;
@@ -8102,6 +8548,234 @@ mod tests {
         .expect("metrics")
     }
 
+    fn assert_v2_request_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected: &[(&str, &str, u64)],
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let mut observed_counts = BTreeMap::new();
+        let mut observed_durations = BTreeMap::new();
+        let mut saw_request_count = false;
+        let mut saw_request_duration = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_requests" => {
+                    saw_request_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                for point in sum.data_points() {
+                                    let attributes = point
+                                        .attributes()
+                                        .map(|attribute| {
+                                            (
+                                                attribute.key.as_str().to_string(),
+                                                attribute.value.as_str().to_string(),
+                                            )
+                                        })
+                                        .collect();
+                                    let (method, outcome) = request_metric_point_tags(attributes);
+                                    *observed_counts.entry((method, outcome)).or_insert(0) +=
+                                        point.value();
+                                }
+                            }
+                            _ => panic!("unexpected v2 request count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 request count type"),
+                    }
+                }
+                "gateway_v2_request_duration" => {
+                    saw_request_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                for point in histogram.data_points() {
+                                    let attributes = point
+                                        .attributes()
+                                        .map(|attribute| {
+                                            (
+                                                attribute.key.as_str().to_string(),
+                                                attribute.value.as_str().to_string(),
+                                            )
+                                        })
+                                        .collect();
+                                    let (method, outcome) = request_metric_point_tags(attributes);
+                                    *observed_durations.entry((method, outcome)).or_insert(0) +=
+                                        point.count();
+                                }
+                            }
+                            _ => panic!("unexpected v2 request duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 request duration type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_request_count);
+        assert!(saw_request_duration);
+        assert_eq!(
+            observed_counts.values().copied().sum::<u64>(),
+            expected.iter().map(|(_, _, count)| *count).sum::<u64>()
+        );
+        assert_eq!(
+            observed_durations.values().copied().sum::<u64>(),
+            expected.iter().map(|(_, _, count)| *count).sum::<u64>()
+        );
+        for (method, outcome, count) in expected {
+            assert_eq!(
+                observed_counts.get(&(method.to_string(), outcome.to_string())),
+                Some(count),
+                "missing v2 request count metric for method={method} outcome={outcome}"
+            );
+            assert_eq!(
+                observed_durations.get(&(method.to_string(), outcome.to_string())),
+                Some(count),
+                "missing v2 request duration metric for method={method} outcome={outcome}"
+            );
+        }
+    }
+
+    fn request_metric_point_tags(attributes: BTreeMap<String, String>) -> (String, String) {
+        let method = attributes
+            .get("method")
+            .expect("request metric should have method")
+            .clone();
+        let outcome = attributes
+            .get("outcome")
+            .expect("request metric should have outcome")
+            .clone();
+        (method, outcome)
+    }
+
+    fn assert_repeated_initialize_metrics(metrics: &codex_otel::MetricsClient) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let mut observed_request_counts = BTreeMap::new();
+        let mut observed_request_durations = BTreeMap::new();
+        let mut saw_protocol_violation_count = false;
+
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_requests" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let (method, outcome) = request_metric_point_tags(attributes);
+                                *observed_request_counts
+                                    .entry((method, outcome))
+                                    .or_insert(0) += point.value();
+                            }
+                        }
+                        _ => panic!("unexpected v2 request count aggregation"),
+                    },
+                    _ => panic!("unexpected v2 request count type"),
+                },
+                "gateway_v2_request_duration" => match metric.data() {
+                    AggregatedMetrics::F64(data) => match data {
+                        MetricData::Histogram(histogram) => {
+                            for point in histogram.data_points() {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let (method, outcome) = request_metric_point_tags(attributes);
+                                *observed_request_durations
+                                    .entry((method, outcome))
+                                    .or_insert(0) += point.count();
+                            }
+                        }
+                        _ => panic!("unexpected v2 request duration aggregation"),
+                    },
+                    _ => panic!("unexpected v2 request duration type"),
+                },
+                "gateway_v2_protocol_violations" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("phase".to_string(), "post_initialize".to_string()),
+                                    ("reason".to_string(), "repeated_initialize".to_string()),
+                                ])
+                            );
+                            saw_protocol_violation_count = true;
+                        }
+                        _ => panic!("unexpected protocol violation count aggregation"),
+                    },
+                    _ => panic!("unexpected protocol violation count type"),
+                },
+                _ => {}
+            }
+        }
+
+        let expected_request_metrics = BTreeMap::from([
+            (("initialize".to_string(), "ok".to_string()), 1),
+            (("initialize".to_string(), "invalid_request".to_string()), 1),
+        ]);
+        assert_eq!(observed_request_counts, expected_request_metrics);
+        assert_eq!(observed_request_durations, expected_request_metrics);
+        assert!(saw_protocol_violation_count);
+    }
+
+    #[test]
+    fn observe_v2_request_records_rate_limited_metrics_and_audit_log() {
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), true);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-quota".to_string(),
+            project_id: Some("project-quota".to_string()),
+        };
+
+        let logs = capture_logs(|| {
+            super::observe_v2_request(
+                &observability,
+                &context,
+                "turn/start",
+                "rate_limited",
+                Duration::from_millis(7),
+            );
+        });
+
+        assert!(logs.contains("codex_gateway.audit"));
+        assert!(logs.contains("gateway v2 request completed"));
+        assert!(logs.contains("method=\"turn/start\""));
+        assert!(logs.contains("outcome=\"rate_limited\""));
+        assert!(logs.contains("tenant_id=\"tenant-quota\""));
+        assert!(logs.contains("project_id=\"project-quota\""));
+        assert_v2_request_metrics(&metrics, &[("turn/start", "rate_limited", 1)]);
+    }
+
     fn assert_v2_fail_closed_request_metric(
         metrics: &codex_otel::MetricsClient,
         method: &str,
@@ -8453,10 +9127,122 @@ mod tests {
         assert_eq!(actual_points, expected_points);
     }
 
-    fn assert_v2_protocol_violation_metric(
+    fn assert_v2_server_request_lifecycle_and_connection_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected_event: &str,
+        expected_method: &str,
+        expected_outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_lifecycle_event = false;
+        let mut saw_connection_count = false;
+        let mut saw_connection_duration = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_server_request_lifecycle_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                if attributes
+                                    == BTreeMap::from([
+                                        ("event".to_string(), expected_event.to_string()),
+                                        ("method".to_string(), expected_method.to_string()),
+                                    ])
+                                {
+                                    assert_eq!(point.value(), 1);
+                                    saw_lifecycle_event = true;
+                                }
+                            }
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                },
+                "gateway_v2_connections" => {
+                    saw_connection_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        expected_outcome.to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection count type"),
+                    }
+                }
+                "gateway_v2_connection_duration" => {
+                    saw_connection_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point = histogram.data_points().next().expect("duration point");
+                                assert_eq!(point.count(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        expected_outcome.to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection duration type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_lifecycle_event);
+        assert!(saw_connection_count);
+        assert!(saw_connection_duration);
+    }
+
+    fn assert_v2_protocol_violation_and_connection_metrics(
         metrics: &codex_otel::MetricsClient,
         phase: &str,
         reason: &str,
+        outcome: &str,
     ) {
         let resource_metrics = metrics.snapshot().expect("snapshot");
         let metrics = resource_metrics
@@ -8464,38 +9250,370 @@ mod tests {
             .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
 
         let mut saw_protocol_violation_count = false;
+        let mut saw_connection_count = false;
+        let mut saw_connection_duration = false;
         for metric in metrics {
-            if metric.name() == "gateway_v2_protocol_violations" {
-                saw_protocol_violation_count = true;
-                match metric.data() {
-                    AggregatedMetrics::U64(data) => match data {
-                        MetricData::Sum(sum) => {
-                            let point = sum.data_points().next().expect("count point");
-                            assert_eq!(point.value(), 1);
-                            let attributes: BTreeMap<String, String> = point
-                                .attributes()
-                                .map(|attribute| {
-                                    (
-                                        attribute.key.as_str().to_string(),
-                                        attribute.value.as_str().to_string(),
-                                    )
-                                })
-                                .collect();
-                            assert_eq!(
-                                attributes,
-                                BTreeMap::from([
-                                    ("phase".to_string(), phase.to_string()),
-                                    ("reason".to_string(), reason.to_string()),
-                                ])
-                            );
-                        }
-                        _ => panic!("unexpected protocol violation count aggregation"),
-                    },
-                    _ => panic!("unexpected protocol violation count type"),
+            match metric.name() {
+                "gateway_v2_protocol_violations" => {
+                    saw_protocol_violation_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("phase".to_string(), phase.to_string()),
+                                        ("reason".to_string(), reason.to_string()),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected protocol violation count aggregation"),
+                        },
+                        _ => panic!("unexpected protocol violation count type"),
+                    }
                 }
+                "gateway_v2_connections" => {
+                    saw_connection_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([("outcome".to_string(), outcome.to_string(),)])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection count type"),
+                    }
+                }
+                "gateway_v2_connection_duration" => {
+                    saw_connection_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point = histogram.data_points().next().expect("duration point");
+                                assert_eq!(point.count(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([("outcome".to_string(), outcome.to_string(),)])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection duration type"),
+                    }
+                }
+                _ => {}
             }
         }
+
         assert!(saw_protocol_violation_count);
+        assert!(saw_connection_count);
+        assert!(saw_connection_duration);
+    }
+
+    fn assert_v2_protocol_violation_and_request_metrics(
+        metrics: &codex_otel::MetricsClient,
+        phase: &str,
+        reason: &str,
+        request_method: &str,
+        request_outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_protocol_violation_count = false;
+        let mut observed_request_counts = BTreeMap::new();
+        let mut observed_request_durations = BTreeMap::new();
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_protocol_violations" => {
+                    saw_protocol_violation_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("phase".to_string(), phase.to_string()),
+                                        ("reason".to_string(), reason.to_string()),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected protocol violation count aggregation"),
+                        },
+                        _ => panic!("unexpected protocol violation count type"),
+                    }
+                }
+                "gateway_v2_requests" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let (method, outcome) = request_metric_point_tags(attributes);
+                                *observed_request_counts
+                                    .entry((method, outcome))
+                                    .or_insert(0) += point.value();
+                            }
+                        }
+                        _ => panic!("unexpected v2 request count aggregation"),
+                    },
+                    _ => panic!("unexpected v2 request count type"),
+                },
+                "gateway_v2_request_duration" => match metric.data() {
+                    AggregatedMetrics::F64(data) => match data {
+                        MetricData::Histogram(histogram) => {
+                            for point in histogram.data_points() {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let (method, outcome) = request_metric_point_tags(attributes);
+                                *observed_request_durations
+                                    .entry((method, outcome))
+                                    .or_insert(0) += point.count();
+                            }
+                        }
+                        _ => panic!("unexpected v2 request duration aggregation"),
+                    },
+                    _ => panic!("unexpected v2 request duration type"),
+                },
+                _ => {}
+            }
+        }
+
+        assert!(saw_protocol_violation_count);
+        let expected_request = (request_method.to_string(), request_outcome.to_string());
+        assert_eq!(observed_request_counts.get(&expected_request), Some(&1));
+        assert_eq!(observed_request_durations.get(&expected_request), Some(&1));
+    }
+
+    fn assert_v2_protocol_violation_connection_and_request_metrics(
+        metrics: &codex_otel::MetricsClient,
+        phase: &str,
+        reason: &str,
+        connection_outcome: &str,
+        request_method: &str,
+        request_outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_protocol_violation_count = false;
+        let mut saw_connection_count = false;
+        let mut saw_connection_duration = false;
+        let mut saw_request_count = false;
+        let mut saw_request_duration = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_protocol_violations" => {
+                    saw_protocol_violation_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("phase".to_string(), phase.to_string()),
+                                        ("reason".to_string(), reason.to_string()),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected protocol violation count aggregation"),
+                        },
+                        _ => panic!("unexpected protocol violation count type"),
+                    }
+                }
+                "gateway_v2_connections" => {
+                    saw_connection_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        connection_outcome.to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection count type"),
+                    }
+                }
+                "gateway_v2_connection_duration" => {
+                    saw_connection_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point = histogram.data_points().next().expect("duration point");
+                                assert_eq!(point.count(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        connection_outcome.to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected v2 connection duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 connection duration type"),
+                    }
+                }
+                "gateway_v2_requests" => {
+                    saw_request_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    request_metric_point_tags(attributes),
+                                    (request_method.to_string(), request_outcome.to_string())
+                                );
+                            }
+                            _ => panic!("unexpected v2 request count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 request count type"),
+                    }
+                }
+                "gateway_v2_request_duration" => {
+                    saw_request_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point = histogram.data_points().next().expect("duration point");
+                                assert_eq!(point.count(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    request_metric_point_tags(attributes),
+                                    (request_method.to_string(), request_outcome.to_string())
+                                );
+                            }
+                            _ => panic!("unexpected v2 request duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 request duration type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_protocol_violation_count);
+        assert!(saw_connection_count);
+        assert!(saw_connection_duration);
+        assert!(saw_request_count);
+        assert!(saw_request_duration);
     }
 
     fn assert_v2_downstream_backpressure_metric(
@@ -8635,16 +9753,6 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_rejects_server_requests_above_pending_limit_without_closing() {
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
         let (rejection_observed_tx, rejection_observed_rx) = oneshot::channel();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -8773,12 +9881,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
             GatewayRequestContext {
-                tenant_id: "default".to_string(),
-                project_id: None,
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
             },
         );
         let (addr, server_task) = spawn_test_server(GatewayV2State {
@@ -8807,87 +9916,118 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
-        send_initialize(&mut websocket).await;
+        let logs = capture_logs_async(async {
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-a".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-a".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
+            send_initialize(&mut websocket).await;
 
-        let JSONRPCMessage::Request(first_request) = read_websocket_message(&mut websocket).await
-        else {
-            panic!("expected first forwarded server request");
-        };
-        assert_eq!(
-            first_request.id,
-            RequestId::String("server-request-1".to_string())
+            let JSONRPCMessage::Request(first_request) =
+                read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected first forwarded server request");
+            };
+            assert_eq!(
+                first_request.id,
+                RequestId::String("server-request-1".to_string())
+            );
+            assert_eq!(
+                first_request.method,
+                "item/commandExecution/requestApproval"
+            );
+
+            rejection_observed_rx
+                .await
+                .expect("downstream should observe pending-limit rejection");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: first_request.id.clone(),
+                        result: serde_json::json!({
+                            "approved": true,
+                        }),
+                    }))
+                    .expect("first server request response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("first server request response should send");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("model-list".to_string()),
+                        method: "model/list".to_string(),
+                        params: Some(serde_json::json!({
+                            "cursor": null,
+                            "limit": null,
+                            "includeHidden": true,
+                        })),
+                        trace: None,
+                    }))
+                    .expect("follow-up request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("follow-up request should send");
+
+            let response = loop {
+                match read_websocket_message(&mut websocket).await {
+                    JSONRPCMessage::Response(response)
+                        if response.id == RequestId::String("model-list".to_string()) =>
+                    {
+                        break response;
+                    }
+                    JSONRPCMessage::Notification(_) => continue,
+                    JSONRPCMessage::Response(response) => {
+                        panic!("unexpected follow-up response id: {:?}", response.id);
+                    }
+                    JSONRPCMessage::Error(error) => {
+                        panic!("unexpected follow-up error: {error:?}");
+                    }
+                    JSONRPCMessage::Request(request) => {
+                        panic!("unexpected follow-up request: {request:?}");
+                    }
+                }
+            };
+            assert_eq!(response.id, RequestId::String("model-list".to_string()));
+            assert_eq!(
+                response.result,
+                serde_json::json!({
+                    "data": [],
+                    "nextCursor": null,
+                })
+            );
+        })
+        .await;
+
+        assert!(logs.contains(
+            "rejecting downstream server request because the gateway websocket connection is saturated"
+        ));
+        assert!(logs.contains("tenant-a"), "{logs}");
+        assert!(logs.contains("project-a"), "{logs}");
+        assert!(logs.contains("worker_websocket_url"));
+        assert!(logs.contains("pending_server_request_count=1"));
+        assert!(logs.contains("limit=1"));
+        assert!(logs.contains("request_id=String(\"server-request-2\")"));
+        assert!(logs.contains("item/commandExecution/requestApproval"));
+        assert!(logs.contains("pending_server_request_ids=[String(\"server-request-1\")]"));
+        assert!(
+            logs.contains("pending_downstream_server_request_ids=[String(\"server-request-1\")]")
         );
-        assert_eq!(
-            first_request.method,
-            "item/commandExecution/requestApproval"
-        );
-
-        rejection_observed_rx
-            .await
-            .expect("downstream should observe pending-limit rejection");
-
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
-                    id: first_request.id.clone(),
-                    result: serde_json::json!({
-                        "approved": true,
-                    }),
-                }))
-                .expect("first server request response should serialize")
-                .into(),
-            ))
-            .await
-            .expect("first server request response should send");
-
-        websocket
-            .send(Message::Text(
-                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
-                    id: RequestId::String("model-list".to_string()),
-                    method: "model/list".to_string(),
-                    params: Some(serde_json::json!({
-                        "cursor": null,
-                        "limit": null,
-                        "includeHidden": true,
-                    })),
-                    trace: None,
-                }))
-                .expect("follow-up request should serialize")
-                .into(),
-            ))
-            .await
-            .expect("follow-up request should send");
-
-        let response = loop {
-            match read_websocket_message(&mut websocket).await {
-                JSONRPCMessage::Response(response)
-                    if response.id == RequestId::String("model-list".to_string()) =>
-                {
-                    break response;
-                }
-                JSONRPCMessage::Notification(_) => continue,
-                JSONRPCMessage::Response(response) => {
-                    panic!("unexpected follow-up response id: {:?}", response.id);
-                }
-                JSONRPCMessage::Error(error) => {
-                    panic!("unexpected follow-up error: {error:?}");
-                }
-                JSONRPCMessage::Request(request) => {
-                    panic!("unexpected follow-up request: {request:?}");
-                }
-            }
-        };
-        assert_eq!(response.id, RequestId::String("model-list".to_string()));
-        assert_eq!(
-            response.result,
-            serde_json::json!({
-                "data": [],
-                "nextCursor": null,
-            })
-        );
+        assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
 
         assert_v2_server_request_rejection_metric(
             &metrics,
@@ -8901,6 +10041,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_applies_scope_headers_and_rate_limits() {
+        let metrics = in_memory_metrics();
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
@@ -8917,7 +10058,7 @@ mod tests {
                 request_rate_limit_per_minute: Some(1),
                 turn_start_quota_per_minute: None,
             }),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -9004,6 +10145,153 @@ mod tests {
             .expect("retryAfterSeconds should be present");
         assert_eq!((59..=60).contains(&retry_after_seconds), true);
 
+        assert_v2_request_metrics(
+            &metrics,
+            &[
+                ("initialize", "ok", 1),
+                ("thread/read", "invalid_params", 1),
+                ("model/list", "rate_limited", 1),
+            ],
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_enforces_turn_start_quota() {
+        let metrics = in_memory_metrics();
+        let initialize_response = test_initialize_response().await;
+        let turn_start_params = serde_json::json!({
+            "approvalPolicy": null,
+            "approvalsReviewer": null,
+            "collaborationMode": null,
+            "input": [],
+            "cwd": "/tmp/project",
+            "effort": null,
+            "model": "gpt-5",
+            "outputSchema": null,
+            "personality": null,
+            "responsesapiClientMetadata": null,
+            "sandboxPolicy": null,
+            "summary": null,
+            "threadId": "thread-visible",
+        });
+        let websocket_url =
+            start_mock_remote_server_for_passthrough_request_with_optional_params_and_result(
+                "turn/start",
+                Some(turn_start_params.clone()),
+                serde_json::json!({
+                    "turn": {
+                        "id": "turn-1",
+                    },
+                }),
+            )
+            .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread(
+            "thread-visible".to_string(),
+            GatewayRequestContext::default(),
+        );
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::new(GatewayAdmissionConfig {
+                request_rate_limit_per_minute: None,
+                turn_start_quota_per_minute: Some(1),
+            }),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry,
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("turn-start-1".to_string()),
+                    method: "turn/start".to_string(),
+                    params: Some(turn_start_params.clone()),
+                    trace: None,
+                }))
+                .expect("first turn/start request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("first turn/start should send");
+
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected first turn/start response");
+        };
+        assert_eq!(response.id, RequestId::String("turn-start-1".to_string()));
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "turn": {
+                    "id": "turn-1",
+                },
+            })
+        );
+
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("turn-start-2".to_string()),
+                    method: "turn/start".to_string(),
+                    params: Some(turn_start_params),
+                    trace: None,
+                }))
+                .expect("second turn/start request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("second turn/start should send");
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected second turn/start error response");
+        };
+        assert_eq!(error.id, RequestId::String("turn-start-2".to_string()));
+        assert_eq!(error.error.code, super::RATE_LIMITED_ERROR_CODE);
+        assert_eq!(
+            error.error.message,
+            "turn start quota exceeded for tenant default"
+        );
+        let retry_after_seconds = error
+            .error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("retryAfterSeconds"))
+            .and_then(serde_json::Value::as_u64)
+            .expect("retryAfterSeconds should be present");
+        assert_eq!((59..=60).contains(&retry_after_seconds), true);
+
+        assert_v2_request_metrics(
+            &metrics,
+            &[
+                ("initialize", "ok", 1),
+                ("turn/start", "ok", 1),
+                ("turn/start", "rate_limited", 1),
+            ],
+        );
+
         server_task.abort();
         let _ = server_task.await;
     }
@@ -9062,10 +10350,11 @@ mod tests {
     async fn websocket_upgrade_rejects_thread_resume_unknown_path_over_jsonrpc() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -9118,6 +10407,14 @@ mod tests {
             path_error.error.message,
             "thread not found: /tmp/rollout.jsonl"
         );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_request_metrics(
+            &metrics,
+            &[
+                ("initialize", "ok", 1),
+                ("thread/resume", "invalid_params", 1),
+            ],
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -9127,10 +10424,11 @@ mod tests {
     async fn websocket_upgrade_rejects_thread_fork_unknown_path_over_jsonrpc() {
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_initialize().await;
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -9177,6 +10475,14 @@ mod tests {
         assert_eq!(error.id, RequestId::String("thread-fork-path".to_string()));
         assert_eq!(error.error.code, super::INVALID_PARAMS_CODE);
         assert_eq!(error.error.message, "thread not found: /tmp/rollout.jsonl");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_request_metrics(
+            &metrics,
+            &[
+                ("initialize", "ok", 1),
+                ("thread/fork", "invalid_params", 1),
+            ],
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -9407,8 +10713,65 @@ mod tests {
 
         let mut saw_count = false;
         let mut saw_duration = false;
+        let mut saw_request_count = false;
+        let mut saw_request_duration = false;
         for metric in metrics {
             match metric.name() {
+                "gateway_v2_requests" => {
+                    saw_request_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("request count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    request_metric_point_tags(attributes),
+                                    ("initialize".to_string(), "timed_out".to_string())
+                                );
+                            }
+                            _ => panic!("unexpected v2 request count aggregation"),
+                        },
+                        _ => panic!("unexpected v2 request count type"),
+                    }
+                }
+                "gateway_v2_request_duration" => {
+                    saw_request_duration = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point = histogram
+                                    .data_points()
+                                    .next()
+                                    .expect("request duration point");
+                                assert_eq!(point.count(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    request_metric_point_tags(attributes),
+                                    ("initialize".to_string(), "timed_out".to_string())
+                                );
+                            }
+                            _ => panic!("unexpected v2 request duration aggregation"),
+                        },
+                        _ => panic!("unexpected v2 request duration type"),
+                    }
+                }
                 "gateway_v2_connections" => {
                     saw_count = true;
                     match metric.data() {
@@ -9484,6 +10847,8 @@ mod tests {
 
         assert_eq!(saw_count, true);
         assert_eq!(saw_duration, true);
+        assert_eq!(saw_request_count, true);
+        assert_eq!(saw_request_duration, true);
 
         server_task.abort();
         let _ = server_task.await;
@@ -9580,9 +10945,9 @@ mod tests {
                             match data {
                                 MetricData::Histogram(histogram) => {
                                     let total_count: u64 = histogram
-                                        .data_points()
-                                        .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
-                                        .sum();
+                                    .data_points()
+                                    .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+                                    .sum();
                                     assert_eq!(total_count, 1);
                                     let point =
                                         histogram.data_points().next().expect("histogram point");
@@ -9698,28 +11063,55 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let logs = capture_logs_async(async {
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-downstream".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-downstream".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        send_initialize(&mut websocket).await;
+            send_initialize(&mut websocket).await;
 
-        let frame = wait_for_close_frame(&mut websocket).await;
-        let Message::Close(Some(close_frame)) = frame else {
-            panic!("expected websocket close frame");
-        };
-        assert_eq!(
-            u16::from(close_frame.code),
-            axum::extract::ws::close_code::ERROR
+            let frame = wait_for_close_frame(&mut websocket).await;
+            let Message::Close(Some(close_frame)) = frame else {
+                panic!("expected websocket close frame");
+            };
+            assert_eq!(
+                u16::from(close_frame.code),
+                axum::extract::ws::close_code::ERROR
+            );
+            assert_eq!(
+                close_frame
+                    .reason
+                    .starts_with("downstream app-server disconnected:"),
+                true
+            );
+            assert!(close_frame.reason.contains("sent invalid JSON-RPC"));
+        })
+        .await;
+        assert!(logs.contains("downstream app-server sent a malformed v2 protocol frame"));
+        assert!(logs.contains("tenant-downstream"));
+        assert!(logs.contains("project-downstream"));
+        assert!(logs.contains("worker_websocket_url"));
+        assert!(logs.contains("reason=\"invalid_jsonrpc\""));
+        assert!(logs.contains("sent invalid JSON-RPC"));
+        assert!(logs.contains("active_worker_count=1"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "downstream",
+            "invalid_jsonrpc",
+            "downstream_protocol_violation",
         );
-        assert_eq!(
-            close_frame
-                .reason
-                .starts_with("downstream app-server disconnected:"),
-            true
-        );
-        assert!(close_frame.reason.contains("sent invalid JSON-RPC"));
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -9780,7 +11172,13 @@ mod tests {
             true
         );
         assert!(close_frame.reason.contains("sent non-text JSON-RPC frame"));
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_binary");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "downstream",
+            "invalid_binary",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -9840,7 +11238,13 @@ mod tests {
                 .reason
                 .contains("sent unexpected JSON-RPC response id")
         );
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "downstream",
+            "invalid_jsonrpc",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -9900,7 +11304,13 @@ mod tests {
                 .reason
                 .contains("sent unexpected JSON-RPC error id")
         );
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "downstream",
+            "invalid_jsonrpc",
+            "downstream_protocol_violation",
+        );
         assert_eq!(
             observability
                 .v2_connection_health()
@@ -10341,6 +11751,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -10352,7 +11763,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -10533,6 +11944,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -10544,7 +11956,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -10699,6 +12111,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -10710,7 +12123,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -10826,6 +12239,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -10837,7 +12251,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -11306,7 +12720,9 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_logs_answered_but_unresolved_routes_when_client_send_times_out() {
-        let logs = capture_logs_async(async {
+        let metrics = in_memory_metrics();
+        let observed_metrics = metrics.clone();
+        let logs = capture_logs_async(async move {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
@@ -11400,7 +12816,7 @@ mod tests {
             let (addr, server_task) = spawn_test_server(GatewayV2State {
                 auth: GatewayAuth::Disabled,
                 admission: GatewayAdmissionController::default(),
-                observability: GatewayObservability::default(),
+                observability: GatewayObservability::new(Some(metrics), false),
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
@@ -11500,21 +12916,13 @@ mod tests {
         ));
         assert!(logs.contains("connection_outcome"));
         assert!(logs.contains("client_send_timed_out"));
+        assert_v2_client_send_timeout_metric(&observed_metrics);
     }
 
     #[tokio::test]
     async fn websocket_upgrade_closes_when_client_responds_to_unknown_server_request() {
         let initialize_response = test_initialize_response().await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
@@ -11571,10 +12979,12 @@ mod tests {
             close_frame.reason,
             "unexpected gateway websocket server-request response: String(\"unknown-server-request\")"
         );
-        assert_v2_server_request_lifecycle_metric(
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_server_request_lifecycle_and_connection_metrics(
             &metrics,
             "unexpected_client_server_request_response",
             "response",
+            "protocol_violation",
         );
 
         server_task.abort();
@@ -11638,6 +13048,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -11649,7 +13060,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -11702,6 +13113,13 @@ mod tests {
         assert_eq!(
             close_frame.reason,
             "unexpected gateway websocket server-request response: String(\"unknown-server-request\")"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_server_request_lifecycle_and_connection_metrics(
+            &metrics,
+            "unexpected_client_server_request_response",
+            "response",
+            "protocol_violation",
         );
 
         server_task.abort();
@@ -11765,6 +13183,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -11776,7 +13195,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -11857,9 +13276,15 @@ mod tests {
         ));
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
+        assert!(logs.contains("response_kind"));
+        assert!(logs.contains("response"));
         assert!(logs.contains("unexpected_request_id=String(\"unknown-server-request\")"));
         assert!(logs.contains("pending_server_request_count=1"));
         assert!(logs.contains("pending_server_request_ids=[String(\"server-request-1\")]"));
+        assert!(
+            logs.contains("pending_downstream_server_request_ids=[String(\"server-request-1\")]")
+        );
+        assert!(logs.contains("pending_worker_ids=[0]"));
         assert!(logs.contains("thread_scoped_pending_server_request_count=1"));
         assert!(logs.contains("connection_scoped_pending_server_request_count=0"));
         assert!(logs.contains("connection_outcome"));
@@ -12112,6 +13537,7 @@ mod tests {
         });
 
         let initialize_response = test_initialize_response().await;
+        let metrics = in_memory_metrics();
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
@@ -12123,7 +13549,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -12180,6 +13606,13 @@ mod tests {
         assert_eq!(
             close_frame.reason,
             "unexpected gateway websocket server-request response: String(\"unknown-server-request\")"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_server_request_lifecycle_and_connection_metrics(
+            &metrics,
+            "unexpected_client_server_request_response",
+            "error",
+            "protocol_violation",
         );
 
         server_task.abort();
@@ -22984,11 +24417,13 @@ mod tests {
             notification_params.clone(),
         )
         .await;
-        let worker_b = start_mock_remote_server_for_connection_notification(
-            "warning",
-            notification_params.clone(),
+        let worker_b = start_mock_remote_server_for_realtime_notifications_after_delay(
+            vec![("warning", notification_params.clone())],
+            Duration::from_millis(50),
         )
         .await;
+        let worker_a_url = worker_a.clone();
+        let worker_b_url = worker_b.clone();
         let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
@@ -23022,21 +24457,50 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let logs = capture_logs_async(async {
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-a".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-a".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        send_initialize(&mut websocket).await;
+            send_initialize(&mut websocket).await;
 
-        assert_jsonrpc_notification(
-            read_websocket_message(&mut websocket).await,
-            "warning",
-            notification_params,
-        );
+            assert_jsonrpc_notification(
+                read_websocket_message(&mut websocket).await,
+                "warning",
+                notification_params,
+            );
 
-        let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
-        assert_eq!(duplicate.is_err(), true);
+            let duplicate = timeout(Duration::from_millis(200), websocket.next()).await;
+            assert_eq!(duplicate.is_err(), true);
+        })
+        .await;
         assert_v2_suppressed_notification_metric(&metrics, "warning", "duplicate");
+        assert!(logs.contains("suppressing exact-duplicate multi-worker connection notification"));
+        assert!(logs.contains("tenant-a"), "{logs}");
+        assert!(logs.contains("project-a"), "{logs}");
+        assert!(logs.contains("worker_id=Some(1)"), "{logs}");
+        assert!(logs.contains("original_worker_id=Some(0)"), "{logs}");
+        assert!(
+            logs.contains(&format!("worker_websocket_url=\"{worker_b_url}\"")),
+            "{logs}"
+        );
+        assert!(
+            logs.contains(&format!("original_worker_websocket_url=\"{worker_a_url}\"")),
+            "{logs}"
+        );
+        assert!(logs.contains("method=\"warning\""), "{logs}");
+        assert!(logs.contains("shared worker warning"), "{logs}");
 
         server_task.abort();
         let _ = server_task.await;
@@ -29434,16 +30898,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_missing_workers_records_downstream_protocol_violation_metrics() {
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let observability = GatewayObservability::new(Some(metrics.clone()), false);
         let (client, request_handle) = start_test_request_handle().await;
         let (event_tx, event_rx) = mpsc::channel(1);
@@ -29515,7 +30970,87 @@ mod tests {
         .await;
 
         assert!(logs.contains("sent invalid initialize response"), "{logs}");
-        assert_v2_protocol_violation_metric(&metrics, "downstream", "invalid_jsonrpc");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let mut saw_protocol_violation = false;
+        let mut saw_worker_reconnect_attempt = false;
+        let mut saw_worker_reconnect_failure = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_protocol_violations" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                if attributes
+                                    == BTreeMap::from([
+                                        ("phase".to_string(), "downstream".to_string()),
+                                        ("reason".to_string(), "invalid_jsonrpc".to_string()),
+                                    ])
+                                {
+                                    assert_eq!(point.value(), 1);
+                                    saw_protocol_violation = true;
+                                }
+                            }
+                        }
+                        _ => panic!("unexpected protocol violation count aggregation"),
+                    },
+                    _ => panic!("unexpected protocol violation count type"),
+                },
+                "gateway_v2_worker_reconnects" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                if attributes
+                                    == BTreeMap::from([
+                                        ("worker_id".to_string(), "1".to_string()),
+                                        ("outcome".to_string(), "attempt".to_string()),
+                                    ])
+                                {
+                                    assert_eq!(point.value(), 1);
+                                    saw_worker_reconnect_attempt = true;
+                                }
+                                if attributes
+                                    == BTreeMap::from([
+                                        ("worker_id".to_string(), "1".to_string()),
+                                        ("outcome".to_string(), "connect_failure".to_string()),
+                                    ])
+                                {
+                                    assert_eq!(point.value(), 1);
+                                    saw_worker_reconnect_failure = true;
+                                }
+                            }
+                        }
+                        _ => panic!("unexpected worker reconnect count aggregation"),
+                    },
+                    _ => panic!("unexpected worker reconnect count type"),
+                },
+                _ => {}
+            }
+        }
+        assert!(saw_protocol_violation);
+        assert!(saw_worker_reconnect_attempt);
+        assert!(saw_worker_reconnect_failure);
 
         client.shutdown().await.expect("client should shut down");
     }
@@ -32303,16 +33838,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_rejects_hidden_downstream_server_requests() {
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_hidden_server_request(
             JSONRPCRequest {
@@ -32359,86 +33885,7 @@ mod tests {
         })
         .await;
 
-        let mut request = format!("ws://{addr}/")
-            .into_client_request()
-            .expect("request should build");
-        request.headers_mut().insert(
-            "x-codex-tenant-id",
-            "tenant-a".parse().expect("tenant header"),
-        );
-        request.headers_mut().insert(
-            "x-codex-project-id",
-            "project-a".parse().expect("project header"),
-        );
-        let (mut websocket, _response) = connect_async(request)
-            .await
-            .expect("websocket should connect");
-
-        send_initialize(&mut websocket).await;
-
-        let hidden_request = timeout(Duration::from_millis(200), websocket.next()).await;
-        assert_eq!(hidden_request.is_err(), true);
-
-        assert_v2_server_request_rejection_metric(
-            &metrics,
-            "item/commandExecution/requestApproval",
-            "hidden_thread",
-        );
-
-        server_task.abort();
-        let _ = server_task.await;
-    }
-
-    #[tokio::test]
-    async fn websocket_upgrade_logs_scope_worker_and_thread_id_for_hidden_downstream_server_requests()
-     {
         let logs = capture_logs_async(async {
-            let initialize_response = test_initialize_response().await;
-            let websocket_url = start_mock_remote_server_for_hidden_server_request(
-                JSONRPCRequest {
-                    id: RequestId::String("hidden-server-request".to_string()),
-                    method: "item/commandExecution/requestApproval".to_string(),
-                    params: Some(serde_json::json!({
-                        "threadId": "thread-hidden",
-                        "turnId": "turn-hidden",
-                        "itemId": "item-hidden",
-                        "reason": "Need to run a hidden command",
-                        "command": "pwd",
-                    })),
-                    trace: None,
-                },
-                "thread not found",
-            )
-            .await;
-            let scope_registry = Arc::new(GatewayScopeRegistry::default());
-            scope_registry.register_thread(
-                "thread-visible".to_string(),
-                GatewayRequestContext {
-                    tenant_id: "tenant-a".to_string(),
-                    project_id: Some("project-a".to_string()),
-                },
-            );
-            let (addr, server_task) = spawn_test_server(GatewayV2State {
-                auth: GatewayAuth::Disabled,
-                admission: GatewayAdmissionController::default(),
-                observability: GatewayObservability::default(),
-                scope_registry,
-                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
-                    RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
-                        client_name: "codex-gateway".to_string(),
-                        client_version: "0.0.0-test".to_string(),
-                        experimental_api: false,
-                        opt_out_notification_methods: Vec::new(),
-                        channel_capacity: 4,
-                    },
-                    initialize_response,
-                ))),
-                timeouts: GatewayV2Timeouts::default(),
-            })
-            .await;
-
             let mut request = format!("ws://{addr}/")
                 .into_client_request()
                 .expect("request should build");
@@ -32458,15 +33905,19 @@ mod tests {
 
             let hidden_request = timeout(Duration::from_millis(200), websocket.next()).await;
             assert_eq!(hidden_request.is_err(), true);
-
-            server_task.abort();
-            let _ = server_task.await;
         })
         .await;
 
+        assert_v2_server_request_rejection_metric(
+            &metrics,
+            "item/commandExecution/requestApproval",
+            "hidden_thread",
+        );
         assert!(logs.contains(
             "rejecting downstream server request for a thread outside the gateway request scope"
         ));
+        assert!(logs.contains("tenant-a"), "{logs}");
+        assert!(logs.contains("project-a"), "{logs}");
         assert!(logs.contains("worker_websocket_url=\"ws://"), "{logs}");
         assert!(
             logs.contains("request_id=String(\"hidden-server-request\")"),
@@ -32477,6 +33928,9 @@ mod tests {
             "{logs}"
         );
         assert!(logs.contains("thread-hidden"));
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -32537,16 +33991,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_suppresses_hidden_thread_notifications() {
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let initialize_response = test_initialize_response().await;
         let websocket_url =
             start_mock_remote_server_for_notification(ServerNotification::AgentMessageDelta(
@@ -32561,7 +34006,10 @@ mod tests {
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
         scope_registry.register_thread(
             "thread-visible".to_string(),
-            GatewayRequestContext::default(),
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
         );
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
@@ -32584,19 +34032,45 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let logs = capture_logs_async(async {
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-a".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-a".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        send_initialize(&mut websocket).await;
+            send_initialize(&mut websocket).await;
 
-        let hidden_notification = timeout(Duration::from_millis(200), websocket.next()).await;
-        assert!(hidden_notification.is_err());
+            let hidden_notification = timeout(Duration::from_millis(200), websocket.next()).await;
+            assert!(hidden_notification.is_err());
+        })
+        .await;
         assert_v2_suppressed_notification_metric(
             &metrics,
             "item/agentMessage/delta",
             "hidden_thread",
         );
+        assert!(logs.contains(
+            "suppressing downstream notification for a thread outside the gateway request scope"
+        ));
+        assert!(logs.contains("tenant-a"), "{logs}");
+        assert!(logs.contains("project-a"), "{logs}");
+        assert!(logs.contains("worker_websocket_url=\"ws://"), "{logs}");
+        assert!(
+            logs.contains("method=\"item/agentMessage/delta\""),
+            "{logs}"
+        );
+        assert!(logs.contains("thread-hidden"), "{logs}");
+        assert!(logs.contains("hidden text"), "{logs}");
 
         server_task.abort();
         let _ = server_task.await;
@@ -33695,16 +35169,7 @@ mod tests {
         let initialize_response = test_initialize_response().await;
         let websocket_url =
             start_mock_remote_server_for_connection_notification("warning", params).await;
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
+        let metrics = in_memory_metrics();
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
@@ -33726,22 +35191,44 @@ mod tests {
         })
         .await;
 
-        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-            .await
-            .expect("websocket should connect");
+        let logs = capture_logs_async(async {
+            let mut request = format!("ws://{addr}/")
+                .into_client_request()
+                .expect("request should build");
+            request.headers_mut().insert(
+                "x-codex-tenant-id",
+                "tenant-a".parse().expect("tenant header"),
+            );
+            request.headers_mut().insert(
+                "x-codex-project-id",
+                "project-a".parse().expect("project header"),
+            );
+            let (mut websocket, _response) = connect_async(request)
+                .await
+                .expect("websocket should connect");
 
-        send_initialize_with_capabilities(
-            &mut websocket,
-            Some(InitializeCapabilities {
-                experimental_api: false,
-                opt_out_notification_methods: Some(vec!["warning".to_string()]),
-            }),
-        )
+            send_initialize_with_capabilities(
+                &mut websocket,
+                Some(InitializeCapabilities {
+                    experimental_api: false,
+                    opt_out_notification_methods: Some(vec!["warning".to_string()]),
+                }),
+            )
+            .await;
+
+            let notification = timeout(Duration::from_millis(200), websocket.next()).await;
+            assert!(notification.is_err());
+        })
         .await;
-
-        let notification = timeout(Duration::from_millis(200), websocket.next()).await;
-        assert!(notification.is_err());
         assert_v2_suppressed_notification_metric(&metrics, "warning", "opted_out");
+        assert!(
+            logs.contains("suppressing downstream notification opted out by northbound v2 client")
+        );
+        assert!(logs.contains("tenant-a"), "{logs}");
+        assert!(logs.contains("project-a"), "{logs}");
+        assert!(logs.contains("worker_websocket_url=\"ws://"), "{logs}");
+        assert!(logs.contains("method=\"warning\""), "{logs}");
+        assert!(logs.contains("Gateway opt-out test message"), "{logs}");
 
         server_task.abort();
         let _ = server_task.await;
@@ -34223,6 +35710,27 @@ mod tests {
         let thread_id = super::request_thread_id(&request);
 
         assert_eq!(thread_id, None);
+    }
+
+    #[test]
+    fn request_thread_id_ignores_path_based_thread_resume_and_fork() {
+        for method in ["thread/resume", "thread/fork"] {
+            let request = JSONRPCRequest {
+                id: RequestId::String(format!("{method}-path")),
+                method: method.to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "thread-placeholder",
+                    "path": "/tmp/rollout.jsonl",
+                })),
+                trace: None,
+            };
+
+            assert_eq!(super::request_thread_id(&request), None);
+            assert_eq!(
+                super::request_thread_path(&request),
+                Some("/tmp/rollout.jsonl")
+            );
+        }
     }
 
     #[test]
@@ -39011,6 +40519,198 @@ mod tests {
                 .await
                 .expect("binary frame should send");
             tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_mock_remote_server_that_sends_server_request_during_initialize()
+    -> (String, oneshot::Receiver<JSONRPCResponse>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(initialize_request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(initialize_request.method, "initialize");
+
+            let server_request_id = RequestId::String("srv-init".to_string());
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: server_request_id.clone(),
+                        method: "item/tool/requestUserInput".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-init",
+                            "turnId": "turn-init",
+                            "itemId": "item-init",
+                            "questions": [{
+                                "id": "question-init",
+                                "header": "Mode",
+                                "question": "Pick one",
+                                "isOther": false,
+                                "isSecret": false,
+                                "options": [],
+                            }],
+                        })),
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: initialize_request.id,
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("initialize response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("initialize response should send");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialized frame should exist")
+                .expect("initialized frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialized text frame");
+            };
+            let JSONRPCMessage::Notification(notification) =
+                serde_json::from_str(&text).expect("initialized should decode")
+            else {
+                panic!("expected initialized notification");
+            };
+            assert_eq!(notification.method, "initialized");
+
+            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected server request response");
+            };
+            assert_eq!(response.id, server_request_id);
+            response_tx
+                .send(response)
+                .expect("test should wait for server request response");
+        });
+        (format!("ws://{addr}"), response_rx)
+    }
+
+    async fn start_mock_remote_server_that_sends_unknown_server_request_during_initialize() -> String
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialize frame should exist")
+                .expect("initialize frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialize text frame");
+            };
+            let JSONRPCMessage::Request(initialize_request) =
+                serde_json::from_str(&text).expect("initialize should decode")
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(initialize_request.method, "initialize");
+
+            let server_request_id = RequestId::String("srv-init-unknown".to_string());
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: server_request_id.clone(),
+                        method: "thread/unknown".to_string(),
+                        params: None,
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected setup-time server request rejection");
+            };
+            assert_eq!(error.id, server_request_id);
+            assert_eq!(error.error.code, -32601);
+            assert_eq!(
+                error.error.message,
+                "unsupported remote app-server request `thread/unknown`"
+            );
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: initialize_request.id,
+                        result: serde_json::json!({}),
+                    }))
+                    .expect("initialize response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("initialize response should send");
+
+            let frame = websocket
+                .next()
+                .await
+                .expect("initialized frame should exist")
+                .expect("initialized frame should decode");
+            let Message::Text(text) = frame else {
+                panic!("expected initialized text frame");
+            };
+            let JSONRPCMessage::Notification(notification) =
+                serde_json::from_str(&text).expect("initialized should decode")
+            else {
+                panic!("expected initialized notification");
+            };
+            assert_eq!(notification.method, "initialized");
+
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected follow-up request");
+            };
+            assert_eq!(request.method, "model/list");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({ "models": [] }),
+                    }))
+                    .expect("model list response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("model list response should send");
         });
         format!("ws://{addr}")
     }
