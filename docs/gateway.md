@@ -528,6 +528,10 @@ Recent progress:
   the rejected `command/exec` (`outcome="rate_limited"`) and the original
   pending `command/exec` (`outcome="ok"`), so dashboards can distinguish
   bounded command saturation from successful long-running command completion
+- saturated pending client requests now also emit
+  `gateway_v2_client_request_rejections{method,reason="pending_limit"}`, so
+  background command-exec overload can be tracked separately from ordinary
+  request outcomes
 - dedicated log coverage now also pins the structured warning emitted for
   saturated pending client requests, including tenant/project scope, request
   id, method, current pending count, and limit
@@ -535,6 +539,10 @@ Recent progress:
   last-completed WebSocket sessions, so operators can distinguish long-running
   background `command/exec` saturation from pending server-request prompt
   lifecycles
+- `/healthz.v2Transport` now also exposes `maxPendingClientRequests` next to
+  `maxPendingServerRequests`, making the independent per-connection
+  saturation limits explicit for background client requests and downstream
+  prompt state
 - that same single-worker reconnect coverage now also re-exercises the broader
   typed server-request surface after worker recovery:
   `item/commandExecution/requestApproval`,
@@ -910,6 +918,14 @@ Recent progress:
   ids, and affected thread and worker ids before pending downstream prompts are
   rejected, so `client_send_timed_out` outcomes can be tied back to the
   stranded session state directly from logs
+- that same slow-client warning now also includes pending background
+  client-request ids and methods, so a wedged `command/exec` response can be
+  correlated with the gateway-owned `client_send_timed_out` outcome without
+  relying only on aggregate `/healthz` counts; a dedicated northbound
+  WebSocket regression now pins that pending `command/exec` diagnostic path
+- that same pending background request diagnostic now also includes downstream
+  worker ids and WebSocket URLs, so multi-worker `command/exec` stalls can be
+  tied directly to the owning worker session from slow-client and teardown logs
 - that slow-client path now also has a real northbound regression where one
   pending downstream server request is left unresolved while large follow-up
   notifications wedge the client send path, verifying the timeout warning,
@@ -1283,8 +1299,9 @@ Phase 6 is in progress with:
   startup and `/healthz` distinguish embedded, single-worker remote, and the
   current partial multi-worker profile; `/healthz` exposes
   `initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
-  `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`; remote-worker
-  entries expose `lastStateChangeAt`, `lastErrorAt`, `reconnecting`,
+  `reconnectRetryBackoffSeconds`, `maxPendingServerRequests`, and
+  `maxPendingClientRequests`; remote-worker entries expose `lastStateChangeAt`,
+  `lastErrorAt`, `reconnecting`,
   `reconnectAttemptCount`, `nextReconnectAt`, and
   `reconnectBackoffRemainingSeconds`; `/healthz` now also exposes
   `v2Connections.activeConnectionCount`,
@@ -1325,9 +1342,43 @@ Phase 6 is in progress with:
   regression coverage, pinning the fields and outcome mapping that rollout
   debugging relies on
 - v2 connection completion and audit logs now also include terminal detail plus
-  the pending and answered-but-unresolved server-request counts, so ordinary
-  connection outcome logs carry the same stranded-session summary that
-  `/healthz` and metrics expose
+  pending client-request, pending server-request, and answered-but-unresolved
+  server-request counts, so ordinary connection outcome logs carry the same
+  background-command and stranded-prompt summary that `/healthz` and metrics
+  expose
+- v2 connection metrics now also emit
+  `gateway_v2_connection_pending_client_requests{outcome}`, aligning
+  connection-level telemetry with `/healthz` and structured logs so background
+  command saturation is visible after connection teardown without relying only
+  on the latest health snapshot
+- v2 connection teardown now also emits a structured warning when pending
+  background client requests are aborted, including tenant/project scope,
+  terminal outcome/detail, request ids, methods, and downstream worker ids /
+  WebSocket URLs, so partially completed `command/exec` lifecycles are visible
+  without reconstructing them only from aggregate terminal counts
+- completed background client requests are now settled before their final
+  northbound JSON-RPC response is sent, so a slow-client failure while
+  delivering a finished `command/exec` response does not leave that request in
+  active pending counts or aborted-request teardown diagnostics; direct
+  regression coverage now pins the pending-count and active-route cleanup
+  invariant
+- if that final background `command/exec` response cannot be delivered because
+  the northbound client times out or disconnects, the gateway now records the
+  request with the connection-owned failure outcome instead of losing the
+  per-method request metric after active-route cleanup
+- the connection teardown path now also drains already completed background
+  responses before logging aborted pending client requests, so a `command/exec`
+  that finished just as the northbound session ended is not misreported as
+  still active
+- aborted background client requests now also emit
+  `gateway_v2_requests{method,outcome}` using the connection terminal outcome,
+  so interrupted long-running `command/exec` calls remain visible in
+  per-method request metrics rather than only connection-level telemetry
+- northbound v2 now fails closed when a client reuses any still-pending
+  background client-request id, even for a different follow-up method,
+  preventing the active pending-client route from being overwritten; dedicated
+  coverage pins the protocol close, violation metric, and structured log
+  fields for the duplicate id plus original worker route
 - v2 server-request saturation and scope-policy rejection now also emit a
   dedicated rejection counter tagged by server-request method and reason
   (`pending_limit` or `hidden_thread`), so overload and policy dashboards can

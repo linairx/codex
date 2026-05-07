@@ -54,6 +54,7 @@ fn gateway_v2_transport_config(gateway_config: &GatewayConfig) -> GatewayV2Trans
         client_send_timeout_seconds: gateway_config.v2_client_send_timeout.as_secs(),
         reconnect_retry_backoff_seconds: gateway_config.v2_reconnect_retry_backoff.as_secs(),
         max_pending_server_requests: gateway_config.v2_max_pending_server_requests,
+        max_pending_client_requests: gateway_config.v2_max_pending_client_requests,
     }
 }
 
@@ -128,6 +129,7 @@ pub async fn start_gateway_server(
                 v2_reconnect_retry_backoff_seconds =
                     gateway_config.v2_reconnect_retry_backoff.as_secs(),
                 v2_max_pending_server_requests = gateway_config.v2_max_pending_server_requests,
+                v2_max_pending_client_requests = gateway_config.v2_max_pending_client_requests,
                 exec_server_url = gateway_config.exec_server_url.as_deref(),
                 "starting gateway with embedded app-server runtime"
             );
@@ -202,6 +204,7 @@ pub async fn start_gateway_server(
                 v2_reconnect_retry_backoff_seconds =
                     gateway_config.v2_reconnect_retry_backoff.as_secs(),
                 v2_max_pending_server_requests = gateway_config.v2_max_pending_server_requests,
+                v2_max_pending_client_requests = gateway_config.v2_max_pending_client_requests,
                 remote_worker_count = gateway_config
                     .remote_runtime
                     .as_ref()
@@ -284,6 +287,13 @@ fn validate_gateway_config(gateway_config: &GatewayConfig) -> io::Result<()> {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             "gateway v2 max pending server requests must be greater than zero",
+        ));
+    }
+
+    if gateway_config.v2_max_pending_client_requests == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "gateway v2 max pending client requests must be greater than zero",
         ));
     }
 
@@ -372,6 +382,7 @@ async fn start_single_runtime_gateway_http_server(
                     client_send: gateway_config.v2_client_send_timeout,
                     reconnect_retry_backoff: gateway_config.v2_reconnect_retry_backoff,
                     max_pending_server_requests: gateway_config.v2_max_pending_server_requests,
+                    max_pending_client_requests: gateway_config.v2_max_pending_client_requests,
                 },
             ),
         )
@@ -493,6 +504,7 @@ async fn start_remote_runtime_gateway_http_server(
                     client_send: gateway_config.v2_client_send_timeout,
                     reconnect_retry_backoff: gateway_config.v2_reconnect_retry_backoff,
                     max_pending_server_requests: gateway_config.v2_max_pending_server_requests,
+                    max_pending_client_requests: gateway_config.v2_max_pending_client_requests,
                 },
             ),
         )
@@ -1386,6 +1398,15 @@ mod tests {
                 },
                 "gateway should reject zero pending server request limit",
                 "gateway v2 max pending server requests must be greater than zero",
+            ),
+            (
+                GatewayConfig {
+                    bind_address,
+                    v2_max_pending_client_requests: 0,
+                    ..GatewayConfig::default()
+                },
+                "gateway should reject zero pending client request limit",
+                "gateway v2 max pending client requests must be greater than zero",
             ),
         ];
 
@@ -26506,6 +26527,7 @@ stream_max_retries = 0
         assert_eq!(health.v2_transport.client_send_timeout_seconds, 10);
         assert_eq!(health.v2_transport.reconnect_retry_backoff_seconds, 1);
         assert_eq!(health.v2_transport.max_pending_server_requests, 64);
+        assert_eq!(health.v2_transport.max_pending_client_requests, 64);
         assert_eq!(health.v2_connections.active_connection_count, 0);
         assert_eq!(health.v2_connections.peak_active_connection_count, 0);
         assert_eq!(health.v2_connections.total_connection_count, 0);
@@ -28093,6 +28115,7 @@ stream_max_retries = 0
                 v2_client_send_timeout: Duration::from_secs(3),
                 v2_reconnect_retry_backoff: Duration::from_secs(5),
                 v2_max_pending_server_requests: 11,
+                v2_max_pending_client_requests: 13,
                 ..GatewayConfig::default()
             },
             Arg0DispatchPaths::default(),
@@ -28115,6 +28138,7 @@ stream_max_retries = 0
         assert_eq!(health.v2_transport.client_send_timeout_seconds, 3);
         assert_eq!(health.v2_transport.reconnect_retry_backoff_seconds, 5);
         assert_eq!(health.v2_transport.max_pending_server_requests, 11);
+        assert_eq!(health.v2_transport.max_pending_client_requests, 13);
         assert_eq!(health.v2_connections.active_connection_count, 0);
         assert_eq!(health.v2_connections.peak_active_connection_count, 0);
         assert_eq!(health.v2_connections.total_connection_count, 0);

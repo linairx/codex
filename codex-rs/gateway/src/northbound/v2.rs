@@ -98,6 +98,7 @@ const INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON: &str =
 const INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON: &str = "invalid gateway websocket UTF-8 payload";
 const UNEXPECTED_CLIENT_SERVER_REQUEST_RESPONSE_CLOSE_REASON: &str =
     "unexpected gateway websocket server-request response";
+const DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON: &str = "duplicate pending client request id";
 const DUPLICATE_DOWNSTREAM_SERVER_REQUEST_CLOSE_REASON: &str =
     "duplicate downstream server-request id";
 const STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON: &str =
@@ -117,6 +118,7 @@ pub struct GatewayV2Timeouts {
     pub client_send: Duration,
     pub reconnect_retry_backoff: Duration,
     pub max_pending_server_requests: usize,
+    pub max_pending_client_requests: usize,
 }
 
 impl Default for GatewayV2Timeouts {
@@ -126,6 +128,7 @@ impl Default for GatewayV2Timeouts {
             client_send: Duration::from_secs(10),
             reconnect_retry_backoff: Duration::from_secs(1),
             max_pending_server_requests: MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+            max_pending_client_requests: MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
         }
     }
 }
@@ -147,6 +150,7 @@ struct GatewayV2ConnectionContext<'a> {
     request_context: &'a GatewayRequestContext,
     client_send_timeout: Duration,
     max_pending_server_requests: usize,
+    max_pending_client_requests: usize,
     opt_out_notification_methods: HashSet<String>,
 }
 
@@ -206,10 +210,33 @@ struct PendingClientResponse {
     result: io::Result<Result<Value, JSONRPCErrorError>>,
 }
 
+struct PendingClientRequestRoute {
+    method: String,
+    request_context: GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: String,
+    started_at: Instant,
+}
+
 struct PendingClientResponses {
     tx: mpsc::Sender<PendingClientResponse>,
     tasks: Vec<JoinHandle<()>>,
     count: usize,
+    active: HashMap<RequestId, PendingClientRequestRoute>,
+}
+
+impl PendingClientResponses {
+    fn settle_response(&mut self, request_id: &RequestId) {
+        self.count = self.count.saturating_sub(1);
+        self.active.remove(request_id);
+        self.tasks.retain(|task| !task.is_finished());
+    }
+
+    fn settle_completed_responses(&mut self, rx: &mut mpsc::Receiver<PendingClientResponse>) {
+        while let Ok(response) = rx.try_recv() {
+            self.settle_response(&response.request_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1004,11 +1031,12 @@ async fn run_websocket_connection(
         let mut reject_pending_server_requests_on_exit = false;
         let mut connection_detail = None;
         let (pending_client_response_tx, mut pending_client_response_rx) =
-            mpsc::channel::<PendingClientResponse>(timeouts.max_pending_server_requests.max(1));
+            mpsc::channel::<PendingClientResponse>(timeouts.max_pending_client_requests.max(1));
         let mut pending_client_responses = PendingClientResponses {
             tx: pending_client_response_tx,
             tasks: Vec::new(),
             count: 0,
+            active: HashMap::new(),
         };
         let connection = GatewayV2ConnectionContext {
             admission: &admission,
@@ -1017,6 +1045,7 @@ async fn run_websocket_connection(
             request_context: &context,
             client_send_timeout: timeouts.client_send,
             max_pending_server_requests: timeouts.max_pending_server_requests,
+            max_pending_client_requests: timeouts.max_pending_client_requests,
             opt_out_notification_methods: initialize_params
                 .capabilities
                 .as_ref()
@@ -1177,11 +1206,8 @@ async fn run_websocket_connection(
                     let Some(pending_response) = pending_response else {
                         continue;
                     };
-                    pending_client_responses.count =
-                        pending_client_responses.count.saturating_sub(1);
-                    pending_client_responses
-                        .tasks
-                        .retain(|task| !task.is_finished());
+                    let pending_response_request_id = pending_response.request_id.clone();
+                    pending_client_responses.settle_response(&pending_response_request_id);
                     update_active_v2_connection_pending_counts(
                         &observability,
                         connection_id,
@@ -1190,15 +1216,26 @@ async fn run_websocket_connection(
                     );
                     match pending_response.result {
                         Ok(Ok(result)) => {
-                            send_jsonrpc(
+                            if let Err(err) = send_jsonrpc(
                                 &mut socket,
                                 JSONRPCMessage::Response(JSONRPCResponse {
-                                    id: pending_response.request_id,
+                                    id: pending_response.request_id.clone(),
                                     result,
                                 }),
                                 timeouts.client_send,
                             )
-                            .await?;
+                            .await
+                            {
+                                let outcome = classify_v2_connection_error(&err);
+                                observe_v2_request(
+                                    &observability,
+                                    &pending_response.request_context,
+                                    &pending_response.method,
+                                    outcome,
+                                    pending_response.started_at.elapsed(),
+                                );
+                                break (Err(err), outcome);
+                            }
                             observe_v2_request(
                                 &observability,
                                 &pending_response.request_context,
@@ -1209,13 +1246,24 @@ async fn run_websocket_connection(
                         }
                         Ok(Err(error)) => {
                             let outcome = jsonrpc_error_outcome_code(error.code);
-                            send_jsonrpc_error(
+                            if let Err(err) = send_jsonrpc_error(
                                 &mut socket,
-                                pending_response.request_id,
+                                pending_response.request_id.clone(),
                                 error,
                                 timeouts.client_send,
                             )
-                            .await?;
+                            .await
+                            {
+                                let outcome = classify_v2_connection_error(&err);
+                                observe_v2_request(
+                                    &observability,
+                                    &pending_response.request_context,
+                                    &pending_response.method,
+                                    outcome,
+                                    pending_response.started_at.elapsed(),
+                                );
+                                break (Err(err), outcome);
+                            }
                             observe_v2_request(
                                 &observability,
                                 &pending_response.request_context,
@@ -1225,9 +1273,9 @@ async fn run_websocket_connection(
                             );
                         }
                         Err(err) => {
-                            send_jsonrpc_error(
+                            if let Err(send_err) = send_jsonrpc_error(
                                 &mut socket,
-                                pending_response.request_id,
+                                pending_response.request_id.clone(),
                                 JSONRPCErrorError {
                                     code: INTERNAL_ERROR_CODE,
                                     message: format!("gateway upstream request failed: {err}"),
@@ -1235,7 +1283,18 @@ async fn run_websocket_connection(
                                 },
                                 timeouts.client_send,
                             )
-                            .await?;
+                            .await
+                            {
+                                let outcome = classify_v2_connection_error(&send_err);
+                                observe_v2_request(
+                                    &observability,
+                                    &pending_response.request_context,
+                                    &pending_response.method,
+                                    outcome,
+                                    pending_response.started_at.elapsed(),
+                                );
+                                break (Err(send_err), outcome);
+                            }
                             observe_v2_request(
                                 &observability,
                                 &pending_response.request_context,
@@ -1249,6 +1308,7 @@ async fn run_websocket_connection(
             }
         };
 
+        pending_client_responses.settle_completed_responses(&mut pending_client_response_rx);
         if let Err(err) = &loop_result
             && err.kind() == ErrorKind::TimedOut
         {
@@ -1256,12 +1316,26 @@ async fn run_websocket_connection(
             log_client_send_timeout(
                 connection.request_context,
                 err.to_string().as_str(),
+                &pending_client_responses.active,
                 &event_state.pending_server_requests,
                 &event_state.resolved_server_requests,
             );
         }
 
         let pending_client_request_count = pending_client_responses.count;
+        if !pending_client_responses.active.is_empty() {
+            log_aborted_pending_client_requests(
+                connection.request_context,
+                connection_outcome,
+                connection_detail.as_deref(),
+                &pending_client_responses.active,
+            );
+            observe_aborted_pending_client_requests(
+                &observability,
+                connection_outcome,
+                &pending_client_responses.active,
+            );
+        }
         for task in pending_client_responses.tasks {
             task.abort();
         }
@@ -1605,18 +1679,43 @@ async fn handle_client_message(
 
             let request_id = request.id.clone();
             let method = request.method.clone();
+            if pending_client_responses.active.contains_key(&request_id) {
+                log_duplicate_pending_client_request(
+                    connection.request_context,
+                    &request_id,
+                    &method,
+                    &pending_client_responses.active,
+                );
+                connection
+                    .observability
+                    .record_v2_protocol_violation("post_initialize", "duplicate_request_id");
+                send_close_frame(
+                    socket,
+                    close_code::PROTOCOL,
+                    DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON,
+                    connection.client_send_timeout,
+                )
+                .await?;
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON,
+                ));
+            }
             if method == "command/exec" {
                 if let Some(error) = pending_client_request_limit_error(
                     pending_client_responses.count,
-                    connection.max_pending_server_requests,
+                    connection.max_pending_client_requests,
                 ) {
                     log_rejected_saturated_client_request(
                         connection.request_context,
                         &request_id,
                         &method,
                         pending_client_responses.count,
-                        connection.max_pending_server_requests,
+                        connection.max_pending_client_requests,
                     );
+                    connection
+                        .observability
+                        .record_v2_client_request_rejection(&method, "pending_limit");
                     send_jsonrpc_error(socket, request_id, error, connection.client_send_timeout)
                         .await?;
                     observe_v2_request(
@@ -1650,6 +1749,19 @@ async fn handle_client_message(
                 let request_context = connection.request_context.clone();
                 let pending_client_response_tx = pending_client_responses.tx.clone();
                 pending_client_responses.count += 1;
+                pending_client_responses.active.insert(
+                    request_id.clone(),
+                    PendingClientRequestRoute {
+                        method: method.clone(),
+                        request_context: request_context.clone(),
+                        worker_id: worker.worker_id,
+                        worker_websocket_url: worker
+                            .worker_websocket_url
+                            .clone()
+                            .unwrap_or_else(|| "<embedded>".to_string()),
+                        started_at,
+                    },
+                );
                 pending_client_responses
                     .tasks
                     .push(tokio::spawn(async move {
@@ -2585,9 +2697,28 @@ fn log_downstream_backpressure_close(
 fn log_client_send_timeout(
     request_context: &GatewayRequestContext,
     detail: &str,
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
+    let mut pending_client_request_ids: Vec<RequestId> =
+        pending_client_requests.keys().cloned().collect();
+    pending_client_request_ids.sort();
+    let mut pending_client_request_methods: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect();
+    pending_client_request_methods.sort();
+    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
+        .values()
+        .filter_map(|route| route.worker_id)
+        .collect();
+    pending_client_request_worker_ids.sort_unstable();
+    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.worker_websocket_url.clone())
+        .collect();
+    pending_client_request_worker_websocket_urls.sort();
     let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
 
@@ -2595,6 +2726,12 @@ fn log_client_send_timeout(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         connection_detail = detail,
+        pending_client_request_count = pending_client_request_ids.len(),
+        pending_client_request_ids = ?pending_client_request_ids,
+        pending_client_request_methods = ?pending_client_request_methods,
+        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_worker_websocket_urls =
+            ?pending_client_request_worker_websocket_urls,
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
@@ -2607,6 +2744,102 @@ fn log_client_send_timeout(
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         "closing gateway v2 connection because sending to the northbound client timed out"
     );
+}
+
+fn log_aborted_pending_client_requests(
+    request_context: &GatewayRequestContext,
+    outcome: &str,
+    detail: Option<&str>,
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+) {
+    let mut pending_client_request_ids: Vec<RequestId> =
+        pending_client_requests.keys().cloned().collect();
+    pending_client_request_ids.sort();
+    let mut pending_client_request_methods: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect();
+    pending_client_request_methods.sort();
+    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
+        .values()
+        .filter_map(|route| route.worker_id)
+        .collect();
+    pending_client_request_worker_ids.sort_unstable();
+    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.worker_websocket_url.clone())
+        .collect();
+    pending_client_request_worker_websocket_urls.sort();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        outcome,
+        detail,
+        pending_client_request_count = pending_client_request_ids.len(),
+        pending_client_request_ids = ?pending_client_request_ids,
+        pending_client_request_methods = ?pending_client_request_methods,
+        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_worker_websocket_urls =
+            ?pending_client_request_worker_websocket_urls,
+        "aborting pending gateway v2 client requests because the northbound connection ended"
+    );
+}
+
+fn log_duplicate_pending_client_request(
+    request_context: &GatewayRequestContext,
+    request_id: &RequestId,
+    method: &str,
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+) {
+    let mut pending_client_request_ids: Vec<RequestId> =
+        pending_client_requests.keys().cloned().collect();
+    pending_client_request_ids.sort();
+    let mut pending_client_request_methods: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect();
+    pending_client_request_methods.sort();
+    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
+        .values()
+        .filter_map(|route| route.worker_id)
+        .collect();
+    pending_client_request_worker_ids.sort_unstable();
+    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.worker_websocket_url.clone())
+        .collect();
+    pending_client_request_worker_websocket_urls.sort();
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        request_id = ?request_id,
+        method,
+        pending_client_request_count = pending_client_request_ids.len(),
+        pending_client_request_ids = ?pending_client_request_ids,
+        pending_client_request_methods = ?pending_client_request_methods,
+        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_worker_websocket_urls =
+            ?pending_client_request_worker_websocket_urls,
+        "closing gateway v2 connection because the northbound client reused a pending request id"
+    );
+}
+
+fn observe_aborted_pending_client_requests(
+    observability: &GatewayObservability,
+    outcome: &str,
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+) {
+    for route in pending_client_requests.values() {
+        observe_v2_request(
+            observability,
+            &route.request_context,
+            &route.method,
+            outcome,
+            route.started_at.elapsed(),
+        );
+    }
 }
 
 fn log_duplicate_downstream_server_request(
@@ -5311,28 +5544,9 @@ fn observe_v2_connection(
     observability
         .v2_connection_health()
         .mark_connection_completed(connection_id, outcome, detail, duration, pending_counts);
-    observability.record_v2_connection(
-        outcome,
-        duration,
-        pending_counts.pending_server_request_count,
-        pending_counts.answered_but_unresolved_server_request_count,
-    );
-    observability.emit_v2_connection_audit_log(
-        outcome,
-        duration,
-        context,
-        detail,
-        pending_counts.pending_server_request_count,
-        pending_counts.answered_but_unresolved_server_request_count,
-    );
-    observability.emit_v2_connection_log(
-        outcome,
-        duration,
-        context,
-        detail,
-        pending_counts.pending_server_request_count,
-        pending_counts.answered_but_unresolved_server_request_count,
-    );
+    observability.record_v2_connection(outcome, duration, pending_counts);
+    observability.emit_v2_connection_audit_log(outcome, duration, context, detail, pending_counts);
+    observability.emit_v2_connection_log(outcome, duration, context, detail, pending_counts);
 }
 
 fn classify_v2_connection_error(err: &io::Error) -> &'static str {
@@ -5841,6 +6055,7 @@ mod tests {
                 client_send: Duration::from_secs(10),
                 reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: 1,
+                max_pending_client_requests: 1,
             },
         })
         .await;
@@ -5917,6 +6132,7 @@ mod tests {
                 client_send: Duration::from_secs(10),
                 reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: 1,
+                max_pending_client_requests: 1,
             },
         })
         .await;
@@ -6837,6 +7053,7 @@ mod tests {
                 client_send: Duration::from_secs(10),
                 reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                max_pending_client_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
             },
         })
         .await;
@@ -7893,6 +8110,35 @@ mod tests {
     }
 
     #[test]
+    fn pending_client_response_settlement_removes_active_request_before_delivery() {
+        let (tx, _rx) = mpsc::channel(1);
+        let request_id = RequestId::String("command-exec-1".to_string());
+        let mut pending_client_responses = super::PendingClientResponses {
+            tx,
+            tasks: Vec::new(),
+            count: 1,
+            active: HashMap::from([(
+                request_id.clone(),
+                super::PendingClientRequestRoute {
+                    method: "command/exec".to_string(),
+                    request_context: GatewayRequestContext {
+                        tenant_id: "tenant-visible".to_string(),
+                        project_id: Some("project-visible".to_string()),
+                    },
+                    worker_id: Some(0),
+                    worker_websocket_url: "ws://worker-a.invalid".to_string(),
+                    started_at: Instant::now(),
+                },
+            )]),
+        };
+
+        pending_client_responses.settle_response(&request_id);
+
+        assert_eq!(pending_client_responses.count, 0);
+        assert!(pending_client_responses.active.is_empty());
+    }
+
+    #[test]
     fn pending_server_request_limit_error_rejects_counts_at_or_above_limit() {
         let error = super::pending_server_request_limit_error(1, 1).expect("error");
         assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
@@ -8554,6 +8800,7 @@ mod tests {
 
         let mut saw_count = false;
         let mut saw_duration = false;
+        let mut saw_pending_client_requests = false;
         let mut saw_pending_server_requests = false;
         let mut saw_answered_but_unresolved_server_requests = false;
         for metric in metrics {
@@ -8616,6 +8863,39 @@ mod tests {
                             _ => panic!("unexpected v2 connection duration aggregation"),
                         },
                         _ => panic!("unexpected v2 connection duration type"),
+                    }
+                }
+                "gateway_v2_connection_pending_client_requests" => {
+                    saw_pending_client_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 4.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected v2 connection pending client request aggregation"
+                            ),
+                        },
+                        _ => panic!("unexpected v2 connection pending client request type"),
                     }
                 }
                 "gateway_v2_connection_pending_server_requests" => {
@@ -8688,6 +8968,7 @@ mod tests {
 
         assert!(saw_count);
         assert!(saw_duration);
+        assert!(saw_pending_client_requests);
         assert!(saw_pending_server_requests);
         assert!(saw_answered_but_unresolved_server_requests);
     }
@@ -8772,6 +9053,116 @@ mod tests {
             }
         }
         assert!(saw_server_request_rejection_count);
+    }
+
+    fn assert_command_exec_pending_client_limit_metrics(metrics: &codex_otel::MetricsClient) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let mut observed_request_counts = BTreeMap::new();
+        let mut observed_request_durations = BTreeMap::new();
+        let mut saw_client_request_rejection_count = false;
+
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_requests" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let (method, outcome) = request_metric_point_tags(attributes);
+                                *observed_request_counts
+                                    .entry((method, outcome))
+                                    .or_insert(0) += point.value();
+                            }
+                        }
+                        _ => panic!("unexpected v2 request count aggregation"),
+                    },
+                    _ => panic!("unexpected v2 request count type"),
+                },
+                "gateway_v2_request_duration" => match metric.data() {
+                    AggregatedMetrics::F64(data) => match data {
+                        MetricData::Histogram(histogram) => {
+                            for point in histogram.data_points() {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                let (method, outcome) = request_metric_point_tags(attributes);
+                                *observed_request_durations
+                                    .entry((method, outcome))
+                                    .or_insert(0) += point.count();
+                            }
+                        }
+                        _ => panic!("unexpected v2 request duration aggregation"),
+                    },
+                    _ => panic!("unexpected v2 request duration type"),
+                },
+                "gateway_v2_client_request_rejections" => {
+                    saw_client_request_rejection_count = true;
+                    match metric.data() {
+                        AggregatedMetrics::U64(data) => match data {
+                            MetricData::Sum(sum) => {
+                                let point = sum.data_points().next().expect("count point");
+                                assert_eq!(point.value(), 1);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        ("method".to_string(), "command/exec".to_string()),
+                                        ("reason".to_string(), "pending_limit".to_string()),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected client-request rejection count aggregation"),
+                        },
+                        _ => panic!("unexpected client-request rejection count type"),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let expected = [
+            ("initialize", "ok", 1),
+            ("command/exec", "rate_limited", 1),
+            ("command/exec", "ok", 1),
+        ];
+        for (method, outcome, count) in expected {
+            assert_eq!(
+                observed_request_counts.get(&(method.to_string(), outcome.to_string())),
+                Some(&count),
+                "missing v2 request count metric for method={method} outcome={outcome}"
+            );
+            assert_eq!(
+                observed_request_durations.get(&(method.to_string(), outcome.to_string())),
+                Some(&count),
+                "missing v2 request duration metric for method={method} outcome={outcome}"
+            );
+        }
+        assert!(saw_client_request_rejection_count);
     }
 
     fn in_memory_metrics() -> codex_otel::MetricsClient {
@@ -10151,6 +10542,7 @@ mod tests {
                 client_send: Duration::from_secs(10),
                 reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: 1,
+                max_pending_client_requests: 1,
             },
         })
         .await;
@@ -11708,6 +12100,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
@@ -11815,6 +12208,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
@@ -12896,6 +13290,7 @@ mod tests {
                     client_send: Duration::from_millis(1),
                     reconnect_retry_backoff: Duration::from_secs(1),
                     max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                    max_pending_client_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
                 },
             })
             .await;
@@ -13073,7 +13468,10 @@ mod tests {
                     initialize: Duration::from_secs(30),
                     client_send: Duration::from_millis(1),
                     reconnect_retry_backoff: Duration::from_secs(1),
-                    max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                    max_pending_server_requests:
+                        super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                    max_pending_client_requests:
+                        super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
                 },
             })
             .await;
@@ -16542,7 +16940,8 @@ mod tests {
                 initialize_response,
             ))),
             timeouts: GatewayV2Timeouts {
-                max_pending_server_requests: 1,
+                max_pending_server_requests: 4,
+                max_pending_client_requests: 1,
                 ..GatewayV2Timeouts::default()
             },
         })
@@ -16610,17 +17009,299 @@ mod tests {
                 .active_connection_pending_client_request_count,
             0
         );
-        assert_v2_request_metrics(
+        assert_command_exec_pending_client_limit_metrics(&metrics);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_closes_when_client_reuses_pending_command_exec_request_id() {
+        let metrics = in_memory_metrics();
+        let (first_request_observed_tx, first_request_observed_rx) = oneshot::channel();
+        let (_finish_first_request_tx, finish_first_request_rx) = oneshot::channel();
+        let websocket_url = start_mock_remote_server_for_pending_command_exec(
+            first_request_observed_tx,
+            finish_first_request_rx,
+        )
+        .await;
+        let initialize_response = test_initialize_response().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts {
+                max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
+                ..GatewayV2Timeouts::default()
+            },
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        send_initialize(&mut websocket).await;
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("command-exec-duplicate".to_string()),
+            "command/exec",
+            pending_command_exec_params("proc-pending-1"),
+        )
+        .await;
+        first_request_observed_rx
+            .await
+            .expect("first command/exec should reach downstream");
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("command-exec-duplicate".to_string()),
+            "command/exec",
+            pending_command_exec_params("proc-pending-2"),
+        )
+        .await;
+
+        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(u16::from(close_frame.code), close_code::PROTOCOL);
+        assert_eq!(
+            close_frame.reason,
+            super::DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
             &metrics,
-            &[
-                ("initialize", "ok", 1),
-                ("command/exec", "rate_limited", 1),
-                ("command/exec", "ok", 1),
-            ],
+            "post_initialize",
+            "duplicate_request_id",
+            "protocol_violation",
         );
 
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_closes_when_client_reuses_pending_request_id_for_other_method() {
+        let metrics = in_memory_metrics();
+        let (first_request_observed_tx, first_request_observed_rx) = oneshot::channel();
+        let (_finish_first_request_tx, finish_first_request_rx) = oneshot::channel();
+        let websocket_url = start_mock_remote_server_for_pending_command_exec(
+            first_request_observed_tx,
+            finish_first_request_rx,
+        )
+        .await;
+        let initialize_response = test_initialize_response().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts {
+                max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
+                ..GatewayV2Timeouts::default()
+            },
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        send_initialize(&mut websocket).await;
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("shared-request-id".to_string()),
+            "command/exec",
+            pending_command_exec_params("proc-pending-1"),
+        )
+        .await;
+        first_request_observed_rx
+            .await
+            .expect("first command/exec should reach downstream");
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("shared-request-id".to_string()),
+            "model/list",
+            serde_json::json!({}),
+        )
+        .await;
+
+        let Message::Close(Some(close_frame)) = wait_for_close_frame(&mut websocket).await else {
+            panic!("expected websocket close frame");
+        };
+        assert_eq!(u16::from(close_frame.code), close_code::PROTOCOL);
+        assert_eq!(
+            close_frame.reason,
+            super::DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_v2_protocol_violation_and_connection_metrics(
+            &metrics,
+            "post_initialize",
+            "duplicate_request_id",
+            "protocol_violation",
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_logs_pending_command_exec_when_client_send_times_out() {
+        let logs = capture_logs_async(async move {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            let downstream_addr = listener.local_addr().expect("listener address");
+            let (request_observed_tx, request_observed_rx) = oneshot::channel();
+            let (flood_started_tx, flood_started_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket should accept");
+                let (mut write, mut read) = websocket.split();
+
+                expect_remote_initialize_split(&mut write, &mut read).await;
+
+                let Message::Text(text) = read
+                    .next()
+                    .await
+                    .expect("command/exec request should exist")
+                    .expect("command/exec request should decode")
+                else {
+                    panic!("expected command/exec request text frame");
+                };
+                let JSONRPCMessage::Request(request) =
+                    serde_json::from_str(&text).expect("command/exec request should decode")
+                else {
+                    panic!("expected command/exec request");
+                };
+                assert_eq!(request.method, "command/exec");
+                assert_eq!(
+                    request.id,
+                    RequestId::String("command-exec-timeout".to_string())
+                );
+                request_observed_tx
+                    .send(())
+                    .expect("request observation should send");
+
+                let large_warning_payload =
+                    serde_json::to_string(&JSONRPCMessage::Notification(JSONRPCNotification {
+                        method: "warning".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": null,
+                            "message": "w".repeat(1024 * 1024),
+                        })),
+                    }))
+                    .expect("warning notification should serialize");
+
+                flood_started_tx
+                    .send(())
+                    .expect("flood start observation should send");
+                for _ in 0..256 {
+                    if write
+                        .send(Message::Text(large_warning_payload.clone().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let initialize_response = test_initialize_response().await;
+            let (addr, server_task) = spawn_test_server(GatewayV2State {
+                auth: GatewayAuth::Disabled,
+                admission: GatewayAdmissionController::default(),
+                observability: GatewayObservability::new(None, false),
+                scope_registry: Arc::new(GatewayScopeRegistry::default()),
+                session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                    RemoteAppServerConnectArgs {
+                        websocket_url: format!("ws://{downstream_addr}"),
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 8,
+                    },
+                    initialize_response,
+                ))),
+                timeouts: GatewayV2Timeouts {
+                    initialize: Duration::from_secs(30),
+                    client_send: Duration::from_millis(1),
+                    reconnect_retry_backoff: Duration::from_secs(1),
+                    max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                    max_pending_client_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                },
+            })
+            .await;
+
+            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+                .await
+                .expect("websocket should connect");
+            send_initialize(&mut websocket).await;
+
+            send_jsonrpc_request(
+                &mut websocket,
+                RequestId::String("command-exec-timeout".to_string()),
+                "command/exec",
+                pending_command_exec_params("proc-pending-timeout"),
+            )
+            .await;
+            request_observed_rx
+                .await
+                .expect("command/exec should reach downstream");
+            timeout(Duration::from_secs(5), flood_started_rx)
+                .await
+                .expect("downstream flood should start")
+                .expect("flood start observation should complete");
+
+            sleep(Duration::from_millis(500)).await;
+
+            server_task.abort();
+            let _ = server_task.await;
+        })
+        .await;
+
+        assert!(logs.contains(
+            "closing gateway v2 connection because sending to the northbound client timed out"
+        ));
+        assert!(logs.contains("pending_client_request_count=1"));
+        assert!(logs.contains("pending_client_request_ids=[String(\"command-exec-timeout\")]"));
+        assert!(logs.contains("pending_client_request_methods=[\"command/exec\"]"));
+        assert!(logs.contains("pending_client_request_worker_ids=[0]"));
+        assert!(logs.contains("pending_client_request_worker_websocket_urls=[\"ws://127.0.0.1:"));
     }
 
     #[tokio::test]
@@ -18583,6 +19264,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -18709,6 +19391,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -18921,6 +19604,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -19054,6 +19738,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -19182,6 +19867,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -19428,6 +20114,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -19515,6 +20202,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -19660,6 +20348,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -19798,6 +20487,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -19894,6 +20584,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -19990,6 +20681,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20169,6 +20861,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20294,6 +20987,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20451,6 +21145,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20559,6 +21254,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20682,6 +21378,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20814,6 +21511,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -20921,6 +21619,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21052,6 +21751,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21165,6 +21865,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21274,6 +21975,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21405,6 +22107,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21549,6 +22252,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21661,6 +22365,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21771,6 +22476,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -21941,6 +22647,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -22039,6 +22746,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -22230,6 +22938,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -22313,6 +23022,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -22613,6 +23323,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -22717,6 +23428,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -23037,6 +23749,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -23176,6 +23889,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -23365,6 +24079,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -23580,6 +24295,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -23708,6 +24424,7 @@ mod tests {
                     request_context: &context,
                     client_send_timeout: Duration::from_secs(10),
                     max_pending_server_requests: 4,
+                    max_pending_client_requests: 4,
                     opt_out_notification_methods: HashSet::new(),
                 };
 
@@ -23816,6 +24533,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -23945,6 +24663,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -24099,6 +24818,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -24289,6 +25009,7 @@ mod tests {
                 request_context: &context,
                 client_send_timeout: Duration::from_secs(10),
                 max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
                 opt_out_notification_methods: HashSet::new(),
             };
 
@@ -24386,6 +25107,7 @@ mod tests {
             request_context: &context,
             client_send_timeout: Duration::from_secs(10),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -31915,6 +32637,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
@@ -32054,6 +32777,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
                         };
                         let (event_tx, event_rx) = mpsc::channel(1);
@@ -32209,6 +32933,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -32335,6 +33060,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -32476,6 +33202,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -32589,6 +33316,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -32700,6 +33428,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -32835,6 +33564,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -32957,6 +33687,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
@@ -33079,6 +33810,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -33209,6 +33941,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -33335,6 +34068,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -33463,6 +34197,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -33609,6 +34344,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -33748,6 +34484,7 @@ mod tests {
                             request_context: &request_context,
                             client_send_timeout: Duration::from_secs(10),
                             max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
                             opt_out_notification_methods: HashSet::new(),
                         };
                         let session_factory = GatewayV2SessionFactory::remote_multi(
@@ -36858,6 +37595,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -36983,6 +37721,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -37026,6 +37765,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -37066,6 +37806,7 @@ mod tests {
             request_context: &request_context,
             client_send_timeout: Duration::from_secs(1),
             max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
             opt_out_notification_methods: HashSet::new(),
         };
 
@@ -37426,6 +38167,50 @@ mod tests {
     }
 
     #[test]
+    fn log_duplicate_pending_client_request_includes_scope_method_and_active_routes() {
+        let logs = capture_logs(|| {
+            super::log_duplicate_pending_client_request(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                &RequestId::String("command-exec-1".to_string()),
+                "command/exec",
+                &HashMap::from([(
+                    RequestId::String("command-exec-1".to_string()),
+                    super::PendingClientRequestRoute {
+                        method: "command/exec".to_string(),
+                        request_context: GatewayRequestContext {
+                            tenant_id: "tenant-visible".to_string(),
+                            project_id: Some("project-visible".to_string()),
+                        },
+                        worker_id: Some(1),
+                        worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                        started_at: Instant::now(),
+                    },
+                )]),
+            );
+        });
+
+        assert!(logs.contains(
+            "closing gateway v2 connection because the northbound client reused a pending request id"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("request_id=String(\"command-exec-1\")"));
+        assert!(logs.contains("method=\"command/exec\""));
+        assert!(logs.contains("pending_client_request_count=1"));
+        assert!(logs.contains("pending_client_request_ids=[String(\"command-exec-1\")]"));
+        assert!(logs.contains("pending_client_request_methods=[\"command/exec\"]"));
+        assert!(logs.contains("pending_client_request_worker_ids=[1]"));
+        assert!(
+            logs.contains(
+                "pending_client_request_worker_websocket_urls=[\"ws://worker-b.invalid\"]"
+            )
+        );
+    }
+
+    #[test]
     fn log_rejected_hidden_downstream_server_request_includes_scope_worker_and_thread_id() {
         let logs = capture_logs(|| {
             super::log_rejected_hidden_downstream_server_request(
@@ -37536,6 +38321,19 @@ mod tests {
                     project_id: Some("project-visible".to_string()),
                 },
                 "gateway websocket send timed out",
+                &HashMap::from([(
+                    RequestId::String("command-exec-1".to_string()),
+                    super::PendingClientRequestRoute {
+                        method: "command/exec".to_string(),
+                        request_context: GatewayRequestContext {
+                            tenant_id: "tenant-visible".to_string(),
+                            project_id: Some("project-visible".to_string()),
+                        },
+                        worker_id: Some(1),
+                        worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                        started_at: Instant::now(),
+                    },
+                )]),
                 &HashMap::from([
                     (
                         RequestId::String("gateway-connection-1".to_string()),
@@ -37577,6 +38375,15 @@ mod tests {
         assert!(logs.contains("tenant-visible"));
         assert!(logs.contains("project-visible"));
         assert!(logs.contains("connection_detail=\"gateway websocket send timed out\""));
+        assert!(logs.contains("pending_client_request_count=1"));
+        assert!(logs.contains("pending_client_request_ids=[String(\"command-exec-1\")]"));
+        assert!(logs.contains("pending_client_request_methods=[\"command/exec\"]"));
+        assert!(logs.contains("pending_client_request_worker_ids=[1]"));
+        assert!(
+            logs.contains(
+                "pending_client_request_worker_websocket_urls=[\"ws://worker-b.invalid\"]"
+            )
+        );
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains(
             "pending_server_request_ids=[String(\"gateway-connection-1\"), String(\"gateway-thread-1\")]"
@@ -37595,6 +38402,157 @@ mod tests {
         ));
         assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
+    }
+
+    #[test]
+    fn pending_client_responses_settle_completed_responses_before_teardown() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut pending_client_responses = super::PendingClientResponses {
+            tx,
+            tasks: Vec::new(),
+            count: 2,
+            active: HashMap::from([
+                (
+                    RequestId::String("command-exec-complete".to_string()),
+                    super::PendingClientRequestRoute {
+                        method: "command/exec".to_string(),
+                        request_context: GatewayRequestContext {
+                            tenant_id: "tenant-visible".to_string(),
+                            project_id: Some("project-visible".to_string()),
+                        },
+                        worker_id: Some(0),
+                        worker_websocket_url: "ws://worker-a.invalid".to_string(),
+                        started_at: Instant::now(),
+                    },
+                ),
+                (
+                    RequestId::String("command-exec-pending".to_string()),
+                    super::PendingClientRequestRoute {
+                        method: "command/exec".to_string(),
+                        request_context: GatewayRequestContext {
+                            tenant_id: "tenant-visible".to_string(),
+                            project_id: Some("project-visible".to_string()),
+                        },
+                        worker_id: Some(1),
+                        worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                        started_at: Instant::now(),
+                    },
+                ),
+            ]),
+        };
+
+        pending_client_responses
+            .tx
+            .try_send(super::PendingClientResponse {
+                request_id: RequestId::String("command-exec-complete".to_string()),
+                request_context: GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                method: "command/exec".to_string(),
+                started_at: Instant::now(),
+                result: Ok(Ok(serde_json::json!({ "exitCode": 0 }))),
+            })
+            .expect("completed background response should enqueue");
+
+        pending_client_responses.settle_completed_responses(&mut rx);
+
+        assert_eq!(pending_client_responses.count, 1);
+        assert_eq!(
+            pending_client_responses
+                .active
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![RequestId::String("command-exec-pending".to_string())]
+        );
+    }
+
+    #[test]
+    fn log_aborted_pending_client_requests_includes_scope_outcome_and_request_ids() {
+        let logs = capture_logs(|| {
+            super::log_aborted_pending_client_requests(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                "client_disconnected",
+                Some("gateway websocket receive failed: closed"),
+                &HashMap::from([
+                    (
+                        RequestId::String("command-exec-1".to_string()),
+                        super::PendingClientRequestRoute {
+                            method: "command/exec".to_string(),
+                            request_context: GatewayRequestContext {
+                                tenant_id: "tenant-visible".to_string(),
+                                project_id: Some("project-visible".to_string()),
+                            },
+                            worker_id: Some(0),
+                            worker_websocket_url: "ws://worker-a.invalid".to_string(),
+                            started_at: Instant::now(),
+                        },
+                    ),
+                    (
+                        RequestId::String("command-exec-2".to_string()),
+                        super::PendingClientRequestRoute {
+                            method: "command/exec".to_string(),
+                            request_context: GatewayRequestContext {
+                                tenant_id: "tenant-visible".to_string(),
+                                project_id: Some("project-visible".to_string()),
+                            },
+                            worker_id: Some(1),
+                            worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                            started_at: Instant::now(),
+                        },
+                    ),
+                ]),
+            );
+        });
+
+        assert!(logs.contains(
+            "aborting pending gateway v2 client requests because the northbound connection ended"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("outcome=\"client_disconnected\""));
+        assert!(logs.contains("detail=\"gateway websocket receive failed: closed\""));
+        assert!(logs.contains("pending_client_request_count=2"));
+        assert!(logs.contains(
+            "pending_client_request_ids=[String(\"command-exec-1\"), String(\"command-exec-2\")]"
+        ));
+        assert!(
+            logs.contains("pending_client_request_methods=[\"command/exec\", \"command/exec\"]")
+        );
+        assert!(logs.contains("pending_client_request_worker_ids=[0, 1]"));
+        assert!(logs.contains(
+            "pending_client_request_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
+        ));
+    }
+
+    #[test]
+    fn observe_aborted_pending_client_requests_records_request_metrics() {
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), true);
+
+        super::observe_aborted_pending_client_requests(
+            &observability,
+            "client_disconnected",
+            &HashMap::from([(
+                RequestId::String("command-exec-1".to_string()),
+                super::PendingClientRequestRoute {
+                    method: "command/exec".to_string(),
+                    request_context: GatewayRequestContext {
+                        tenant_id: "tenant-visible".to_string(),
+                        project_id: Some("project-visible".to_string()),
+                    },
+                    worker_id: Some(0),
+                    worker_websocket_url: "ws://worker-a.invalid".to_string(),
+                    started_at: Instant::now(),
+                },
+            )]),
+        );
+
+        assert_v2_request_metrics(&metrics, &[("command/exec", "client_disconnected", 1)]);
     }
 
     #[test]

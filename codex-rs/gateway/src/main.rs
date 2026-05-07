@@ -77,6 +77,9 @@ struct GatewayCli {
     #[arg(long = "v2-max-pending-server-requests", value_name = "COUNT")]
     v2_max_pending_server_requests: Option<usize>,
 
+    #[arg(long = "v2-max-pending-client-requests", value_name = "COUNT")]
+    v2_max_pending_client_requests: Option<usize>,
+
     #[arg(long = "remote-websocket-url", value_name = "URL")]
     remote_websocket_url: Vec<String>,
 
@@ -141,6 +144,10 @@ fn main() -> anyhow::Result<()> {
                     .inner
                     .v2_max_pending_server_requests
                     .unwrap_or(default_gateway_config.v2_max_pending_server_requests),
+                v2_max_pending_client_requests: top_cli
+                    .inner
+                    .v2_max_pending_client_requests
+                    .unwrap_or(default_gateway_config.v2_max_pending_client_requests),
                 remote_runtime: (!top_cli.inner.remote_websocket_url.is_empty()).then_some(
                     GatewayRemoteRuntimeConfig {
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,

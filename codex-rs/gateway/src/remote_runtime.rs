@@ -518,6 +518,7 @@ mod tests {
                 client_send_timeout_seconds: 10,
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
         };
@@ -559,6 +560,7 @@ mod tests {
                 client_send_timeout_seconds: 10,
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
         };
@@ -642,6 +644,7 @@ mod tests {
                 client_send_timeout_seconds: 10,
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
         };
@@ -661,6 +664,7 @@ mod tests {
                 client_send_timeout_seconds: 10,
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
             }
         );
         assert_eq!(
@@ -736,6 +740,7 @@ mod tests {
                 client_send_timeout_seconds: 10,
                 reconnect_retry_backoff_seconds: 1,
                 max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
         };

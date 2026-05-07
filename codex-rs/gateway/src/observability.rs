@@ -1,5 +1,6 @@
 use crate::scope::GatewayRequestContext;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
+use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 use axum::extract::MatchedPath;
 use axum::extract::State;
 use axum::http::Request;
@@ -22,11 +23,14 @@ const V2_REQUEST_COUNT_METRIC: &str = "gateway_v2_requests";
 const V2_REQUEST_DURATION_METRIC: &str = "gateway_v2_request_duration";
 const V2_CONNECTION_COUNT_METRIC: &str = "gateway_v2_connections";
 const V2_CONNECTION_DURATION_METRIC: &str = "gateway_v2_connection_duration";
+const V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC: &str =
+    "gateway_v2_connection_pending_client_requests";
 const V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_pending_server_requests";
 const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_answered_but_unresolved_server_requests";
 const V2_SERVER_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_server_request_rejections";
+const V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_client_request_rejections";
 const V2_WORKER_RECONNECT_COUNT_METRIC: &str = "gateway_v2_worker_reconnects";
 const V2_FAIL_CLOSED_REQUEST_COUNT_METRIC: &str = "gateway_v2_fail_closed_requests";
 const V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC: &str = "gateway_v2_upstream_request_failures";
@@ -104,8 +108,7 @@ impl GatewayObservability {
         &self,
         outcome: &str,
         duration: Duration,
-        pending_server_request_count: usize,
-        answered_but_unresolved_server_request_count: usize,
+        pending_counts: GatewayV2ConnectionPendingCounts,
     ) {
         let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
         let tags = [("outcome", outcome)];
@@ -118,8 +121,21 @@ impl GatewayObservability {
                 tracing::warn!("failed to record gateway v2 connection duration metric: {err}");
             }
             if let Err(err) = metrics.histogram(
+                V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC,
+                pending_counts
+                    .pending_client_request_count
+                    .min(i64::MAX as usize) as i64,
+                &tags,
+            ) {
+                tracing::warn!(
+                    "failed to record gateway v2 connection pending client request metric: {err}"
+                );
+            }
+            if let Err(err) = metrics.histogram(
                 V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC,
-                pending_server_request_count.min(i64::MAX as usize) as i64,
+                pending_counts
+                    .pending_server_request_count
+                    .min(i64::MAX as usize) as i64,
                 &tags,
             ) {
                 tracing::warn!(
@@ -128,7 +144,9 @@ impl GatewayObservability {
             }
             if let Err(err) = metrics.histogram(
                 V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC,
-                answered_but_unresolved_server_request_count.min(i64::MAX as usize) as i64,
+                pending_counts
+                    .answered_but_unresolved_server_request_count
+                    .min(i64::MAX as usize) as i64,
                 &tags,
             ) {
                 tracing::warn!(
@@ -145,6 +163,16 @@ impl GatewayObservability {
             && let Err(err) = metrics.counter(V2_SERVER_REQUEST_REJECTION_COUNT_METRIC, 1, &tags)
         {
             tracing::warn!("failed to record gateway v2 server-request rejection metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_v2_client_request_rejection(&self, method: &str, reason: &str) {
+        let tags = [("method", method), ("reason", reason)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 client-request rejection metric: {err}");
         }
     }
 
@@ -379,8 +407,7 @@ impl GatewayObservability {
         duration: Duration,
         context: &GatewayRequestContext,
         detail: Option<&str>,
-        pending_server_request_count: usize,
-        answered_but_unresolved_server_request_count: usize,
+        pending_counts: GatewayV2ConnectionPendingCounts,
     ) {
         if !self.audit_logs_enabled {
             return;
@@ -398,8 +425,10 @@ impl GatewayObservability {
             tenant_id,
             project_id,
             detail,
-            pending_server_request_count,
-            answered_but_unresolved_server_request_count,
+            pending_client_request_count = pending_counts.pending_client_request_count,
+            pending_server_request_count = pending_counts.pending_server_request_count,
+            answered_but_unresolved_server_request_count =
+                pending_counts.answered_but_unresolved_server_request_count,
             "gateway v2 connection completed"
         );
     }
@@ -410,8 +439,7 @@ impl GatewayObservability {
         duration: Duration,
         context: &GatewayRequestContext,
         detail: Option<&str>,
-        pending_server_request_count: usize,
-        answered_but_unresolved_server_request_count: usize,
+        pending_counts: GatewayV2ConnectionPendingCounts,
     ) {
         let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         let tenant_id = context.tenant_id.as_str();
@@ -425,8 +453,10 @@ impl GatewayObservability {
                 tenant_id,
                 project_id,
                 detail,
-                pending_server_request_count,
-                answered_but_unresolved_server_request_count,
+                pending_client_request_count = pending_counts.pending_client_request_count,
+                pending_server_request_count = pending_counts.pending_server_request_count,
+                answered_but_unresolved_server_request_count =
+                    pending_counts.answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             (Level::INFO, None) => tracing::event!(
@@ -436,8 +466,10 @@ impl GatewayObservability {
                 duration_ms,
                 tenant_id,
                 project_id,
-                pending_server_request_count,
-                answered_but_unresolved_server_request_count,
+                pending_client_request_count = pending_counts.pending_client_request_count,
+                pending_server_request_count = pending_counts.pending_server_request_count,
+                answered_but_unresolved_server_request_count =
+                    pending_counts.answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             (Level::WARN, Some(detail)) => tracing::event!(
@@ -448,8 +480,10 @@ impl GatewayObservability {
                 tenant_id,
                 project_id,
                 detail,
-                pending_server_request_count,
-                answered_but_unresolved_server_request_count,
+                pending_client_request_count = pending_counts.pending_client_request_count,
+                pending_server_request_count = pending_counts.pending_server_request_count,
+                answered_but_unresolved_server_request_count =
+                    pending_counts.answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             (Level::WARN, None) => tracing::event!(
@@ -459,8 +493,10 @@ impl GatewayObservability {
                 duration_ms,
                 tenant_id,
                 project_id,
-                pending_server_request_count,
-                answered_but_unresolved_server_request_count,
+                pending_client_request_count = pending_counts.pending_client_request_count,
+                pending_server_request_count = pending_counts.pending_server_request_count,
+                answered_but_unresolved_server_request_count =
+                    pending_counts.answered_but_unresolved_server_request_count,
                 "gateway v2 connection completed"
             ),
             _ => unreachable!("v2 connection log level should stay within info/warn"),
@@ -533,10 +569,12 @@ mod tests {
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC;
     use super::V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC;
     use super::V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC;
     use super::V2_CONNECTION_COUNT_METRIC;
     use super::V2_CONNECTION_DURATION_METRIC;
+    use super::V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC;
     use super::V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC;
     use super::V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC;
@@ -552,6 +590,7 @@ mod tests {
     use super::V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC;
     use super::V2_WORKER_RECONNECT_COUNT_METRIC;
     use crate::scope::GatewayRequestContext;
+    use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::MetricData;
@@ -784,8 +823,11 @@ mod tests {
         observability.record_v2_connection(
             "downstream_session_ended",
             Duration::from_millis(14),
-            2,
-            1,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 3,
+                pending_server_request_count: 2,
+                answered_but_unresolved_server_request_count: 1,
+            },
         );
 
         let resource_metrics = observability
@@ -800,6 +842,7 @@ mod tests {
 
         let mut saw_count = false;
         let mut saw_duration = false;
+        let mut saw_pending_client_requests = false;
         let mut saw_pending_server_requests = false;
         let mut saw_answered_but_unresolved_server_requests = false;
         for metric in metrics {
@@ -862,6 +905,37 @@ mod tests {
                             _ => panic!("unexpected connection duration aggregation"),
                         },
                         _ => panic!("unexpected connection duration type"),
+                    }
+                }
+                name if name == V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC => {
+                    saw_pending_client_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 3.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected pending client request aggregation"),
+                        },
+                        _ => panic!("unexpected pending client request type"),
                     }
                 }
                 name if name == V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC => {
@@ -934,6 +1008,7 @@ mod tests {
 
         assert!(saw_count);
         assert!(saw_duration);
+        assert!(saw_pending_client_requests);
         assert!(saw_pending_server_requests);
         assert!(saw_answered_but_unresolved_server_requests);
     }
@@ -998,6 +1073,69 @@ mod tests {
                         _ => panic!("unexpected server-request rejection count aggregation"),
                     },
                     _ => panic!("unexpected server-request rejection count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_client_request_rejection_metrics_with_reason_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_client_request_rejection("command/exec", "pending_limit");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), "command/exec".to_string()),
+                                    ("reason".to_string(), "pending_limit".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected client-request rejection count aggregation"),
+                    },
+                    _ => panic!("unexpected client-request rejection count type"),
                 }
             }
         }
@@ -1692,8 +1830,11 @@ mod tests {
                 Duration::from_millis(7),
                 &context,
                 None,
-                2,
-                1,
+                GatewayV2ConnectionPendingCounts {
+                    pending_client_request_count: 4,
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 1,
+                },
             );
         });
 
@@ -1703,6 +1844,7 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("project-a"));
         assert!(logs.contains("7"));
+        assert!(logs.contains("pending_client_request_count=4"));
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
     }
@@ -1720,8 +1862,11 @@ mod tests {
                 Duration::from_millis(11),
                 &context,
                 Some("downstream app-server event stream lagged"),
-                3,
-                2,
+                GatewayV2ConnectionPendingCounts {
+                    pending_client_request_count: 5,
+                    pending_server_request_count: 3,
+                    answered_but_unresolved_server_request_count: 2,
+                },
             );
         });
 
@@ -1731,6 +1876,7 @@ mod tests {
         assert!(logs.contains("downstream app-server event stream lagged"));
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("11"));
+        assert!(logs.contains("pending_client_request_count=5"));
         assert!(logs.contains("pending_server_request_count=3"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=2"));
     }
@@ -1748,8 +1894,11 @@ mod tests {
                 Duration::from_millis(17),
                 &context,
                 Some("gateway websocket send timed out"),
-                4,
-                3,
+                GatewayV2ConnectionPendingCounts {
+                    pending_client_request_count: 6,
+                    pending_server_request_count: 4,
+                    answered_but_unresolved_server_request_count: 3,
+                },
             );
         });
 
@@ -1760,6 +1909,7 @@ mod tests {
         assert!(logs.contains("project-audit"));
         assert!(logs.contains("17"));
         assert!(logs.contains("gateway websocket send timed out"));
+        assert!(logs.contains("pending_client_request_count=6"));
         assert!(logs.contains("pending_server_request_count=4"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
     }

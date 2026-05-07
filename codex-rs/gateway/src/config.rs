@@ -26,6 +26,7 @@ pub struct GatewayConfig {
     pub v2_client_send_timeout: Duration,
     pub v2_reconnect_retry_backoff: Duration,
     pub v2_max_pending_server_requests: usize,
+    pub v2_max_pending_client_requests: usize,
     pub remote_runtime: Option<GatewayRemoteRuntimeConfig>,
 }
 
@@ -50,6 +51,7 @@ impl Default for GatewayConfig {
             v2_client_send_timeout: Duration::from_secs(10),
             v2_reconnect_retry_backoff: Duration::from_secs(1),
             v2_max_pending_server_requests: 64,
+            v2_max_pending_client_requests: 64,
             remote_runtime: None,
         }
     }
@@ -123,6 +125,7 @@ mod tests {
         assert_eq!(config.v2_client_send_timeout, Duration::from_secs(10));
         assert_eq!(config.v2_reconnect_retry_backoff, Duration::from_secs(1));
         assert_eq!(config.v2_max_pending_server_requests, 64);
+        assert_eq!(config.v2_max_pending_client_requests, 64);
         assert_eq!(config.remote_runtime, None);
     }
 

@@ -79,6 +79,7 @@ pub struct GatewayV2TransportConfig {
     pub client_send_timeout_seconds: u64,
     pub reconnect_retry_backoff_seconds: u64,
     pub max_pending_server_requests: usize,
+    pub max_pending_client_requests: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

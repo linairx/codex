@@ -1275,6 +1275,10 @@ Recent progress:
   `command/exec` with `outcome="rate_limited"` and `outcome="ok"`, making the
   bounded-saturation path observable separately from successful long-running
   command completion
+- saturated pending client requests now also increment
+  `gateway_v2_client_request_rejections` with `method` and `reason` tags, so
+  background command-exec overload has a dedicated counter alongside request
+  outcome metrics
 - dedicated log coverage now also pins the structured warning emitted for
   saturated pending client requests, including tenant/project scope, request
   id, method, current pending count, and configured limit
@@ -1612,6 +1616,14 @@ Recent progress:
   ids, and affected thread and worker ids before pending downstream prompts are
   rejected, so `client_send_timed_out` outcomes can be tied back to the
   stranded session state directly from logs
+- that same slow-client warning now also includes pending background
+  client-request ids and methods, so long-running `command/exec` responses are
+  visible in teardown diagnostics alongside stranded server-request prompt
+  state; dedicated northbound WebSocket coverage now pins that slow-client
+  diagnostic path while `command/exec` remains pending in the background
+- pending background client-request diagnostics now also include downstream
+  worker ids and WebSocket URLs, so multi-worker `command/exec` stalls and
+  aborts can be attributed to the owning app-server session from logs
 - v2 connection accounting now also records terminal outcome and decrements the
   active connection count even if an early handshake-time close frame or
   JSON-RPC error response cannot be delivered, so `/healthz` does not retain
@@ -1854,11 +1866,14 @@ Operational notes:
   `--v2-client-send-timeout-seconds` when you need stricter or looser
   northbound timeout behavior during rollout
 - v2 transport hardening values are validated at startup: initialize timeout,
-  client-send timeout, reconnect retry backoff, and max pending server-request
-  count must all be greater than zero
+  client-send timeout, reconnect retry backoff, max pending server-request
+  count, and max pending client-request count must all be greater than zero
 - tune `--v2-max-pending-server-requests` when you need a tighter or looser
   cap on unresolved server-request state for each northbound compatibility
   session
+- tune `--v2-max-pending-client-requests` when you need a tighter or looser
+  cap on long-running background client requests such as live `command/exec`
+  calls for each northbound compatibility session
 
 ### Profile 2: Remote Gateway With One Worker
 
@@ -1908,6 +1923,9 @@ Operational notes:
   in this profile too
 - `--v2-max-pending-server-requests` also applies in this profile when you need
   to bound unresolved server-request state more aggressively during rollout
+- `--v2-max-pending-client-requests` also applies in this profile when you
+  need to bound long-running background client requests independently from
+  downstream prompt state
 - new threads can fail over to a healthy worker at the HTTP layer in multi-
   worker remote mode, but that does not apply to a single v2 WebSocket session
   yet because the Stage A transport remains 1:1
@@ -1946,11 +1964,13 @@ Operational notes:
   hardening for reconnect and load behavior across multiple workers
 - `/healthz` exposes the effective v2 transport hardening config
   (`initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
-  `reconnectRetryBackoffSeconds`, and `maxPendingServerRequests`) so operators
-  can confirm rollout settings without relying only on startup logs
+  `reconnectRetryBackoffSeconds`, `maxPendingServerRequests`, and
+  `maxPendingClientRequests`) so operators can confirm rollout settings
+  without relying only on startup logs
 - startup validation rejects zero-valued v2 transport hardening settings in
   this profile as well, so a multi-worker rollout cannot accidentally disable
-  handshake, slow-client, reconnect-backoff, or pending-prompt bounds
+  handshake, slow-client, reconnect-backoff, pending-prompt, or pending-client
+  bounds
 - `/healthz` also exposes the same `v2Connections` snapshot in this profile,
   and that connection-health view now has real multi-worker regression
   coverage for live, concurrent, and settled northbound client sessions
@@ -1978,9 +1998,43 @@ Operational notes:
   distinguish slow-client, handshake, and downstream session failures without
   depending only on metrics or audit-enabled logs
 - those connection completion logs and audit logs also include terminal detail
-  plus the pending and answered-but-unresolved server-request counts, matching
-  the `/healthz` v2 connection snapshot and connection metrics used to
-  diagnose stranded prompt lifecycles
+  plus pending client-request, pending server-request, and
+  answered-but-unresolved server-request counts, matching the `/healthz` v2
+  connection snapshot and connection metrics used to diagnose background
+  command saturation and stranded prompt lifecycles
+- connection-level metrics now also include
+  `gateway_v2_connection_pending_client_requests{outcome}`, so post-teardown
+  dashboards can track background client-request buildup with the same outcome
+  tags used for pending and answered-but-unresolved server-request lifecycles
+- connection teardown also logs any aborted pending background client requests
+  with tenant/project scope, terminal outcome/detail, request ids, methods, and
+  downstream worker ids / WebSocket URLs, so operators can correlate partially
+  completed `command/exec` lifecycles with the matching connection outcome and
+  owning app-server session
+- completed background client requests are settled before the gateway attempts
+  to send their final northbound JSON-RPC response, so slow-client teardown
+  diagnostics only report truly still-pending `command/exec` requests rather
+  than requests that already completed downstream; direct regression coverage
+  pins the pending-count and active-route cleanup invariant
+- if final delivery of that completed background response fails because the
+  northbound client times out or disconnects, the gateway records
+  `gateway_v2_requests{method,outcome}` with the connection-owned failure
+  outcome before closing the session, so completed-but-undelivered
+  `command/exec` calls stay visible in per-method telemetry
+- connection teardown now also drains already completed background responses
+  before aborted-request diagnostics are emitted, so a `command/exec` that
+  finished concurrently with northbound disconnect is removed from active
+  pending state first
+- aborted background client requests also record
+  `gateway_v2_requests{method,outcome}` with the connection terminal outcome,
+  so dashboards can separate successful, rate-limited, and interrupted
+  long-running `command/exec` calls at the request-metric boundary
+- duplicate in-flight background client-request ids now fail the northbound v2
+  connection closed with a gateway-owned protocol close reason before the
+  pending route can be overwritten, even if the duplicate id is used by a
+  different follow-up method; regression coverage pins the protocol-violation
+  metric and duplicate-request log fields, including the original worker id and
+  WebSocket URL
 - `/healthz.v2Connections` also exposes active-session pending client-request
   totals plus pending and answered-but-unresolved server-request totals, so
   background client-request saturation and multi-worker prompt lifecycle
