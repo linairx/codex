@@ -1253,6 +1253,34 @@ Recent progress:
   plane: `command/exec`, `command/exec/outputDelta`,
   `command/exec/write`, `command/exec/resize`, and
   `command/exec/terminate`
+- the real embedded compatibility harness now also exercises the standalone
+  command-execution controls against a live PTY-backed process, so
+  `command/exec/write`, `command/exec/resize`, and
+  `command/exec/terminate` are covered by the embedded release-quality client
+  path in addition to passthrough and remote harness coverage
+- northbound v2 now lets a long-running `command/exec` response remain pending
+  while the same WebSocket connection continues to process
+  `command/exec/write`, `command/exec/resize`, and
+  `command/exec/terminate`, closing the embedded live-process control gap that
+  passthrough-only fixtures could not exercise
+- that pending `command/exec` response path is also bounded by the gateway's
+  per-connection pending-request limit, so long-running standalone command
+  sessions fail closed with a gateway-owned rate-limit error instead of
+  accumulating unbounded background upstream requests
+- dedicated northbound v2 regression coverage now verifies the overload path
+  through a real WebSocket session: a second `command/exec` is rejected while
+  the first request remains pending, and the connection still delivers the
+  original command response after the downstream worker releases it
+- that same overload regression now also verifies the v2 request metrics for
+  `command/exec` with `outcome="rate_limited"` and `outcome="ok"`, making the
+  bounded-saturation path observable separately from successful long-running
+  command completion
+- dedicated log coverage now also pins the structured warning emitted for
+  saturated pending client requests, including tenant/project scope, request
+  id, method, current pending count, and configured limit
+- `/healthz` now also reports active and last-completed pending v2 client
+  request counts, making the background `command/exec` pending queue visible
+  alongside existing server-request prompt lifecycle counts
 - that same single-worker reconnect regression now also verifies the recovered
   v2 session can still complete the post-bootstrap plugin-management path:
   `plugin/read`, `plugin/install`, and `plugin/uninstall`, including the
@@ -1804,19 +1832,22 @@ Operational notes:
 - request scoping, auth, audit logs, metrics, and rate limiting apply to v2
   traffic the same way they apply to HTTP traffic
 - `/healthz` exposes `v2Connections.activeConnectionCount`,
+  `v2Connections.activeConnectionPendingClientRequestCount`,
   `v2Connections.activeConnectionPendingServerRequestCount`,
   `v2Connections.activeConnectionAnsweredButUnresolvedServerRequestCount`,
   `v2Connections.peakActiveConnectionCount`,
   `v2Connections.totalConnectionCount`,
   `v2Connections.lastConnectionStartedAt`,
   `v2Connections.lastConnectionDurationMs`,
+  `v2Connections.lastConnectionPendingClientRequestCount`,
   `v2Connections.lastConnectionPendingServerRequestCount`, and
   `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
   the latest completed v2 connection outcome/detail/timestamp for quick
   northbound compatibility-session diagnostics
-- those active prompt counters roll up all currently active v2 compatibility
-  sessions, making live server-request buildup visible before a session closes
-  and updates the latest completed connection fields
+- those active counters roll up all currently active v2 compatibility
+  sessions, making live background client-request and server-request buildup
+  visible before a session closes and updates the latest completed connection
+  fields
 - initialize timeout and downstream disconnects surface as explicit WebSocket
   close frames, not silent socket drops
 - tune `--v2-initialize-timeout-seconds` and
@@ -1950,10 +1981,11 @@ Operational notes:
   plus the pending and answered-but-unresolved server-request counts, matching
   the `/healthz` v2 connection snapshot and connection metrics used to
   diagnose stranded prompt lifecycles
-- `/healthz.v2Connections` also exposes active-session pending and
-  answered-but-unresolved server-request totals, so multi-worker prompt
-  lifecycle buildup is visible during a live shared session rather than only
-  after teardown
+- `/healthz.v2Connections` also exposes active-session pending client-request
+  totals plus pending and answered-but-unresolved server-request totals, so
+  background client-request saturation and multi-worker prompt lifecycle
+  buildup are visible during a live shared session rather than only after
+  teardown
 - saturated and hidden-thread downstream server-request rejections also
   increment the `gateway_v2_server_request_rejections` counter with `method`
   and `reason` tags; current reasons are `pending_limit` and `hidden_thread`.
@@ -2393,6 +2425,12 @@ Current Stage A compatibility caveats:
   worker-owned visible threads on one shared `RemoteAppServerClient` session,
   so thread lifecycle notification fan-in no longer relies only on targeted
   northbound fixtures in the bounded Stage B profile
+- the real multi-worker thread-mutation harness now also observes
+  `thread/name/updated` from both worker-owned visible threads after sticky
+  `thread/name/set` routing on one shared `RemoteAppServerClient` session, so
+  steady-state rename notification fan-in no longer relies only on targeted
+  northbound fixtures or recovered-worker coverage in the bounded Stage B
+  profile
 - the real multi-worker same-session recovery harness now also observes those
   same thread lifecycle notifications from a lazily re-added worker on one
   shared `RemoteAppServerClient` session, so recovered-worker thread state

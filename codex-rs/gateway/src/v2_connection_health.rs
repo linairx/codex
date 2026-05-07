@@ -7,6 +7,13 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatewayV2ConnectionPendingCounts {
+    pub pending_client_request_count: usize,
+    pub pending_server_request_count: usize,
+    pub answered_but_unresolved_server_request_count: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GatewayV2ConnectionHealthState {
     next_connection_id: u64,
@@ -19,12 +26,14 @@ struct GatewayV2ConnectionHealthState {
     last_connection_duration_ms: Option<u64>,
     last_connection_outcome: Option<String>,
     last_connection_detail: Option<String>,
+    last_connection_pending_client_request_count: usize,
     last_connection_pending_server_request_count: usize,
     last_connection_answered_but_unresolved_server_request_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ActiveGatewayV2ConnectionHealth {
+    pending_client_request_count: usize,
     pending_server_request_count: usize,
     answered_but_unresolved_server_request_count: usize,
 }
@@ -51,17 +60,17 @@ impl GatewayV2ConnectionHealthRegistry {
         connection_id
     }
 
-    pub fn update_connection_server_request_counts(
+    pub fn update_connection_pending_counts(
         &self,
         connection_id: u64,
-        pending_server_request_count: usize,
-        answered_but_unresolved_server_request_count: usize,
+        counts: GatewayV2ConnectionPendingCounts,
     ) {
         let mut state = write_guard(&self.state);
         if let Some(connection) = state.active_connections.get_mut(&connection_id) {
-            connection.pending_server_request_count = pending_server_request_count;
+            connection.pending_client_request_count = counts.pending_client_request_count;
+            connection.pending_server_request_count = counts.pending_server_request_count;
             connection.answered_but_unresolved_server_request_count =
-                answered_but_unresolved_server_request_count;
+                counts.answered_but_unresolved_server_request_count;
         }
     }
 
@@ -71,8 +80,7 @@ impl GatewayV2ConnectionHealthRegistry {
         outcome: &str,
         detail: Option<&str>,
         duration: Duration,
-        pending_server_request_count: usize,
-        answered_but_unresolved_server_request_count: usize,
+        counts: GatewayV2ConnectionPendingCounts,
     ) {
         let mut state = write_guard(&self.state);
         state.active_connections.remove(&connection_id);
@@ -82,13 +90,19 @@ impl GatewayV2ConnectionHealthRegistry {
             Some(duration.as_millis().min(u128::from(u64::MAX)) as u64);
         state.last_connection_outcome = Some(outcome.to_string());
         state.last_connection_detail = detail.map(ToString::to_string);
-        state.last_connection_pending_server_request_count = pending_server_request_count;
+        state.last_connection_pending_client_request_count = counts.pending_client_request_count;
+        state.last_connection_pending_server_request_count = counts.pending_server_request_count;
         state.last_connection_answered_but_unresolved_server_request_count =
-            answered_but_unresolved_server_request_count;
+            counts.answered_but_unresolved_server_request_count;
     }
 
     pub fn snapshot(&self) -> GatewayV2ConnectionHealth {
         let state = read_guard(&self.state);
+        let active_connection_pending_client_request_count = state
+            .active_connections
+            .values()
+            .map(|connection| connection.pending_client_request_count)
+            .sum();
         let active_connection_pending_server_request_count = state
             .active_connections
             .values()
@@ -101,6 +115,7 @@ impl GatewayV2ConnectionHealthRegistry {
             .sum();
         GatewayV2ConnectionHealth {
             active_connection_count: state.active_connection_count,
+            active_connection_pending_client_request_count,
             active_connection_pending_server_request_count,
             active_connection_answered_but_unresolved_server_request_count,
             peak_active_connection_count: state.peak_active_connection_count,
@@ -110,6 +125,8 @@ impl GatewayV2ConnectionHealthRegistry {
             last_connection_duration_ms: state.last_connection_duration_ms,
             last_connection_outcome: state.last_connection_outcome.clone(),
             last_connection_detail: state.last_connection_detail.clone(),
+            last_connection_pending_client_request_count: state
+                .last_connection_pending_client_request_count,
             last_connection_pending_server_request_count: state
                 .last_connection_pending_server_request_count,
             last_connection_answered_but_unresolved_server_request_count: state
@@ -142,6 +159,7 @@ fn write_guard<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::GatewayV2ConnectionHealthRegistry;
+    use super::GatewayV2ConnectionPendingCounts;
     use crate::api::GatewayV2ConnectionHealth;
     use pretty_assertions::assert_eq;
     use std::time::Duration;
@@ -154,6 +172,7 @@ mod tests {
             registry.snapshot(),
             GatewayV2ConnectionHealth {
                 active_connection_count: 0,
+                active_connection_pending_client_request_count: 0,
                 active_connection_pending_server_request_count: 0,
                 active_connection_answered_but_unresolved_server_request_count: 0,
                 peak_active_connection_count: 0,
@@ -163,6 +182,7 @@ mod tests {
                 last_connection_duration_ms: None,
                 last_connection_outcome: None,
                 last_connection_detail: None,
+                last_connection_pending_client_request_count: 0,
                 last_connection_pending_server_request_count: 0,
                 last_connection_answered_but_unresolved_server_request_count: 0,
             }
@@ -175,10 +195,28 @@ mod tests {
 
         let first_connection_id = registry.mark_connection_started();
         let second_connection_id = registry.mark_connection_started();
-        registry.update_connection_server_request_counts(first_connection_id, 3, 2);
-        registry.update_connection_server_request_counts(second_connection_id, 5, 4);
+        registry.update_connection_pending_counts(
+            first_connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 7,
+                pending_server_request_count: 3,
+                answered_but_unresolved_server_request_count: 2,
+            },
+        );
+        registry.update_connection_pending_counts(
+            second_connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 11,
+                pending_server_request_count: 5,
+                answered_but_unresolved_server_request_count: 4,
+            },
+        );
         let active_snapshot = registry.snapshot();
         assert_eq!(active_snapshot.active_connection_count, 2);
+        assert_eq!(
+            active_snapshot.active_connection_pending_client_request_count,
+            18
+        );
         assert_eq!(
             active_snapshot.active_connection_pending_server_request_count,
             8
@@ -196,12 +234,16 @@ mod tests {
             "client_disconnected",
             Some("socket closed"),
             Duration::from_millis(42),
-            3,
-            2,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 7,
+                pending_server_request_count: 3,
+                answered_but_unresolved_server_request_count: 2,
+            },
         );
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.active_connection_count, 1);
+        assert_eq!(snapshot.active_connection_pending_client_request_count, 11);
         assert_eq!(snapshot.active_connection_pending_server_request_count, 5);
         assert_eq!(
             snapshot.active_connection_answered_but_unresolved_server_request_count,
@@ -218,6 +260,7 @@ mod tests {
             Some("socket closed".to_string())
         );
         assert_eq!(snapshot.last_connection_duration_ms, Some(42));
+        assert_eq!(snapshot.last_connection_pending_client_request_count, 7);
         assert_eq!(snapshot.last_connection_pending_server_request_count, 3);
         assert_eq!(
             snapshot.last_connection_answered_but_unresolved_server_request_count,
@@ -237,8 +280,7 @@ mod tests {
             "client_disconnected",
             None,
             Duration::from_secs(u64::MAX),
-            0,
-            0,
+            GatewayV2ConnectionPendingCounts::default(),
         );
 
         assert_eq!(

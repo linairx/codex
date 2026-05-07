@@ -351,7 +351,9 @@ Recent progress:
   regression covering thread mutation routing across two workers, verifying
   that `thread/name/set` stays sticky to the owning worker and the aggregated
   `thread/read` / `thread/list` results reflect each worker's renamed thread
-  state on the shared northbound connection
+  state on the shared northbound connection; that same harness now also
+  observes `thread/name/updated` from both worker-owned threads, so steady-state
+  rename notification fan-in is covered by real Stage B client traffic
 - multi-worker remote runtime now also has a real northbound v2 client
   regression covering lower-frequency thread-control and detached review
   routing across two workers, verifying that `thread/unsubscribe`,
@@ -364,9 +366,10 @@ Recent progress:
   `thread/read` of worker-owned review threads on the shared northbound
   connection
 - dedicated northbound notification coverage now also pins
-  `thread/name/updated`, and the real embedded plus single-worker remote
-  compatibility harnesses now also observe that rename notification during
-  `thread/name/set` flows through unmodified `RemoteAppServerClient` sessions
+  `thread/name/updated`, and the real embedded, single-worker remote, and
+  multi-worker remote compatibility harnesses now also observe that rename
+  notification during `thread/name/set` flows through unmodified
+  `RemoteAppServerClient` sessions
 - dedicated northbound notification coverage now also pins the streamed item
   update notifications `item/reasoning/summaryTextDelta`,
   `item/reasoning/textDelta`, `item/commandExecution/outputDelta`, and
@@ -504,6 +507,34 @@ Recent progress:
   plane: `command/exec`, `command/exec/outputDelta`,
   `command/exec/write`, `command/exec/resize`, and
   `command/exec/terminate`
+- the real embedded compatibility harness now also exercises the standalone
+  command-execution control plane beyond initial output streaming, covering
+  `command/exec/write`, `command/exec/resize`, and
+  `command/exec/terminate` against a live PTY-backed process through an
+  unmodified `RemoteAppServerClient` session
+- northbound v2 now keeps long-running `command/exec` requests pending in the
+  background while the shared WebSocket session continues processing follow-up
+  control requests, so live `command/exec/write`, `command/exec/resize`, and
+  `command/exec/terminate` traffic can reach the active embedded app-server
+  process before the final `command/exec` response is available
+- that background `command/exec` path now also has a gateway-owned pending
+  client-request limit, so long-running standalone commands cannot bypass the
+  existing per-connection pending-request bound under overload
+- dedicated northbound v2 regression coverage now verifies that a second
+  `command/exec` request receives a gateway-owned rate-limit error while an
+  earlier long-running `command/exec` remains pending, and that the same
+  WebSocket connection stays open for the original response
+- that same overload regression now also pins the v2 request metrics for both
+  the rejected `command/exec` (`outcome="rate_limited"`) and the original
+  pending `command/exec` (`outcome="ok"`), so dashboards can distinguish
+  bounded command saturation from successful long-running command completion
+- dedicated log coverage now also pins the structured warning emitted for
+  saturated pending client requests, including tenant/project scope, request
+  id, method, current pending count, and limit
+- `/healthz` now also exposes pending v2 client-request counts for active and
+  last-completed WebSocket sessions, so operators can distinguish long-running
+  background `command/exec` saturation from pending server-request prompt
+  lifecycles
 - that same single-worker reconnect coverage now also re-exercises the broader
   typed server-request surface after worker recovery:
   `item/commandExecution/requestApproval`,
@@ -1257,12 +1288,14 @@ Phase 6 is in progress with:
   `reconnectAttemptCount`, `nextReconnectAt`, and
   `reconnectBackoffRemainingSeconds`; `/healthz` now also exposes
   `v2Connections.activeConnectionCount`,
+  `v2Connections.activeConnectionPendingClientRequestCount`,
   `v2Connections.activeConnectionPendingServerRequestCount`,
   `v2Connections.activeConnectionAnsweredButUnresolvedServerRequestCount`,
   `v2Connections.peakActiveConnectionCount`,
   `v2Connections.totalConnectionCount`,
   `v2Connections.lastConnectionStartedAt`,
   `v2Connections.lastConnectionDurationMs`,
+  `v2Connections.lastConnectionPendingClientRequestCount`,
   `v2Connections.lastConnectionPendingServerRequestCount`, and
   `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
   the latest completed v2 connection outcome/detail/timestamp; health, metrics,

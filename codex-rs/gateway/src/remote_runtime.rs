@@ -667,6 +667,7 @@ mod tests {
             health.v2_connections,
             GatewayV2ConnectionHealth {
                 active_connection_count: 0,
+                active_connection_pending_client_request_count: 0,
                 active_connection_pending_server_request_count: 0,
                 active_connection_answered_but_unresolved_server_request_count: 0,
                 peak_active_connection_count: 0,
@@ -676,6 +677,7 @@ mod tests {
                 last_connection_duration_ms: None,
                 last_connection_outcome: None,
                 last_connection_detail: None,
+                last_connection_pending_client_request_count: 0,
                 last_connection_pending_server_request_count: 0,
                 last_connection_answered_but_unresolved_server_request_count: 0,
             }

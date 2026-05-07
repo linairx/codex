@@ -7,6 +7,7 @@ use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
 use crate::v2::GatewayV2ConnectedSession;
 use crate::v2::GatewayV2SessionFactory;
+use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::CloseFrame;
@@ -103,6 +104,8 @@ const STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON: &str =
     "downstream worker disconnected during connection-scoped server request";
 const TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE: &str =
     "too many pending server requests for websocket connection";
+const TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE: &str =
+    "too many pending client requests for websocket connection";
 const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
     "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
@@ -165,26 +168,48 @@ struct ForwardedConnectionNotification {
     params: Option<Value>,
 }
 
-fn update_active_v2_connection_server_request_counts(
+fn update_active_v2_connection_pending_counts(
     observability: &GatewayObservability,
     connection_id: u64,
     event_state: &GatewayV2EventState,
+    pending_client_request_count: usize,
 ) {
     observability
         .v2_connection_health()
-        .update_connection_server_request_counts(
+        .update_connection_pending_counts(
             connection_id,
-            event_state.pending_server_requests.len(),
-            answered_but_unresolved_server_request_count(&event_state.resolved_server_requests),
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count,
+                pending_server_request_count: event_state.pending_server_requests.len(),
+                answered_but_unresolved_server_request_count:
+                    answered_but_unresolved_server_request_count(
+                        &event_state.resolved_server_requests,
+                    ),
+            },
         );
 }
 
 struct GatewayV2ConnectionRunResult {
     outcome: &'static str,
     detail: Option<String>,
+    pending_client_request_count: usize,
     pending_server_request_count: usize,
     answered_but_unresolved_server_request_count: usize,
     result: io::Result<()>,
+}
+
+struct PendingClientResponse {
+    request_id: RequestId,
+    method: String,
+    request_context: GatewayRequestContext,
+    started_at: Instant,
+    result: io::Result<Result<Value, JSONRPCErrorError>>,
+}
+
+struct PendingClientResponses {
+    tx: mpsc::Sender<PendingClientResponse>,
+    tasks: Vec<JoinHandle<()>>,
+    count: usize,
 }
 
 #[derive(Clone)]
@@ -851,6 +876,7 @@ async fn run_websocket_connection(
                 return Ok(GatewayV2ConnectionRunResult {
                     outcome: "initialize_timed_out",
                     detail: Some(INITIALIZE_TIMEOUT_CLOSE_REASON.to_string()),
+                    pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     result: Ok(()),
@@ -860,6 +886,7 @@ async fn run_websocket_connection(
                 return Ok(GatewayV2ConnectionRunResult {
                     outcome: "invalid_client_payload",
                     detail: Some(err.to_string()),
+                    pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     result: Ok(()),
@@ -893,6 +920,7 @@ async fn run_websocket_connection(
                 return Ok(GatewayV2ConnectionRunResult {
                     outcome: "initialize_invalid_request",
                     detail: Some(detail),
+                    pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     result: Ok(()),
@@ -942,6 +970,7 @@ async fn run_websocket_connection(
                 return Ok(GatewayV2ConnectionRunResult {
                     outcome: request_outcome,
                     detail: Some(detail),
+                    pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     result: Ok(()),
@@ -974,6 +1003,13 @@ async fn run_websocket_connection(
         };
         let mut reject_pending_server_requests_on_exit = false;
         let mut connection_detail = None;
+        let (pending_client_response_tx, mut pending_client_response_rx) =
+            mpsc::channel::<PendingClientResponse>(timeouts.max_pending_server_requests.max(1));
+        let mut pending_client_responses = PendingClientResponses {
+            tx: pending_client_response_tx,
+            tasks: Vec::new(),
+            count: 0,
+        };
         let connection = GatewayV2ConnectionContext {
             admission: &admission,
             observability: &observability,
@@ -1019,19 +1055,19 @@ async fn run_websocket_connection(
                                 &mut socket,
                                 &mut downstream,
                                 &connection,
-                                &mut event_state.pending_server_requests,
-                                &mut event_state.resolved_server_requests,
-                                &mut event_state.skills_changed_pending_refresh,
+                                &mut event_state,
+                                &mut pending_client_responses,
                                 message,
                             )
                             .await {
                                 let outcome = classify_v2_connection_error(&err);
                                 break (Err(err), outcome);
                             }
-                            update_active_v2_connection_server_request_counts(
+                            update_active_v2_connection_pending_counts(
                                 &observability,
                                 connection_id,
                                 &event_state,
+                                pending_client_responses.count,
                             );
                         }
                         Ok(WebSocketMessage::Binary(bytes)) => {
@@ -1057,19 +1093,19 @@ async fn run_websocket_connection(
                                 &mut socket,
                                 &mut downstream,
                                 &connection,
-                                &mut event_state.pending_server_requests,
-                                &mut event_state.resolved_server_requests,
-                                &mut event_state.skills_changed_pending_refresh,
+                                &mut event_state,
+                                &mut pending_client_responses,
                                 message,
                             )
                             .await {
                                 let outcome = classify_v2_connection_error(&err);
                                 break (Err(err), outcome);
                             }
-                            update_active_v2_connection_server_request_counts(
+                            update_active_v2_connection_pending_counts(
                                 &observability,
                                 connection_id,
                                 &event_state,
+                                pending_client_responses.count,
                             );
                         }
                         Ok(WebSocketMessage::Close(_)) => {
@@ -1122,18 +1158,93 @@ async fn run_websocket_connection(
                     };
                     if let Some(close) = should_close {
                         reject_pending_server_requests_on_exit = close.reject_pending_server_requests;
-                        update_active_v2_connection_server_request_counts(
-                            &observability,
-                            connection_id,
-                            &event_state,
-                        );
+                        update_active_v2_connection_pending_counts(
+                                &observability,
+                                connection_id,
+                                &event_state,
+                                pending_client_responses.count,
+                            );
                         break (Ok(()), close.outcome);
                     }
-                    update_active_v2_connection_server_request_counts(
+                    update_active_v2_connection_pending_counts(
+                                &observability,
+                                connection_id,
+                                &event_state,
+                                pending_client_responses.count,
+                            );
+                }
+                pending_response = pending_client_response_rx.recv() => {
+                    let Some(pending_response) = pending_response else {
+                        continue;
+                    };
+                    pending_client_responses.count =
+                        pending_client_responses.count.saturating_sub(1);
+                    pending_client_responses
+                        .tasks
+                        .retain(|task| !task.is_finished());
+                    update_active_v2_connection_pending_counts(
                         &observability,
                         connection_id,
                         &event_state,
+                        pending_client_responses.count,
                     );
+                    match pending_response.result {
+                        Ok(Ok(result)) => {
+                            send_jsonrpc(
+                                &mut socket,
+                                JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: pending_response.request_id,
+                                    result,
+                                }),
+                                timeouts.client_send,
+                            )
+                            .await?;
+                            observe_v2_request(
+                                &observability,
+                                &pending_response.request_context,
+                                &pending_response.method,
+                                "ok",
+                                pending_response.started_at.elapsed(),
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            let outcome = jsonrpc_error_outcome_code(error.code);
+                            send_jsonrpc_error(
+                                &mut socket,
+                                pending_response.request_id,
+                                error,
+                                timeouts.client_send,
+                            )
+                            .await?;
+                            observe_v2_request(
+                                &observability,
+                                &pending_response.request_context,
+                                &pending_response.method,
+                                outcome,
+                                pending_response.started_at.elapsed(),
+                            );
+                        }
+                        Err(err) => {
+                            send_jsonrpc_error(
+                                &mut socket,
+                                pending_response.request_id,
+                                JSONRPCErrorError {
+                                    code: INTERNAL_ERROR_CODE,
+                                    message: format!("gateway upstream request failed: {err}"),
+                                    data: None,
+                                },
+                                timeouts.client_send,
+                            )
+                            .await?;
+                            observe_v2_request(
+                                &observability,
+                                &pending_response.request_context,
+                                &pending_response.method,
+                                "internal_error",
+                                pending_response.started_at.elapsed(),
+                            );
+                        }
+                    }
                 }
             }
         };
@@ -1148,6 +1259,11 @@ async fn run_websocket_connection(
                 &event_state.pending_server_requests,
                 &event_state.resolved_server_requests,
             );
+        }
+
+        let pending_client_request_count = pending_client_responses.count;
+        for task in pending_client_responses.tasks {
+            task.abort();
         }
 
         let pending_server_request_count = event_state.pending_server_requests.len();
@@ -1197,6 +1313,7 @@ async fn run_websocket_connection(
         Ok(GatewayV2ConnectionRunResult {
             outcome: connection_outcome,
             detail: connection_detail,
+            pending_client_request_count,
             pending_server_request_count,
             answered_but_unresolved_server_request_count,
             result,
@@ -1208,6 +1325,7 @@ async fn run_websocket_connection(
         Err(err) => GatewayV2ConnectionRunResult {
             outcome: classify_v2_connection_error(&err),
             detail: Some(err.to_string()),
+            pending_client_request_count: 0,
             pending_server_request_count: 0,
             answered_but_unresolved_server_request_count: 0,
             result: Err(err),
@@ -1219,10 +1337,12 @@ async fn run_websocket_connection(
         &context,
         run_result.outcome,
         run_result.detail.as_deref(),
-        (
-            run_result.pending_server_request_count,
-            run_result.answered_but_unresolved_server_request_count,
-        ),
+        GatewayV2ConnectionPendingCounts {
+            pending_client_request_count: run_result.pending_client_request_count,
+            pending_server_request_count: run_result.pending_server_request_count,
+            answered_but_unresolved_server_request_count: run_result
+                .answered_but_unresolved_server_request_count,
+        },
         connection_started_at.elapsed(),
     );
     run_result.result
@@ -1405,9 +1525,8 @@ async fn handle_client_message(
     socket: &mut WebSocket,
     downstream: &mut GatewayV2DownstreamRouter,
     connection: &GatewayV2ConnectionContext<'_>,
-    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-    skills_changed_pending_refresh: &mut bool,
+    event_state: &mut GatewayV2EventState,
+    pending_client_responses: &mut PendingClientResponses,
     message: JSONRPCMessage,
 ) -> io::Result<()> {
     match message {
@@ -1486,6 +1605,67 @@ async fn handle_client_message(
 
             let request_id = request.id.clone();
             let method = request.method.clone();
+            if method == "command/exec" {
+                if let Some(error) = pending_client_request_limit_error(
+                    pending_client_responses.count,
+                    connection.max_pending_server_requests,
+                ) {
+                    log_rejected_saturated_client_request(
+                        connection.request_context,
+                        &request_id,
+                        &method,
+                        pending_client_responses.count,
+                        connection.max_pending_server_requests,
+                    );
+                    send_jsonrpc_error(socket, request_id, error, connection.client_send_timeout)
+                        .await?;
+                    observe_v2_request(
+                        connection.observability,
+                        connection.request_context,
+                        &method,
+                        "rate_limited",
+                        started_at.elapsed(),
+                    );
+                    return Ok(());
+                }
+                if downstream.reconnect_state.is_some() {
+                    downstream
+                        .reconnect_missing_workers(connection.observability)
+                        .await;
+                }
+                let worker =
+                    match worker_for_request(downstream, connection.scope_registry, &request) {
+                        Ok(worker) => worker.clone(),
+                        Err(err) => {
+                            log_fail_closed_multi_worker_request(
+                                downstream,
+                                connection,
+                                method.as_str(),
+                                &err,
+                            );
+                            return Err(err);
+                        }
+                    };
+                let client_request = jsonrpc_request_to_client_request(request)?;
+                let request_context = connection.request_context.clone();
+                let pending_client_response_tx = pending_client_responses.tx.clone();
+                pending_client_responses.count += 1;
+                pending_client_responses
+                    .tasks
+                    .push(tokio::spawn(async move {
+                        let result = worker.request_handle.request(client_request).await;
+                        let _ = pending_client_response_tx
+                            .send(PendingClientResponse {
+                                request_id,
+                                method,
+                                request_context,
+                                started_at,
+                                result,
+                            })
+                            .await;
+                    }));
+                return Ok(());
+            }
             match handle_client_request(downstream, connection, request).await {
                 Ok(Ok(result)) => {
                     send_jsonrpc(
@@ -1498,7 +1678,7 @@ async fn handle_client_message(
                     )
                     .await?;
                     if downstream.multi_worker_topology() && method == "skills/list" {
-                        *skills_changed_pending_refresh = false;
+                        event_state.skills_changed_pending_refresh = false;
                     }
                     observe_v2_request(
                         connection.observability,
@@ -1557,13 +1737,13 @@ async fn handle_client_message(
             worker.request_handle.notify(client_notification).await?;
         }
         JSONRPCMessage::Response(response) => {
-            let Some(route) = pending_server_requests.remove(&response.id) else {
+            let Some(route) = event_state.pending_server_requests.remove(&response.id) else {
                 log_unexpected_client_server_request_response(
                     connection.request_context,
                     "response",
                     &response.id,
-                    pending_server_requests,
-                    resolved_server_requests,
+                    &event_state.pending_server_requests,
+                    &event_state.resolved_server_requests,
                 );
                 connection
                     .observability
@@ -1581,7 +1761,7 @@ async fn handle_client_message(
                 send_invalid_payload_close(socket, &err, connection.client_send_timeout).await?;
                 return Err(err);
             };
-            resolved_server_requests.insert(
+            event_state.resolved_server_requests.insert(
                 DownstreamServerRequestKey {
                     worker_id: route.worker_id,
                     request_id: route.downstream_request_id.clone(),
@@ -1597,13 +1777,13 @@ async fn handle_client_message(
                 .await?;
         }
         JSONRPCMessage::Error(error) => {
-            let Some(route) = pending_server_requests.remove(&error.id) else {
+            let Some(route) = event_state.pending_server_requests.remove(&error.id) else {
                 log_unexpected_client_server_request_response(
                     connection.request_context,
                     "error",
                     &error.id,
-                    pending_server_requests,
-                    resolved_server_requests,
+                    &event_state.pending_server_requests,
+                    &event_state.resolved_server_requests,
                 );
                 connection
                     .observability
@@ -1621,7 +1801,7 @@ async fn handle_client_message(
                 send_invalid_payload_close(socket, &err, connection.client_send_timeout).await?;
                 return Err(err);
             };
-            resolved_server_requests.insert(
+            event_state.resolved_server_requests.insert(
                 DownstreamServerRequestKey {
                     worker_id: route.worker_id,
                     request_id: route.downstream_request_id.clone(),
@@ -2330,6 +2510,24 @@ fn log_rejected_saturated_server_request(
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         "rejecting downstream server request because the gateway websocket connection is saturated"
+    );
+}
+
+fn log_rejected_saturated_client_request(
+    request_context: &GatewayRequestContext,
+    request_id: &RequestId,
+    method: &str,
+    pending_client_request_count: usize,
+    limit: usize,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        request_id = ?request_id,
+        method,
+        pending_client_request_count,
+        limit,
+        "rejecting client request because the gateway websocket connection is saturated"
     );
 }
 
@@ -4851,6 +5049,21 @@ fn pending_server_request_limit_error(
     }
 }
 
+fn pending_client_request_limit_error(
+    pending_client_request_count: usize,
+    max_pending_client_requests: usize,
+) -> Option<JSONRPCErrorError> {
+    if pending_client_request_count < max_pending_client_requests {
+        None
+    } else {
+        Some(JSONRPCErrorError {
+            code: RATE_LIMITED_ERROR_CODE,
+            message: TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE.to_string(),
+            data: None,
+        })
+    }
+}
+
 fn notification_visible_to(
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
@@ -5092,42 +5305,33 @@ fn observe_v2_connection(
     context: &GatewayRequestContext,
     outcome: &str,
     detail: Option<&str>,
-    server_request_counts: (usize, usize),
+    pending_counts: GatewayV2ConnectionPendingCounts,
     duration: std::time::Duration,
 ) {
-    let (pending_server_request_count, answered_but_unresolved_server_request_count) =
-        server_request_counts;
     observability
         .v2_connection_health()
-        .mark_connection_completed(
-            connection_id,
-            outcome,
-            detail,
-            duration,
-            pending_server_request_count,
-            answered_but_unresolved_server_request_count,
-        );
+        .mark_connection_completed(connection_id, outcome, detail, duration, pending_counts);
     observability.record_v2_connection(
         outcome,
         duration,
-        pending_server_request_count,
-        answered_but_unresolved_server_request_count,
+        pending_counts.pending_server_request_count,
+        pending_counts.answered_but_unresolved_server_request_count,
     );
     observability.emit_v2_connection_audit_log(
         outcome,
         duration,
         context,
         detail,
-        pending_server_request_count,
-        answered_but_unresolved_server_request_count,
+        pending_counts.pending_server_request_count,
+        pending_counts.answered_but_unresolved_server_request_count,
     );
     observability.emit_v2_connection_log(
         outcome,
         duration,
         context,
         detail,
-        pending_server_request_count,
-        answered_but_unresolved_server_request_count,
+        pending_counts.pending_server_request_count,
+        pending_counts.answered_but_unresolved_server_request_count,
     );
 }
 
@@ -7683,6 +7887,12 @@ mod tests {
     }
 
     #[test]
+    fn pending_client_request_limit_error_allows_counts_below_limit() {
+        assert_eq!(super::pending_client_request_limit_error(0, 1), None);
+        assert_eq!(super::pending_client_request_limit_error(3, 4), None);
+    }
+
+    #[test]
     fn pending_server_request_limit_error_rejects_counts_at_or_above_limit() {
         let error = super::pending_server_request_limit_error(1, 1).expect("error");
         assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
@@ -7696,6 +7906,23 @@ mod tests {
         assert_eq!(
             error.message,
             super::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE
+        );
+    }
+
+    #[test]
+    fn pending_client_request_limit_error_rejects_counts_at_or_above_limit() {
+        let error = super::pending_client_request_limit_error(1, 1).expect("error");
+        assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
+        assert_eq!(
+            error.message,
+            super::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE
+        );
+
+        let error = super::pending_client_request_limit_error(2, 1).expect("error");
+        assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
+        assert_eq!(
+            error.message,
+            super::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE
         );
     }
 
@@ -8290,7 +8517,11 @@ mod tests {
                 "gateway websocket send timed out",
             )),
             None,
-            (2, 1),
+            super::GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 4,
+                pending_server_request_count: 2,
+                answered_but_unresolved_server_request_count: 1,
+            },
             Duration::from_millis(9),
         );
 
@@ -8301,6 +8532,10 @@ mod tests {
             Some("client_send_timed_out".to_string())
         );
         assert_eq!(health_snapshot.last_connection_detail, None);
+        assert_eq!(
+            health_snapshot.last_connection_pending_client_request_count,
+            4
+        );
         assert_eq!(
             health_snapshot.last_connection_pending_server_request_count,
             2
@@ -8475,7 +8710,11 @@ mod tests {
                 &context,
                 "protocol_violation",
                 Some("unexpected gateway websocket server-request response"),
-                (1, 2),
+                super::GatewayV2ConnectionPendingCounts {
+                    pending_client_request_count: 0,
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 2,
+                },
                 Duration::from_millis(13),
             );
         });
@@ -16267,6 +16506,118 @@ mod tests {
             panic!("expected command/exec/outputDelta notification");
         };
         assert_eq!(actual, expected);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_command_exec_above_pending_client_limit_without_closing() {
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let v2_connection_health = observability.v2_connection_health();
+        let (first_request_observed_tx, first_request_observed_rx) = oneshot::channel();
+        let (finish_first_request_tx, finish_first_request_rx) = oneshot::channel();
+        let websocket_url = start_mock_remote_server_for_pending_command_exec(
+            first_request_observed_tx,
+            finish_first_request_rx,
+        )
+        .await;
+        let initialize_response = test_initialize_response().await;
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability,
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
+                RemoteAppServerConnectArgs {
+                    websocket_url,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                initialize_response,
+            ))),
+            timeouts: GatewayV2Timeouts {
+                max_pending_server_requests: 1,
+                ..GatewayV2Timeouts::default()
+            },
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        send_initialize(&mut websocket).await;
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("command-exec-1".to_string()),
+            "command/exec",
+            pending_command_exec_params("proc-pending-1"),
+        )
+        .await;
+        first_request_observed_rx
+            .await
+            .expect("first command/exec should reach downstream");
+        assert_eq!(
+            v2_connection_health
+                .snapshot()
+                .active_connection_pending_client_request_count,
+            1
+        );
+
+        send_jsonrpc_request(
+            &mut websocket,
+            RequestId::String("command-exec-2".to_string()),
+            "command/exec",
+            pending_command_exec_params("proc-pending-2"),
+        )
+        .await;
+
+        let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+            panic!("expected rate-limit error for second pending command/exec");
+        };
+        assert_eq!(error.id, RequestId::String("command-exec-2".to_string()));
+        assert_eq!(error.error.code, super::RATE_LIMITED_ERROR_CODE);
+        assert_eq!(
+            error.error.message,
+            super::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE
+        );
+
+        finish_first_request_tx
+            .send(())
+            .expect("first command/exec completion signal should send");
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected first command/exec response after releasing downstream");
+        };
+        assert_eq!(response.id, RequestId::String("command-exec-1".to_string()));
+        assert_eq!(
+            response.result,
+            serde_json::json!({
+                "exitCode": 0,
+                "stdout": "",
+                "stderr": "",
+            })
+        );
+        assert_eq!(
+            v2_connection_health
+                .snapshot()
+                .active_connection_pending_client_request_count,
+            0
+        );
+        assert_v2_request_metrics(
+            &metrics,
+            &[
+                ("initialize", "ok", 1),
+                ("command/exec", "rate_limited", 1),
+                ("command/exec", "ok", 1),
+            ],
+        );
 
         server_task.abort();
         let _ = server_task.await;
@@ -37049,6 +37400,32 @@ mod tests {
     }
 
     #[test]
+    fn log_rejected_saturated_client_request_includes_scope_method_and_limit() {
+        let logs = capture_logs(|| {
+            super::log_rejected_saturated_client_request(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                &RequestId::String("command-exec-2".to_string()),
+                "command/exec",
+                1,
+                1,
+            );
+        });
+
+        assert!(logs.contains(
+            "rejecting client request because the gateway websocket connection is saturated"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("request_id=String(\"command-exec-2\")"));
+        assert!(logs.contains("method=\"command/exec\""));
+        assert!(logs.contains("pending_client_request_count=1"));
+        assert!(logs.contains("limit=1"));
+    }
+
+    #[test]
     fn log_rejected_hidden_downstream_server_request_includes_scope_worker_and_thread_id() {
         let logs = capture_logs(|| {
             super::log_rejected_hidden_downstream_server_request(
@@ -39066,6 +39443,75 @@ mod tests {
                 ))
                 .await
                 .expect("response should send");
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    fn pending_command_exec_params(process_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "command": ["sh", "-lc", "sleep 1"],
+            "processId": process_id,
+            "tty": true,
+            "streamStdin": true,
+            "streamStdoutStderr": true,
+            "outputBytesCap": null,
+            "timeoutMs": null,
+            "cwd": null,
+            "env": null,
+            "size": {
+                "rows": 24,
+                "cols": 80,
+            },
+            "sandboxPolicy": null,
+        })
+    }
+
+    async fn start_mock_remote_server_for_pending_command_exec(
+        first_request_observed_tx: oneshot::Sender<()>,
+        finish_first_request_rx: oneshot::Receiver<()>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            let request = read_websocket_request(&mut websocket).await;
+            assert_eq!(request.method, "command/exec");
+            assert_eq!(
+                request.params,
+                Some(pending_command_exec_params("proc-pending-1"))
+            );
+            first_request_observed_tx
+                .send(())
+                .expect("first command/exec observation should send");
+            finish_first_request_rx
+                .await
+                .expect("first command/exec completion signal should arrive");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({
+                            "exitCode": 0,
+                            "stdout": "",
+                            "stderr": "",
+                        }),
+                    }))
+                    .expect("command/exec response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("command/exec response should send");
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         });

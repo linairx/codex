@@ -2708,6 +2708,95 @@ mod tests {
             }
         );
 
+        let request_handle = client.request_handle();
+        let controlled_command_task = tokio::spawn(async move {
+            request_handle
+                .request_typed::<CommandExecResponse>(ClientRequest::OneOffCommandExec {
+                    request_id: RequestId::Integer(41),
+                    params: CommandExecParams {
+                        command: vec![
+                            "sh".to_string(),
+                            "-lc".to_string(),
+                            "while true; do sleep 1; done".to_string(),
+                        ],
+                        process_id: Some("proc-embedded-control".to_string()),
+                        tty: true,
+                        stream_stdin: false,
+                        stream_stdout_stderr: false,
+                        output_bytes_cap: None,
+                        disable_output_cap: false,
+                        disable_timeout: false,
+                        timeout_ms: None,
+                        cwd: None,
+                        env: None,
+                        size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
+                        sandbox_policy: Some(SandboxPolicy::DangerFullAccess.into()),
+                    },
+                })
+                .await
+        });
+
+        let command_write: CommandExecWriteResponse = timeout(Duration::from_secs(5), async {
+            loop {
+                match client
+                    .request_typed(ClientRequest::CommandExecWrite {
+                        request_id: RequestId::Integer(42),
+                        params: CommandExecWriteParams {
+                            process_id: "proc-embedded-control".to_string(),
+                            delta_base64: Some("Z28K".to_string()),
+                            close_stdin: false,
+                        },
+                    })
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(TypedRequestError::Server { source, .. })
+                        if source.message.contains("no active command/exec") =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(err) => {
+                        panic!("command/exec/write should succeed through embedded gateway: {err}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("command/exec/write should eventually find the active embedded command");
+        assert_eq!(command_write, CommandExecWriteResponse {});
+
+        let command_resize: CommandExecResizeResponse = client
+            .request_typed(ClientRequest::CommandExecResize {
+                request_id: RequestId::Integer(43),
+                params: CommandExecResizeParams {
+                    process_id: "proc-embedded-control".to_string(),
+                    size: CommandExecTerminalSize {
+                        rows: 40,
+                        cols: 120,
+                    },
+                },
+            })
+            .await
+            .expect("command/exec/resize should succeed through embedded gateway");
+        assert_eq!(command_resize, CommandExecResizeResponse {});
+
+        let command_terminate: CommandExecTerminateResponse = client
+            .request_typed(ClientRequest::CommandExecTerminate {
+                request_id: RequestId::Integer(44),
+                params: CommandExecTerminateParams {
+                    process_id: "proc-embedded-control".to_string(),
+                },
+            })
+            .await
+            .expect("command/exec/terminate should succeed through embedded gateway");
+        assert_eq!(command_terminate, CommandExecTerminateResponse {});
+
+        timeout(Duration::from_secs(5), controlled_command_task)
+            .await
+            .expect("controlled command/exec should finish after terminate")
+            .expect("controlled command/exec task should join")
+            .expect("controlled command/exec should return a final response");
+
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
     }
@@ -25719,7 +25808,7 @@ stream_max_retries = 0
         .await
         .expect("server");
 
-        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
             client_name: "codex-gateway-test".to_string(),
@@ -25784,6 +25873,29 @@ stream_max_retries = 0
             .await
             .expect("second thread/start should succeed through multi-worker remote gateway");
 
+        let expected_started_notifications = HashSet::from([
+            first_started.thread.id.clone(),
+            second_started.thread.id.clone(),
+        ]);
+        let mut started_notifications = HashSet::new();
+        timeout(Duration::from_secs(5), async {
+            while started_notifications != expected_started_notifications {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadStarted(
+                    notification,
+                )) = event
+                    && expected_started_notifications.contains(&notification.thread.id)
+                {
+                    started_notifications.insert(notification.thread.id);
+                }
+            }
+        })
+        .await
+        .expect("thread/started notifications should fan in from both workers");
+
         let first_name = "Worker A Thread".to_string();
         let second_name = "Worker B Thread".to_string();
 
@@ -25816,6 +25928,32 @@ stream_max_retries = 0
         .expect("second thread/name/set should finish in time")
         .expect("second thread/name/set should route to worker B");
         assert_eq!(second_rename, ThreadSetNameResponse {});
+
+        let expected_rename_notifications = HashMap::from([
+            (first_started.thread.id.clone(), first_name.clone()),
+            (second_started.thread.id.clone(), second_name.clone()),
+        ]);
+        let mut rename_notifications = HashMap::new();
+        timeout(Duration::from_secs(5), async {
+            while rename_notifications != expected_rename_notifications {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                if let AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
+                    notification,
+                )) = event
+                    && let Some(thread_name) = notification.thread_name
+                    && expected_rename_notifications
+                        .get(&notification.thread_id)
+                        .is_some_and(|expected| expected == &thread_name)
+                {
+                    rename_notifications.insert(notification.thread_id, thread_name);
+                }
+            }
+        })
+        .await
+        .expect("thread/name/updated notifications should fan in from both workers");
 
         let first_memory_mode: ThreadMemoryModeSetResponse = timeout(
             Duration::from_secs(5),
@@ -40278,20 +40416,47 @@ stream_max_retries = 0
                     loop {
                         let request = read_websocket_request(&mut websocket).await;
                         let result = match request.method.as_str() {
-                            "thread/start" => serde_json::json!({
-                                "thread": mock_thread_with_name(thread_id, preview, thread_name.as_deref()),
-                                "model": "gpt-5",
-                                "modelProvider": "openai",
-                                "serviceTier": null,
-                                "cwd": preview,
-                                "instructionSources": [],
-                                "approvalPolicy": "never",
-                                "approvalsReviewer": "user",
-                                "sandbox": {
-                                    "type": "dangerFullAccess"
-                                },
-                                "reasoningEffort": null,
-                            }),
+                            "thread/start" => {
+                                let thread = mock_thread_with_name(
+                                    thread_id,
+                                    preview,
+                                    thread_name.as_deref(),
+                                );
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id.clone(),
+                                        result: serde_json::json!({
+                                            "thread": thread,
+                                            "model": "gpt-5",
+                                            "modelProvider": "openai",
+                                            "serviceTier": null,
+                                            "cwd": preview,
+                                            "instructionSources": [],
+                                            "approvalPolicy": "never",
+                                            "approvalsReviewer": "user",
+                                            "sandbox": {
+                                                "type": "dangerFullAccess"
+                                            },
+                                            "reasoningEffort": null,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Notification(
+                                        codex_app_server_protocol::JSONRPCNotification {
+                                            method: "thread/started".to_string(),
+                                            params: Some(serde_json::json!({
+                                                "thread": thread,
+                                            })),
+                                        },
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
                             "thread/name/set" => {
                                 let requested_thread_id = request
                                     .params
