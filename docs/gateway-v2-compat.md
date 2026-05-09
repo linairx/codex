@@ -482,6 +482,12 @@ Recent progress:
   pending prompts, rejected connection-scoped pending prompts, and
   answered-but-unresolved prompts left behind by client disconnect,
   protocol-violation, or slow-send teardown paths
+- successful delivery of client-side pending-prompt cleanup rejections now also
+  emits `event=client_cleanup_rejection_delivered`, complementing the existing
+  failure and skipped-route cleanup delivery counters
+- the ordinary northbound WebSocket client-disconnect path now has direct
+  regression coverage for that successful cleanup-delivery counter, in
+  addition to the slow-client timeout path
 - client replies for unknown server-request ids now also emit
   `gateway_v2_server_request_lifecycle_events` with
   `event=unexpected_client_server_request_response`, so protocol-violation
@@ -1084,6 +1090,15 @@ Recent progress:
   surviving multi-worker sessions still expose the worker protocol violation to
   operators; malformed downstream JSON-RPC after initialization now also has
   real northbound WebSocket coverage for that structured warning-log path
+- post-handshake downstream malformed JSON-RPC and non-text frame regressions
+  now also pin the matching gateway v2 connection audit record with
+  `outcome="downstream_protocol_violation"`, so worker protocol failures are
+  visible through audit logs as well as close behavior, metrics, and structured
+  diagnostics
+- post-handshake downstream unexpected JSON-RPC response and error id
+  regressions now also pin that same gateway v2 connection audit record, so
+  out-of-order worker traffic has the same audit visibility as malformed
+  worker frames
 - downstream non-text JSON-RPC data frames now also fail closed as explicit
   `invalid_binary` protocol violations instead of being silently ignored by the
   remote app-server transport, so malformed-frame hardening covers both invalid
@@ -1279,6 +1294,10 @@ Recent progress:
   `gateway_v2_client_request_rejections` with `method` and `reason` tags, so
   background command-exec overload has a dedicated counter alongside request
   outcome metrics
+- direct audit-log coverage now also pins the saturated pending client-request
+  path as `gateway_v2_requests{method="command/exec",outcome="rate_limited"}`,
+  so rejected long-running command requests remain visible in request-level
+  audit trails as well as rejection counters
 - dedicated log coverage now also pins the structured warning emitted for
   saturated pending client requests, including tenant/project scope, request
   id, method, current pending count, and configured limit
@@ -1646,6 +1665,10 @@ Recent progress:
   so thread-scoped prompt cleanup failures are visible before the gateway
   returns the terminal send error; the send-failure warning includes the
   affected worker websocket URL
+- successful synthesized `serverRequest/resolved` delivery during worker-loss
+  cleanup now also emits a server-request lifecycle metric on the real
+  northbound WebSocket path, so operators can distinguish delivered synthetic
+  prompt resolution from cleanup send failures
 - worker-loss cleanup warning logs now also include affected thread ids for
   thread-scoped prompts that the gateway resolves synthetically after a
   downstream worker disappears, so cleanup diagnostics point back to the
@@ -1658,11 +1681,21 @@ Recent progress:
   pending downstream server request is left unresolved while large follow-up
   notifications wedge the client send path, verifying the timeout warning,
   `client_send_timed_out` outcome, and downstream prompt rejection together
+- that same slow-client regression now also pins the server-request lifecycle
+  metrics for the originally forwarded prompt and the later
+  `client_cleanup_rejected_thread_scoped` cleanup event, so dashboards can
+  correlate the timeout with the rejected prompt lifecycle rather than only the
+  connection outcome
 - those slow-client and connection-end teardown logs now also include any
   answered-but-unresolved server-request routes, with translated gateway ids,
   downstream ids, and worker ids, and that same slow-client path now also has
   a real northbound regression where the client has already replied but
   downstream `serverRequest/resolved` never arrives before timeout
+- that answered-but-unresolved slow-client regression now also pins the
+  forwarded, answered, delivered, and
+  `client_cleanup_answered_but_unresolved` lifecycle metrics, so the partially
+  completed prompt is visible from first northbound delivery through terminal
+  cleanup
 - that same connection-end teardown path now also has a real northbound
   regression for client disconnects after one server request has already been
   answered but before downstream `serverRequest/resolved` arrives, pinning the
@@ -1676,6 +1709,9 @@ Recent progress:
   coverage, pinning the warning log fields emitted when a multi-worker
   downstream session replays `serverRequest/resolved` after the translated
   route has already been drained
+- that same northbound regression now also pins the lifecycle metrics for both
+  the initial `downstream_server_request_resolved` event and the later
+  `duplicate_resolved_replay` event on the translated server-request route
 - suppressed multi-worker notification dedupe paths now also emit structured
   warning logs: duplicate `skills/changed` invalidations include scope,
   worker id, worker websocket URL, and params until the client refreshes
@@ -2035,6 +2071,24 @@ Operational notes:
   different follow-up method; regression coverage pins the protocol-violation
   metric and duplicate-request log fields, including the original worker id and
   WebSocket URL
+- that duplicate pending client-request path now also records the offending
+  follow-up request as `gateway_v2_requests{method,outcome="protocol_violation"}`,
+  and emits the matching request audit log, so request-level telemetry and
+  audit trails identify which method reused the in-flight id
+- aborted background `command/exec` requests now also have direct audit-log
+  coverage for the per-request terminal outcome, so client disconnect,
+  protocol-violation, and slow-client teardown paths stay visible at the same
+  request boundary as successful and rejected command requests
+- primary-worker fail-closed routing for background `command/exec` now also
+  records `gateway_v2_requests{method="command/exec",outcome="internal_error"}`
+  and emits the matching request audit log before the northbound connection
+  ends, so route failures for standalone command execution remain visible in
+  per-method telemetry
+- primary-worker route failures for ordinary request/response methods now also
+  have real northbound WebSocket coverage for the matching
+  `gateway_v2_requests{method,outcome="internal_error"}` metric and request
+  audit log, so degraded primary-worker setup reads are visible at the same
+  request boundary as background command execution
 - `/healthz.v2Connections` also exposes active-session pending client-request
   totals plus pending and answered-but-unresolved server-request totals, so
   background client-request saturation and multi-worker prompt lifecycle
@@ -2129,6 +2183,71 @@ Operational notes:
   gateway request ids, downstream request ids, affected thread ids, worker ids,
   and worker websocket URLs for the pending prompts being rejected, plus
   affected thread ids for answered-but-unresolved routes
+- once the gateway attempts to reject pending prompts during client-side
+  cleanup, successful deliveries increment
+  `event=client_cleanup_rejection_delivered`, failed deliveries increment
+  `event=client_cleanup_rejection_failed`, and unavailable worker routes
+  increment `event=client_cleanup_rejection_skipped_unavailable_worker`, all
+  with `method=serverRequest/pending`
+- normal client replies to forwarded server requests increment
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=client_server_request_answered` and `method=response` or
+  `method=error`, so operators can distinguish prompts that reached the
+  downstream answered-but-unresolved stage from prompts still pending on the
+  northbound client
+- downstream delivery of those client replies now also increments
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=client_server_request_delivered` or
+  `event=client_server_request_delivery_failed`, so a reply that reached the
+  gateway but could not be handed back to the owning app-server worker is
+  visible as its own partially completed lifecycle stage; direct regression
+  coverage now pins the delivery-failure branch when the owning worker route is
+  no longer available
+- that delivery-failure branch now also emits a structured warning log with
+  tenant/project scope, response kind, worker id, worker websocket URL,
+  gateway request id, downstream request id, thread id, and error detail, so
+  operators can diagnose answered-but-not-delivered prompt lifecycles without
+  reconstructing the route table from metrics alone
+- pending server-request routes now snapshot the worker websocket URL when the
+  prompt is forwarded, so answered-but-undeliverable and cleanup diagnostics
+  retain the original downstream route even after the worker route disappears
+- pending server-request log summaries now also include
+  `pending_worker_websocket_urls` alongside `pending_worker_ids` for unexpected
+  client replies, saturation, downstream backpressure, slow-client timeout, and
+  downstream protocol violation plus duplicate downstream request-id
+  diagnostics, so operator logs retain the original worker routes across prompt
+  lifecycle failures
+- answered-but-unresolved server-request log summaries now also include
+  `answered_but_unresolved_worker_websocket_urls`, and duplicate
+  `serverRequest/resolved` replay diagnostics include the remaining resolved
+  route URLs, so operators can identify the original worker route even after a
+  client answer has already drained the pending prompt entry
+- downstream server requests that pass gateway scope and saturation checks
+  increment `gateway_v2_server_request_lifecycle_events` with
+  `event=downstream_server_request_forwarded` and the forwarded request method,
+  so prompt lifecycle telemetry now marks when a prompt actually reached the
+  northbound client
+- downstream server requests rejected by gateway saturation or scope policy
+  increment `gateway_v2_server_request_lifecycle_events` with
+  `event=downstream_server_request_rejected_pending_limit` or
+  `event=downstream_server_request_rejected_hidden_thread`, so rejected prompts
+  remain visible in the same lifecycle counter as forwarded, answered, and
+  resolved prompts
+- delivery of those gateway-owned downstream rejections now also increments
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=downstream_server_request_rejection_delivered` or
+  `event=downstream_server_request_rejection_delivery_failed`, with structured
+  warning-log route context on failure, so operators can tell whether the
+  owning worker actually observed the gateway rejection
+- normal downstream `serverRequest/resolved` notifications increment
+  `gateway_v2_server_request_lifecycle_events` with
+  `event=downstream_server_request_resolved`, so completed prompt lifecycles
+  are visible through the same lifecycle counter as duplicate replay and
+  cleanup paths
+- the real northbound WebSocket server-request error regression now also carries
+  the rejected prompt through the downstream `serverRequest/resolved`
+  notification, so error replies are covered through the same forwarded,
+  answered, delivered, and resolved lifecycle telemetry as successful replies
 - client replies for unknown server-request ids increment
   `gateway_v2_server_request_lifecycle_events` with
   `event=unexpected_client_server_request_response` and `method=response` or
