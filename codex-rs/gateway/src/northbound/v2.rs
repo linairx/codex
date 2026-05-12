@@ -36,8 +36,11 @@ use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::FsUnwatchParams;
 use codex_app_server_protocol::FsWatchParams;
 use codex_app_server_protocol::FsWatchResponse;
+use codex_app_server_protocol::FuzzyFileSearchResponse;
+use codex_app_server_protocol::FuzzyFileSearchResult;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
+use codex_app_server_protocol::GetAuthStatusResponse;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -459,6 +462,24 @@ impl GatewayV2DownstreamRouter {
         let index = self.next_worker % self.workers.len();
         self.next_worker = self.next_worker.wrapping_add(1);
         Ok(&self.workers[index])
+    }
+
+    fn next_thread_start_worker_for_project(
+        &mut self,
+        scope_registry: &GatewayScopeRegistry,
+        context: &GatewayRequestContext,
+    ) -> io::Result<&DownstreamWorkerHandle> {
+        if let Some(worker_id) = scope_registry.select_project_worker_id(
+            context,
+            self.workers.iter().filter_map(|worker| worker.worker_id),
+        ) && let Some(index) = self
+            .workers
+            .iter()
+            .position(|worker| worker.worker_id == Some(worker_id))
+        {
+            return Ok(&self.workers[index]);
+        }
+        self.next_thread_start_worker()
     }
 
     fn worker_for_thread(
@@ -1868,26 +1889,30 @@ async fn handle_client_message(
                         .reconnect_missing_workers(connection.observability)
                         .await;
                 }
-                let worker =
-                    match worker_for_request(downstream, connection.scope_registry, &request) {
-                        Ok(worker) => worker.clone(),
-                        Err(err) => {
-                            log_fail_closed_multi_worker_request(
-                                downstream,
-                                connection,
-                                method.as_str(),
-                                &err,
-                            );
-                            observe_v2_request(
-                                connection.observability,
-                                connection.request_context,
-                                &method,
-                                "internal_error",
-                                started_at.elapsed(),
-                            );
-                            return Err(err);
-                        }
-                    };
+                let worker = match worker_for_request(
+                    downstream,
+                    connection.scope_registry,
+                    connection.request_context,
+                    &request,
+                ) {
+                    Ok(worker) => worker.clone(),
+                    Err(err) => {
+                        log_fail_closed_multi_worker_request(
+                            downstream,
+                            connection,
+                            method.as_str(),
+                            &err,
+                        );
+                        observe_v2_request(
+                            connection.observability,
+                            connection.request_context,
+                            &method,
+                            "internal_error",
+                            started_at.elapsed(),
+                        );
+                        return Err(err);
+                    }
+                };
                 let client_request = jsonrpc_request_to_client_request(request)?;
                 let request_context = connection.request_context.clone();
                 let pending_client_response_tx = pending_client_responses.tx.clone();
@@ -3888,7 +3913,9 @@ async fn handle_client_request(
             }
 
             match request.method.as_str() {
-                "thread/resume" | "thread/fork" if request_thread_path(&request).is_some() => {
+                "thread/resume" | "thread/fork" | "getConversationSummary"
+                    if request_thread_path(&request).is_some() =>
+                {
                     return first_successful_scoped_path_thread_request(
                         downstream,
                         connection.scope_registry,
@@ -3936,6 +3963,11 @@ async fn handle_client_request(
                         .await
                         .map(Ok);
                 }
+                "getAuthStatus" => {
+                    return aggregate_get_auth_status_response(downstream, &request)
+                        .await
+                        .map(Ok);
+                }
                 "account/rateLimits/read" => {
                     return aggregate_account_rate_limits_response(downstream, &request)
                         .await
@@ -3979,7 +4011,15 @@ async fn handle_client_request(
                         .await
                         .map(Ok);
                 }
+                "fuzzyFileSearch" => {
+                    return aggregate_fuzzy_file_search_response(downstream, &request)
+                        .await
+                        .map(Ok);
+                }
                 "plugin/read" | "plugin/install" | "plugin/uninstall" => {
+                    return first_successful_connection_request(downstream, request).await;
+                }
+                "gitDiffToRemote" => {
                     return first_successful_connection_request(downstream, request).await;
                 }
                 "mcpServer/oauth/login" => {
@@ -4019,7 +4059,12 @@ async fn handle_client_request(
             }
         }
 
-        let worker = worker_for_request(downstream, connection.scope_registry, &request)?;
+        let worker = worker_for_request(
+            downstream,
+            connection.scope_registry,
+            connection.request_context,
+            &request,
+        )?;
         let method = request.method.clone();
         let client_request = jsonrpc_request_to_client_request(request)?;
         let response = worker.request_handle.request(client_request).await?;
@@ -4417,6 +4462,7 @@ async fn first_successful_scoped_path_thread_request(
 fn worker_for_request<'a>(
     downstream: &'a mut GatewayV2DownstreamRouter,
     scope_registry: &GatewayScopeRegistry,
+    context: &GatewayRequestContext,
     request: &JSONRPCRequest,
 ) -> io::Result<&'a DownstreamWorkerHandle> {
     if !downstream.multi_worker_topology() {
@@ -4424,7 +4470,7 @@ fn worker_for_request<'a>(
     }
 
     if request.method == "thread/start" {
-        return downstream.next_thread_start_worker();
+        return downstream.next_thread_start_worker_for_project(scope_registry, context);
     }
 
     if requires_primary_worker_route(request) {
@@ -4753,7 +4799,6 @@ fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
             | "fs/readDirectory"
             | "fs/remove"
             | "fs/copy"
-            | "fuzzyFileSearch"
             | "fuzzyFileSearch/sessionStart"
             | "fuzzyFileSearch/sessionUpdate"
             | "fuzzyFileSearch/sessionStop"
@@ -5133,6 +5178,37 @@ async fn aggregate_account_read_response(
     serde_json::to_value(response).map_err(io::Error::other)
 }
 
+async fn aggregate_get_auth_status_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
+    let mut primary_response = None;
+    let mut requires_openai_auth = None;
+
+    for (index, worker) in downstream.workers.iter().enumerate() {
+        let response: GetAuthStatusResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        if let Some(requires_openai_auth_value) = response.requires_openai_auth {
+            requires_openai_auth =
+                Some(requires_openai_auth.unwrap_or(false) || requires_openai_auth_value);
+        }
+        if index == 0 {
+            primary_response = Some(response);
+        }
+    }
+
+    let mut response = primary_response.ok_or_else(|| {
+        io::Error::other("gateway v2 connection has no downstream app-server sessions")
+    })?;
+    response.requires_openai_auth = requires_openai_auth;
+    serde_json::to_value(response).map_err(io::Error::other)
+}
+
 async fn aggregate_account_rate_limits_response(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
@@ -5329,6 +5405,46 @@ async fn aggregate_realtime_list_voices_response(
         default_v2: response.voices.default_v2,
     };
     serde_json::to_value(response).map_err(io::Error::other)
+}
+
+async fn aggregate_fuzzy_file_search_response(
+    downstream: &GatewayV2DownstreamRouter,
+    request: &JSONRPCRequest,
+) -> io::Result<Value> {
+    downstream.ensure_all_configured_workers_present_for(&request.method)?;
+
+    let mut files = Vec::<FuzzyFileSearchResult>::new();
+
+    for worker in &downstream.workers {
+        let response: FuzzyFileSearchResponse = worker
+            .request_handle
+            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
+            .await
+            .map_err(io::Error::other)?;
+        for incoming in response.files {
+            if let Some(existing) = files.iter_mut().find(|file| {
+                file.root == incoming.root
+                    && file.path == incoming.path
+                    && file.match_type == incoming.match_type
+            }) {
+                if incoming.score > existing.score {
+                    *existing = incoming;
+                }
+            } else {
+                files.push(incoming);
+            }
+        }
+    }
+
+    files.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.root.cmp(&b.root))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.file_name.cmp(&b.file_name))
+    });
+
+    serde_json::to_value(FuzzyFileSearchResponse { files }).map_err(io::Error::other)
 }
 
 fn merge_realtime_voices(target: &mut Vec<RealtimeVoice>, incoming: &[RealtimeVoice]) {
@@ -5666,16 +5782,7 @@ fn enforce_request_scope(
     request: &JSONRPCRequest,
 ) -> Result<(), GatewayError> {
     match request.method.as_str() {
-        "thread/resume" => {
-            if let Some(thread_path) = request_thread_path(request)
-                && !scope_registry.thread_path_visible_to(context, thread_path)
-            {
-                return Err(GatewayError::NotFound(format!(
-                    "thread not found: {thread_path}"
-                )));
-            }
-        }
-        "thread/fork" => {
+        "thread/resume" | "thread/fork" | "getConversationSummary" => {
             if let Some(thread_path) = request_thread_path(request)
                 && !scope_registry.thread_path_visible_to(context, thread_path)
             {
@@ -5714,12 +5821,37 @@ fn apply_response_scope_policy(
                     worker_id,
                 );
             }
+            if method == "thread/start"
+                && let Some(worker_id) = worker_id
+            {
+                scope_registry.register_project_worker(context.clone(), worker_id);
+            }
             if let Some(thread_path) = response_thread_path(&result) {
                 scope_registry.register_thread_path_with_worker(
                     thread_path,
                     context.clone(),
                     worker_id,
                 );
+            }
+        }
+        "getConversationSummary" => {
+            if let Some(summary) = result.get("summary") {
+                let thread_id = summary.get("conversationId").and_then(Value::as_str);
+                let thread_path = summary.get("path").and_then(Value::as_str);
+                if let Some(thread_id) = thread_id {
+                    scope_registry.register_thread_with_worker(
+                        thread_id.to_string(),
+                        context.clone(),
+                        worker_id,
+                    );
+                }
+                if let Some(thread_path) = thread_path {
+                    scope_registry.register_thread_path_with_worker(
+                        thread_path,
+                        context.clone(),
+                        worker_id,
+                    );
+                }
             }
         }
         "review/start" => {
@@ -5925,15 +6057,19 @@ fn request_thread_id(request: &JSONRPCRequest) -> Option<&str> {
 }
 
 fn request_thread_path(request: &JSONRPCRequest) -> Option<&str> {
-    if !matches!(request.method.as_str(), "thread/resume" | "thread/fork") {
-        return None;
+    match request.method.as_str() {
+        "thread/resume" | "thread/fork" => request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("path"))
+            .and_then(Value::as_str),
+        "getConversationSummary" => request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("rolloutPath"))
+            .and_then(Value::as_str),
+        _ => None,
     }
-
-    request
-        .params
-        .as_ref()
-        .and_then(|params| params.get("path"))
-        .and_then(Value::as_str)
 }
 
 fn response_thread_path(result: &Value) -> Option<&str> {
@@ -6416,6 +6552,7 @@ mod tests {
     use codex_app_server_protocol::FsWatchParams;
     use codex_app_server_protocol::FsWatchResponse;
     use codex_app_server_protocol::FuzzyFileSearchMatchType;
+    use codex_app_server_protocol::FuzzyFileSearchResponse;
     use codex_app_server_protocol::FuzzyFileSearchResult;
     use codex_app_server_protocol::FuzzyFileSearchSessionCompletedNotification;
     use codex_app_server_protocol::FuzzyFileSearchSessionUpdatedNotification;
@@ -19364,6 +19501,20 @@ mod tests {
                 }),
             ),
             (
+                "getAuthStatus",
+                "get-auth-status",
+                None,
+                Some(serde_json::json!({
+                    "includeToken": true,
+                    "refreshToken": false,
+                })),
+                serde_json::json!({
+                    "authMethod": "chatgpt",
+                    "authToken": "legacy-token",
+                    "requiresOpenaiAuth": true,
+                }),
+            ),
+            (
                 "windowsSandbox/setupStart",
                 "windows-sandbox-setup-start",
                 None,
@@ -21265,6 +21416,248 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_fuzzy_file_search_response_merges_multi_worker_results() {
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "fuzzyFileSearch",
+            serde_json::json!({
+                "query": "gate",
+                "roots": ["/tmp/project"],
+                "cancellationToken": "search-1",
+            }),
+            serde_json::json!({
+                "files": [
+                    {
+                        "root": "/tmp/project-a",
+                        "path": "docs/gateway.md",
+                        "match_type": "file",
+                        "file_name": "gateway.md",
+                        "score": 40,
+                        "indices": [5, 6, 7, 8],
+                    },
+                    {
+                        "root": "/tmp/shared",
+                        "path": "README.md",
+                        "match_type": "file",
+                        "file_name": "README.md",
+                        "score": 10,
+                        "indices": null,
+                    },
+                ],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_passthrough_request_with_result(
+            "fuzzyFileSearch",
+            serde_json::json!({
+                "query": "gate",
+                "roots": ["/tmp/project"],
+                "cancellationToken": "search-1",
+            }),
+            serde_json::json!({
+                "files": [
+                    {
+                        "root": "/tmp/project-b",
+                        "path": "src/gateway.rs",
+                        "match_type": "file",
+                        "file_name": "gateway.rs",
+                        "score": 60,
+                        "indices": [4, 5, 6, 7],
+                    },
+                    {
+                        "root": "/tmp/shared",
+                        "path": "README.md",
+                        "match_type": "file",
+                        "file_name": "README.md",
+                        "score": 25,
+                        "indices": [0],
+                    },
+                ],
+            }),
+        )
+        .await;
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let router = GatewayV2DownstreamRouter::connect(
+            &session_factory,
+            &initialize_params,
+            &GatewayRequestContext::default(),
+        )
+        .await
+        .expect("downstream router should connect");
+
+        let response = super::aggregate_fuzzy_file_search_response(
+            &router,
+            &JSONRPCRequest {
+                id: RequestId::String("fuzzy-file-search".to_string()),
+                method: "fuzzyFileSearch".to_string(),
+                params: Some(serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-1",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("fuzzy file search aggregation should succeed");
+        let response: FuzzyFileSearchResponse =
+            serde_json::from_value(response).expect("fuzzy file search should decode");
+
+        assert_eq!(
+            response,
+            FuzzyFileSearchResponse {
+                files: vec![
+                    FuzzyFileSearchResult {
+                        root: "/tmp/project-b".to_string(),
+                        path: "src/gateway.rs".to_string(),
+                        match_type: FuzzyFileSearchMatchType::File,
+                        file_name: "gateway.rs".to_string(),
+                        score: 60,
+                        indices: Some(vec![4, 5, 6, 7]),
+                    },
+                    FuzzyFileSearchResult {
+                        root: "/tmp/project-a".to_string(),
+                        path: "docs/gateway.md".to_string(),
+                        match_type: FuzzyFileSearchMatchType::File,
+                        file_name: "gateway.md".to_string(),
+                        score: 40,
+                        indices: Some(vec![5, 6, 7, 8]),
+                    },
+                    FuzzyFileSearchResult {
+                        root: "/tmp/shared".to_string(),
+                        path: "README.md".to_string(),
+                        match_type: FuzzyFileSearchMatchType::File,
+                        file_name: "README.md".to_string(),
+                        score: 25,
+                        indices: Some(vec![0]),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_get_auth_status_response_merges_multi_worker_auth_requirement() {
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "getAuthStatus",
+            serde_json::json!({
+                "includeToken": true,
+                "refreshToken": false,
+            }),
+            serde_json::json!({
+                "authMethod": "chatgpt",
+                "authToken": "primary-token",
+                "requiresOpenaiAuth": false,
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_passthrough_request_with_result(
+            "getAuthStatus",
+            serde_json::json!({
+                "includeToken": true,
+                "refreshToken": false,
+            }),
+            serde_json::json!({
+                "authMethod": null,
+                "authToken": null,
+                "requiresOpenaiAuth": true,
+            }),
+        )
+        .await;
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let router = GatewayV2DownstreamRouter::connect(
+            &session_factory,
+            &initialize_params,
+            &GatewayRequestContext::default(),
+        )
+        .await
+        .expect("downstream router should connect");
+
+        let response = super::aggregate_get_auth_status_response(
+            &router,
+            &JSONRPCRequest {
+                id: RequestId::String("get-auth-status".to_string()),
+                method: "getAuthStatus".to_string(),
+                params: Some(serde_json::json!({
+                    "includeToken": true,
+                    "refreshToken": false,
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("getAuthStatus aggregation should succeed");
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "authMethod": "chatgpt",
+                "authToken": "primary-token",
+                "requiresOpenaiAuth": true,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn aggregate_account_rate_limits_response_merges_multi_worker_data() {
         let worker_a =
             start_mock_remote_server_for_passthrough_request_with_optional_params_and_result(
@@ -22527,6 +22920,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_client_request_routes_conversation_summary_by_visible_rollout_path() {
+        let summary_params = serde_json::json!({
+            "rolloutPath": "/tmp/worker-b/rollout.jsonl",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+            "getConversationSummary",
+            summary_params.clone(),
+            JSONRPCErrorError {
+                code: super::INVALID_PARAMS_CODE,
+                message: "thread not found: /tmp/worker-b/rollout.jsonl".to_string(),
+                data: None,
+            },
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_passthrough_request_with_result(
+            "getConversationSummary",
+            summary_params,
+            serde_json::json!({
+                "summary": {
+                    "conversationId": "thread-worker-b",
+                    "path": "/tmp/worker-b/rollout.jsonl",
+                    "preview": "Worker B summary",
+                    "timestamp": null,
+                    "updatedAt": null,
+                    "modelProvider": "openai",
+                    "cwd": "/tmp/worker-b",
+                    "cliVersion": "0.0.0-test",
+                    "source": "codex_cli",
+                    "gitInfo": null,
+                },
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        scope_registry.register_thread_path_with_worker(
+            "/tmp/worker-b/rollout.jsonl",
+            context.clone(),
+            None,
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("conversation-summary-path".to_string()),
+                method: "getConversationSummary".to_string(),
+                params: Some(serde_json::json!({
+                    "rolloutPath": "/tmp/worker-b/rollout.jsonl",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("getConversationSummary should reach downstream workers")
+        .expect("getConversationSummary should succeed through visible path discovery");
+
+        assert_eq!(
+            result["summary"]["conversationId"],
+            serde_json::json!("thread-worker-b")
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_eq!(
+            scope_registry.thread_path_worker_id("/tmp/worker-b/rollout.jsonl"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_routes_git_diff_to_first_successful_worker() {
+        let git_diff_params = serde_json::json!({
+            "cwd": "/tmp/worker-b/repo",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+            "gitDiffToRemote",
+            git_diff_params.clone(),
+            JSONRPCErrorError {
+                code: super::INVALID_PARAMS_CODE,
+                message: "failed to compute git diff to remote for cwd: /tmp/worker-b/repo"
+                    .to_string(),
+                data: None,
+            },
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_passthrough_request_with_result(
+            "gitDiffToRemote",
+            git_diff_params,
+            serde_json::json!({
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "diff": "diff --git a/README.md b/README.md\n",
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("git-diff-to-remote".to_string()),
+                method: "gitDiffToRemote".to_string(),
+                params: Some(serde_json::json!({
+                    "cwd": "/tmp/worker-b/repo",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("gitDiffToRemote should reach downstream workers")
+        .expect("gitDiffToRemote should succeed through worker discovery");
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "diff": "diff --git a/README.md b/README.md\n",
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn handle_client_request_reconnects_missing_worker_before_sticky_thread_mutations() {
         let cases = vec![
             (
@@ -23266,6 +23876,138 @@ mod tests {
         assert_eq!(response.data[1].cwd, PathBuf::from("/tmp/worker-b"));
         assert_eq!(response.data[1].skills.len(), 1);
         assert_eq!(response.data[1].skills[0].name, "skill-b");
+    }
+
+    #[tokio::test]
+    async fn handle_client_request_reconnects_missing_worker_before_aggregated_fuzzy_file_search() {
+        let worker_a = start_mock_remote_server_for_reconnectable_request(
+            "fuzzyFileSearch",
+            serde_json::json!({
+                "files": [{
+                    "root": "/tmp/worker-a",
+                    "path": "docs/gateway.md",
+                    "match_type": "file",
+                    "file_name": "gateway.md",
+                    "score": 40,
+                    "indices": [5, 6, 7, 8],
+                }],
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_reconnectable_request(
+            "fuzzyFileSearch",
+            serde_json::json!({
+                "files": [{
+                    "root": "/tmp/worker-b",
+                    "path": "src/gateway.rs",
+                    "match_type": "file",
+                    "file_name": "gateway.rs",
+                    "score": 60,
+                    "indices": [4, 5, 6, 7],
+                }],
+            }),
+        )
+        .await;
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext::default();
+        let session_factory = GatewayV2SessionFactory::remote_multi(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+        );
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        assert_eq!(router.worker_count(), 2);
+        assert!(
+            router.remove_worker(Some(1)),
+            "test should drop the second worker before reconnect"
+        );
+        assert_eq!(router.worker_count(), 1);
+
+        let admission = GatewayAdmissionController::default();
+        let observability = GatewayObservability::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let result = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("fuzzy-file-search".to_string()),
+                method: "fuzzyFileSearch".to_string(),
+                params: Some(serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-reconnected",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect("fuzzyFileSearch should reach downstream workers")
+        .expect("fuzzyFileSearch should succeed after reconnecting the missing worker");
+
+        let response: FuzzyFileSearchResponse =
+            serde_json::from_value(result).expect("fuzzyFileSearch response should decode");
+
+        assert_eq!(router.worker_count(), 2);
+        assert_eq!(
+            response.files,
+            vec![
+                FuzzyFileSearchResult {
+                    root: "/tmp/worker-b".to_string(),
+                    path: "src/gateway.rs".to_string(),
+                    match_type: FuzzyFileSearchMatchType::File,
+                    file_name: "gateway.rs".to_string(),
+                    score: 60,
+                    indices: Some(vec![4, 5, 6, 7]),
+                },
+                FuzzyFileSearchResult {
+                    root: "/tmp/worker-a".to_string(),
+                    path: "docs/gateway.md".to_string(),
+                    match_type: FuzzyFileSearchMatchType::File,
+                    file_name: "gateway.md".to_string(),
+                    score: 40,
+                    indices: Some(vec![5, 6, 7, 8]),
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -25327,6 +26069,16 @@ mod tests {
                 }),
                 serde_json::json!({}),
             ),
+            (
+                "gitDiffToRemote",
+                serde_json::json!({
+                    "cwd": "/tmp/worker-b/repo",
+                }),
+                serde_json::json!({
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "diff": "diff --git a/README.md b/README.md\n",
+                }),
+            ),
         ];
 
         for (method, params, expected_result) in cases {
@@ -25951,24 +26703,6 @@ mod tests {
                 }),
             ),
             (
-                "fuzzyFileSearch",
-                Some(serde_json::json!({
-                    "query": "gate",
-                    "roots": ["/tmp/project"],
-                    "cancellationToken": "search-reconnected",
-                })),
-                serde_json::json!({
-                    "files": [{
-                        "root": "/tmp/project",
-                        "path": "docs/gateway.md",
-                        "match_type": "file",
-                        "file_name": "gateway.md",
-                        "score": 42,
-                        "indices": [5, 6, 7, 8],
-                    }],
-                }),
-            ),
-            (
                 "fuzzyFileSearch/sessionStart",
                 Some(serde_json::json!({
                     "sessionId": "search-session-reconnected",
@@ -26515,10 +27249,17 @@ mod tests {
             .await
             .expect_err("primary-worker method should not fall back during reconnect backoff");
 
-            assert_eq!(
-                err.to_string(),
-                format!("primary worker route is unavailable for {method}")
-            );
+            if method == "fuzzyFileSearch" {
+                assert_eq!(
+                    err.to_string(),
+                    "required worker routes are unavailable for fuzzyFileSearch: [0]"
+                );
+            } else {
+                assert_eq!(
+                    err.to_string(),
+                    format!("primary worker route is unavailable for {method}")
+                );
+            }
             assert_eq!(router.worker_count(), 1);
             assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
             assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
@@ -26655,10 +27396,17 @@ mod tests {
             .await
             .expect_err("fuzzy file search should not fall back during reconnect backoff");
 
-            assert_eq!(
-                err.to_string(),
-                format!("primary worker route is unavailable for {method}")
-            );
+            if method == "fuzzyFileSearch" {
+                assert_eq!(
+                    err.to_string(),
+                    "required worker routes are unavailable for fuzzyFileSearch: [0]"
+                );
+            } else {
+                assert_eq!(
+                    err.to_string(),
+                    format!("primary worker route is unavailable for {method}")
+                );
+            }
             assert_eq!(router.worker_count(), 1);
             assert_eq!(*worker_a_requests.lock().await, Vec::<String>::new());
             assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
@@ -26865,6 +27613,18 @@ mod tests {
                 })),
                 serde_json::json!({
                     "account": null,
+                    "requiresOpenaiAuth": false,
+                }),
+            ),
+            (
+                "getAuthStatus",
+                Some(serde_json::json!({
+                    "includeToken": false,
+                    "refreshToken": false,
+                })),
+                serde_json::json!({
+                    "authMethod": null,
+                    "authToken": null,
                     "requiresOpenaiAuth": false,
                 }),
             ),
@@ -27690,6 +28450,16 @@ mod tests {
                     "pluginId": "demo-plugin@local",
                 }),
                 serde_json::json!({}),
+            ),
+            (
+                "gitDiffToRemote",
+                serde_json::json!({
+                    "cwd": "/tmp/worker-b/repo",
+                }),
+                serde_json::json!({
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "diff": "diff --git a/README.md b/README.md\n",
+                }),
             ),
         ];
 
@@ -30107,6 +30877,16 @@ mod tests {
                 }),
                 serde_json::json!({}),
             ),
+            (
+                "gitDiffToRemote",
+                serde_json::json!({
+                    "cwd": "/tmp/worker-b/repo",
+                }),
+                serde_json::json!({
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "diff": "diff --git a/README.md b/README.md\n",
+                }),
+            ),
         ];
 
         for (method, params, expected_result) in cases {
@@ -31755,6 +32535,29 @@ mod tests {
                 }),
             ),
             (
+                "getAuthStatus",
+                "get-auth-status",
+                serde_json::json!({
+                    "includeToken": true,
+                    "refreshToken": false,
+                }),
+                serde_json::json!({
+                    "authMethod": "chatgpt",
+                    "authToken": "primary-token",
+                    "requiresOpenaiAuth": false,
+                }),
+                serde_json::json!({
+                    "authMethod": null,
+                    "authToken": null,
+                    "requiresOpenaiAuth": true,
+                }),
+                serde_json::json!({
+                    "authMethod": "chatgpt",
+                    "authToken": "primary-token",
+                    "requiresOpenaiAuth": true,
+                }),
+            ),
+            (
                 "account/rateLimits/read",
                 "account-rate-limits-read",
                 serde_json::json!({}),
@@ -32285,6 +33088,55 @@ mod tests {
                         "defaultV1": "juniper",
                         "defaultV2": "alloy",
                     },
+                }),
+            ),
+            (
+                "fuzzyFileSearch",
+                "fuzzy-file-search",
+                serde_json::json!({
+                    "query": "gate",
+                    "roots": ["/tmp/project"],
+                    "cancellationToken": "search-reconnected",
+                }),
+                serde_json::json!({
+                    "files": [{
+                        "root": "/tmp/worker-a",
+                        "path": "docs/gateway.md",
+                        "match_type": "file",
+                        "file_name": "gateway.md",
+                        "score": 40,
+                        "indices": [5, 6, 7, 8],
+                    }],
+                }),
+                serde_json::json!({
+                    "files": [{
+                        "root": "/tmp/worker-b",
+                        "path": "src/gateway.rs",
+                        "match_type": "file",
+                        "file_name": "gateway.rs",
+                        "score": 60,
+                        "indices": [4, 5, 6, 7],
+                    }],
+                }),
+                serde_json::json!({
+                    "files": [
+                        {
+                            "root": "/tmp/worker-b",
+                            "path": "src/gateway.rs",
+                            "match_type": "file",
+                            "file_name": "gateway.rs",
+                            "score": 60,
+                            "indices": [4, 5, 6, 7],
+                        },
+                        {
+                            "root": "/tmp/worker-a",
+                            "path": "docs/gateway.md",
+                            "match_type": "file",
+                            "file_name": "gateway.md",
+                            "score": 40,
+                            "indices": [5, 6, 7, 8],
+                        }
+                    ],
                 }),
             ),
         ];
@@ -33502,25 +34354,6 @@ mod tests {
                 })),
                 serde_json::json!({
                     "threadId": "feedback-thread-reconnected",
-                }),
-            ),
-            (
-                "fuzzyFileSearch",
-                "fuzzy-file-search",
-                Some(serde_json::json!({
-                    "query": "gate",
-                    "roots": ["/tmp/project"],
-                    "cancellationToken": "search-reconnected",
-                })),
-                serde_json::json!({
-                    "files": [{
-                        "root": "/tmp/project",
-                        "path": "docs/gateway.md",
-                        "match_type": "file",
-                        "file_name": "gateway.md",
-                        "score": 42,
-                        "indices": [5, 6, 7, 8],
-                    }],
                 }),
             ),
             (
@@ -35166,6 +35999,7 @@ mod tests {
         let err = match super::worker_for_request(
             &mut router,
             &GatewayScopeRegistry::default(),
+            &GatewayRequestContext::default(),
             &JSONRPCRequest {
                 id: RequestId::String("command-exec".to_string()),
                 method: "command/exec".to_string(),
@@ -35261,6 +36095,7 @@ mod tests {
         let worker = super::worker_for_request(
             &mut router,
             &scope_registry,
+            &context,
             &JSONRPCRequest {
                 id: RequestId::String("thread-read".to_string()),
                 method: "thread/read".to_string(),
@@ -35288,6 +36123,67 @@ mod tests {
         assert_eq!(worker.worker_id, Some(1));
 
         client.shutdown().await.expect("client should shut down");
+    }
+
+    #[tokio::test]
+    async fn thread_start_prefers_registered_project_worker_route() {
+        let (client_a, request_handle_a) = start_test_request_handle().await;
+        let (client_b, request_handle_b) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![
+                DownstreamWorkerHandle {
+                    worker_id: Some(0),
+                    worker_websocket_url: None,
+                    request_handle: request_handle_a,
+                },
+                DownstreamWorkerHandle {
+                    worker_id: Some(1),
+                    worker_websocket_url: None,
+                    request_handle: request_handle_b,
+                },
+            ],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: None,
+        };
+        let scope_registry = GatewayScopeRegistry::default();
+        let project_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_project_worker(project_context.clone(), 1);
+
+        let worker = super::worker_for_request(
+            &mut router,
+            &scope_registry,
+            &project_context,
+            &JSONRPCRequest {
+                id: RequestId::String("thread-start".to_string()),
+                method: "thread/start".to_string(),
+                params: Some(serde_json::json!({
+                    "cwd": "/tmp/project-a",
+                })),
+                trace: None,
+            },
+        )
+        .expect("thread/start should use project-affine worker");
+
+        assert_eq!(worker.worker_id, Some(1));
+        client_a
+            .shutdown()
+            .await
+            .expect("client A should shut down");
+        client_b
+            .shutdown()
+            .await
+            .expect("client B should shut down");
     }
 
     #[tokio::test]
@@ -39637,6 +40533,62 @@ mod tests {
                 Some("/tmp/rollout.jsonl")
             );
         }
+    }
+
+    #[test]
+    fn request_thread_path_uses_rollout_path_for_conversation_summary() {
+        let request = JSONRPCRequest {
+            id: RequestId::String("conversation-summary-path".to_string()),
+            method: "getConversationSummary".to_string(),
+            params: Some(serde_json::json!({
+                "rolloutPath": "/tmp/rollout.jsonl",
+            })),
+            trace: None,
+        };
+
+        assert_eq!(super::request_thread_id(&request), None);
+        assert_eq!(
+            super::request_thread_path(&request),
+            Some("/tmp/rollout.jsonl")
+        );
+    }
+
+    #[test]
+    fn enforce_request_scope_rejects_conversation_summary_hidden_rollout_path() {
+        let scope_registry = GatewayScopeRegistry::default();
+        let visible_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let other_context = GatewayRequestContext {
+            tenant_id: "tenant-b".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+        scope_registry.register_thread_path_with_worker(
+            "/tmp/rollout.jsonl",
+            visible_context,
+            None,
+        );
+
+        let err = super::enforce_request_scope(
+            &scope_registry,
+            &other_context,
+            &JSONRPCRequest {
+                id: RequestId::String("conversation-summary-hidden-path".to_string()),
+                method: "getConversationSummary".to_string(),
+                params: Some(serde_json::json!({
+                    "rolloutPath": "/tmp/rollout.jsonl",
+                })),
+                trace: None,
+            },
+        )
+        .expect_err("hidden rollout summary should be rejected");
+
+        assert!(matches!(
+            err,
+            super::GatewayError::NotFound(message)
+                if message == "thread not found: /tmp/rollout.jsonl"
+        ));
     }
 
     #[test]

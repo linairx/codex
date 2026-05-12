@@ -893,6 +893,24 @@ Recent progress:
 - path-based `thread/resume` / `thread/fork` scope-policy tests now also pin
   that placeholder `threadId` values are ignored for route affinity while the
   rollout `path` remains the scope-check key
+- legacy `getConversationSummary` requests that use `rolloutPath` now also use
+  visible rollout paths as the scope-check key, route through the multi-worker
+  path-discovery fallback, and register returned `conversationId` / `path`
+  ownership for later sticky routing
+- the real multi-worker legacy compatibility harness now also validates
+  `getConversationSummary` by `conversationId` after thread ownership is
+  registered, so both legacy summary request shapes are covered through an
+  unmodified `RemoteAppServerClient` session
+- legacy `gitDiffToRemote` requests now also use multi-worker
+  worker-discovery routing instead of defaulting to the primary worker, so
+  cwd-local git diff requests can be served by the worker that owns the
+  requested checkout while degraded sessions still fail closed before serving
+  an incomplete worker set; dedicated northbound WebSocket regressions now pin
+  both steady-state fallback and lazy recovered-worker fallback
+- deprecated `getAuthStatus` requests now also use multi-worker aggregation,
+  preserving the primary worker's reported auth method/token while OR-ing
+  `requiresOpenaiAuth` across all workers and failing closed during reconnect
+  backoff instead of returning partial legacy auth state
 - the gateway now also has real northbound JSON-RPC regression tests for
   `thread/list` and `thread/loaded/list` scope filtering, verifying that hidden
   threads are stripped from v2 responses at the transport boundary
@@ -1472,8 +1490,9 @@ Recent progress:
   `thread/inject_items`, `thread/compact/start`, `thread/shellCommand`,
   `thread/backgroundTerminals/clean`, and `thread/rollback`; recovered workers
   are re-added into connection-scoped fanout and discovery paths such as
-  `fs/watch` / `fs/unwatch`, `account/read`, `account/rateLimits/read`,
-  `model/list`, threadless `app/list`, threadless `plugin/list`,
+  `fs/watch` / `fs/unwatch`, `account/read`, deprecated `getAuthStatus`,
+  `account/rateLimits/read`, `model/list`, threadless `app/list`,
+  threadless `plugin/list`,
   `skills/list`, `mcpServerStatus/list`, `thread/realtime/listVoices`,
   threadless and cwd-aware `config/read`, `experimentalFeature/list`, and
   `collaborationMode/list`; recovered primary-worker flows stay usable for
@@ -1778,6 +1797,18 @@ Recent progress:
   legacy prompts are rejected instead of bypassing visibility checks; dedicated
   northbound websocket regressions now also pin the legacy approval round-trip
   transport for both methods
+- legacy `getConversationSummary` requests now also use `rolloutPath` for
+  gateway path-scope enforcement and multi-worker worker discovery, so hidden
+  rollout summary reads cannot fall through to the primary worker by default
+- legacy `gitDiffToRemote` requests now also use multi-worker worker discovery
+  with the same required-worker availability guard as plugin fallback routing,
+  so local git diff reads do not silently reflect only the primary worker's
+  checkout; real northbound WebSocket coverage now pins both the steady-state
+  route and the recovered-worker route
+- deprecated `getAuthStatus` requests now also mirror the `account/read`
+  multi-worker aggregation policy, so legacy auth-state reads preserve primary
+  auth details, reflect worker-wide OpenAI auth requirements, and fail closed
+  while any required worker remains in reconnect backoff
 - fail-closed handling for a downstream session that reuses a still-pending
   server-request id now also emits a structured warning log with scope, worker
   id, the colliding request id/method, and the gateway request ids already
@@ -1978,6 +2009,11 @@ Current status:
 - aggregated `thread/list`, `thread/loaded/list`, and threadless `app/list`
   responses plus translated server-request IDs are supported, but broader
   parity and hardening work are still in progress
+- project-aware account routing is only partially started: project-scoped
+  `thread/start` requests can reuse a recorded project-to-worker route for
+  cache affinity, but multi-worker selection does not yet model accounts,
+  intentionally spread different projects across separate accounts, or transfer
+  an active context to a new account when the current account runs out of quota
 
 Example:
 
@@ -1998,6 +2034,13 @@ Operational notes:
   use it for development and targeted validation, not broad drop-in rollout
 - remaining work is broader request/notification parity plus more operational
   hardening for reconnect and load behavior across multiple workers
+- account-backed worker pools are a planned extension, not a property of the
+  current Stage B routing model; today's worker health and reconnect logic
+  should not be treated as quota-aware account failover
+- future account-aware routing must preserve tenant/project scope while adding
+  cache-affinity selection for same-project clients, policy-based distribution
+  across accounts for different projects, and explicit context restoration
+  when quota exhaustion requires a handoff to a replacement account
 - `/healthz` exposes the effective v2 transport hardening config
   (`initializeTimeoutSeconds`, `clientSendTimeoutSeconds`,
   `reconnectRetryBackoffSeconds`, `maxPendingServerRequests`, and
@@ -2137,9 +2180,9 @@ Operational notes:
 - primary-worker-only multi-worker requests now also have method-family
   reconnect-backoff coverage for config requirements, managed login, login
   cancellation, add-credits nudge email, feedback upload, standalone command
-  control, basic filesystem operations, fuzzy file search, and Windows sandbox
-  setup, so the fail-closed metric and no-fallback behavior are pinned across
-  the full primary route set
+  control, basic filesystem operations, streaming fuzzy file-search sessions,
+  and Windows sandbox setup, so the fail-closed metric and no-fallback behavior
+  are pinned across the full primary route set
 - suppressed multi-worker notification dedupe increments
   `gateway_v2_suppressed_notifications` with `method` and `reason` tags,
   matching the structured warning logs emitted when duplicate connection-state
@@ -2504,15 +2547,26 @@ Operational notes:
   `RemoteAppServerClient` sessions, so file helper reads, writes, metadata,
   directory listing, copy, and remove paths are validated in the release-gate
   topologies
-- multi-worker `fuzzyFileSearch` routing now also remains primary-worker
-  affine, with real northbound WebSocket reconnect coverage for a missing
-  primary worker and fail-closed coverage while that worker is still in
-  reconnect backoff
+- multi-worker one-shot `fuzzyFileSearch` now fans out across all configured
+  workers, deduplicates repeated root/path/type matches while keeping the
+  highest-scoring duplicate, returns a score-sorted merged result set, and
+  fails closed while any required worker remains in reconnect backoff; streaming
+  fuzzy-file-search sessions remain primary-worker affine because their
+  session ids own worker-local search state
+- the real multi-worker `RemoteAppServerClient` filesystem harness now also
+  verifies one-shot `fuzzyFileSearch` result fan-in from two workers on the
+  shared northbound session, so the aggregation path is covered beyond raw
+  JSON-RPC fixtures
+- dedicated northbound request-routing coverage now also verifies that a later
+  one-shot `fuzzyFileSearch` reconnects a missing worker before serving the
+  aggregated result set, and dedicated northbound WebSocket coverage now pins
+  that same recovered-worker fan-in path through a real shared client session,
+  so degraded sessions do not silently search only the surviving worker subset
 - the real multi-worker `RemoteAppServerClient` primary-worker harness now
-  also validates `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`,
+  also validates `fuzzyFileSearch/sessionStart`,
   `fuzzyFileSearch/sessionUpdate`, and `fuzzyFileSearch/sessionStop`, so one
-  shared northbound session keeps file-search helper state on the primary
-  worker
+  shared northbound session keeps streaming file-search helper state on the
+  primary worker
 - multi-worker basic filesystem operations now also remain primary-worker
   affine, so primary-local filesystem helper state does not silently drift to
   a secondary worker while the primary worker is unavailable
@@ -2523,10 +2577,13 @@ Operational notes:
   the owning primary worker
 - the real multi-worker same-session primary-worker recovery harness now also
   re-exercises `fs/createDirectory`, `fs/writeFile`, `fs/readFile`,
-  `fs/getMetadata`, `fs/readDirectory`, `fs/copy`, `fs/remove`, and one-shot
-  `fuzzyFileSearch` after the primary worker is re-added, so local filesystem
-  helpers and file-search requests route through the recovered primary worker
-  without requiring a northbound reconnect
+  `fs/getMetadata`, `fs/readDirectory`, `fs/copy`, and `fs/remove` after the
+  primary worker is re-added, so local filesystem helpers route through the
+  recovered primary worker without requiring a northbound reconnect
+- that same recovery harness now also re-exercises one-shot
+  `fuzzyFileSearch` after the recovered worker is re-added, verifying the
+  shared session can aggregate file-search results from both workers again
+  after lazy reconnect
 - that same primary-worker recovery harness now also re-exercises
   `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, and
   `fuzzyFileSearch/sessionStop` after the primary worker is re-added, so
@@ -2618,8 +2675,9 @@ Operational notes:
   invalidation delivery
 - multi-worker connection-scoped aggregated discovery requests now also fail
   closed while a required worker is unavailable during reconnect backoff,
-  covering `account/read`, `account/rateLimits/read`, `model/list`,
-  threadless `app/list`, `mcpServerStatus/list`,
+  covering `account/read`, deprecated `getAuthStatus`,
+  `account/rateLimits/read`, `model/list`, threadless `app/list`,
+  `mcpServerStatus/list`,
   `externalAgentConfig/detect`, `skills/list`, `experimentalFeature/list`,
   `collaborationMode/list`, threadless `plugin/list`, and
   `thread/realtime/listVoices`, so clients cannot accidentally treat the
@@ -2665,6 +2723,21 @@ Current Stage A compatibility caveats:
 - `thread/fork` is supported through the gateway scope policy with `threadId`
   or a rollout `path` that is already visible in the current tenant/project
   scope
+- legacy `getConversationSummary` is supported through the same scope policy:
+  `conversationId` follows thread ownership, while `rolloutPath` follows the
+  visible rollout-path routing used by path-based `thread/resume` and
+  `thread/fork`
+- legacy `gitDiffToRemote` uses worker-discovery routing in multi-worker mode
+  and fails closed while the configured worker set is incomplete, so local
+  checkout diffs do not silently reflect only a surviving worker
+- deprecated `getAuthStatus` mirrors the `account/read` multi-worker
+  compatibility behavior: primary-worker auth details stay authoritative while
+  `requiresOpenaiAuth` reflects all configured workers
+- full account-aware routing is not part of the current compatibility profile:
+  the gateway has initial same-project worker affinity for new thread starts,
+  but account-level cache-affinity selection, cross-project account
+  distribution, quota-aware account selection, and active-context account
+  handoff remain planned gateway work
 - release-quality drop-in v2 compatibility currently means embedded runtime or
   remote runtime with exactly one downstream worker
 - multi-worker remote runtime is now partially supported for v2, but it has

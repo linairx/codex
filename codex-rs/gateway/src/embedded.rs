@@ -891,6 +891,7 @@ mod tests {
     use codex_app_server_protocol::FuzzyFileSearchMatchType;
     use codex_app_server_protocol::FuzzyFileSearchParams;
     use codex_app_server_protocol::FuzzyFileSearchResponse;
+    use codex_app_server_protocol::FuzzyFileSearchResult;
     use codex_app_server_protocol::FuzzyFileSearchSessionStartParams;
     use codex_app_server_protocol::FuzzyFileSearchSessionStartResponse;
     use codex_app_server_protocol::FuzzyFileSearchSessionStopParams;
@@ -900,6 +901,12 @@ mod tests {
     use codex_app_server_protocol::GetAccountParams;
     use codex_app_server_protocol::GetAccountRateLimitsResponse;
     use codex_app_server_protocol::GetAccountResponse;
+    use codex_app_server_protocol::GetAuthStatusParams;
+    use codex_app_server_protocol::GetAuthStatusResponse;
+    use codex_app_server_protocol::GetConversationSummaryParams;
+    use codex_app_server_protocol::GetConversationSummaryResponse;
+    use codex_app_server_protocol::GitDiffToRemoteParams;
+    use codex_app_server_protocol::GitDiffToRemoteResponse;
     use codex_app_server_protocol::ItemCompletedNotification;
     use codex_app_server_protocol::ItemStartedNotification;
     use codex_app_server_protocol::JSONRPCError;
@@ -1036,6 +1043,7 @@ mod tests {
     use codex_config::types::AuthCredentialsStoreMode;
     use codex_core::config::Config;
     use codex_core::config_loader::LoaderOverrides;
+    use codex_protocol::ThreadId;
     use codex_protocol::account::PlanType as AccountPlanType;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
@@ -15114,34 +15122,6 @@ stream_max_retries = 0
             .expect("first thread/start should succeed through multi-worker remote gateway");
         assert_eq!(first_started.thread.id, "thread-worker-a");
 
-        let second_started: AppServerThreadStartResponse = owner_client
-            .request_typed(ClientRequest::ThreadStart {
-                request_id: RequestId::Integer(2),
-                params: ThreadStartParams {
-                    model: None,
-                    model_provider: None,
-                    service_tier: None,
-                    cwd: Some("/tmp/project-b".to_string()),
-                    approval_policy: None,
-                    approvals_reviewer: None,
-                    sandbox: None,
-                    config: None,
-                    service_name: None,
-                    base_instructions: None,
-                    developer_instructions: None,
-                    personality: None,
-                    ephemeral: Some(true),
-                    session_start_source: None,
-                    dynamic_tools: None,
-                    mock_experimental_field: None,
-                    experimental_raw_events: false,
-                    persist_extended_history: false,
-                },
-            })
-            .await
-            .expect("second thread/start should succeed through multi-worker remote gateway");
-        assert_eq!(second_started.thread.id, "thread-worker-b");
-
         let same_scope_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
                 websocket_url: format!("ws://{}/", server.local_addr()),
@@ -15184,7 +15164,7 @@ stream_max_retries = 0
                 .iter()
                 .map(|thread| thread.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["thread-worker-b", "thread-worker-a"]
+            vec!["thread-worker-a"]
         );
 
         let same_scope_loaded: ThreadLoadedListResponse = same_scope_client
@@ -15198,10 +15178,7 @@ stream_max_retries = 0
             .await
             .expect("same-scope thread/loaded/list should succeed through multi-worker gateway");
         assert_eq!(same_scope_loaded.next_cursor, None);
-        assert_eq!(
-            same_scope_loaded.data,
-            vec!["thread-worker-a", "thread-worker-b"]
-        );
+        assert_eq!(same_scope_loaded.data, vec!["thread-worker-a"]);
 
         let same_scope_read: AppServerThreadReadResponse = same_scope_client
             .request_typed(ClientRequest::ThreadRead {
@@ -15233,9 +15210,39 @@ stream_max_retries = 0
         .await
         .expect("other-project client should connect to multi-worker gateway");
 
+        let second_started: AppServerThreadStartResponse = other_project_client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(6),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/project-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            })
+            .await
+            .expect(
+                "other-project thread/start should succeed through multi-worker remote gateway",
+            );
+        assert_eq!(second_started.thread.id, "thread-worker-b");
+
         let other_project_list: AppServerThreadListResponse = other_project_client
             .request_typed(ClientRequest::ThreadList {
-                request_id: RequestId::Integer(6),
+                request_id: RequestId::Integer(7),
                 params: ThreadListParams {
                     cursor: None,
                     limit: Some(10),
@@ -15250,11 +15257,18 @@ stream_max_retries = 0
             })
             .await
             .expect("other-project thread/list should succeed through multi-worker gateway");
-        assert_eq!(other_project_list.data.is_empty(), true);
+        assert_eq!(
+            other_project_list
+                .data
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-worker-b"]
+        );
 
         let other_project_loaded: ThreadLoadedListResponse = other_project_client
             .request_typed(ClientRequest::ThreadLoadedList {
-                request_id: RequestId::Integer(7),
+                request_id: RequestId::Integer(8),
                 params: ThreadLoadedListParams {
                     cursor: None,
                     limit: Some(10),
@@ -15262,11 +15276,11 @@ stream_max_retries = 0
             })
             .await
             .expect("other-project thread/loaded/list should succeed through multi-worker gateway");
-        assert_eq!(other_project_loaded.data.is_empty(), true);
+        assert_eq!(other_project_loaded.data, vec!["thread-worker-b"]);
 
         let other_project_read_error = other_project_client
             .request_typed::<AppServerThreadReadResponse>(ClientRequest::ThreadRead {
-                request_id: RequestId::Integer(8),
+                request_id: RequestId::Integer(9),
                 params: ThreadReadParams {
                     thread_id: first_started.thread.id.clone(),
                     include_turns: false,
@@ -15313,7 +15327,7 @@ stream_max_retries = 0
 
         let other_tenant_list: AppServerThreadListResponse = other_tenant_client
             .request_typed(ClientRequest::ThreadList {
-                request_id: RequestId::Integer(9),
+                request_id: RequestId::Integer(10),
                 params: ThreadListParams {
                     cursor: None,
                     limit: Some(10),
@@ -18355,13 +18369,27 @@ stream_max_retries = 0
         )
         .await
         .expect("fuzzyFileSearch should finish in time")
-        .expect("fuzzyFileSearch should succeed through recovered primary worker");
-        assert_eq!(fuzzy_search.files.len(), 1);
-        assert_eq!(fuzzy_search.files[0].root, "/tmp/worker-a-primary");
-        assert_eq!(fuzzy_search.files[0].path, "docs/gateway.md");
+        .expect("fuzzyFileSearch should succeed through recovered workers");
         assert_eq!(
-            fuzzy_search.files[0].match_type,
-            FuzzyFileSearchMatchType::File
+            fuzzy_search.files,
+            vec![
+                FuzzyFileSearchResult {
+                    root: "/tmp/worker-b-search".to_string(),
+                    path: "src/gateway.rs".to_string(),
+                    match_type: FuzzyFileSearchMatchType::File,
+                    file_name: "gateway.rs".to_string(),
+                    score: 60,
+                    indices: Some(vec![4, 5, 6, 7]),
+                },
+                FuzzyFileSearchResult {
+                    root: "/tmp/worker-a-primary".to_string(),
+                    path: "docs/gateway.md".to_string(),
+                    match_type: FuzzyFileSearchMatchType::File,
+                    file_name: "gateway.md".to_string(),
+                    score: 42,
+                    indices: Some(vec![5, 6, 7, 8]),
+                },
+            ]
         );
 
         let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = timeout(
@@ -18693,10 +18721,27 @@ stream_max_retries = 0
         assert_eq!(account.account, None);
         assert_eq!(account.requires_openai_auth, true);
 
+        let legacy_auth: GetAuthStatusResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::GetAuthStatus {
+                request_id: RequestId::Integer(2),
+                params: GetAuthStatusParams {
+                    include_token: Some(true),
+                    refresh_token: Some(false),
+                },
+            }),
+        )
+        .await
+        .expect("getAuthStatus should finish in time")
+        .expect("getAuthStatus should aggregate through multi-worker gateway");
+        assert_eq!(legacy_auth.auth_method, None);
+        assert_eq!(legacy_auth.auth_token, Some("worker-a-token".to_string()));
+        assert_eq!(legacy_auth.requires_openai_auth, Some(true));
+
         let rate_limits: GetAccountRateLimitsResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::GetAccountRateLimits {
-                request_id: RequestId::Integer(2),
+                request_id: RequestId::Integer(3),
                 params: None,
             }),
         )
@@ -18717,7 +18762,7 @@ stream_max_retries = 0
         let models: ModelListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ModelList {
-                request_id: RequestId::Integer(3),
+                request_id: RequestId::Integer(4),
                 params: ModelListParams {
                     cursor: None,
                     limit: None,
@@ -20585,12 +20630,26 @@ stream_max_retries = 0
         .await
         .expect("fuzzyFileSearch should finish in time")
         .expect("fuzzyFileSearch should route through multi-worker gateway");
-        assert_eq!(fuzzy_search.files.len(), 1);
-        assert_eq!(fuzzy_search.files[0].root, "/tmp/worker-a-primary");
-        assert_eq!(fuzzy_search.files[0].path, "docs/gateway.md");
         assert_eq!(
-            fuzzy_search.files[0].match_type,
-            FuzzyFileSearchMatchType::File
+            fuzzy_search.files,
+            vec![
+                FuzzyFileSearchResult {
+                    root: "/tmp/worker-b-search".to_string(),
+                    path: "src/gateway.rs".to_string(),
+                    match_type: FuzzyFileSearchMatchType::File,
+                    file_name: "gateway.rs".to_string(),
+                    score: 60,
+                    indices: Some(vec![4, 5, 6, 7]),
+                },
+                FuzzyFileSearchResult {
+                    root: "/tmp/worker-a-primary".to_string(),
+                    path: "docs/gateway.md".to_string(),
+                    match_type: FuzzyFileSearchMatchType::File,
+                    file_name: "gateway.md".to_string(),
+                    score: 42,
+                    indices: Some(vec![5, 6, 7, 8]),
+                },
+            ]
         );
 
         let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = timeout(
@@ -20743,7 +20802,10 @@ stream_max_retries = 0
                 "windowsSandbox/setupStart".to_string(),
             ]
         );
-        assert_eq!(*worker_b_requests.lock().await, Vec::<String>::new());
+        assert_eq!(
+            *worker_b_requests.lock().await,
+            vec!["fuzzyFileSearch".to_string()]
+        );
 
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
@@ -21017,7 +21079,7 @@ stream_max_retries = 0
         let first_model_page: ModelListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ModelList {
-                request_id: RequestId::Integer(4),
+                request_id: RequestId::Integer(5),
                 params: ModelListParams {
                     cursor: None,
                     limit: Some(2),
@@ -21044,7 +21106,7 @@ stream_max_retries = 0
         let second_model_page: ModelListResponse = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::ModelList {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(6),
                 params: ModelListParams {
                     cursor: first_model_page.next_cursor,
                     limit: Some(2),
@@ -21064,6 +21126,182 @@ stream_max_retries = 0
                 .collect::<Vec<_>>(),
             vec!["worker-b-model"]
         );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_supports_legacy_client_requests_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_server("worker-a").await;
+        let worker_b = start_mock_remote_multi_connection_legacy_server("worker-b").await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+        let worker_b_rollout_path = worker_b_thread
+            .thread
+            .path
+            .expect("worker B thread should expose rollout path");
+
+        let summary: GetConversationSummaryResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::GetConversationSummary {
+                request_id: RequestId::Integer(3),
+                params: GetConversationSummaryParams::RolloutPath {
+                    rollout_path: worker_b_rollout_path.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("getConversationSummary should finish in time")
+        .expect("getConversationSummary should route through multi-worker gateway");
+        assert_eq!(
+            summary.summary.conversation_id.to_string(),
+            "00000000-0000-0000-0000-0000000000b2"
+        );
+        assert_eq!(summary.summary.path, worker_b_rollout_path);
+        assert_eq!(summary.summary.preview, "Worker B summary");
+
+        let summary_by_thread_id: GetConversationSummaryResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::GetConversationSummary {
+                request_id: RequestId::Integer(4),
+                params: GetConversationSummaryParams::ThreadId {
+                    conversation_id: ThreadId::from_string(&worker_b_thread.thread.id)
+                        .expect("worker B thread id should parse"),
+                },
+            }),
+        )
+        .await
+        .expect("getConversationSummary by thread id should finish in time")
+        .expect("getConversationSummary by thread id should route to the owning worker");
+        assert_eq!(
+            summary_by_thread_id.summary.conversation_id,
+            ThreadId::from_string(&worker_b_thread.thread.id)
+                .expect("worker B thread id should parse")
+        );
+        assert_eq!(summary_by_thread_id.summary.path, worker_b_rollout_path);
+        assert_eq!(summary_by_thread_id.summary.preview, "Worker B summary");
+
+        let diff: GitDiffToRemoteResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::GitDiffToRemote {
+                request_id: RequestId::Integer(5),
+                params: GitDiffToRemoteParams {
+                    cwd: PathBuf::from("/tmp/worker-b/repo"),
+                },
+            }),
+        )
+        .await
+        .expect("gitDiffToRemote should finish in time")
+        .expect("gitDiffToRemote should route through multi-worker gateway");
+        assert_eq!(diff.sha.0, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(diff.diff, "diff --git a/README.md b/README.md\n");
 
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
@@ -35863,6 +36101,11 @@ stream_max_retries = 0
                                 "account": null,
                                 "requiresOpenaiAuth": requires_openai_auth,
                             }),
+                            "getAuthStatus" => serde_json::json!({
+                                "authMethod": null,
+                                "authToken": "worker-a-token",
+                                "requiresOpenaiAuth": requires_openai_auth,
+                            }),
                             "account/rateLimits/read" => {
                                 let snapshots = rate_limits
                                     .as_ref()
@@ -35926,6 +36169,150 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
+    async fn start_mock_remote_multi_connection_legacy_server(
+        worker_label: &'static str,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
+                    expect_remote_initialize(&mut websocket).await;
+
+                    loop {
+                        let request = read_websocket_request(&mut websocket).await;
+                        match request.method.as_str() {
+                            "thread/start" => {
+                                let (thread_id, preview, rollout_path) =
+                                    if worker_label == "worker-b" {
+                                        (
+                                            "00000000-0000-0000-0000-0000000000b2",
+                                            "/tmp/worker-b",
+                                            "/tmp/worker-b/rollout.jsonl",
+                                        )
+                                    } else {
+                                        (
+                                            "00000000-0000-0000-0000-0000000000a1",
+                                            "/tmp/worker-a",
+                                            "/tmp/worker-a/rollout.jsonl",
+                                        )
+                                    };
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "thread": mock_thread_with_path(
+                                                thread_id,
+                                                preview,
+                                                Some(rollout_path),
+                                            ),
+                                            "model": "gpt-5",
+                                            "modelProvider": "openai",
+                                            "serviceTier": null,
+                                            "cwd": preview,
+                                            "instructionSources": [],
+                                            "approvalPolicy": "never",
+                                            "approvalsReviewer": "user",
+                                            "sandbox": {
+                                                "type": "dangerFullAccess"
+                                            },
+                                            "reasoningEffort": null,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "thread/list" => {
+                                let data = if worker_label == "worker-b" {
+                                    vec![mock_thread_with_path(
+                                        "00000000-0000-0000-0000-0000000000b2",
+                                        "/tmp/worker-b",
+                                        Some("/tmp/worker-b/rollout.jsonl"),
+                                    )]
+                                } else {
+                                    Vec::new()
+                                };
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "data": data,
+                                            "nextCursor": null,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "getConversationSummary" if worker_label == "worker-b" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "summary": {
+                                                "conversationId": "00000000-0000-0000-0000-0000000000b2",
+                                                "path": "/tmp/worker-b/rollout.jsonl",
+                                                "preview": "Worker B summary",
+                                                "timestamp": null,
+                                                "updatedAt": null,
+                                                "modelProvider": "openai",
+                                                "cwd": "/tmp/worker-b",
+                                                "cliVersion": "0.0.0-test",
+                                                "source": "codex_cli",
+                                                "gitInfo": null,
+                                            },
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "gitDiffToRemote" if worker_label == "worker-b" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "sha": "0123456789abcdef0123456789abcdef01234567",
+                                            "diff": "diff --git a/README.md b/README.md\n",
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
+                            "getConversationSummary" | "gitDiffToRemote" => {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Error(JSONRPCError {
+                                        id: request.id,
+                                        error: JSONRPCErrorError {
+                                            code: -32000,
+                                            message: format!(
+                                                "{worker_label} cannot serve {}",
+                                                request.method
+                                            ),
+                                            data: None,
+                                        },
+                                    }),
+                                )
+                                .await;
+                            }
+                            method => panic!("unexpected legacy request method: {method}"),
+                        }
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     fn paginated_model_list_result(
         request: &codex_app_server_protocol::JSONRPCRequest,
         models: &[(&'static str, &'static str, bool)],
@@ -35981,6 +36368,36 @@ stream_max_retries = 0
         (start, end, next_cursor)
     }
 
+    fn multi_worker_fuzzy_file_search_response(worker_label: &str) -> serde_json::Value {
+        let (root, path, file_name, score, indices) = match worker_label {
+            "worker-a" => (
+                "/tmp/worker-a-primary",
+                "docs/gateway.md",
+                "gateway.md",
+                42,
+                vec![5, 6, 7, 8],
+            ),
+            "worker-b" => (
+                "/tmp/worker-b-search",
+                "src/gateway.rs",
+                "gateway.rs",
+                60,
+                vec![4, 5, 6, 7],
+            ),
+            other => panic!("unexpected worker label: {other}"),
+        };
+        serde_json::json!({
+            "files": [{
+                "root": root,
+                "path": path,
+                "match_type": "file",
+                "file_name": file_name,
+                "score": score,
+                "indices": indices,
+            }],
+        })
+    }
+
     async fn start_mock_remote_multi_connection_bootstrap_setup_server(
         config: MultiConnectionBootstrapSetupConfig,
     ) -> String {
@@ -36023,6 +36440,18 @@ stream_max_retries = 0
                                 "account": account,
                                 "requiresOpenaiAuth": requires_openai_auth,
                             }),
+                            "getAuthStatus" => {
+                                let auth_token = if worker_label == "worker-a" {
+                                    serde_json::json!("worker-a-token")
+                                } else {
+                                    serde_json::Value::Null
+                                };
+                                serde_json::json!({
+                                    "authMethod": null,
+                                    "authToken": auth_token,
+                                    "requiresOpenaiAuth": requires_openai_auth,
+                                })
+                            }
                             "account/rateLimits/read" => {
                                 let primary = rate_limits
                                     .first()
@@ -36435,6 +36864,9 @@ stream_max_retries = 0
                             "account/sendAddCreditsNudgeEmail" => serde_json::json!({
                                 "status": "sent",
                             }),
+                            "fuzzyFileSearch" => {
+                                multi_worker_fuzzy_file_search_response(worker_label)
+                            }
                             "command/exec" => {
                                 let process_id = request
                                     .params
@@ -36567,6 +36999,18 @@ stream_max_retries = 0
                                     "account": account,
                                     "requiresOpenaiAuth": requires_openai_auth,
                                 }),
+                                "getAuthStatus" => {
+                                    let auth_token = if worker_label == "worker-a" {
+                                        serde_json::json!("worker-a-token")
+                                    } else {
+                                        serde_json::Value::Null
+                                    };
+                                    serde_json::json!({
+                                        "authMethod": null,
+                                        "authToken": auth_token,
+                                        "requiresOpenaiAuth": requires_openai_auth,
+                                    })
+                                }
                                 "account/rateLimits/read" => {
                                     let primary = rate_limits
                                         .first()
@@ -37034,16 +37478,9 @@ stream_max_retries = 0
                                 }),
                                 "fs/copy" => serde_json::json!({}),
                                 "fs/remove" => serde_json::json!({}),
-                                "fuzzyFileSearch" => serde_json::json!({
-                                    "files": [{
-                                        "root": "/tmp/worker-a-primary",
-                                        "path": "docs/gateway.md",
-                                        "match_type": "file",
-                                        "file_name": "gateway.md",
-                                        "score": 42,
-                                        "indices": [5, 6, 7, 8],
-                                    }],
-                                }),
+                                "fuzzyFileSearch" => {
+                                    multi_worker_fuzzy_file_search_response(worker_label)
+                                }
                                 "fuzzyFileSearch/sessionStart" => serde_json::json!({}),
                                 "fuzzyFileSearch/sessionUpdate" => {
                                     write_websocket_message(
@@ -37567,16 +38004,9 @@ stream_max_retries = 0
                                         "isFile": true,
                                     }],
                                 }),
-                                "fuzzyFileSearch" => serde_json::json!({
-                                    "files": [{
-                                        "root": "/tmp/worker-a-primary",
-                                        "path": "docs/gateway.md",
-                                        "match_type": "file",
-                                        "file_name": "gateway.md",
-                                        "score": 42,
-                                        "indices": [5, 6, 7, 8],
-                                    }],
-                                }),
+                                "fuzzyFileSearch" => {
+                                    multi_worker_fuzzy_file_search_response(worker_label)
+                                }
                                 "fuzzyFileSearch/sessionStart" => serde_json::json!({}),
                                 "fuzzyFileSearch/sessionUpdate" => {
                                     write_websocket_message(

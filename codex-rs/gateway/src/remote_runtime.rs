@@ -105,6 +105,30 @@ impl RemoteWorkerGatewayRuntime {
         }
     }
 
+    fn project_worker(&self, context: &GatewayRequestContext) -> Option<&GatewayRemoteWorker> {
+        let worker_id = self.scope_registry.select_project_worker_id(
+            context,
+            self.workers
+                .iter()
+                .filter(|worker| self.worker_health.is_healthy(worker.id()))
+                .map(GatewayRemoteWorker::id),
+        )?;
+        self.workers
+            .iter()
+            .find(|worker| worker.id() == worker_id)
+            .filter(|worker| self.worker_health.is_healthy(worker.id()))
+    }
+
+    fn pick_worker_for_project(
+        &self,
+        context: &GatewayRequestContext,
+    ) -> Result<&GatewayRemoteWorker, GatewayError> {
+        if let Some(worker) = self.project_worker(context) {
+            return Ok(worker);
+        }
+        self.pick_worker()
+    }
+
     fn worker_for_thread(
         &self,
         context: &GatewayRequestContext,
@@ -232,7 +256,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
         request: CreateThreadRequest,
     ) -> Result<ThreadResponse, GatewayError> {
         for _ in 0..self.workers.len() {
-            let worker = self.pick_worker()?;
+            let worker = self.pick_worker_for_project(&context)?;
             match worker
                 .request_handle()
                 .request_typed::<codex_app_server_protocol::ThreadStartResponse>(
@@ -246,6 +270,8 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                         context.clone(),
                         Some(worker.id()),
                     );
+                    self.scope_registry
+                        .register_project_worker(context.clone(), worker.id());
 
                     return Ok(ThreadResponse {
                         thread: response.thread.into(),

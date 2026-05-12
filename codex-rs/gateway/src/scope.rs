@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 const DEFAULT_TENANT_ID: &str = "default";
 const TENANT_HEADER: HeaderName = HeaderName::from_static("x-codex-tenant-id");
@@ -85,6 +87,8 @@ struct ThreadScope {
 pub struct GatewayScopeRegistry {
     thread_contexts: RwLock<HashMap<String, ThreadScope>>,
     thread_paths: RwLock<HashMap<String, ThreadScope>>,
+    project_workers: RwLock<HashMap<GatewayRequestContext, usize>>,
+    next_project_worker: AtomicUsize,
     pending_server_requests: RwLock<HashMap<RequestId, PendingServerRequest>>,
 }
 
@@ -112,6 +116,39 @@ impl GatewayScopeRegistry {
         read_guard(&self.thread_contexts)
             .get(thread_id)
             .and_then(|scope| scope.worker_id)
+    }
+
+    pub fn register_project_worker(&self, context: GatewayRequestContext, worker_id: usize) {
+        if context.project_id.is_some() {
+            write_guard(&self.project_workers).insert(context, worker_id);
+        }
+    }
+
+    pub fn project_worker_id(&self, context: &GatewayRequestContext) -> Option<usize> {
+        context.project_id.as_ref()?;
+        read_guard(&self.project_workers).get(context).copied()
+    }
+
+    pub fn select_project_worker_id(
+        &self,
+        context: &GatewayRequestContext,
+        worker_ids: impl IntoIterator<Item = usize>,
+    ) -> Option<usize> {
+        context.project_id.as_ref()?;
+
+        let worker_ids = worker_ids.into_iter().collect::<Vec<_>>();
+        if worker_ids.is_empty() {
+            return None;
+        }
+
+        if let Some(worker_id) = self.project_worker_id(context)
+            && worker_ids.contains(&worker_id)
+        {
+            return Some(worker_id);
+        }
+
+        let index = self.next_project_worker.fetch_add(1, Ordering::Relaxed) % worker_ids.len();
+        worker_ids.get(index).copied()
     }
 
     pub fn register_thread_path_with_worker(
@@ -436,6 +473,65 @@ mod tests {
             false
         );
         assert_eq!(registry.thread_worker_id("thread-a"), Some(7));
+    }
+
+    #[test]
+    fn project_worker_routes_are_scoped_by_tenant_and_project() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let project_b = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+        let unscoped_project = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: None,
+        };
+
+        registry.register_project_worker(project_a.clone(), 7);
+        registry.register_project_worker(unscoped_project.clone(), 9);
+
+        assert_eq!(registry.project_worker_id(&project_a), Some(7));
+        assert_eq!(registry.project_worker_id(&project_b), None);
+        assert_eq!(registry.project_worker_id(&unscoped_project), None);
+    }
+
+    #[test]
+    fn project_worker_selection_distributes_unmapped_projects() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let project_b = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+        let unscoped_project = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: None,
+        };
+
+        assert_eq!(
+            registry.select_project_worker_id(&project_a, [0, 1]),
+            Some(0)
+        );
+        registry.register_project_worker(project_a.clone(), 0);
+        assert_eq!(
+            registry.select_project_worker_id(&project_a, [0, 1]),
+            Some(0)
+        );
+        assert_eq!(
+            registry.select_project_worker_id(&project_b, [0, 1]),
+            Some(1)
+        );
+        assert_eq!(
+            registry.select_project_worker_id(&unscoped_project, [0, 1]),
+            None
+        );
     }
 
     #[test]
