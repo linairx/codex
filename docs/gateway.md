@@ -1370,6 +1370,13 @@ Phase 6 is in progress with:
   terminal outcome/detail, request ids, methods, and downstream worker ids /
   WebSocket URLs, so partially completed `command/exec` lifecycles are visible
   without reconstructing them only from aggregate terminal counts
+- if downstream app-server shutdown also fails after a gateway v2 connection
+  error, teardown now emits a structured warning with tenant/project scope,
+  terminal outcome/detail, pending client-request count, pending
+  server-request count, answered-but-unresolved server-request count, and the
+  shutdown error detail, and increments
+  `gateway_v2_downstream_shutdown_failures{outcome}` so cleanup failures are
+  visible as a direct rollout signal
 - completed background client requests are now settled before their final
   northbound JSON-RPC response is sent, so a slow-client failure while
   delivering a finished `command/exec` response does not leave that request in
@@ -1437,6 +1444,11 @@ Phase 6 is in progress with:
   prompts that are answered northbound but cannot be handed back downstream
   have the same operator-visible route context as other partially completed
   server-request lifecycles
+- that same answered-but-not-delivered branch now also increments
+  `gateway_v2_server_request_answer_delivery_failures{response_kind}`, so
+  prompt / elicitation replies that reached the gateway but failed on the
+  downstream handoff have a direct alerting counter alongside the broader
+  lifecycle event stream
 - pending server-request routes now snapshot the worker websocket URL at
   forwarding time, so later cleanup and answered-but-undeliverable warning logs
   preserve the original downstream route even if the worker handle is no longer
@@ -1533,6 +1545,77 @@ Phase 6 is in progress with:
   now also include the affected worker websocket URL, and exact-duplicate
   connection-state suppression logs include both the dropped worker route and
   the original forwarded worker route
+- forwarded downstream v2 notifications now also emit
+  `gateway_v2_forwarded_notifications{method}`, with direct visible-thread
+  forwarding coverage, multi-worker fan-in count coverage, plus opt-out and
+  hidden-thread negative coverage, so notification fan-in dashboards can
+  compare delivered traffic against duplicate, opt-out, pending-refresh, and
+  hidden-thread suppression
+- downstream v2 notifications that fail during northbound delivery now emit
+  `gateway_v2_notification_send_failures{method,outcome}`, so slow-client
+  notification stalls can be attributed to the notification family that hit the
+  terminal send failure instead of only the broad connection outcome
+- those notification send failures now also emit structured warning logs with
+  tenant/project scope, worker id, worker websocket URL, method, outcome, and
+  error detail, so failed notification fan-in is diagnosable without relying
+  only on aggregate metrics
+- downstream v2 server requests that pass gateway policy but fail during
+  northbound delivery now emit
+  `event=downstream_server_request_forward_delivery_failed` on the
+  server-request lifecycle counter, with structured warning logs carrying
+  tenant/project scope, worker route, method, outcome, and send error detail
+- those downstream server-request forward delivery failures now also increment
+  `gateway_v2_server_request_forward_send_failures{method,outcome}`, so
+  dashboards can alert directly on prompt / elicitation delivery failures
+  without filtering the broader lifecycle event stream
+- client answers to forwarded server requests that fail during downstream
+  delivery now also increment
+  `gateway_v2_server_request_answer_delivery_failures{response_kind}`, so
+  answered-but-not-delivered prompt / elicitation replies are directly
+  measurable without filtering the broader lifecycle event stream
+- gateway-owned server-request rejections that fail during downstream delivery
+  now also increment
+  `gateway_v2_server_request_rejection_delivery_failures{method}`, so prompt /
+  elicitation rejections that never reach the owning worker have a direct
+  alerting counter alongside the broader lifecycle event stream
+- client-side cleanup rejections for still-pending server requests now also
+  increment
+  `gateway_v2_server_request_rejection_delivery_failures{method="serverRequest/pending"}`
+  when the downstream handoff fails or the worker route is already unavailable,
+  so teardown-time prompt cleanup failures show up in the same direct alerting
+  channel as ordinary gateway-owned rejection delivery failures
+- gateway v2 client request responses that fail during northbound delivery now
+  emit structured warning logs with tenant/project scope, JSON-RPC request id,
+  method, outcome, and send error detail, so response-path slow-client
+  failures can be diagnosed at request granularity alongside the existing
+  request outcome metrics
+- failed northbound delivery of gateway v2 client request responses now also
+  increments `gateway_v2_client_response_send_failures{method,outcome}` for
+  initialize handshake responses, ordinary request responses, and background
+  `command/exec` completions, so response-path slow-client failures are
+  measurable without filtering the broader per-request outcome counter
+- dedicated northbound regression coverage now also pins ordinary success and
+  error client-response send-failure paths over a real WebSocket, so this
+  metric is exercised at the compatibility boundary instead of only by direct
+  helper tests
+- failed delivery of synthesized worker-cleanup `serverRequest/resolved`
+  notifications now also increments
+  `gateway_v2_notification_send_failures{method="serverRequest/resolved",outcome}`
+  and includes tenant/project scope in the structured cleanup warning, so
+  prompt-dismissal failures during worker loss are visible through the same
+  notification failure channel as ordinary downstream notification fan-in
+- failed delivery of gateway-owned v2 WebSocket close frames now increments
+  `gateway_v2_close_frame_send_failures{code,outcome}`, so operators can
+  distinguish slow-client failures that prevent a terminal policy/protocol
+  close frame from reaching the client from ordinary response or notification
+  send failures; those failures now also emit structured warning logs with
+  tenant/project scope, the close code, protocol-safe reason, outcome, and send
+  error detail
+- dedicated northbound regression coverage now also pins gateway-owned close
+  frame send failures over a real WebSocket, including the
+  `gateway_v2_close_frame_send_failures{code,outcome}` counter and structured
+  warning log fields, so terminal close delivery failures are exercised at the
+  compatibility boundary instead of only through observability helper tests
 - the real northbound WebSocket exact-duplicate `warning` suppression
   regression now also pins that structured suppression log end to end,
   including tenant/project scope, dropped and original worker routes, worker
@@ -1652,8 +1735,8 @@ Phase 6 is in progress with:
   correlation before cleanup rejection is attempted
 - gateway startup now rejects zero-valued v2 transport hardening settings for
   initialize timeout, client-send timeout, reconnect retry backoff, and max
-  pending server-request count, so misconfigured rollouts fail before accepting
-  northbound compatibility traffic
+  pending server-request / client-request counts, so misconfigured rollouts
+  fail before accepting northbound compatibility traffic
 - multi-worker thread routing diagnostics now also emit
   `gateway_v2_thread_list_deduplications` tagged by selected worker and
   `gateway_v2_thread_route_recoveries` tagged by success or miss, so
@@ -2152,6 +2235,18 @@ Phase 6 is in progress with:
   explicitly records the current steady-state Stage B compatibility coverage,
   and [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md)
   keeps the deployment caveats and rollout guidance current
+- the v2 rollout checklist now also calls out the concrete transport
+  dashboards to inspect for notification fan-in, suppression, send failures,
+  close-frame delivery failures, downstream server-request forward send
+  failures, server-request answer and rejection delivery failures, and
+  server-request lifecycle events, so operators validate the new observability
+  surface during staged rollout rather than relying only on compatibility-flow
+  success
+- that rollout checklist now also calls out remote / multi-worker degraded
+  topology counters for reconnect attempts, fail-closed requests, upstream
+  failures while worker routes are unavailable, downstream backpressure, and
+  slow-client timeouts, tying those dashboard checks back to `/healthz` worker
+  state during staged validation
 
 The remaining Phase 6 work is:
 

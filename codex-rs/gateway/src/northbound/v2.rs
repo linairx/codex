@@ -110,6 +110,7 @@ const TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE: &str =
 const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
     "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
+const MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION: usize = 64;
 const MAX_CLOSE_REASON_BYTES: usize = 123;
 const MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD: usize = 256;
 #[derive(Clone, Copy, Debug)]
@@ -128,7 +129,7 @@ impl Default for GatewayV2Timeouts {
             client_send: Duration::from_secs(10),
             reconnect_retry_backoff: Duration::from_secs(1),
             max_pending_server_requests: MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
-            max_pending_client_requests: MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+            max_pending_client_requests: MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION,
         }
     }
 }
@@ -910,8 +911,10 @@ async fn run_websocket_connection(
             match recv_initialize_request(&mut socket, timeouts, &observability, &context).await {
             Ok(request) => request,
             Err(err) if err.kind() == ErrorKind::TimedOut => {
-                send_close_frame(
+                send_observed_close_frame(
                     &mut socket,
+                    &observability,
+                    &context,
                     close_code::POLICY,
                     INITIALIZE_TIMEOUT_CLOSE_REASON,
                     timeouts.client_send,
@@ -952,7 +955,7 @@ async fn run_websocket_connection(
                 let detail = err.to_string();
                 send_jsonrpc_error(
                     &mut socket,
-                    initialize_request_id,
+                    initialize_request_id.clone(),
                     JSONRPCErrorError {
                         code: INVALID_REQUEST_CODE,
                         message: detail.clone(),
@@ -960,7 +963,18 @@ async fn run_websocket_connection(
                     },
                     timeouts.client_send,
                 )
-                .await?;
+                .await
+                .inspect_err(|err| {
+                    let outcome = classify_v2_connection_error(err);
+                    observe_client_response_send_failure(
+                        &observability,
+                        &context,
+                        &initialize_request_id,
+                        "initialize",
+                        outcome,
+                        err,
+                    );
+                })?;
                 observe_v2_request(
                     &observability,
                     &context,
@@ -1009,7 +1023,7 @@ async fn run_websocket_connection(
                 );
                 send_jsonrpc_error(
                     &mut socket,
-                    initialize_request_id,
+                    initialize_request_id.clone(),
                     JSONRPCErrorError {
                         code: INTERNAL_ERROR_CODE,
                         message: format!("gateway failed to connect downstream app-server: {err}"),
@@ -1017,7 +1031,18 @@ async fn run_websocket_connection(
                     },
                     timeouts.client_send,
                 )
-                .await?;
+                .await
+                .inspect_err(|err| {
+                    let outcome = classify_v2_connection_error(err);
+                    observe_client_response_send_failure(
+                        &observability,
+                        &context,
+                        &initialize_request_id,
+                        "initialize",
+                        outcome,
+                        err,
+                    );
+                })?;
                 return Ok(GatewayV2ConnectionRunResult {
                     outcome: request_outcome,
                     detail: Some(detail),
@@ -1031,13 +1056,24 @@ async fn run_websocket_connection(
         send_jsonrpc(
             &mut socket,
             JSONRPCMessage::Response(JSONRPCResponse {
-                id: initialize_request.id,
+                id: initialize_request_id.clone(),
                 result: serde_json::to_value(session_factory.initialize_response())
                     .map_err(io::Error::other)?,
             }),
             timeouts.client_send,
         )
-        .await?;
+        .await
+        .inspect_err(|err| {
+            let outcome = classify_v2_connection_error(err);
+            observe_client_response_send_failure(
+                &observability,
+                &context,
+                &initialize_request_id,
+                "initialize",
+                outcome,
+                err,
+            );
+        })?;
         observe_v2_request(
             &observability,
             &context,
@@ -1094,8 +1130,10 @@ async fn run_websocket_connection(
                                         "post_initialize",
                                         protocol_violation_reason_from_invalid_payload(&err),
                                     );
-                                    send_invalid_payload_close(
+                                    send_observed_invalid_payload_close(
                                         &mut socket,
+                                        connection.observability,
+                                        connection.request_context,
                                         &err,
                                         timeouts.client_send,
                                     )
@@ -1132,8 +1170,10 @@ async fn run_websocket_connection(
                                         "post_initialize",
                                         protocol_violation_reason_from_invalid_payload(&err),
                                     );
-                                    send_invalid_payload_close(
+                                    send_observed_invalid_payload_close(
                                         &mut socket,
+                                        connection.observability,
+                                        connection.request_context,
                                         &err,
                                         timeouts.client_send,
                                     )
@@ -1184,8 +1224,10 @@ async fn run_websocket_connection(
                 }
                 event = downstream.next_event() => {
                     let Some(event) = event else {
-                        send_close_frame(
+                        send_observed_close_frame(
                             &mut socket,
+                            &observability,
+                            &context,
                             close_code::ERROR,
                             DOWNSTREAM_SESSION_ENDED_CLOSE_REASON,
                             timeouts.client_send,
@@ -1251,6 +1293,14 @@ async fn run_websocket_connection(
                             .await
                             {
                                 let outcome = classify_v2_connection_error(&err);
+                                observe_client_response_send_failure(
+                                    &observability,
+                                    &pending_response.request_context,
+                                    &pending_response.request_id,
+                                    &pending_response.method,
+                                    outcome,
+                                    &err,
+                                );
                                 observe_v2_request(
                                     &observability,
                                     &pending_response.request_context,
@@ -1279,6 +1329,14 @@ async fn run_websocket_connection(
                             .await
                             {
                                 let outcome = classify_v2_connection_error(&err);
+                                observe_client_response_send_failure(
+                                    &observability,
+                                    &pending_response.request_context,
+                                    &pending_response.request_id,
+                                    &pending_response.method,
+                                    outcome,
+                                    &err,
+                                );
                                 observe_v2_request(
                                     &observability,
                                     &pending_response.request_context,
@@ -1310,6 +1368,14 @@ async fn run_websocket_connection(
                             .await
                             {
                                 let outcome = classify_v2_connection_error(&send_err);
+                                observe_client_response_send_failure(
+                                    &observability,
+                                    &pending_response.request_context,
+                                    &pending_response.request_id,
+                                    &pending_response.method,
+                                    outcome,
+                                    &send_err,
+                                );
                                 observe_v2_request(
                                     &observability,
                                     &pending_response.request_context,
@@ -1403,7 +1469,16 @@ async fn run_websocket_connection(
             Err(err) => {
                 connection_detail = Some(err.to_string());
                 if let Err(shutdown_err) = shutdown_result {
-                    warn!(%shutdown_err, "gateway v2 websocket downstream shutdown also failed after connection error");
+                    observability.record_v2_downstream_shutdown_failure(connection_outcome);
+                    log_downstream_shutdown_failure(
+                        connection.request_context,
+                        connection_outcome,
+                        connection_detail.as_deref(),
+                        pending_client_request_count,
+                        pending_server_request_count,
+                        answered_but_unresolved_server_request_count,
+                        &shutdown_err,
+                    );
                 }
                 Err(err)
             }
@@ -1469,7 +1544,14 @@ async fn recv_initialize_request(
                                 "pre_initialize",
                                 protocol_violation_reason_from_invalid_payload(&err),
                             );
-                            send_invalid_payload_close(socket, &err, timeouts.client_send).await?;
+                            send_observed_invalid_payload_close(
+                                socket,
+                                observability,
+                                context,
+                                &err,
+                                timeouts.client_send,
+                            )
+                            .await?;
                             return Err(err);
                         }
                     };
@@ -1493,7 +1575,14 @@ async fn recv_initialize_request(
                                 "pre_initialize",
                                 protocol_violation_reason_from_invalid_payload(&err),
                             );
-                            send_invalid_payload_close(socket, &err, timeouts.client_send).await?;
+                            send_observed_invalid_payload_close(
+                                socket,
+                                observability,
+                                context,
+                                &err,
+                                timeouts.client_send,
+                            )
+                            .await?;
                             return Err(err);
                         }
                     };
@@ -1602,7 +1691,7 @@ async fn handle_pre_initialize_message(
             );
             send_jsonrpc_error(
                 socket,
-                request.id,
+                request.id.clone(),
                 JSONRPCErrorError {
                     code: INVALID_REQUEST_CODE,
                     message: "initialize must be the first request".to_string(),
@@ -1610,7 +1699,18 @@ async fn handle_pre_initialize_message(
                 },
                 client_send_timeout,
             )
-            .await?;
+            .await
+            .inspect_err(|err| {
+                let outcome = classify_v2_connection_error(err);
+                observe_client_response_send_failure(
+                    observability,
+                    context,
+                    &request.id,
+                    &method,
+                    outcome,
+                    err,
+                );
+            })?;
             Ok(None)
         }
         JSONRPCMessage::Notification(_)
@@ -1635,15 +1735,16 @@ async fn handle_client_message(
                 connection
                     .observability
                     .record_v2_protocol_violation("post_initialize", "repeated_initialize");
-                send_jsonrpc_error(
+                send_client_jsonrpc_error(
                     socket,
-                    request.id,
+                    connection,
+                    &request.id,
+                    &method,
                     JSONRPCErrorError {
                         code: INVALID_REQUEST_CODE,
                         message: "connection is already initialized".to_string(),
                         data: None,
                     },
-                    connection.client_send_timeout,
                 )
                 .await?;
                 observe_v2_request(
@@ -1661,11 +1762,12 @@ async fn handle_client_message(
                 .check_request(connection.request_context, request.method.as_str())
             {
                 let outcome = gateway_error_outcome(&err);
-                send_jsonrpc_error(
+                send_client_jsonrpc_error(
                     socket,
-                    request.id,
+                    connection,
+                    &request.id,
+                    &method,
                     gateway_error_to_jsonrpc_error(err),
-                    connection.client_send_timeout,
                 )
                 .await?;
                 observe_v2_request(
@@ -1684,11 +1786,12 @@ async fn handle_client_message(
                 &request,
             ) {
                 let outcome = gateway_error_outcome(&err);
-                send_jsonrpc_error(
+                send_client_jsonrpc_error(
                     socket,
-                    request.id,
+                    connection,
+                    &request.id,
+                    &method,
                     gateway_error_to_jsonrpc_error(err),
-                    connection.client_send_timeout,
                 )
                 .await?;
                 observe_v2_request(
@@ -1720,8 +1823,10 @@ async fn handle_client_message(
                     "protocol_violation",
                     started_at.elapsed(),
                 );
-                send_close_frame(
+                send_observed_close_frame(
                     socket,
+                    connection.observability,
+                    connection.request_context,
                     close_code::PROTOCOL,
                     DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON,
                     connection.client_send_timeout,
@@ -1747,7 +1852,7 @@ async fn handle_client_message(
                     connection
                         .observability
                         .record_v2_client_request_rejection(&method, "pending_limit");
-                    send_jsonrpc_error(socket, request_id, error, connection.client_send_timeout)
+                    send_client_jsonrpc_error(socket, connection, &request_id, &method, error)
                         .await?;
                     observe_v2_request(
                         connection.observability,
@@ -1818,13 +1923,15 @@ async fn handle_client_message(
             }
             match handle_client_request(downstream, connection, request).await {
                 Ok(Ok(result)) => {
-                    send_jsonrpc(
+                    send_client_jsonrpc(
                         socket,
+                        connection,
+                        &request_id,
+                        &method,
                         JSONRPCMessage::Response(JSONRPCResponse {
-                            id: request_id,
+                            id: request_id.clone(),
                             result,
                         }),
-                        connection.client_send_timeout,
                     )
                     .await?;
                     if downstream.multi_worker_topology() && method == "skills/list" {
@@ -1840,7 +1947,7 @@ async fn handle_client_message(
                 }
                 Ok(Err(error)) => {
                     let outcome = jsonrpc_error_outcome_code(error.code);
-                    send_jsonrpc_error(socket, request_id, error, connection.client_send_timeout)
+                    send_client_jsonrpc_error(socket, connection, &request_id, &method, error)
                         .await?;
                     observe_v2_request(
                         connection.observability,
@@ -1851,15 +1958,16 @@ async fn handle_client_message(
                     );
                 }
                 Err(err) => {
-                    send_jsonrpc_error(
+                    send_client_jsonrpc_error(
                         socket,
-                        request_id,
+                        connection,
+                        &request_id,
+                        &method,
                         JSONRPCErrorError {
                             code: INTERNAL_ERROR_CODE,
                             message: format!("gateway upstream request failed: {err}"),
                             data: None,
                         },
-                        connection.client_send_timeout,
                     )
                     .await?;
                     observe_v2_request(
@@ -1909,7 +2017,14 @@ async fn handle_client_message(
                         response.id
                     ),
                 );
-                send_invalid_payload_close(socket, &err, connection.client_send_timeout).await?;
+                send_observed_invalid_payload_close(
+                    socket,
+                    connection.observability,
+                    connection.request_context,
+                    &err,
+                    connection.client_send_timeout,
+                )
+                .await?;
                 return Err(err);
             };
             event_state.resolved_server_requests.insert(
@@ -1955,7 +2070,14 @@ async fn handle_client_message(
                         error.id
                     ),
                 );
-                send_invalid_payload_close(socket, &err, connection.client_send_timeout).await?;
+                send_observed_invalid_payload_close(
+                    socket,
+                    connection.observability,
+                    connection.request_context,
+                    &err,
+                    connection.client_send_timeout,
+                )
+                .await?;
                 return Err(err);
             };
             event_state.resolved_server_requests.insert(
@@ -2024,6 +2146,9 @@ async fn deliver_client_server_request_answer(
         .observability
         .record_v2_server_request_lifecycle_event(event, method_tag);
     if let Err(err) = &result {
+        connection
+            .observability
+            .record_v2_server_request_answer_delivery_failure(method_tag);
         warn!(
             tenant_id = connection.request_context.tenant_id.as_str(),
             project_id = connection.request_context.project_id.as_deref(),
@@ -2065,6 +2190,9 @@ async fn reject_downstream_server_request_at_gateway_boundary(
         .observability
         .record_v2_server_request_lifecycle_event(event, request.method);
     if let Err(err) = &result {
+        connection
+            .observability
+            .record_v2_server_request_rejection_delivery_failure(request.method);
         warn!(
             tenant_id = connection.request_context.tenant_id.as_str(),
             project_id = connection.request_context.project_id.as_deref(),
@@ -2100,8 +2228,7 @@ async fn handle_app_server_event(
         if !downstream.single_worker() && downstream.remove_worker(worker_id) {
             cleanup = resolve_server_requests_for_worker(
                 socket,
-                connection.client_send_timeout,
-                connection.observability,
+                connection,
                 worker_websocket_url.as_str(),
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
@@ -2119,8 +2246,10 @@ async fn handle_app_server_event(
                 );
             }
             if cleanup.has_stranded_connection_scoped_requests() {
-                send_close_frame(
+                send_observed_close_frame(
                     socket,
+                    connection.observability,
+                    connection.request_context,
                     close_code::ERROR,
                     STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON,
                     connection.client_send_timeout,
@@ -2137,8 +2266,7 @@ async fn handle_app_server_event(
         } else if worker_id.is_none() {
             cleanup = resolve_server_requests_for_worker(
                 socket,
-                connection.client_send_timeout,
-                connection.observability,
+                connection,
                 worker_websocket_url.as_str(),
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
@@ -2157,8 +2285,10 @@ async fn handle_app_server_event(
             }
         }
         if cleanup.has_stranded_connection_scoped_requests() {
-            send_close_frame(
+            send_observed_close_frame(
                 socket,
+                connection.observability,
+                connection.request_context,
                 close_code::ERROR,
                 STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON,
                 connection.client_send_timeout,
@@ -2169,8 +2299,10 @@ async fn handle_app_server_event(
                 reject_pending_server_requests: true,
             }));
         }
-        send_close_frame(
+        send_observed_close_frame(
             socket,
+            connection.observability,
+            connection.request_context,
             close_code::ERROR,
             DOWNSTREAM_SESSION_ENDED_CLOSE_REASON,
             connection.client_send_timeout,
@@ -2194,8 +2326,10 @@ async fn handle_app_server_event(
             connection
                 .observability
                 .record_v2_downstream_backpressure(worker_id);
-            send_close_frame(
+            send_observed_close_frame(
                 socket,
+                connection.observability,
+                connection.request_context,
                 close_code::POLICY,
                 &format_lagged_close_reason(skipped),
                 connection.client_send_timeout,
@@ -2286,12 +2420,31 @@ async fn handle_app_server_event(
                         &notification,
                     );
                 }
-                send_jsonrpc(
+                let method = notification.method.clone();
+                if let Err(err) = send_jsonrpc(
                     socket,
                     JSONRPCMessage::Notification(notification),
                     connection.client_send_timeout,
                 )
-                .await?;
+                .await
+                {
+                    let outcome = classify_v2_connection_error(&err);
+                    log_notification_send_failure(
+                        connection.request_context,
+                        worker_id,
+                        worker_websocket_url.as_str(),
+                        &method,
+                        outcome,
+                        &err,
+                    );
+                    connection
+                        .observability
+                        .record_v2_notification_send_failure(&method, outcome);
+                    return Err(err);
+                }
+                connection
+                    .observability
+                    .record_v2_forwarded_notification(&method);
             } else {
                 log_suppressed_hidden_thread_notification(
                     connection.request_context,
@@ -2330,8 +2483,10 @@ async fn handle_app_server_event(
                         "duplicate_pending_request",
                         &request.method,
                     );
-                send_close_frame(
+                send_observed_close_frame(
                     socket,
+                    connection.observability,
+                    connection.request_context,
                     close_code::ERROR,
                     DUPLICATE_DOWNSTREAM_SERVER_REQUEST_CLOSE_REASON,
                     connection.client_send_timeout,
@@ -2394,12 +2549,33 @@ async fn handle_app_server_event(
                     },
                 );
                 let method = request.method.clone();
-                send_jsonrpc(
+                if let Err(err) = send_jsonrpc(
                     socket,
                     JSONRPCMessage::Request(request),
                     connection.client_send_timeout,
                 )
-                .await?;
+                .await
+                {
+                    let outcome = classify_v2_connection_error(&err);
+                    log_downstream_server_request_forward_failure(
+                        connection.request_context,
+                        worker_id,
+                        worker_websocket_url.as_str(),
+                        &method,
+                        outcome,
+                        &err,
+                    );
+                    connection
+                        .observability
+                        .record_v2_server_request_forward_send_failure(&method, outcome);
+                    connection
+                        .observability
+                        .record_v2_server_request_lifecycle_event(
+                            "downstream_server_request_forward_delivery_failed",
+                            &method,
+                        );
+                    return Err(err);
+                }
                 connection
                     .observability
                     .record_v2_server_request_lifecycle_event(
@@ -2464,8 +2640,7 @@ async fn handle_app_server_event(
             if !downstream.single_worker() && downstream.remove_worker(worker_id) {
                 cleanup = resolve_server_requests_for_worker(
                     socket,
-                    connection.client_send_timeout,
-                    connection.observability,
+                    connection,
                     worker_websocket_url.as_str(),
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
@@ -2483,8 +2658,10 @@ async fn handle_app_server_event(
                     );
                 }
                 if cleanup.has_stranded_connection_scoped_requests() {
-                    send_close_frame(
+                    send_observed_close_frame(
                         socket,
+                        connection.observability,
+                        connection.request_context,
                         close_code::ERROR,
                         STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON,
                         connection.client_send_timeout,
@@ -2501,8 +2678,7 @@ async fn handle_app_server_event(
             } else if worker_id.is_none() {
                 cleanup = resolve_server_requests_for_worker(
                     socket,
-                    connection.client_send_timeout,
-                    connection.observability,
+                    connection,
                     worker_websocket_url.as_str(),
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
@@ -2521,8 +2697,10 @@ async fn handle_app_server_event(
                 }
             }
             if cleanup.has_stranded_connection_scoped_requests() {
-                send_close_frame(
+                send_observed_close_frame(
                     socket,
+                    connection.observability,
+                    connection.request_context,
                     close_code::ERROR,
                     STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON,
                     connection.client_send_timeout,
@@ -2533,8 +2711,10 @@ async fn handle_app_server_event(
                     reject_pending_server_requests: true,
                 }));
             }
-            send_close_frame(
+            send_observed_close_frame(
                 socket,
+                connection.observability,
+                connection.request_context,
                 close_code::ERROR,
                 &format!("downstream app-server disconnected: {message}"),
                 connection.client_send_timeout,
@@ -2556,8 +2736,7 @@ async fn handle_app_server_event(
 
 async fn resolve_server_requests_for_worker(
     socket: &mut WebSocket,
-    client_send_timeout: Duration,
-    observability: &GatewayObservability,
+    connection: &GatewayV2ConnectionContext<'_>,
     worker_websocket_url: &str,
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
@@ -2569,7 +2748,7 @@ async fn resolve_server_requests_for_worker(
         worker_id,
     );
 
-    record_worker_server_request_cleanup_metrics(observability, &cleanup);
+    record_worker_server_request_cleanup_metrics(connection.observability, &cleanup);
 
     for notification in cleanup.resolved_notifications.iter().cloned() {
         let thread_id = notification.thread_id.clone();
@@ -2579,12 +2758,13 @@ async fn resolve_server_requests_for_worker(
             JSONRPCMessage::Notification(tagged_type_to_notification(
                 ServerNotification::ServerRequestResolved(notification),
             )?),
-            client_send_timeout,
+            connection.client_send_timeout,
         )
         .await
         {
             record_worker_cleanup_resolution_send_failure(
-                observability,
+                connection.observability,
+                connection.request_context,
                 worker_id,
                 worker_websocket_url,
                 &thread_id,
@@ -2593,10 +2773,12 @@ async fn resolve_server_requests_for_worker(
             );
             return Err(err);
         }
-        observability.record_v2_server_request_lifecycle_event(
-            "worker_cleanup_resolution_delivered",
-            "serverRequest/resolved",
-        );
+        connection
+            .observability
+            .record_v2_server_request_lifecycle_event(
+                "worker_cleanup_resolution_delivered",
+                "serverRequest/resolved",
+            );
     }
 
     Ok(cleanup)
@@ -2604,21 +2786,27 @@ async fn resolve_server_requests_for_worker(
 
 fn record_worker_cleanup_resolution_send_failure(
     observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
     worker_websocket_url: &str,
     thread_id: &str,
     request_id: &RequestId,
     err: &io::Error,
 ) {
+    let outcome = classify_v2_connection_error(err);
+    observability.record_v2_notification_send_failure("serverRequest/resolved", outcome);
     observability.record_v2_server_request_lifecycle_event(
         "worker_cleanup_resolution_send_failed",
         "serverRequest/resolved",
     );
     warn!(
+        tenant_id = %request_context.tenant_id,
+        project_id = ?request_context.project_id,
         worker_id = ?worker_id,
         worker_websocket_url,
         thread_id,
         gateway_request_id = ?request_id,
+        outcome,
         %err,
         "failed to deliver synthesized serverRequest/resolved during worker cleanup"
     );
@@ -2942,6 +3130,28 @@ fn log_client_send_timeout(
     );
 }
 
+fn log_downstream_shutdown_failure(
+    request_context: &GatewayRequestContext,
+    connection_outcome: &str,
+    connection_detail: Option<&str>,
+    pending_client_request_count: usize,
+    pending_server_request_count: usize,
+    answered_but_unresolved_server_request_count: usize,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        connection_outcome,
+        connection_detail,
+        pending_client_request_count,
+        pending_server_request_count,
+        answered_but_unresolved_server_request_count,
+        shutdown_error = %err,
+        "gateway v2 websocket downstream shutdown also failed after connection error"
+    );
+}
+
 fn log_aborted_pending_client_requests(
     request_context: &GatewayRequestContext,
     outcome: &str,
@@ -3237,6 +3447,94 @@ fn log_suppressed_hidden_thread_notification(
     );
 }
 
+fn log_notification_send_failure(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method,
+        outcome,
+        error = %err,
+        "failed to deliver downstream notification to northbound v2 client"
+    );
+}
+
+fn log_downstream_server_request_forward_failure(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method,
+        outcome,
+        error = %err,
+        "failed to deliver downstream server request to northbound v2 client"
+    );
+}
+
+fn observe_client_response_send_failure(
+    observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
+    request_id: &RequestId,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    observability.record_v2_client_response_send_failure(method, outcome);
+    log_client_response_send_failure(request_context, request_id, method, outcome, err);
+}
+
+fn log_client_response_send_failure(
+    request_context: &GatewayRequestContext,
+    request_id: &RequestId,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        request_id = ?request_id,
+        method,
+        outcome,
+        error = %err,
+        "failed to deliver gateway v2 client request response to northbound client"
+    );
+}
+
+fn log_close_frame_send_failure(
+    request_context: &GatewayRequestContext,
+    code: u16,
+    reason: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        code,
+        reason = websocket_close_reason(reason),
+        outcome,
+        error = %err,
+        "failed to deliver gateway v2 close frame to northbound client"
+    );
+}
+
 async fn reject_pending_server_requests(
     downstream: &GatewayV2DownstreamRouter,
     observability: &GatewayObservability,
@@ -3273,6 +3571,8 @@ async fn reject_pending_server_requests(
     for (gateway_request_id, route) in pending_server_requests.drain() {
         let Ok(worker) = worker_for_server_request(downstream, route.worker_id) else {
             skipped_unavailable_worker_rejections += 1;
+            observability
+                .record_v2_server_request_rejection_delivery_failure("serverRequest/pending");
             warn!(
                 tenant_id = request_context.tenant_id.as_str(),
                 project_id = request_context.project_id.as_deref(),
@@ -3305,6 +3605,8 @@ async fn reject_pending_server_requests(
                 delivered_rejections += 1;
             }
             Err(err) => {
+                observability
+                    .record_v2_server_request_rejection_delivery_failure("serverRequest/pending");
                 warn!(
                     tenant_id = request_context.tenant_id.as_str(),
                     project_id = request_context.project_id.as_deref(),
@@ -5942,6 +6244,28 @@ async fn send_jsonrpc(
     .await
 }
 
+async fn send_client_jsonrpc(
+    socket: &mut WebSocket,
+    connection: &GatewayV2ConnectionContext<'_>,
+    request_id: &RequestId,
+    method: &str,
+    message: JSONRPCMessage,
+) -> io::Result<()> {
+    send_jsonrpc(socket, message, connection.client_send_timeout)
+        .await
+        .inspect_err(|err| {
+            let outcome = classify_v2_connection_error(err);
+            observe_client_response_send_failure(
+                connection.observability,
+                connection.request_context,
+                request_id,
+                method,
+                outcome,
+                err,
+            );
+        })
+}
+
 async fn send_jsonrpc_error(
     socket: &mut WebSocket,
     id: RequestId,
@@ -5954,6 +6278,43 @@ async fn send_jsonrpc_error(
         client_send_timeout,
     )
     .await
+}
+
+async fn send_client_jsonrpc_error(
+    socket: &mut WebSocket,
+    connection: &GatewayV2ConnectionContext<'_>,
+    request_id: &RequestId,
+    method: &str,
+    error: JSONRPCErrorError,
+) -> io::Result<()> {
+    send_client_jsonrpc(
+        socket,
+        connection,
+        request_id,
+        method,
+        JSONRPCMessage::Error(JSONRPCError {
+            id: request_id.clone(),
+            error,
+        }),
+    )
+    .await
+}
+
+async fn send_observed_close_frame(
+    socket: &mut WebSocket,
+    observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
+    code: u16,
+    reason: &str,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    send_close_frame(socket, code, reason, client_send_timeout)
+        .await
+        .inspect_err(|err| {
+            let outcome = classify_v2_connection_error(err);
+            observability.record_v2_close_frame_send_failure(code, outcome);
+            log_close_frame_send_failure(request_context, code, reason, outcome, err);
+        })
 }
 
 async fn send_close_frame(
@@ -5973,8 +6334,10 @@ async fn send_close_frame(
     .await
 }
 
-async fn send_invalid_payload_close(
+async fn send_observed_invalid_payload_close(
     socket: &mut WebSocket,
+    observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
     err: &io::Error,
     client_send_timeout: Duration,
 ) -> io::Result<()> {
@@ -5987,7 +6350,15 @@ async fn send_invalid_payload_close(
         } else {
             close_code::PROTOCOL
         };
-        send_close_frame(socket, code, &err.to_string(), client_send_timeout).await
+        send_observed_close_frame(
+            socket,
+            observability,
+            request_context,
+            code,
+            &err.to_string(),
+            client_send_timeout,
+        )
+        .await
     } else {
         Ok(())
     }
@@ -6035,6 +6406,7 @@ mod tests {
     use codex_app_server_protocol::CommandExecOutputDeltaNotification;
     use codex_app_server_protocol::CommandExecOutputStream;
     use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
+    use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
     use codex_app_server_protocol::ContextCompactedNotification;
     use codex_app_server_protocol::ErrorNotification;
     use codex_app_server_protocol::ExecCommandApprovalResponse;
@@ -6096,6 +6468,7 @@ mod tests {
     use codex_app_server_protocol::TurnPlanStep;
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_app_server_protocol::TurnPlanUpdatedNotification;
+    use codex_app_server_protocol::WarningNotification;
     use codex_arg0::Arg0DispatchPaths;
     use codex_core::config::Config;
     use codex_core::config_loader::CloudRequirementsLoader;
@@ -7295,7 +7668,7 @@ mod tests {
                 client_send: Duration::from_secs(10),
                 reconnect_retry_backoff: Duration::from_secs(1),
                 max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
-                max_pending_client_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                max_pending_client_requests: super::MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION,
             },
         })
         .await;
@@ -8460,12 +8833,13 @@ mod tests {
             "{logs}"
         );
         assert!(logs.contains("thread_id=\"thread-visible\""), "{logs}");
-        assert_v2_server_request_lifecycle_metrics(
+        assert_v2_server_request_lifecycle_and_answer_delivery_failure_metrics(
             &metrics,
             &[
                 ("client_server_request_answered", "response", 1),
                 ("client_server_request_delivery_failed", "response", 1),
             ],
+            "response",
         );
     }
 
@@ -8550,12 +8924,13 @@ mod tests {
             "{logs}"
         );
         assert!(logs.contains("thread_id=\"thread-visible\""), "{logs}");
-        assert_v2_server_request_lifecycle_metrics(
+        assert_v2_server_request_lifecycle_and_answer_delivery_failure_metrics(
             &metrics,
             &[
                 ("client_server_request_answered", "error", 1),
                 ("client_server_request_delivery_failed", "error", 1),
             ],
+            "error",
         );
     }
 
@@ -8650,13 +9025,15 @@ mod tests {
             logs.contains("method=\"item/tool/requestUserInput\""),
             "{logs}"
         );
-        assert_v2_server_request_lifecycle_metrics(
+        assert_v2_server_request_lifecycle_and_rejection_delivery_failure_metrics(
             &metrics,
             &[(
                 "downstream_server_request_rejection_delivery_failed",
                 "item/tool/requestUserInput",
                 1,
             )],
+            "item/tool/requestUserInput",
+            1,
         );
     }
 
@@ -9203,7 +9580,7 @@ mod tests {
         assert!(logs.contains("failed to reject pending downstream server request"));
         assert!(logs.contains("worker_websocket_url=\"ws://worker-a.invalid\""));
         assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
-        assert_v2_server_request_lifecycle_metrics(
+        assert_v2_server_request_lifecycle_and_rejection_delivery_failure_metrics(
             &metrics,
             &[
                 (
@@ -9227,6 +9604,8 @@ mod tests {
                     1,
                 ),
             ],
+            "serverRequest/pending",
+            2,
         );
     }
 
@@ -9240,6 +9619,10 @@ mod tests {
         let logs = capture_logs(|| {
             super::record_worker_cleanup_resolution_send_failure(
                 &observability,
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
                 Some(2),
                 "ws://worker-c.invalid",
                 "thread-visible",
@@ -9251,17 +9634,17 @@ mod tests {
         assert!(logs.contains(
             "failed to deliver synthesized serverRequest/resolved during worker cleanup"
         ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
         assert!(logs.contains("worker_id=Some(2)"));
         assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
         assert!(logs.contains("thread_id=\"thread-visible\""));
         assert!(logs.contains("gateway_request_id=String(\"gateway-srv-1\")"));
-        assert_v2_server_request_lifecycle_metrics(
+        assert!(logs.contains("outcome=\"client_send_timed_out\""));
+        assert_worker_cleanup_resolution_send_failure_metrics(
             &metrics,
-            &[(
-                "worker_cleanup_resolution_send_failed",
-                "serverRequest/resolved",
-                1,
-            )],
+            "worker_cleanup_resolution_send_failed",
+            "client_send_timed_out",
         );
     }
 
@@ -10347,6 +10730,266 @@ mod tests {
         assert_no_v2_metric(metrics, "gateway_v2_suppressed_notifications");
     }
 
+    fn assert_v2_forwarded_notification_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        expected_count: u64,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_forwarded_notification_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_forwarded_notifications" {
+                saw_forwarded_notification_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), expected_count);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([("method".to_string(), method.to_string())])
+                            );
+                        }
+                        _ => panic!("unexpected forwarded notification count aggregation"),
+                    },
+                    _ => panic!("unexpected forwarded notification count type"),
+                }
+            }
+        }
+        assert!(saw_forwarded_notification_count);
+    }
+
+    fn assert_no_v2_forwarded_notification_metric(metrics: &codex_otel::MetricsClient) {
+        assert_no_v2_metric(metrics, "gateway_v2_forwarded_notifications");
+    }
+
+    fn assert_v2_notification_send_failure_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_notification_send_failure_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_notification_send_failures" {
+                saw_notification_send_failure_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    ("outcome".to_string(), outcome.to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected notification send failure count aggregation"),
+                    },
+                    _ => panic!("unexpected notification send failure count type"),
+                }
+            }
+        }
+        assert!(saw_notification_send_failure_count);
+    }
+
+    fn assert_v2_client_response_send_failure_metric(
+        metrics: &codex_otel::MetricsClient,
+        method: &str,
+        outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_response_send_failure_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_client_response_send_failures" {
+                saw_response_send_failure_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), method.to_string()),
+                                    ("outcome".to_string(), outcome.to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected client response send failure count aggregation"),
+                    },
+                    _ => panic!("unexpected client response send failure count type"),
+                }
+            }
+        }
+        assert!(saw_response_send_failure_count);
+    }
+
+    fn assert_v2_close_frame_send_failure_metric(
+        metrics: &codex_otel::MetricsClient,
+        code: u16,
+        outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_close_frame_send_failure_count = false;
+        for metric in metrics {
+            if metric.name() == "gateway_v2_close_frame_send_failures" {
+                saw_close_frame_send_failure_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("code".to_string(), code.to_string()),
+                                    ("outcome".to_string(), outcome.to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected close frame send failure count aggregation"),
+                    },
+                    _ => panic!("unexpected close frame send failure count type"),
+                }
+            }
+        }
+        assert!(saw_close_frame_send_failure_count);
+    }
+
+    fn assert_worker_cleanup_resolution_send_failure_metrics(
+        metrics: &codex_otel::MetricsClient,
+        lifecycle_event: &str,
+        notification_outcome: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_lifecycle_count = false;
+        let mut saw_notification_send_failure_count = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_server_request_lifecycle_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("lifecycle point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("event".to_string(), lifecycle_event.to_string()),
+                                    ("method".to_string(), "serverRequest/resolved".to_string()),
+                                ])
+                            );
+                            saw_lifecycle_count = true;
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                },
+                "gateway_v2_notification_send_failures" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum
+                                .data_points()
+                                .next()
+                                .expect("notification failure point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("method".to_string(), "serverRequest/resolved".to_string()),
+                                    ("outcome".to_string(), notification_outcome.to_string()),
+                                ])
+                            );
+                            saw_notification_send_failure_count = true;
+                        }
+                        _ => panic!("unexpected notification send failure count aggregation"),
+                    },
+                    _ => panic!("unexpected notification send failure count type"),
+                },
+                _ => {}
+            }
+        }
+
+        assert!(saw_lifecycle_count);
+        assert!(saw_notification_send_failure_count);
+    }
+
     fn assert_v2_server_request_lifecycle_metrics(
         metrics: &codex_otel::MetricsClient,
         expected: &[(&str, &str, u64)],
@@ -10397,6 +11040,177 @@ mod tests {
         }
         actual_points.sort();
         assert_eq!(actual_points, expected_points);
+    }
+
+    fn assert_v2_server_request_lifecycle_and_answer_delivery_failure_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected_lifecycle: &[(&str, &str, u64)],
+        expected_response_kind: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut expected_lifecycle_points = expected_lifecycle
+            .iter()
+            .map(|(event, method, value)| {
+                (
+                    BTreeMap::from([
+                        ("event".to_string(), (*event).to_string()),
+                        ("method".to_string(), (*method).to_string()),
+                    ]),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_lifecycle_points.sort();
+
+        let mut actual_lifecycle_points = Vec::new();
+        let mut saw_delivery_failure_count = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_server_request_lifecycle_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            actual_lifecycle_points.extend(sum.data_points().map(|point| {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (attributes, point.value())
+                            }));
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                },
+                "gateway_v2_server_request_answer_delivery_failures" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([(
+                                    "response_kind".to_string(),
+                                    expected_response_kind.to_string(),
+                                )])
+                            );
+                            saw_delivery_failure_count = true;
+                        }
+                        _ => {
+                            panic!("unexpected server-request answer delivery failure aggregation")
+                        }
+                    },
+                    _ => panic!("unexpected server-request answer delivery failure count type"),
+                },
+                _ => {}
+            }
+        }
+        actual_lifecycle_points.sort();
+        assert_eq!(actual_lifecycle_points, expected_lifecycle_points);
+        assert!(saw_delivery_failure_count);
+    }
+
+    fn assert_v2_server_request_lifecycle_and_rejection_delivery_failure_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected_lifecycle: &[(&str, &str, u64)],
+        expected_method: &str,
+        expected_delivery_failure_count: u64,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut expected_lifecycle_points = expected_lifecycle
+            .iter()
+            .map(|(event, method, value)| {
+                (
+                    BTreeMap::from([
+                        ("event".to_string(), (*event).to_string()),
+                        ("method".to_string(), (*method).to_string()),
+                    ]),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_lifecycle_points.sort();
+
+        let mut actual_lifecycle_points = Vec::new();
+        let mut saw_delivery_failure_count = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_server_request_lifecycle_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            actual_lifecycle_points.extend(sum.data_points().map(|point| {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (attributes, point.value())
+                            }));
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                },
+                "gateway_v2_server_request_rejection_delivery_failures" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), expected_delivery_failure_count);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([(
+                                    "method".to_string(),
+                                    expected_method.to_string(),
+                                )])
+                            );
+                            saw_delivery_failure_count = true;
+                        }
+                        _ => panic!(
+                            "unexpected server-request rejection delivery failure aggregation"
+                        ),
+                    },
+                    _ => panic!("unexpected server-request rejection delivery failure count type"),
+                },
+                _ => {}
+            }
+        }
+        actual_lifecycle_points.sort();
+        assert_eq!(actual_lifecycle_points, expected_lifecycle_points);
+        assert!(saw_delivery_failure_count);
     }
 
     fn assert_v2_server_request_lifecycle_and_connection_metrics(
@@ -12807,8 +13621,12 @@ mod tests {
             "/",
             any(|websocket: WebSocketUpgrade| async move {
                 websocket.on_upgrade(|mut socket| async move {
-                    super::send_invalid_payload_close(
+                    let observability = GatewayObservability::default();
+                    let request_context = GatewayRequestContext::default();
+                    super::send_observed_invalid_payload_close(
                         &mut socket,
+                        &observability,
+                        &request_context,
                         &std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
@@ -12969,6 +13787,565 @@ mod tests {
         server_task.abort();
         let _ = server_task.await;
         assert_v2_downstream_backpressure_metric(&metrics, "none");
+    }
+
+    #[tokio::test]
+    async fn handle_app_server_event_records_notification_send_failure_metric() {
+        let metrics = in_memory_metrics();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let metrics_for_server = metrics.clone();
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let metrics = metrics_for_server.clone();
+                let outcome_tx = outcome_tx.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::new(Some(metrics), false);
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext::default();
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_millis(1),
+                            max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
+                        };
+                        let (event_tx, event_rx) = mpsc::channel(1);
+                        let mut router = GatewayV2DownstreamRouter {
+                            workers: Vec::new(),
+                            event_tx,
+                            event_rx,
+                            shutdown_txs: Vec::new(),
+                            event_tasks: Vec::new(),
+                            next_worker: 0,
+                            initialized_notification_sent: false,
+                            active_fs_watches: HashMap::new(),
+                            reconnect_retry_after: HashMap::new(),
+                            reconnect_state: None,
+                        };
+                        let session_factory = GatewayV2SessionFactory::remote_single(
+                            RemoteAppServerConnectArgs {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+                                auth_token: None,
+                                client_name: "codex-gateway".to_string(),
+                                client_version: "0.0.0-test".to_string(),
+                                experimental_api: false,
+                                opt_out_notification_methods: Vec::new(),
+                                channel_capacity: 4,
+                            },
+                            test_initialize_response().await,
+                        );
+                        let mut event_state = GatewayV2EventState {
+                            pending_server_requests: HashMap::new(),
+                            resolved_server_requests: HashMap::new(),
+                            skills_changed_pending_refresh: false,
+                            forwarded_connection_notifications: HashMap::new(),
+                        };
+                        let warning = ServerNotification::Warning(WarningNotification {
+                            thread_id: None,
+                            message: "w".repeat(1024 * 1024),
+                        });
+
+                        for _ in 0..256 {
+                            let result = handle_app_server_event(
+                                &mut socket,
+                                &mut router,
+                                &session_factory,
+                                &connection,
+                                &mut event_state,
+                                DownstreamWorkerEvent {
+                                    worker_id: None,
+                                    event: Some(AppServerEvent::ServerNotification(
+                                        warning.clone(),
+                                    )),
+                                },
+                            )
+                            .await;
+                            if let Err(err) = result {
+                                let _ = outcome_tx
+                                    .send(super::classify_v2_connection_error(&err).to_string())
+                                    .await;
+                                return;
+                            }
+                        }
+
+                        let _ = outcome_tx.send("no_send_failure".to_string()).await;
+                    })
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (_websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        let outcome = timeout(Duration::from_secs(5), outcome_rx.recv())
+            .await
+            .expect("notification send should fail")
+            .expect("notification send outcome should be recorded");
+
+        assert_eq!(outcome, "client_send_timed_out");
+        assert_v2_notification_send_failure_metric(&metrics, "warning", "client_send_timed_out");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn send_client_jsonrpc_records_client_response_send_failure_metric() {
+        let metrics = in_memory_metrics();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let metrics_for_server = metrics.clone();
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let metrics = metrics_for_server.clone();
+                let outcome_tx = outcome_tx.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::new(Some(metrics), false);
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext::default();
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_millis(1),
+                            max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
+                        };
+                        let request_id = RequestId::String("model-list-1".to_string());
+                        let response = JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request_id.clone(),
+                            result: serde_json::json!({
+                                "models": ["m".repeat(1024 * 1024)],
+                            }),
+                        });
+
+                        for _ in 0..256 {
+                            let result = super::send_client_jsonrpc(
+                                &mut socket,
+                                &connection,
+                                &request_id,
+                                "model/list",
+                                response.clone(),
+                            )
+                            .await;
+                            if let Err(err) = result {
+                                let _ = outcome_tx
+                                    .send(super::classify_v2_connection_error(&err).to_string())
+                                    .await;
+                                return;
+                            }
+                        }
+
+                        let _ = outcome_tx.send("no_send_failure".to_string()).await;
+                    })
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (_websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        let outcome = timeout(Duration::from_secs(5), outcome_rx.recv())
+            .await
+            .expect("client response send should fail")
+            .expect("client response send outcome should be recorded");
+
+        assert_eq!(outcome, "client_send_timed_out");
+        assert_v2_client_response_send_failure_metric(
+            &metrics,
+            "model/list",
+            "client_send_timed_out",
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn send_client_jsonrpc_error_records_client_response_send_failure_metric() {
+        let metrics = in_memory_metrics();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let metrics_for_server = metrics.clone();
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let metrics = metrics_for_server.clone();
+                let outcome_tx = outcome_tx.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::new(Some(metrics), false);
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext::default();
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_millis(1),
+                            max_pending_server_requests: 4,
+                            max_pending_client_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
+                        };
+                        let request_id = RequestId::String("thread-read-1".to_string());
+
+                        for _ in 0..256 {
+                            let result = super::send_client_jsonrpc_error(
+                                &mut socket,
+                                &connection,
+                                &request_id,
+                                "thread/read",
+                                JSONRPCErrorError {
+                                    code: super::INTERNAL_ERROR_CODE,
+                                    message: "m".repeat(1024 * 1024),
+                                    data: None,
+                                },
+                            )
+                            .await;
+                            if let Err(err) = result {
+                                let _ = outcome_tx
+                                    .send(super::classify_v2_connection_error(&err).to_string())
+                                    .await;
+                                return;
+                            }
+                        }
+
+                        let _ = outcome_tx.send("no_send_failure".to_string()).await;
+                    })
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (_websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        let outcome = timeout(Duration::from_secs(5), outcome_rx.recv())
+            .await
+            .expect("client error response send should fail")
+            .expect("client error response send outcome should be recorded");
+
+        assert_eq!(outcome, "client_send_timed_out");
+        assert_v2_client_response_send_failure_metric(
+            &metrics,
+            "thread/read",
+            "client_send_timed_out",
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn send_observed_close_frame_records_send_failure_metric() {
+        let metrics = in_memory_metrics();
+        let logs = capture_logs_async({
+            let metrics = metrics.clone();
+            async move {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("listener should bind");
+                let addr = listener.local_addr().expect("listener address");
+                let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+                let metrics_for_server = metrics.clone();
+                let app = Router::new().route(
+                    "/",
+                    any(move |websocket: WebSocketUpgrade| {
+                        let metrics = metrics_for_server.clone();
+                        let outcome_tx = outcome_tx.clone();
+                        async move {
+                            websocket.on_upgrade(move |mut socket| async move {
+                                let observability = GatewayObservability::new(Some(metrics), false);
+                                let request_context = GatewayRequestContext::default();
+
+                                for _ in 0..256 {
+                                    let result = super::send_observed_close_frame(
+                                        &mut socket,
+                                        &observability,
+                                        &request_context,
+                                        close_code::POLICY,
+                                        "gateway initialize timed out",
+                                        Duration::from_millis(1),
+                                    )
+                                    .await;
+                                    if let Err(err) = result {
+                                        let _ = outcome_tx
+                                            .send(
+                                                super::classify_v2_connection_error(&err)
+                                                    .to_string(),
+                                            )
+                                            .await;
+                                        return;
+                                    }
+                                }
+
+                                let _ = outcome_tx.send("no_send_failure".to_string()).await;
+                            })
+                        }
+                    }),
+                );
+                let server_task = tokio::spawn(async move {
+                    axum::serve(listener, app).await.expect("server should run");
+                });
+
+                let (_websocket, _response) = connect_async(format!("ws://{addr}/"))
+                    .await
+                    .expect("websocket should connect");
+                let outcome = timeout(Duration::from_secs(5), outcome_rx.recv())
+                    .await
+                    .expect("close frame send should fail")
+                    .expect("close frame send outcome should be recorded");
+
+                assert_eq!(outcome, "connection_error");
+
+                server_task.abort();
+                let _ = server_task.await;
+            }
+        })
+        .await;
+
+        assert_v2_close_frame_send_failure_metric(&metrics, close_code::POLICY, "connection_error");
+        assert!(logs.contains("failed to deliver gateway v2 close frame to northbound client"));
+        assert!(logs.contains("tenant_id=\"default\""));
+        assert!(logs.contains("code=1008"));
+        assert!(logs.contains("reason=\"gateway initialize timed out\""));
+        assert!(logs.contains("outcome=\"connection_error\""));
+    }
+
+    #[tokio::test]
+    async fn handle_app_server_event_records_server_request_forward_send_failure_lifecycle() {
+        let metrics = in_memory_metrics();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let metrics_for_server = metrics.clone();
+        let app = Router::new().route(
+            "/",
+            any(move |websocket: WebSocketUpgrade| {
+                let metrics = metrics_for_server.clone();
+                let outcome_tx = outcome_tx.clone();
+                async move {
+                    websocket.on_upgrade(move |mut socket| async move {
+                        let admission = GatewayAdmissionController::default();
+                        let observability = GatewayObservability::new(Some(metrics), false);
+                        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+                        let request_context = GatewayRequestContext::default();
+                        scope_registry
+                            .register_thread("thread-visible".to_string(), request_context.clone());
+                        let connection = GatewayV2ConnectionContext {
+                            admission: &admission,
+                            observability: &observability,
+                            scope_registry: &scope_registry,
+                            request_context: &request_context,
+                            client_send_timeout: Duration::from_millis(1),
+                            max_pending_server_requests: 512,
+                            max_pending_client_requests: 4,
+                            opt_out_notification_methods: HashSet::new(),
+                        };
+                        let (event_tx, event_rx) = mpsc::channel(1);
+                        let mut router = GatewayV2DownstreamRouter {
+                            workers: Vec::new(),
+                            event_tx,
+                            event_rx,
+                            shutdown_txs: Vec::new(),
+                            event_tasks: Vec::new(),
+                            next_worker: 0,
+                            initialized_notification_sent: false,
+                            active_fs_watches: HashMap::new(),
+                            reconnect_retry_after: HashMap::new(),
+                            reconnect_state: None,
+                        };
+                        let session_factory = GatewayV2SessionFactory::remote_single(
+                            RemoteAppServerConnectArgs {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+                                auth_token: None,
+                                client_name: "codex-gateway".to_string(),
+                                client_version: "0.0.0-test".to_string(),
+                                experimental_api: false,
+                                opt_out_notification_methods: Vec::new(),
+                                channel_capacity: 4,
+                            },
+                            test_initialize_response().await,
+                        );
+                        let mut event_state = GatewayV2EventState {
+                            pending_server_requests: HashMap::new(),
+                            resolved_server_requests: HashMap::new(),
+                            skills_changed_pending_refresh: false,
+                            forwarded_connection_notifications: HashMap::new(),
+                        };
+
+                        for index in 0..256 {
+                            let request = ServerRequest::CommandExecutionRequestApproval {
+                                request_id: RequestId::String(format!("server-request-{index}")),
+                                params: CommandExecutionRequestApprovalParams {
+                                    thread_id: "thread-visible".to_string(),
+                                    turn_id: "turn-visible".to_string(),
+                                    item_id: format!("item-visible-{index}"),
+                                    approval_id: None,
+                                    reason: Some("r".repeat(1024 * 1024)),
+                                    network_approval_context: None,
+                                    command: Some("pwd".to_string()),
+                                    cwd: None,
+                                    command_actions: None,
+                                    additional_permissions: None,
+                                    proposed_execpolicy_amendment: None,
+                                    proposed_network_policy_amendments: None,
+                                    available_decisions: None,
+                                },
+                            };
+                            let result = handle_app_server_event(
+                                &mut socket,
+                                &mut router,
+                                &session_factory,
+                                &connection,
+                                &mut event_state,
+                                DownstreamWorkerEvent {
+                                    worker_id: None,
+                                    event: Some(AppServerEvent::ServerRequest(request)),
+                                },
+                            )
+                            .await;
+                            if let Err(err) = result {
+                                let _ = outcome_tx
+                                    .send(super::classify_v2_connection_error(&err).to_string())
+                                    .await;
+                                return;
+                            }
+                        }
+
+                        let _ = outcome_tx.send("no_send_failure".to_string()).await;
+                    })
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let (_websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+        let outcome = timeout(Duration::from_secs(5), outcome_rx.recv())
+            .await
+            .expect("server request send should fail")
+            .expect("server request send outcome should be recorded");
+
+        assert_eq!(outcome, "client_send_timed_out");
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let mut saw_lifecycle_event = false;
+        let mut saw_forward_send_failure = false;
+        for metric in metrics {
+            match metric.name() {
+                "gateway_v2_server_request_lifecycle_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                if attributes
+                                    == BTreeMap::from([
+                                        (
+                                            "event".to_string(),
+                                            "downstream_server_request_forward_delivery_failed"
+                                                .to_string(),
+                                        ),
+                                        (
+                                            "method".to_string(),
+                                            "item/commandExecution/requestApproval".to_string(),
+                                        ),
+                                    ])
+                                {
+                                    assert_eq!(point.value(), 1);
+                                    saw_lifecycle_event = true;
+                                }
+                            }
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                },
+                "gateway_v2_server_request_forward_send_failures" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    (
+                                        "method".to_string(),
+                                        "item/commandExecution/requestApproval".to_string()
+                                    ),
+                                    ("outcome".to_string(), "client_send_timed_out".to_string()),
+                                ])
+                            );
+                            saw_forward_send_failure = true;
+                        }
+                        _ => {
+                            panic!("unexpected server-request forward send failure aggregation")
+                        }
+                    },
+                    _ => panic!("unexpected server-request forward send failure count type"),
+                },
+                _ => {}
+            }
+        }
+        assert!(saw_lifecycle_event);
+        assert!(saw_forward_send_failure);
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -14101,7 +15478,7 @@ mod tests {
                     client_send: Duration::from_millis(1),
                     reconnect_retry_backoff: Duration::from_secs(1),
                     max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
-                    max_pending_client_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                    max_pending_client_requests: super::MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION,
                 },
             })
             .await;
@@ -14301,7 +15678,7 @@ mod tests {
                     max_pending_server_requests:
                         super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
                     max_pending_client_requests:
-                        super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                        super::MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION,
                 },
             })
             .await;
@@ -18634,7 +20011,7 @@ mod tests {
                     client_send: Duration::from_millis(1),
                     reconnect_retry_backoff: Duration::from_secs(1),
                     max_pending_server_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
-                    max_pending_client_requests: super::MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION,
+                    max_pending_client_requests: super::MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION,
                 },
             })
             .await;
@@ -36458,6 +37835,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_forwards_item_delta_notifications_for_visible_threads() {
+        let metrics = in_memory_metrics();
         let initialize_response = test_initialize_response().await;
         let websocket_url = start_mock_remote_server_for_item_delta_notification().await;
         let scope_registry = Arc::new(GatewayScopeRegistry::default());
@@ -36468,7 +37846,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
@@ -36507,6 +37885,7 @@ mod tests {
                 "delta": "streamed text",
             }))
         );
+        assert_v2_forwarded_notification_metric(&metrics, "item/agentMessage/delta", 1);
 
         server_task.abort();
         let _ = server_task.await;
@@ -36582,6 +37961,7 @@ mod tests {
             "item/agentMessage/delta",
             "hidden_thread",
         );
+        assert_no_v2_forwarded_notification_metric(&metrics);
         assert!(logs.contains(
             "suppressing downstream notification for a thread outside the gateway request scope"
         ));
@@ -37744,6 +39124,7 @@ mod tests {
         })
         .await;
         assert_v2_suppressed_notification_metric(&metrics, "warning", "opted_out");
+        assert_no_v2_forwarded_notification_metric(&metrics);
         assert!(
             logs.contains("suppressing downstream notification opted out by northbound v2 client")
         );
@@ -37959,6 +39340,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_fans_in_multi_worker_raw_response_items() {
+        let metrics = in_memory_metrics();
         let worker_a = start_mock_remote_server_for_realtime_notifications(vec![(
             "rawResponseItem/completed",
             serde_json::json!({
@@ -37988,7 +39370,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
@@ -38059,6 +39441,7 @@ mod tests {
                 })),
             ]
         );
+        assert_v2_forwarded_notification_metric(&metrics, "rawResponseItem/completed", 2);
 
         server_task.abort();
         let _ = server_task.await;
@@ -39629,6 +41012,124 @@ mod tests {
     }
 
     #[test]
+    fn log_notification_send_failure_includes_scope_worker_method_and_outcome() {
+        let logs = capture_logs(|| {
+            super::log_notification_send_failure(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(2),
+                "ws://worker-c.invalid",
+                "warning",
+                "client_send_timed_out",
+                &std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "gateway websocket send timed out",
+                ),
+            );
+        });
+
+        assert!(logs.contains("failed to deliver downstream notification to northbound v2 client"));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
+        assert!(logs.contains("method=\"warning\""));
+        assert!(logs.contains("outcome=\"client_send_timed_out\""));
+        assert!(logs.contains("gateway websocket send timed out"));
+    }
+
+    #[test]
+    fn log_downstream_server_request_forward_failure_includes_scope_worker_and_method() {
+        let logs = capture_logs(|| {
+            super::log_downstream_server_request_forward_failure(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                Some(2),
+                "ws://worker-c.invalid",
+                "item/commandExecution/requestApproval",
+                "client_send_timed_out",
+                &std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "gateway websocket send timed out",
+                ),
+            );
+        });
+
+        assert!(
+            logs.contains("failed to deliver downstream server request to northbound v2 client")
+        );
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("worker_id=Some(2)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
+        assert!(logs.contains("method=\"item/commandExecution/requestApproval\""));
+        assert!(logs.contains("outcome=\"client_send_timed_out\""));
+        assert!(logs.contains("gateway websocket send timed out"));
+    }
+
+    #[test]
+    fn log_client_response_send_failure_includes_scope_request_method_and_outcome() {
+        let logs = capture_logs(|| {
+            super::log_client_response_send_failure(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                &RequestId::String("client-request-1".to_string()),
+                "model/list",
+                "client_send_timed_out",
+                &std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "gateway websocket send timed out",
+                ),
+            );
+        });
+
+        assert!(
+            logs.contains(
+                "failed to deliver gateway v2 client request response to northbound client"
+            )
+        );
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("request_id=String(\"client-request-1\")"));
+        assert!(logs.contains("method=\"model/list\""));
+        assert!(logs.contains("outcome=\"client_send_timed_out\""));
+        assert!(logs.contains("gateway websocket send timed out"));
+    }
+
+    #[test]
+    fn log_close_frame_send_failure_includes_scope_code_reason_and_outcome() {
+        let logs = capture_logs(|| {
+            super::log_close_frame_send_failure(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                close_code::POLICY,
+                "gateway initialize timed out",
+                "client_send_timed_out",
+                &std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "gateway websocket send timed out",
+                ),
+            );
+        });
+
+        assert!(logs.contains("failed to deliver gateway v2 close frame to northbound client"));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("code=1008"));
+        assert!(logs.contains("reason=\"gateway initialize timed out\""));
+        assert!(logs.contains("outcome=\"client_send_timed_out\""));
+        assert!(logs.contains("gateway websocket send timed out"));
+    }
+
+    #[test]
     fn log_duplicate_pending_client_request_includes_scope_method_and_active_routes() {
         let logs = capture_logs(|| {
             super::log_duplicate_pending_client_request(
@@ -39886,6 +41387,39 @@ mod tests {
                 "answered_but_unresolved_worker_websocket_urls=[\"ws://worker-b.invalid\"]"
             )
         );
+    }
+
+    #[test]
+    fn log_downstream_shutdown_failure_includes_scope_outcome_and_pending_counts() {
+        let logs = capture_logs(|| {
+            super::log_downstream_shutdown_failure(
+                &GatewayRequestContext {
+                    tenant_id: "tenant-visible".to_string(),
+                    project_id: Some("project-visible".to_string()),
+                },
+                "client_send_timed_out",
+                Some("gateway websocket send timed out"),
+                1,
+                2,
+                3,
+                &std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream shutdown channel closed",
+                ),
+            );
+        });
+
+        assert!(logs.contains(
+            "gateway v2 websocket downstream shutdown also failed after connection error"
+        ));
+        assert!(logs.contains("tenant-visible"));
+        assert!(logs.contains("project-visible"));
+        assert!(logs.contains("connection_outcome=\"client_send_timed_out\""));
+        assert!(logs.contains("connection_detail=\"gateway websocket send timed out\""));
+        assert!(logs.contains("pending_client_request_count=1"));
+        assert!(logs.contains("pending_server_request_count=2"));
+        assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
+        assert!(logs.contains("downstream shutdown channel closed"));
     }
 
     #[test]
