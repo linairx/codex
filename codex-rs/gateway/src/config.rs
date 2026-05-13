@@ -79,6 +79,7 @@ pub enum GatewayRemoteSelectionPolicy {
 pub struct GatewayRemoteWorkerConfig {
     pub websocket_url: String,
     pub auth_token: Option<String>,
+    pub account_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -136,6 +137,7 @@ mod tests {
             workers: vec![GatewayRemoteWorkerConfig {
                 websocket_url: "ws://127.0.0.1:8081".to_string(),
                 auth_token: Some("secret".to_string()),
+                account_id: Some("acct-a".to_string()),
             }],
         };
 

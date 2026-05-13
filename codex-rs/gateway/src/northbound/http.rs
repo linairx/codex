@@ -431,6 +431,7 @@ mod tests {
                 },
                 v2_connections: default_v2_connections(),
                 remote_workers: None,
+                project_worker_routes: None,
             }
         }
 
@@ -471,7 +472,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":null}"#
+            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":null,"projectWorkerRoutes":null}"#
         );
     }
 
@@ -548,6 +549,10 @@ mod tests {
                     remote_workers: Some(vec![GatewayRemoteWorkerHealth {
                         worker_id: 0,
                         websocket_url: "ws://127.0.0.1:8081".to_string(),
+                        account_id: None,
+                        account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                        account_capacity_reason: None,
+                        account_capacity_last_changed_at: None,
                         healthy: false,
                         reconnecting: true,
                         reconnect_attempt_count: 2,
@@ -557,6 +562,7 @@ mod tests {
                         next_reconnect_at: Some(1710000002),
                         reconnect_backoff_remaining_seconds: Some(1),
                     }]),
+                    project_worker_routes: Some(Vec::new()),
                 }
             }
 
@@ -596,7 +602,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002,"reconnectBackoffRemainingSeconds":1}]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002,"reconnectBackoffRemainingSeconds":1}],"projectWorkerRoutes":[]}"#
         );
     }
 
@@ -690,6 +696,10 @@ mod tests {
                     remote_workers: Some(vec![GatewayRemoteWorkerHealth {
                         worker_id: 0,
                         websocket_url: "ws://127.0.0.1:8081".to_string(),
+                        account_id: None,
+                        account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                        account_capacity_reason: None,
+                        account_capacity_last_changed_at: None,
                         healthy: true,
                         reconnecting: false,
                         reconnect_attempt_count: 0,
@@ -699,6 +709,7 @@ mod tests {
                         next_reconnect_at: None,
                         reconnect_backoff_remaining_seconds: None,
                     }]),
+                    project_worker_routes: Some(Vec::new()),
                 }
             }
 
@@ -738,7 +749,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionDurationMs":2500,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingClientRequestCount":4,"lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null,"reconnectBackoffRemainingSeconds":null}]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionDurationMs":2500,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingClientRequestCount":4,"lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null,"reconnectBackoffRemainingSeconds":null}],"projectWorkerRoutes":[]}"#
         );
     }
 
@@ -1047,6 +1058,7 @@ mod tests {
                     },
                     v2_connections: default_v2_connections(),
                     remote_workers: None,
+                    project_worker_routes: None,
                 }
             }
 
@@ -1221,6 +1233,7 @@ mod tests {
                     },
                     v2_connections: default_v2_connections(),
                     remote_workers: Some(Vec::new()),
+                    project_worker_routes: Some(Vec::new()),
                 }
             }
 

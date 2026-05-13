@@ -1,3 +1,4 @@
+use crate::event::GatewayEvent;
 use crate::scope::GatewayRequestContext;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
@@ -11,6 +12,7 @@ use codex_otel::OtelProvider;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::broadcast;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
@@ -19,6 +21,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const REQUEST_COUNT_METRIC: &str = "gateway_http_requests";
 const REQUEST_DURATION_METRIC: &str = "gateway_http_request_duration";
+const ACCOUNT_CAPACITY_EVENT_COUNT_METRIC: &str = "gateway_account_capacity_events";
 const V2_REQUEST_COUNT_METRIC: &str = "gateway_v2_requests";
 const V2_REQUEST_DURATION_METRIC: &str = "gateway_v2_request_duration";
 const V2_CONNECTION_COUNT_METRIC: &str = "gateway_v2_connections";
@@ -55,6 +58,7 @@ const V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC: &str = "gateway_v2_client_send_timeou
 const V2_THREAD_LIST_DEDUPLICATION_COUNT_METRIC: &str = "gateway_v2_thread_list_deduplications";
 const V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC: &str = "gateway_v2_thread_route_recoveries";
 const V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC: &str = "gateway_v2_degraded_thread_discovery";
+const V2_ACCOUNT_CAPACITY_EVENT_COUNT_METRIC: &str = "gateway_v2_account_capacity_events";
 
 type StderrLogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
 
@@ -63,6 +67,7 @@ pub struct GatewayObservability {
     metrics: Option<MetricsClient>,
     audit_logs_enabled: bool,
     v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
+    operator_events: Option<broadcast::Sender<GatewayEvent>>,
 }
 
 impl GatewayObservability {
@@ -71,6 +76,7 @@ impl GatewayObservability {
             metrics,
             audit_logs_enabled,
             v2_connection_health: Arc::new(GatewayV2ConnectionHealthRegistry::default()),
+            operator_events: None,
         }
     }
 
@@ -79,6 +85,17 @@ impl GatewayObservability {
             otel.and_then(OtelProvider::metrics).cloned(),
             audit_logs_enabled,
         )
+    }
+
+    pub fn with_operator_events(mut self, events: broadcast::Sender<GatewayEvent>) -> Self {
+        self.operator_events = Some(events);
+        self
+    }
+
+    pub(crate) fn publish_operator_event(&self, event: GatewayEvent) {
+        if let Some(events) = &self.operator_events {
+            let _ = events.send(event);
+        }
     }
 
     fn record_http_request(&self, method: &str, route: &str, status_code: u16, duration: Duration) {
@@ -99,6 +116,17 @@ impl GatewayObservability {
             if let Err(err) = metrics.histogram(REQUEST_DURATION_METRIC, duration_ms, &tags) {
                 tracing::warn!("failed to record gateway request duration metric: {err}");
             }
+        }
+    }
+
+    pub(crate) fn record_account_capacity_event(&self, worker_id: usize, event: &str) {
+        let worker_id = worker_id.to_string();
+        let tags = [("worker_id", worker_id.as_str()), ("event", event)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(ACCOUNT_CAPACITY_EVENT_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway account capacity event metric: {err}");
         }
     }
 
@@ -457,6 +485,17 @@ impl GatewayObservability {
         }
     }
 
+    pub(crate) fn record_v2_account_capacity_event(&self, worker_id: usize, event: &str) {
+        let worker_id = worker_id.to_string();
+        let tags = [("worker_id", worker_id.as_str()), ("event", event)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(V2_ACCOUNT_CAPACITY_EVENT_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway v2 account capacity event metric: {err}");
+        }
+    }
+
     pub fn v2_connection_health(&self) -> Arc<GatewayV2ConnectionHealthRegistry> {
         Arc::clone(&self.v2_connection_health)
     }
@@ -684,9 +723,11 @@ fn v2_connection_log_level(outcome: &str) -> Level {
 
 #[cfg(test)]
 mod tests {
+    use super::ACCOUNT_CAPACITY_EVENT_COUNT_METRIC;
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::V2_ACCOUNT_CAPACITY_EVENT_COUNT_METRIC;
     use super::V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC;
     use super::V2_CLIENT_RESPONSE_SEND_FAILURE_COUNT_METRIC;
     use super::V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC;
@@ -1325,6 +1366,132 @@ mod tests {
                         _ => panic!("unexpected worker reconnect count aggregation"),
                     },
                     _ => panic!("unexpected worker reconnect count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_account_capacity_event_metrics_with_worker_and_event_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_account_capacity_event(7, "exhausted");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == ACCOUNT_CAPACITY_EVENT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("worker_id".to_string(), "7".to_string()),
+                                    ("event".to_string(), "exhausted".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected account capacity event count aggregation"),
+                    },
+                    _ => panic!("unexpected account capacity event count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_v2_account_capacity_event_metrics_with_worker_and_event_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_v2_account_capacity_event(7, "exhausted");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == V2_ACCOUNT_CAPACITY_EVENT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("worker_id".to_string(), "7".to_string()),
+                                    ("event".to_string(), "exhausted".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected account capacity event count aggregation"),
+                    },
+                    _ => panic!("unexpected account capacity event count type"),
                 }
             }
         }

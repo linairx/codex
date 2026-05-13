@@ -1,3 +1,4 @@
+use crate::api::GatewayAccountCapacityStatus;
 use crate::api::GatewayRemoteWorkerHealth;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
@@ -9,6 +10,10 @@ use std::time::UNIX_EPOCH;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteWorkerHealthState {
     websocket_url: String,
+    account_id: Option<String>,
+    account_capacity: GatewayAccountCapacityStatus,
+    account_capacity_reason: Option<String>,
+    account_capacity_last_changed_at: Option<i64>,
     healthy: bool,
     reconnecting: bool,
     reconnect_attempt_count: u32,
@@ -24,12 +29,25 @@ pub struct RemoteWorkerHealthRegistry {
 
 impl RemoteWorkerHealthRegistry {
     pub fn new(websocket_urls: Vec<String>) -> Self {
+        Self::new_with_accounts(
+            websocket_urls
+                .into_iter()
+                .map(|websocket_url| (websocket_url, None))
+                .collect(),
+        )
+    }
+
+    pub fn new_with_accounts(workers: Vec<(String, Option<String>)>) -> Self {
         Self {
             workers: RwLock::new(
-                websocket_urls
+                workers
                     .into_iter()
-                    .map(|websocket_url| RemoteWorkerHealthState {
+                    .map(|(websocket_url, account_id)| RemoteWorkerHealthState {
                         websocket_url,
+                        account_id,
+                        account_capacity: GatewayAccountCapacityStatus::Available,
+                        account_capacity_reason: None,
+                        account_capacity_last_changed_at: None,
                         healthy: true,
                         reconnecting: false,
                         reconnect_attempt_count: 0,
@@ -47,6 +65,42 @@ impl RemoteWorkerHealthRegistry {
         read_guard(&self.workers)
             .get(worker_id)
             .is_some_and(|worker| worker.healthy)
+    }
+
+    pub fn account_id(&self, worker_id: usize) -> Option<String> {
+        read_guard(&self.workers)
+            .get(worker_id)
+            .and_then(|worker| worker.account_id.clone())
+    }
+
+    pub fn account_capacity(&self, worker_id: usize) -> Option<GatewayAccountCapacityStatus> {
+        read_guard(&self.workers)
+            .get(worker_id)
+            .map(|worker| worker.account_capacity)
+    }
+
+    pub fn account_has_capacity(&self, worker_id: usize) -> bool {
+        self.account_capacity(worker_id) == Some(GatewayAccountCapacityStatus::Available)
+    }
+
+    pub fn mark_account_exhausted_for_worker(&self, worker_id: usize, reason: String) {
+        let account_id = self.account_id(worker_id);
+        self.update_account_capacity(
+            account_id.as_deref(),
+            worker_id,
+            GatewayAccountCapacityStatus::Exhausted,
+            Some(reason),
+        );
+    }
+
+    pub fn mark_account_available_for_worker(&self, worker_id: usize) {
+        let account_id = self.account_id(worker_id);
+        self.update_account_capacity(
+            account_id.as_deref(),
+            worker_id,
+            GatewayAccountCapacityStatus::Available,
+            None,
+        );
     }
 
     pub fn mark_unhealthy(&self, worker_id: usize, error: Option<String>) {
@@ -112,6 +166,10 @@ impl RemoteWorkerHealthRegistry {
             .map(|(worker_id, worker)| GatewayRemoteWorkerHealth {
                 worker_id,
                 websocket_url: worker.websocket_url.clone(),
+                account_id: worker.account_id.clone(),
+                account_capacity: worker.account_capacity,
+                account_capacity_reason: worker.account_capacity_reason.clone(),
+                account_capacity_last_changed_at: worker.account_capacity_last_changed_at,
                 healthy: worker.healthy,
                 reconnecting: worker.reconnecting,
                 reconnect_attempt_count: worker.reconnect_attempt_count,
@@ -124,6 +182,33 @@ impl RemoteWorkerHealthRegistry {
                     .map(|next_reconnect_at| next_reconnect_at.saturating_sub(now)),
             })
             .collect()
+    }
+
+    fn update_account_capacity(
+        &self,
+        account_id: Option<&str>,
+        fallback_worker_id: usize,
+        status: GatewayAccountCapacityStatus,
+        reason: Option<String>,
+    ) {
+        let now = unix_timestamp_now();
+        for (worker_id, worker) in write_guard(&self.workers).iter_mut().enumerate() {
+            let same_account = match account_id {
+                Some(account_id) => worker.account_id.as_deref() == Some(account_id),
+                None => worker_id == fallback_worker_id,
+            };
+            if !same_account {
+                continue;
+            }
+
+            let state_changed =
+                worker.account_capacity != status || worker.account_capacity_reason != reason;
+            worker.account_capacity = status;
+            worker.account_capacity_reason = reason.clone();
+            if state_changed {
+                worker.account_capacity_last_changed_at = Some(now);
+            }
+        }
     }
 }
 
@@ -162,9 +247,12 @@ mod tests {
 
     #[test]
     fn workers_start_healthy_and_capture_last_error() {
-        let registry = RemoteWorkerHealthRegistry::new(vec![
-            "ws://127.0.0.1:8081".to_string(),
-            "ws://127.0.0.1:8082".to_string(),
+        let registry = RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            ("ws://127.0.0.1:8082".to_string(), None),
         ]);
 
         assert_eq!(registry.is_healthy(0), true);
@@ -182,6 +270,10 @@ mod tests {
             crate::api::GatewayRemoteWorkerHealth {
                 worker_id: 0,
                 websocket_url: "ws://127.0.0.1:8081".to_string(),
+                account_id: Some("acct-a".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                account_capacity_reason: None,
+                account_capacity_last_changed_at: None,
                 healthy: true,
                 reconnecting: false,
                 reconnect_attempt_count: 0,
@@ -341,5 +433,38 @@ mod tests {
                 .is_some(),
             true
         );
+    }
+
+    #[test]
+    fn account_capacity_updates_all_workers_with_the_same_account() {
+        let registry = RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            (
+                "ws://127.0.0.1:8082".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            (
+                "ws://127.0.0.1:8083".to_string(),
+                Some("acct-b".to_string()),
+            ),
+        ]);
+
+        registry.mark_account_exhausted_for_worker(0, "rate limit reached".to_string());
+
+        assert_eq!(registry.account_has_capacity(0), false);
+        assert_eq!(registry.account_has_capacity(1), false);
+        assert_eq!(registry.account_has_capacity(2), true);
+        assert_eq!(
+            registry.snapshot()[0].account_capacity,
+            crate::api::GatewayAccountCapacityStatus::Exhausted
+        );
+
+        registry.mark_account_available_for_worker(1);
+
+        assert_eq!(registry.account_has_capacity(0), true);
+        assert_eq!(registry.account_has_capacity(1), true);
     }
 }

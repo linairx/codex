@@ -85,6 +85,9 @@ struct GatewayCli {
 
     #[arg(long = "remote-auth-token", value_name = "TOKEN")]
     remote_auth_token: Option<String>,
+
+    #[arg(long = "remote-account-id", value_name = "ACCOUNT_ID")]
+    remote_account_id: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -109,6 +112,14 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         let default_gateway_config = GatewayConfig::default();
+        if !top_cli.inner.remote_account_id.is_empty()
+            && top_cli.inner.remote_account_id.len() != top_cli.inner.remote_websocket_url.len()
+        {
+            anyhow::bail!(
+                "--remote-account-id must be provided once per --remote-websocket-url when configured"
+            );
+        }
+        let remote_account_ids = top_cli.inner.remote_account_id.clone();
         let server = start_gateway_server(
             GatewayConfig {
                 bind_address: top_cli.inner.listen,
@@ -155,9 +166,11 @@ fn main() -> anyhow::Result<()> {
                             .inner
                             .remote_websocket_url
                             .into_iter()
-                            .map(|websocket_url| GatewayRemoteWorkerConfig {
+                            .enumerate()
+                            .map(|(index, websocket_url)| GatewayRemoteWorkerConfig {
                                 websocket_url,
                                 auth_token: top_cli.inner.remote_auth_token.clone(),
+                                account_id: remote_account_ids.get(index).cloned(),
                             })
                             .collect(),
                     },

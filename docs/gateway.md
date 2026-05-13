@@ -205,8 +205,9 @@ Exit criteria:
 
 5. Project-aware account routing and quota failover
 
-Status: initial project-to-worker affinity foundation in progress; account
-capacity tracking, quota failover, and context handoff are still planned
+Status: project-to-worker affinity, account-capacity tracking, and bounded
+new-thread quota failover are in progress; full active-context handoff is still
+planned
 
 Goal:
 
@@ -283,6 +284,187 @@ Recent progress:
   `thread/start` requests prefer that worker when it is still available; this
   is only the cache-affinity foundation and does not yet implement account
   quota tracking or context handoff
+- remote `/healthz` now exposes the current project-to-worker affinity table as
+  `projectWorkerRoutes`, including whether the pinned worker is currently
+  healthy and the configured `accountId` for that worker when one is supplied,
+  giving operators a concrete view of which tenant/project scopes are pinned
+  to which account-backed worker before quota tracking and context handoff are
+  added
+- remote worker configuration now accepts per-worker account identity via
+  `--remote-account-id`, and remote `/healthz` carries that identity through
+  both `remoteWorkers[].accountId` and `projectWorkerRoutes[].accountId`; this
+  still only exposes identity and does not yet implement quota-aware routing
+- project-scoped remote `thread/start` selection now uses configured
+  `accountId` labels as an initial distribution signal: once one project is
+  pinned to an account-backed worker, a different project in the same tenant
+  prefers a less-loaded account when one is healthy and eligible, while
+  existing same-project affinity still wins
+- remote worker health now tracks account capacity separately from worker
+  process health: `/healthz` exposes `accountCapacity`,
+  `accountCapacityReason`, and `accountCapacityLastChangedAt` for each worker,
+  and `projectWorkerRoutes` carries the current `accountCapacity` for the
+  pinned route
+- HTTP `thread/start` now treats downstream quota, rate-limit, billing, credits,
+  and 429 JSON-RPC failures as account-capacity exhaustion signals instead of
+  worker-health failures; later project-scoped selection avoids exhausted
+  account-backed workers and retries another healthy account when one is
+  available, but this still does not transfer active in-memory context
+- HTTP `thread/start` quota failover now emits
+  `gateway_account_capacity_events` metrics for exhausted workers and
+  successful replacement routes, and writes structured logs with
+  tenant/project scope, exhausted worker/account identity, replacement
+  worker/account identity, and the downstream quota reason, matching the v2
+  new-thread failover observability path
+- HTTP `thread/start` quota failover also publishes `/v1/events` operator
+  events for `gateway/accountCapacityExhausted` and
+  `gateway/accountFailoverSucceeded`, so account-backed worker handoff is
+  visible to event-stream consumers in addition to `/healthz`, metrics, and
+  logs
+- the HTTP remote account-capacity failover regression now opens the real
+  `/v1/events` SSE stream before triggering a quota-like `thread/start`
+  failure, and verifies both account-exhaustion and replacement-route events
+  are delivered to operators
+- northbound v2 multi-worker `thread/start` now carries the configured
+  per-worker `accountId` labels into the connection-local router, so
+  project-scoped v2 clients use the same less-loaded-account preference for
+  new projects that HTTP `thread/start` uses; this is still label-aware cache
+  distribution, not quota-aware context handoff
+- northbound v2 multi-worker `thread/start` now also consults the shared
+  remote-worker health registry before applying project affinity, so an
+  existing same-project route to an account currently marked exhausted is
+  bypassed in favor of a worker with available account capacity; v2 still does
+  not transfer active context after a quota failure
+- northbound v2 multi-worker `thread/start` now marks quota-like downstream
+  JSON-RPC failures as account-capacity exhaustion and retries the same new
+  thread request against another available account-backed worker when one is
+  eligible; this is bounded failover for new thread creation only and still
+  does not transfer active in-memory context
+- northbound v2 multi-worker account capacity now also synchronizes from
+  successful `account/rateLimits/read` responses and
+  `account/rateLimits/updated` notifications, so operator-visible capacity can
+  recover to available after fresh rate-limit state shows no exhausted bucket
+  instead of only changing on `thread/start` failure or success paths
+- northbound v2 `thread/start` quota failover now emits
+  `gateway_v2_account_capacity_events` metrics for exhausted workers and
+  successful replacement routes, and writes structured logs with
+  tenant/project scope, exhausted worker/account identity, replacement
+  worker/account identity, and the downstream quota reason; it also publishes
+  `/v1/events` operator events for `gateway/accountCapacityExhausted` and
+  `gateway/accountFailoverSucceeded`, so the bounded new-thread failover path
+  is visible outside `/healthz`
+- northbound v2 thread-scoped requests now fail closed when the thread is
+  pinned to a worker whose account is already marked exhausted, rather than
+  silently moving active context to a different account-backed worker without a
+  protocol-visible resume or handoff path
+- northbound v2 explicit `thread/resume` by thread id now treats that
+  protocol-visible resume request as a bounded account-handoff surface: if the
+  visible thread is pinned to an exhausted account-backed worker, the gateway
+  skips that worker, attempts the resume on another available account, updates
+  sticky thread routing on success, and fails closed if no replacement restores
+  the thread
+- that explicit thread-id resume handoff path emits
+  `gateway_v2_account_capacity_events` as
+  `thread_resume_handoff_success` or `thread_resume_handoff_failure`, writes
+  structured tenant/project/worker/account logs, and publishes `/v1/events`
+  operator events as `gateway/accountThreadHandoffSucceeded` or
+  `gateway/accountThreadHandoffFailed`
+- northbound v2 `thread/fork` by thread id now uses the same bounded
+  account-handoff surface as explicit `thread/resume`: if the visible source
+  thread is pinned to an exhausted account-backed worker, the gateway attempts
+  the fork on another available account, updates sticky routing for the forked
+  thread on success, and fails closed when no replacement can restore the
+  request
+- that explicit thread-id fork handoff path emits
+  `gateway_v2_account_capacity_events` as `thread_fork_handoff_success` or
+  `thread_fork_handoff_failure`, writes structured tenant/project/worker/account
+  logs, and publishes `/v1/events` operator events as
+  `gateway/accountThreadHandoffSucceeded` or
+  `gateway/accountThreadHandoffFailed`
+- the real multi-worker legacy compatibility harness now also verifies that an
+  explicit `thread/resume` by thread id can restore a visible thread through a
+  replacement account-backed worker after the cached owner account is marked
+  exhausted, and that `/v1/events` publishes
+  `gateway/accountThreadHandoffSucceeded` with the old and replacement
+  worker/account identities; the same harness now also verifies a follow-up
+  `thread/read` stays sticky to the replacement worker after the successful
+  handoff
+- that same real multi-worker legacy compatibility harness now also verifies
+  the successful explicit `thread/fork` by thread id restoration path through
+  an unmodified `RemoteAppServerClient` session, including the
+  `gateway/accountThreadHandoffSucceeded` operator event with the old and
+  replacement worker/account identities
+- the same real multi-worker legacy compatibility harness now also covers the
+  no-replacement explicit `thread/resume` branch: when every eligible
+  account-backed worker is marked exhausted, the gateway fails closed and
+  publishes `gateway/accountThreadHandoffFailed` instead of retrying on an
+  exhausted account or silently moving active state
+- that real no-replacement harness now also covers explicit `thread/fork` by
+  thread id: when every eligible account-backed worker is exhausted, the
+  gateway fails closed, keeps the existing source-thread route unchanged, and
+  publishes `gateway/accountThreadHandoffFailed` with method `thread/fork`
+- that exhausted-account fail-closed path is now covered by the same
+  `gateway_v2_fail_closed_requests` metric and structured route diagnostic log
+  as unavailable-worker fail-closed requests, including the no-reconnect case
+  where all worker sessions are present but the owning account lacks capacity
+- that same active-thread fail-closed path now also emits a
+  `gateway_v2_account_capacity_events` metric with
+  `active_thread_handoff_failure` and publishes a `/v1/events` operator event
+  as `gateway/accountActiveThreadHandoffFailed`, so clients and operators can
+  distinguish a deliberate no-handoff decision from an ordinary worker-route
+  failure
+- northbound v2 path-based `thread/resume`, `thread/fork`, and
+  `getConversationSummary` now treat protocol-visible rollout paths as the
+  first bounded account-handoff surface: if the cached path route points at an
+  exhausted account-backed worker, the gateway skips that worker, tries to
+  restore the request on another available worker, updates the visible route on
+  success, and emits `gateway_v2_account_capacity_events` plus structured
+  tenant/project/worker/account logs for the replacement route; if no
+  replacement restores the path, the gateway emits a
+  `path_thread_handoff_failure` account-capacity event with structured
+  tenant/project/worker/account logs and fails closed instead of silently using
+  the exhausted account
+- those v2 path-based account handoff success and failure paths now also
+  publish `/v1/events` operator events as
+  `gateway/accountPathHandoffSucceeded` and
+  `gateway/accountPathHandoffFailed`, carrying the tenant/project scope,
+  method, rollout path, exhausted worker/account identity, and replacement
+  worker/account identity when restoration succeeds
+- legacy v2 `getConversationSummary` by `conversationId` now also treats that
+  visible thread id as a bounded account-handoff surface: if the cached worker
+  account is exhausted, the gateway attempts the same summary request on
+  another available account, updates the returned conversation/path route on
+  success, and fails closed if no replacement can restore the summary
+- that conversation-summary thread-id handoff path emits
+  `gateway_v2_account_capacity_events` as
+  `conversation_summary_handoff_success` or
+  `conversation_summary_handoff_failure`, writes structured
+  tenant/project/worker/account logs, and publishes `/v1/events` operator
+  events as `gateway/accountThreadHandoffSucceeded` or
+  `gateway/accountThreadHandoffFailed`
+- the real multi-worker legacy compatibility harness now also drives
+  `account/rateLimits/read` to mark the cached rollout-path worker exhausted,
+  then verifies `getConversationSummary.rolloutPath` restores through another
+  account-backed worker on an unmodified `RemoteAppServerClient` session; that
+  harness now also watches the real `/v1/events` SSE stream and verifies the
+  resulting `gateway/accountPathHandoffSucceeded` operator event
+- that same real multi-worker legacy compatibility harness now also verifies
+  `getConversationSummary.conversationId` restores through a replacement
+  account-backed worker after the cached owner account is marked exhausted,
+  including the `gateway/accountThreadHandoffSucceeded` operator event
+- the same real multi-worker legacy compatibility harness now also covers the
+  no-replacement rollout-path branch: when every eligible account-backed worker
+  is marked exhausted, `getConversationSummary.rolloutPath` fails closed and
+  publishes `gateway/accountPathHandoffFailed` instead of silently using an
+  exhausted cached route
+- that real no-replacement harness now also covers
+  `getConversationSummary.conversationId`: when every eligible account-backed
+  worker is exhausted, the gateway fails closed and publishes
+  `gateway/accountThreadHandoffFailed` instead of retrying on an exhausted
+  account or changing the cached thread route
+- the remote HTTP runtime now has regression coverage showing that same-project
+  affinity is only an optimization: if the cached project worker becomes
+  unhealthy, the next same-project `thread/start` routes to another healthy
+  worker and updates the visible `projectWorkerRoutes` entry
 - dedicated gateway passthrough tests now cover the bootstrap-critical
   `account/read` and `model/list` requests in addition to the previously added
   thread, turn, server-request, and realtime compatibility coverage
@@ -2374,4 +2556,5 @@ The remaining Phase 6 work is:
 - design and implement project-aware account routing so same-project clients can
   stay on the same account-backed worker for cache affinity, different projects
   can be distributed across eligible accounts, and quota exhaustion can trigger
-  a safe, observable context handoff when the conversation state is resumable
+  a safe, observable context handoff for active thread state when the
+  conversation state is resumable

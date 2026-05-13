@@ -4,6 +4,7 @@ use crate::adapter::thread_start_request;
 use crate::adapter::turn_interrupt_request;
 use crate::adapter::turn_start_request;
 use crate::api::CreateThreadRequest;
+use crate::api::GatewayAccountCapacityStatus;
 use crate::api::GatewayExecutionMode;
 use crate::api::GatewayHealthResponse;
 use crate::api::GatewayHealthStatus;
@@ -20,6 +21,7 @@ use crate::api::TurnResponse;
 use crate::config::GatewayRemoteSelectionPolicy;
 use crate::error::GatewayError;
 use crate::event::GatewayEvent;
+use crate::observability::GatewayObservability;
 use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::remote_worker::GatewayRemoteWorker;
 use crate::runtime::GatewayRuntime;
@@ -27,6 +29,8 @@ use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use async_trait::async_trait;
+use codex_app_server_client::TypedRequestError;
+use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListResponse as AppServerThreadListResponse;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -38,6 +42,8 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
+use tracing::info;
+use tracing::warn;
 
 const DEFAULT_THREAD_LIST_LIMIT: usize = 20;
 const GATEWAY_THREAD_CURSOR_PREFIX: &str = "offset:";
@@ -52,6 +58,7 @@ pub struct RemoteWorkerGatewayRuntime {
     worker_health: Arc<RemoteWorkerHealthRegistry>,
     v2_transport: GatewayV2TransportConfig,
     v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
+    observability: GatewayObservability,
 }
 
 impl RemoteWorkerGatewayRuntime {
@@ -62,7 +69,7 @@ impl RemoteWorkerGatewayRuntime {
         scope_registry: Arc<GatewayScopeRegistry>,
         worker_health: Arc<RemoteWorkerHealthRegistry>,
         v2_transport: GatewayV2TransportConfig,
-        v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
+        observability: GatewayObservability,
     ) -> Result<Self, GatewayError> {
         if workers.is_empty() {
             return Err(GatewayError::InvalidRequest(
@@ -79,7 +86,8 @@ impl RemoteWorkerGatewayRuntime {
             scope_registry,
             worker_health,
             v2_transport,
-            v2_connection_health,
+            v2_connection_health: observability.v2_connection_health(),
+            observability,
         })
     }
 
@@ -93,30 +101,40 @@ impl RemoteWorkerGatewayRuntime {
                 let start = self.next_worker.fetch_add(1, Ordering::Relaxed);
                 for offset in 0..self.workers.len() {
                     let index = (start + offset) % self.workers.len();
-                    if self.worker_health.is_healthy(index) {
+                    if self.worker_health.is_healthy(index)
+                        && self.worker_health.account_has_capacity(index)
+                    {
                         return Ok(&self.workers[index]);
                     }
                 }
 
                 Err(GatewayError::Upstream(
-                    "no healthy remote workers are available".to_string(),
+                    "no healthy remote workers with available account capacity are available"
+                        .to_string(),
                 ))
             }
         }
     }
 
     fn project_worker(&self, context: &GatewayRequestContext) -> Option<&GatewayRemoteWorker> {
-        let worker_id = self.scope_registry.select_project_worker_id(
+        let worker_id = self.scope_registry.select_project_worker_id_with_accounts(
             context,
             self.workers
                 .iter()
-                .filter(|worker| self.worker_health.is_healthy(worker.id()))
+                .filter(|worker| {
+                    self.worker_health.is_healthy(worker.id())
+                        && self.worker_health.account_has_capacity(worker.id())
+                })
                 .map(GatewayRemoteWorker::id),
+            |worker_id| self.worker_health.account_id(worker_id),
         )?;
         self.workers
             .iter()
             .find(|worker| worker.id() == worker_id)
-            .filter(|worker| self.worker_health.is_healthy(worker.id()))
+            .filter(|worker| {
+                self.worker_health.is_healthy(worker.id())
+                    && self.worker_health.account_has_capacity(worker.id())
+            })
     }
 
     fn pick_worker_for_project(
@@ -255,6 +273,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
         context: GatewayRequestContext,
         request: CreateThreadRequest,
     ) -> Result<ThreadResponse, GatewayError> {
+        let mut exhausted_worker_ids = Vec::new();
         for _ in 0..self.workers.len() {
             let worker = self.pick_worker_for_project(&context)?;
             match worker
@@ -265,6 +284,30 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                 .await
             {
                 Ok(response) => {
+                    self.worker_health
+                        .mark_account_available_for_worker(worker.id());
+                    if !exhausted_worker_ids.is_empty() {
+                        let _ = self.events.send(GatewayEvent::account_failover_succeeded(
+                            context.tenant_id.as_str(),
+                            context.project_id.as_deref(),
+                            worker.id(),
+                            self.worker_health.account_id(worker.id()),
+                            exhausted_worker_ids.clone(),
+                        ));
+                        self.observability.record_account_capacity_event(
+                            worker.id(),
+                            "thread_start_failover_success",
+                        );
+                        info!(
+                            method = "thread/start",
+                            tenant_id = context.tenant_id.as_str(),
+                            project_id = context.project_id.as_deref(),
+                            replacement_worker_id = worker.id(),
+                            replacement_account_id = self.worker_health.account_id(worker.id()),
+                            exhausted_worker_ids = ?exhausted_worker_ids,
+                            "gateway HTTP thread/start retried on another account-backed worker after account capacity exhaustion"
+                        );
+                    }
                     self.scope_registry.register_thread_with_worker(
                         response.thread.id.clone(),
                         context.clone(),
@@ -278,6 +321,31 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                     });
                 }
                 Err(error) => {
+                    if let Some(reason) = account_capacity_error_reason(&error) {
+                        self.observability
+                            .record_account_capacity_event(worker.id(), "exhausted");
+                        warn!(
+                            method = "thread/start",
+                            tenant_id = context.tenant_id.as_str(),
+                            project_id = context.project_id.as_deref(),
+                            exhausted_worker_id = worker.id(),
+                            exhausted_account_id = self.worker_health.account_id(worker.id()),
+                            reason = reason.as_str(),
+                            "gateway HTTP marked account-backed worker exhausted after downstream thread/start failure"
+                        );
+                        let _ = self.events.send(GatewayEvent::account_capacity_exhausted(
+                            context.tenant_id.as_str(),
+                            context.project_id.as_deref(),
+                            worker.id(),
+                            self.worker_health.account_id(worker.id()),
+                            reason.as_str(),
+                        ));
+                        self.worker_health
+                            .mark_account_exhausted_for_worker(worker.id(), reason);
+                        exhausted_worker_ids.push(worker.id());
+                        continue;
+                    }
+
                     let gateway_error = GatewayError::from(error);
                     if matches!(gateway_error, GatewayError::Upstream(_)) {
                         self.worker_health
@@ -291,7 +359,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
         }
 
         Err(GatewayError::Upstream(
-            "no healthy remote workers are available".to_string(),
+            "no healthy remote workers with available account capacity are available".to_string(),
         ))
     }
 
@@ -472,6 +540,15 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
             v2_transport: self.v2_transport,
             v2_connections: self.v2_connection_health.snapshot(),
             remote_workers: Some(remote_workers),
+            project_worker_routes: Some(self.scope_registry.project_worker_routes(
+                |worker_id| self.worker_health.is_healthy(worker_id),
+                |worker_id| self.worker_health.account_id(worker_id),
+                |worker_id| {
+                    self.worker_health
+                        .account_capacity(worker_id)
+                        .unwrap_or(GatewayAccountCapacityStatus::Exhausted)
+                },
+            )),
         }
     }
 
@@ -482,6 +559,33 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
     fn event_visible_to(&self, context: &GatewayRequestContext, event: &GatewayEvent) -> bool {
         self.scope_registry.event_visible_to(context, event)
     }
+}
+
+fn account_capacity_error_reason(error: &TypedRequestError) -> Option<String> {
+    let TypedRequestError::Server { source, .. } = error else {
+        return None;
+    };
+
+    is_account_capacity_error(source).then(|| source.message.clone())
+}
+
+fn is_account_capacity_error(error: &JSONRPCErrorError) -> bool {
+    if error.code == 429 {
+        return true;
+    }
+
+    let message = error.message.to_ascii_lowercase();
+    [
+        "rate limit",
+        "rate_limit",
+        "usage limit",
+        "usage_limit",
+        "credits depleted",
+        "billing",
+        "quota",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 #[cfg(test)]
@@ -499,11 +603,13 @@ mod tests {
     use crate::api::ListThreadsRequest;
     use crate::config::GatewayRemoteSelectionPolicy;
     use crate::error::GatewayError;
+    use crate::observability::GatewayObservability;
     use crate::remote_health::RemoteWorkerHealthRegistry;
     use crate::runtime::GatewayRuntime;
     use crate::scope::GatewayRequestContext;
     use crate::scope::GatewayScopeRegistry;
     use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
+    use codex_app_server_protocol::JSONRPCErrorError;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use std::sync::atomic::AtomicI64;
@@ -528,6 +634,25 @@ mod tests {
     }
 
     #[test]
+    fn detects_account_capacity_errors_without_treating_all_server_errors_as_capacity() {
+        assert!(super::is_account_capacity_error(&JSONRPCErrorError {
+            code: 429,
+            data: None,
+            message: "too many requests".to_string(),
+        }));
+        assert!(super::is_account_capacity_error(&JSONRPCErrorError {
+            code: -32000,
+            data: None,
+            message: "workspace_member_usage_limit_reached".to_string(),
+        }));
+        assert!(!super::is_account_capacity_error(&JSONRPCErrorError {
+            code: -32602,
+            data: None,
+            message: "cwd must be absolute".to_string(),
+        }));
+    }
+
+    #[test]
     fn sorts_threads_by_created_at_desc_by_default() {
         let runtime = RemoteWorkerGatewayRuntime {
             workers: Vec::new(),
@@ -547,6 +672,7 @@ mod tests {
                 max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
         };
         let mut threads = vec![
             test_thread("thread-1", 1, 10),
@@ -589,6 +715,7 @@ mod tests {
                 max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
         };
         let mut threads = vec![
             test_thread("thread-1", 1, 10),
@@ -652,18 +779,29 @@ mod tests {
 
     #[test]
     fn reports_degraded_remote_health_when_some_workers_are_unhealthy() {
-        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new(vec![
-            "ws://127.0.0.1:8081".to_string(),
-            "ws://127.0.0.1:8082".to_string(),
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            ("ws://127.0.0.1:8081".to_string(), None),
+            (
+                "ws://127.0.0.1:8082".to_string(),
+                Some("acct-b".to_string()),
+            ),
         ]));
         worker_health.mark_unhealthy(1, Some("socket closed".to_string()));
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            1,
+        );
         let runtime = RemoteWorkerGatewayRuntime {
             workers: Vec::new(),
             selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
             next_worker: AtomicUsize::new(0),
             next_request_id: Arc::new(AtomicI64::new(1)),
             events: broadcast::channel(4).0,
-            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            scope_registry,
             worker_health,
             v2_transport: GatewayV2TransportConfig {
                 initialize_timeout_seconds: 30,
@@ -673,6 +811,7 @@ mod tests {
                 max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
         };
 
         assert_eq!(runtime.health().status, GatewayHealthStatus::Degraded);
@@ -719,6 +858,10 @@ mod tests {
             crate::api::GatewayRemoteWorkerHealth {
                 worker_id: 0,
                 websocket_url: "ws://127.0.0.1:8081".to_string(),
+                account_id: None,
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                account_capacity_reason: None,
+                account_capacity_last_changed_at: None,
                 healthy: true,
                 reconnecting: false,
                 reconnect_attempt_count: 0,
@@ -731,6 +874,7 @@ mod tests {
         );
         assert_eq!(remote_workers[1].worker_id, 1);
         assert_eq!(remote_workers[1].websocket_url, "ws://127.0.0.1:8082");
+        assert_eq!(remote_workers[1].account_id, Some("acct-b".to_string()));
         assert_eq!(remote_workers[1].healthy, false);
         assert_eq!(remote_workers[1].reconnecting, false);
         assert_eq!(remote_workers[1].reconnect_attempt_count, 0);
@@ -741,6 +885,17 @@ mod tests {
         assert_eq!(remote_workers[1].last_state_change_at.is_some(), true);
         assert_eq!(remote_workers[1].last_error_at.is_some(), true);
         assert_eq!(remote_workers[1].next_reconnect_at, None);
+        assert_eq!(
+            health.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: Some("acct-b".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: false,
+            }])
+        );
     }
 
     #[test]
@@ -769,6 +924,7 @@ mod tests {
                 max_pending_client_requests: 64,
             },
             v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
         };
 
         let health = runtime.health();

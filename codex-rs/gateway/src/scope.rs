@@ -1,3 +1,5 @@
+use crate::api::GatewayAccountCapacityStatus;
+use crate::api::GatewayProjectWorkerRoute;
 use crate::api::GatewayServerRequestKind;
 use crate::error::GatewayError;
 use crate::event::GatewayEvent;
@@ -129,10 +131,50 @@ impl GatewayScopeRegistry {
         read_guard(&self.project_workers).get(context).copied()
     }
 
+    pub fn project_worker_routes(
+        &self,
+        worker_healthy: impl Fn(usize) -> bool,
+        worker_account_id: impl Fn(usize) -> Option<String>,
+        worker_account_capacity: impl Fn(usize) -> GatewayAccountCapacityStatus,
+    ) -> Vec<GatewayProjectWorkerRoute> {
+        let mut routes = read_guard(&self.project_workers)
+            .iter()
+            .filter_map(|(context, worker_id)| {
+                context
+                    .project_id
+                    .as_ref()
+                    .map(|project_id| GatewayProjectWorkerRoute {
+                        tenant_id: context.tenant_id.clone(),
+                        project_id: project_id.clone(),
+                        worker_id: *worker_id,
+                        account_id: worker_account_id(*worker_id),
+                        account_capacity: worker_account_capacity(*worker_id),
+                        worker_healthy: worker_healthy(*worker_id),
+                    })
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| {
+            left.tenant_id
+                .cmp(&right.tenant_id)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+                .then_with(|| left.worker_id.cmp(&right.worker_id))
+        });
+        routes
+    }
+
     pub fn select_project_worker_id(
         &self,
         context: &GatewayRequestContext,
         worker_ids: impl IntoIterator<Item = usize>,
+    ) -> Option<usize> {
+        self.select_project_worker_id_with_accounts(context, worker_ids, |_| None)
+    }
+
+    pub fn select_project_worker_id_with_accounts(
+        &self,
+        context: &GatewayRequestContext,
+        worker_ids: impl IntoIterator<Item = usize>,
+        worker_account_id: impl Fn(usize) -> Option<String>,
     ) -> Option<usize> {
         context.project_id.as_ref()?;
 
@@ -147,8 +189,36 @@ impl GatewayScopeRegistry {
             return Some(worker_id);
         }
 
-        let index = self.next_project_worker.fetch_add(1, Ordering::Relaxed) % worker_ids.len();
-        worker_ids.get(index).copied()
+        let start = self.next_project_worker.fetch_add(1, Ordering::Relaxed);
+        let route_loads = {
+            let project_workers = read_guard(&self.project_workers);
+            project_workers
+                .iter()
+                .filter(|(project_context, worker_id)| {
+                    project_context.project_id.is_some()
+                        && project_context.tenant_id == context.tenant_id
+                        && worker_ids.contains(worker_id)
+                })
+                .fold(
+                    HashMap::<String, usize>::new(),
+                    |mut loads, (_, worker_id)| {
+                        let key = account_route_key(*worker_id, worker_account_id(*worker_id));
+                        *loads.entry(key).or_default() += 1;
+                        loads
+                    },
+                )
+        };
+
+        worker_ids
+            .iter()
+            .copied()
+            .cycle()
+            .skip(start % worker_ids.len())
+            .take(worker_ids.len())
+            .min_by_key(|worker_id| {
+                let key = account_route_key(*worker_id, worker_account_id(*worker_id));
+                route_loads.get(&key).copied().unwrap_or_default()
+            })
     }
 
     pub fn register_thread_path_with_worker(
@@ -306,6 +376,12 @@ fn header_value(headers: &HeaderMap, name: &HeaderName) -> Result<Option<String>
             })
         })
         .transpose()
+}
+
+fn account_route_key(worker_id: usize, account_id: Option<String>) -> String {
+    account_id
+        .map(|account_id| format!("account:{account_id}"))
+        .unwrap_or_else(|| format!("worker:{worker_id}"))
 }
 
 fn read_guard<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -497,6 +573,21 @@ mod tests {
         assert_eq!(registry.project_worker_id(&project_a), Some(7));
         assert_eq!(registry.project_worker_id(&project_b), None);
         assert_eq!(registry.project_worker_id(&unscoped_project), None);
+        assert_eq!(
+            registry.project_worker_routes(
+                |_| true,
+                |_| Some("acct-a".to_string()),
+                |_| crate::api::GatewayAccountCapacityStatus::Available,
+            ),
+            vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 7,
+                account_id: Some("acct-a".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+            }]
+        );
     }
 
     #[test]
@@ -531,6 +622,47 @@ mod tests {
         assert_eq!(
             registry.select_project_worker_id(&unscoped_project, [0, 1]),
             None
+        );
+    }
+
+    #[test]
+    fn project_worker_selection_prefers_less_loaded_accounts() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let project_b = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+        let other_tenant_project = GatewayRequestContext {
+            tenant_id: "tenant-b".to_string(),
+            project_id: Some("project-c".to_string()),
+        };
+
+        registry.register_project_worker(project_a.clone(), 0);
+        registry.register_project_worker(other_tenant_project, 2);
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1, 2], |worker_id| {
+                match worker_id {
+                    0 | 1 => Some("acct-a".to_string()),
+                    2 => Some("acct-b".to_string()),
+                    _ => None,
+                }
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_b, [0, 1, 2], |worker_id| {
+                match worker_id {
+                    0 | 1 => Some("acct-a".to_string()),
+                    2 => Some("acct-b".to_string()),
+                    _ => None,
+                }
+            }),
+            Some(2)
         );
     }
 

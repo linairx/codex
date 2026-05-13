@@ -15,6 +15,58 @@ pub struct GatewayEvent {
     pub data: Value,
 }
 
+pub(crate) struct GatewayAccountPathHandoffSucceeded<'a> {
+    pub tenant_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub method: &'a str,
+    pub thread_path: &'a str,
+    pub exhausted_worker_id: usize,
+    pub exhausted_account_id: Option<String>,
+    pub replacement_worker_id: usize,
+    pub replacement_account_id: Option<String>,
+}
+
+pub(crate) struct GatewayAccountPathHandoffFailed<'a> {
+    pub tenant_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub method: &'a str,
+    pub thread_path: &'a str,
+    pub exhausted_worker_id: usize,
+    pub exhausted_account_id: Option<String>,
+    pub reason: &'a str,
+}
+
+pub(crate) struct GatewayAccountActiveThreadHandoffFailed<'a> {
+    pub tenant_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub method: &'a str,
+    pub thread_id: &'a str,
+    pub exhausted_worker_id: usize,
+    pub exhausted_account_id: Option<String>,
+    pub reason: &'a str,
+}
+
+pub(crate) struct GatewayAccountThreadHandoffSucceeded<'a> {
+    pub tenant_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub method: &'a str,
+    pub thread_id: &'a str,
+    pub exhausted_worker_id: usize,
+    pub exhausted_account_id: Option<String>,
+    pub replacement_worker_id: usize,
+    pub replacement_account_id: Option<String>,
+}
+
+pub(crate) struct GatewayAccountThreadHandoffFailed<'a> {
+    pub tenant_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub method: &'a str,
+    pub thread_id: &'a str,
+    pub exhausted_worker_id: usize,
+    pub exhausted_account_id: Option<String>,
+    pub reason: &'a str,
+}
+
 impl GatewayEvent {
     pub fn from_notification(notification: ServerNotification) -> Self {
         let value = serde_json::to_value(notification).unwrap_or(Value::Null);
@@ -105,6 +157,136 @@ impl GatewayEvent {
         }
     }
 
+    pub fn account_capacity_exhausted(
+        tenant_id: &str,
+        project_id: Option<&str>,
+        worker_id: usize,
+        account_id: Option<String>,
+        reason: &str,
+    ) -> Self {
+        Self {
+            method: "gateway/accountCapacityExhausted".to_string(),
+            thread_id: None,
+            data: serde_json::json!({
+                "tenantId": tenant_id,
+                "projectId": project_id,
+                "workerId": worker_id,
+                "accountId": account_id,
+                "reason": reason,
+            }),
+        }
+    }
+
+    pub fn account_failover_succeeded(
+        tenant_id: &str,
+        project_id: Option<&str>,
+        replacement_worker_id: usize,
+        replacement_account_id: Option<String>,
+        exhausted_worker_ids: Vec<usize>,
+    ) -> Self {
+        Self {
+            method: "gateway/accountFailoverSucceeded".to_string(),
+            thread_id: None,
+            data: serde_json::json!({
+                "tenantId": tenant_id,
+                "projectId": project_id,
+                "replacementWorkerId": replacement_worker_id,
+                "replacementAccountId": replacement_account_id,
+                "exhaustedWorkerIds": exhausted_worker_ids,
+            }),
+        }
+    }
+
+    pub(crate) fn account_path_handoff_succeeded(
+        params: GatewayAccountPathHandoffSucceeded<'_>,
+    ) -> Self {
+        Self {
+            method: "gateway/accountPathHandoffSucceeded".to_string(),
+            thread_id: None,
+            data: serde_json::json!({
+                "tenantId": params.tenant_id,
+                "projectId": params.project_id,
+                "method": params.method,
+                "threadPath": params.thread_path,
+                "exhaustedWorkerId": params.exhausted_worker_id,
+                "exhaustedAccountId": params.exhausted_account_id,
+                "replacementWorkerId": params.replacement_worker_id,
+                "replacementAccountId": params.replacement_account_id,
+            }),
+        }
+    }
+
+    pub(crate) fn account_path_handoff_failed(params: GatewayAccountPathHandoffFailed<'_>) -> Self {
+        Self {
+            method: "gateway/accountPathHandoffFailed".to_string(),
+            thread_id: None,
+            data: serde_json::json!({
+                "tenantId": params.tenant_id,
+                "projectId": params.project_id,
+                "method": params.method,
+                "threadPath": params.thread_path,
+                "exhaustedWorkerId": params.exhausted_worker_id,
+                "exhaustedAccountId": params.exhausted_account_id,
+                "reason": params.reason,
+            }),
+        }
+    }
+
+    pub(crate) fn account_active_thread_handoff_failed(
+        params: GatewayAccountActiveThreadHandoffFailed<'_>,
+    ) -> Self {
+        Self {
+            method: "gateway/accountActiveThreadHandoffFailed".to_string(),
+            thread_id: Some(params.thread_id.to_string()),
+            data: serde_json::json!({
+                "tenantId": params.tenant_id,
+                "projectId": params.project_id,
+                "method": params.method,
+                "threadId": params.thread_id,
+                "exhaustedWorkerId": params.exhausted_worker_id,
+                "exhaustedAccountId": params.exhausted_account_id,
+                "reason": params.reason,
+            }),
+        }
+    }
+
+    pub(crate) fn account_thread_handoff_succeeded(
+        params: GatewayAccountThreadHandoffSucceeded<'_>,
+    ) -> Self {
+        Self {
+            method: "gateway/accountThreadHandoffSucceeded".to_string(),
+            thread_id: Some(params.thread_id.to_string()),
+            data: serde_json::json!({
+                "tenantId": params.tenant_id,
+                "projectId": params.project_id,
+                "method": params.method,
+                "threadId": params.thread_id,
+                "exhaustedWorkerId": params.exhausted_worker_id,
+                "exhaustedAccountId": params.exhausted_account_id,
+                "replacementWorkerId": params.replacement_worker_id,
+                "replacementAccountId": params.replacement_account_id,
+            }),
+        }
+    }
+
+    pub(crate) fn account_thread_handoff_failed(
+        params: GatewayAccountThreadHandoffFailed<'_>,
+    ) -> Self {
+        Self {
+            method: "gateway/accountThreadHandoffFailed".to_string(),
+            thread_id: Some(params.thread_id.to_string()),
+            data: serde_json::json!({
+                "tenantId": params.tenant_id,
+                "projectId": params.project_id,
+                "method": params.method,
+                "threadId": params.thread_id,
+                "exhaustedWorkerId": params.exhausted_worker_id,
+                "exhaustedAccountId": params.exhausted_account_id,
+                "reason": params.reason,
+            }),
+        }
+    }
+
     fn from_wire_value(value: Value) -> Self {
         let method = value
             .get("method")
@@ -132,6 +314,11 @@ fn extract_thread_id(value: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::GatewayAccountActiveThreadHandoffFailed;
+    use super::GatewayAccountPathHandoffFailed;
+    use super::GatewayAccountPathHandoffSucceeded;
+    use super::GatewayAccountThreadHandoffFailed;
+    use super::GatewayAccountThreadHandoffSucceeded;
     use super::GatewayEvent;
     use crate::api::GatewayServerRequest;
     use codex_app_server_protocol::RequestId;
@@ -297,6 +484,203 @@ mod tests {
                 "websocketUrl": "ws://127.0.0.1:8082",
                 "reason": "remote app server event stream ended",
                 "retryDelaySeconds": 1,
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_capacity_exhaustion() {
+        let event = GatewayEvent::account_capacity_exhausted(
+            "tenant-a",
+            Some("project-a"),
+            1,
+            Some("acct-a".to_string()),
+            "billing quota reached",
+        );
+
+        assert_eq!(event.method, "gateway/accountCapacityExhausted");
+        assert_eq!(event.thread_id, None);
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "workerId": 1,
+                "accountId": "acct-a",
+                "reason": "billing quota reached",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_failover_success() {
+        let event = GatewayEvent::account_failover_succeeded(
+            "tenant-a",
+            Some("project-a"),
+            2,
+            Some("acct-b".to_string()),
+            vec![1],
+        );
+
+        assert_eq!(event.method, "gateway/accountFailoverSucceeded");
+        assert_eq!(event.thread_id, None);
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "replacementWorkerId": 2,
+                "replacementAccountId": "acct-b",
+                "exhaustedWorkerIds": [1],
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_path_handoff_success() {
+        let event =
+            GatewayEvent::account_path_handoff_succeeded(GatewayAccountPathHandoffSucceeded {
+                tenant_id: "tenant-a",
+                project_id: Some("project-a"),
+                method: "thread/resume",
+                thread_path: "/tmp/shared/rollout.jsonl",
+                exhausted_worker_id: 1,
+                exhausted_account_id: Some("acct-a".to_string()),
+                replacement_worker_id: 2,
+                replacement_account_id: Some("acct-b".to_string()),
+            });
+
+        assert_eq!(event.method, "gateway/accountPathHandoffSucceeded");
+        assert_eq!(event.thread_id, None);
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/resume",
+                "threadPath": "/tmp/shared/rollout.jsonl",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-a",
+                "replacementWorkerId": 2,
+                "replacementAccountId": "acct-b",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_path_handoff_failure() {
+        let event = GatewayEvent::account_path_handoff_failed(GatewayAccountPathHandoffFailed {
+            tenant_id: "tenant-a",
+            project_id: Some("project-a"),
+            method: "getConversationSummary",
+            thread_path: "/tmp/shared/rollout.jsonl",
+            exhausted_worker_id: 1,
+            exhausted_account_id: Some("acct-a".to_string()),
+            reason: "no replacement worker restored the context",
+        });
+
+        assert_eq!(event.method, "gateway/accountPathHandoffFailed");
+        assert_eq!(event.thread_id, None);
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "getConversationSummary",
+                "threadPath": "/tmp/shared/rollout.jsonl",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-a",
+                "reason": "no replacement worker restored the context",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_active_thread_handoff_failure() {
+        let event = GatewayEvent::account_active_thread_handoff_failed(
+            GatewayAccountActiveThreadHandoffFailed {
+                tenant_id: "tenant-a",
+                project_id: Some("project-a"),
+                method: "turn/start",
+                thread_id: "thread-1",
+                exhausted_worker_id: 1,
+                exhausted_account_id: Some("acct-a".to_string()),
+                reason: "active thread state cannot be restored without an explicit resume",
+            },
+        );
+
+        assert_eq!(event.method, "gateway/accountActiveThreadHandoffFailed");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "turn/start",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-a",
+                "reason": "active thread state cannot be restored without an explicit resume",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_thread_handoff_success() {
+        let event =
+            GatewayEvent::account_thread_handoff_succeeded(GatewayAccountThreadHandoffSucceeded {
+                tenant_id: "tenant-a",
+                project_id: Some("project-a"),
+                method: "thread/resume",
+                thread_id: "thread-1",
+                exhausted_worker_id: 1,
+                exhausted_account_id: Some("acct-a".to_string()),
+                replacement_worker_id: 2,
+                replacement_account_id: Some("acct-b".to_string()),
+            });
+
+        assert_eq!(event.method, "gateway/accountThreadHandoffSucceeded");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/resume",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-a",
+                "replacementWorkerId": 2,
+                "replacementAccountId": "acct-b",
+            })
+        );
+    }
+
+    #[test]
+    fn reports_account_thread_handoff_failure() {
+        let event =
+            GatewayEvent::account_thread_handoff_failed(GatewayAccountThreadHandoffFailed {
+                tenant_id: "tenant-a",
+                project_id: Some("project-a"),
+                method: "thread/resume",
+                thread_id: "thread-1",
+                exhausted_worker_id: 1,
+                exhausted_account_id: Some("acct-a".to_string()),
+                reason: "no replacement worker restored the context",
+            });
+
+        assert_eq!(event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/resume",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-a",
+                "reason": "no replacement worker restored the context",
             })
         );
     }

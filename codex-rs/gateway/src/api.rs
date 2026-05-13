@@ -62,6 +62,10 @@ pub enum GatewayV2CompatibilityMode {
 pub struct GatewayRemoteWorkerHealth {
     pub worker_id: usize,
     pub websocket_url: String,
+    pub account_id: Option<String>,
+    pub account_capacity: GatewayAccountCapacityStatus,
+    pub account_capacity_reason: Option<String>,
+    pub account_capacity_last_changed_at: Option<i64>,
     pub healthy: bool,
     pub reconnecting: bool,
     pub reconnect_attempt_count: u32,
@@ -70,6 +74,24 @@ pub struct GatewayRemoteWorkerHealth {
     pub last_error_at: Option<i64>,
     pub next_reconnect_at: Option<i64>,
     pub reconnect_backoff_remaining_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayProjectWorkerRoute {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub worker_id: usize,
+    pub account_id: Option<String>,
+    pub account_capacity: GatewayAccountCapacityStatus,
+    pub worker_healthy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GatewayAccountCapacityStatus {
+    Available,
+    Exhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +133,7 @@ pub struct GatewayHealthResponse {
     pub v2_transport: GatewayV2TransportConfig,
     pub v2_connections: GatewayV2ConnectionHealth,
     pub remote_workers: Option<Vec<GatewayRemoteWorkerHealth>>,
+    pub project_worker_routes: Option<Vec<GatewayProjectWorkerRoute>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

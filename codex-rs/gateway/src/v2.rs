@@ -1,3 +1,4 @@
+use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::scope::GatewayRequestContext;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::InProcessAppServerClient;
@@ -21,11 +22,15 @@ pub enum GatewayV2SessionFactory {
     RemoteSingle {
         connect_args: Box<RemoteAppServerConnectArgs>,
         initialize_response: Arc<InitializeResponse>,
+        account_id: Option<String>,
+        worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
     },
     RemoteMulti {
         connect_args: Vec<RemoteAppServerConnectArgs>,
         initialize_response: Arc<InitializeResponse>,
         next_server_request_id: Arc<AtomicU64>,
+        account_ids: Vec<Option<String>>,
+        worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
     },
 }
 
@@ -53,6 +58,21 @@ impl GatewayV2SessionFactory {
         Self::RemoteSingle {
             connect_args: Box::new(connect_args),
             initialize_response: Arc::new(initialize_response),
+            account_id: None,
+            worker_health: None,
+        }
+    }
+
+    pub fn remote_single_with_account_id(
+        connect_args: RemoteAppServerConnectArgs,
+        initialize_response: InitializeResponse,
+        account_id: Option<String>,
+    ) -> Self {
+        Self::RemoteSingle {
+            connect_args: Box::new(connect_args),
+            initialize_response: Arc::new(initialize_response),
+            account_id,
+            worker_health: None,
         }
     }
 
@@ -60,10 +80,21 @@ impl GatewayV2SessionFactory {
         connect_args: Vec<RemoteAppServerConnectArgs>,
         initialize_response: InitializeResponse,
     ) -> Self {
+        let account_ids = vec![None; connect_args.len()];
+        Self::remote_multi_with_account_ids(connect_args, initialize_response, account_ids)
+    }
+
+    pub fn remote_multi_with_account_ids(
+        connect_args: Vec<RemoteAppServerConnectArgs>,
+        initialize_response: InitializeResponse,
+        account_ids: Vec<Option<String>>,
+    ) -> Self {
         Self::RemoteMulti {
             connect_args,
             initialize_response: Arc::new(initialize_response),
             next_server_request_id: Arc::new(AtomicU64::new(1)),
+            account_ids,
+            worker_health: None,
         }
     }
 
@@ -165,6 +196,64 @@ impl GatewayV2SessionFactory {
                 next_server_request_id.fetch_add(1, Ordering::Relaxed)
             )),
             _ => RequestId::String("gateway-srv-1".to_string()),
+        }
+    }
+
+    pub fn worker_account_id(&self, worker_id: usize) -> Option<String> {
+        match self {
+            Self::RemoteSingle { account_id, .. } if worker_id == 0 => account_id.clone(),
+            Self::RemoteMulti { account_ids, .. } => account_ids.get(worker_id).cloned().flatten(),
+            _ => None,
+        }
+    }
+
+    pub fn with_worker_health(mut self, worker_health: Arc<RemoteWorkerHealthRegistry>) -> Self {
+        match &mut self {
+            Self::RemoteSingle {
+                worker_health: remote_worker_health,
+                ..
+            }
+            | Self::RemoteMulti {
+                worker_health: remote_worker_health,
+                ..
+            } => {
+                *remote_worker_health = Some(worker_health);
+            }
+            Self::Embedded { .. } => {}
+        }
+        self
+    }
+
+    pub fn worker_account_has_capacity(&self, worker_id: usize) -> bool {
+        match self {
+            Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
+                worker_health
+                    .as_ref()
+                    .is_none_or(|worker_health| worker_health.account_has_capacity(worker_id))
+            }
+            Self::Embedded { .. } => true,
+        }
+    }
+
+    pub fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) {
+        match self {
+            Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
+                if let Some(worker_health) = worker_health {
+                    worker_health.mark_account_exhausted_for_worker(worker_id, reason);
+                }
+            }
+            Self::Embedded { .. } => {}
+        }
+    }
+
+    pub fn mark_worker_account_available(&self, worker_id: usize) {
+        match self {
+            Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
+                if let Some(worker_health) = worker_health {
+                    worker_health.mark_account_available_for_worker(worker_id);
+                }
+            }
+            Self::Embedded { .. } => {}
         }
     }
 }

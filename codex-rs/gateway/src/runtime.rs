@@ -383,6 +383,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
             v2_transport: self.v2_transport,
             v2_connections: self.v2_connection_health.snapshot(),
             remote_workers: None,
+            project_worker_routes: None,
         }
     }
 
