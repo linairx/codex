@@ -320,6 +320,80 @@ Recent progress:
   `gateway/accountFailoverSucceeded`, so account-backed worker handoff is
   visible to event-stream consumers in addition to `/healthz`, metrics, and
   logs
+- HTTP `turn/start` now fails closed when the visible thread is pinned to an
+  account-backed worker already marked exhausted, emits
+  `gateway_account_capacity_events` with `active_thread_handoff_failure`, and
+  publishes `gateway/accountActiveThreadHandoffFailed` instead of silently
+  continuing active work on an exhausted account or moving live context to
+  another worker
+- HTTP `turn/start` now also treats downstream quota-like failures as
+  account-capacity exhaustion signals, marking the owning account-backed
+  worker exhausted and publishing `gateway/accountCapacityExhausted` so later
+  active-thread requests fail closed before attempting more work on that
+  account
+- HTTP `turn/interrupt` now uses the same active-thread account-capacity guard
+  as `turn/start`, so an interrupt for a thread pinned to an exhausted
+  account-backed worker fails closed and publishes
+  `gateway/accountActiveThreadHandoffFailed` instead of continuing turn control
+  on an account known to be out of capacity
+- HTTP `serverRequest/respond` now records the pending request thread id and
+  applies that same exhausted-account fail-closed guard before forwarding
+  approval or user-input responses to the owning worker, keeping active
+  server-request round trips from silently continuing on an account already
+  known to be out of capacity
+- a real remote HTTP regression now covers that active server-request response
+  fail-closed path end to end: a pending `serverRequest/requested` is left on
+  one account-backed worker, another worker with the same `accountId` reports a
+  429 quota failure, and `/v1/server-requests/respond` returns the explicit
+  exhausted-account error plus `gateway/accountActiveThreadHandoffFailed`
+- HTTP `serverRequest/respond` now keeps the pending server request registered
+  until the downstream response is successfully forwarded, so a missing worker
+  route or transport failure does not silently drop a partially completed
+  approval or user-input lifecycle
+- HTTP `serverRequest/respond` delivery failures now emit
+  `gateway_server_request_lifecycle_events` for answered and delivery-failed
+  stages plus `gateway_server_request_answer_delivery_failures`, and write
+  structured logs with tenant/project scope, response kind, worker route,
+  request id, thread id, and error details when the downstream handoff cannot
+  complete; embedded and remote runtime paths now both keep the pending
+  request registered until the downstream response is accepted
+- HTTP `serverRequest/respond` now checks exhausted account capacity from the
+  pending server-request worker route itself, so a partially completed approval
+  or user-input round trip still fails closed even if the thread route table no
+  longer has the owning worker entry
+- that exhausted-account HTTP `serverRequest/respond` fail-closed branch now
+  also records the answered and delivery-failed server-request lifecycle
+  metrics plus the direct answer-delivery-failure counter, so quota-driven
+  refusal is observable the same way as missing-route and transport delivery
+  failures
+- HTTP `serverRequest/respond` now records
+  `client_server_request_invalid_response` lifecycle metrics and structured
+  tenant/project logs when a client answers a pending server request with the
+  wrong response type, keeping the pending request registered while making the
+  client-side mismatch visible to operators
+- HTTP `thread/read` now treats a visible thread id as a bounded account
+  restoration surface: if the cached worker route points at an exhausted
+  account-backed worker, the gateway skips that account, attempts the read on
+  another healthy worker with available account capacity, updates the sticky
+  thread route on success, and publishes
+  `gateway/accountThreadHandoffSucceeded`; if no replacement can restore the
+  read, or if a replacement returns a different thread id than the requested
+  one, it emits `thread_read_handoff_failure` account-capacity metrics and
+  publishes `gateway/accountThreadHandoffFailed` instead of silently reading
+  through the exhausted account or accepting the wrong context
+- `/healthz` now exposes `pendingServerRequestCount` and
+  `pendingServerRequestKindCounts` for the gateway HTTP/SSE surface, so
+  partially completed approval and user-input lifecycles are visible while
+  they are still waiting for a successful downstream delivery or explicit
+  resolution, without exposing individual request ids
+- `/healthz` now also exposes `pendingServerRequestRouteCounts`, grouping those
+  HTTP/SSE pending server requests by owning worker route plus response kind,
+  so operators can see whether approval or user-input buildup is concentrated
+  on one remote worker or on the embedded route without exposing individual
+  request ids
+- `/healthz` now also exposes `pendingServerRequestOldestAt`, giving operators
+  the Unix timestamp of the oldest partially completed HTTP/SSE server-request
+  lifecycle so buildup age is visible without exposing individual request ids
 - the HTTP remote account-capacity failover regression now opens the real
   `/v1/events` SSE stream before triggering a quota-like `thread/start`
   failure, and verifies both account-exhaustion and replacement-route events

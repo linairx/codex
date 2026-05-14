@@ -293,12 +293,20 @@ mod tests {
 
     struct FakeRuntime {
         events: broadcast::Sender<GatewayEvent>,
+        start_turn_error: Option<String>,
+        interrupt_turn_error: Option<String>,
+        resolve_server_request_error: Option<String>,
     }
 
     impl Default for FakeRuntime {
         fn default() -> Self {
             let (events, _rx) = broadcast::channel(16);
-            Self { events }
+            Self {
+                events,
+                start_turn_error: None,
+                interrupt_turn_error: None,
+                resolve_server_request_error: None,
+            }
         }
     }
 
@@ -387,6 +395,9 @@ mod tests {
             _thread_id: String,
             request: StartTurnRequest,
         ) -> Result<TurnResponse, GatewayError> {
+            if let Some(error) = &self.start_turn_error {
+                return Err(GatewayError::Upstream(error.clone()));
+            }
             Ok(TurnResponse {
                 turn: GatewayTurn {
                     id: "turn-1".to_string(),
@@ -405,6 +416,9 @@ mod tests {
             _thread_id: String,
             _turn_id: String,
         ) -> Result<InterruptTurnResponse, GatewayError> {
+            if let Some(error) = &self.interrupt_turn_error {
+                return Err(GatewayError::Upstream(error.clone()));
+            }
             Ok(InterruptTurnResponse { status: "accepted" })
         }
 
@@ -413,6 +427,9 @@ mod tests {
             _context: GatewayRequestContext,
             _request: ResolveServerRequestRequest,
         ) -> Result<ResolveServerRequestResponse, GatewayError> {
+            if let Some(error) = &self.resolve_server_request_error {
+                return Err(GatewayError::Upstream(error.clone()));
+            }
             Ok(ResolveServerRequestResponse { status: "accepted" })
         }
 
@@ -430,6 +447,10 @@ mod tests {
                     max_pending_client_requests: 64,
                 },
                 v2_connections: default_v2_connections(),
+                pending_server_request_count: 0,
+                pending_server_request_kind_counts: std::collections::BTreeMap::new(),
+                pending_server_request_route_counts: Vec::new(),
+                pending_server_request_oldest_at: None,
                 remote_workers: None,
                 project_worker_routes: None,
             }
@@ -472,7 +493,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":null,"projectWorkerRoutes":null}"#
+            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":null,"projectWorkerRoutes":null}"#
         );
     }
 
@@ -546,6 +567,10 @@ mod tests {
                         max_pending_client_requests: 64,
                     },
                     v2_connections: default_v2_connections(),
+                    pending_server_request_count: 0,
+                    pending_server_request_kind_counts: std::collections::BTreeMap::new(),
+                    pending_server_request_route_counts: Vec::new(),
+                    pending_server_request_oldest_at: None,
                     remote_workers: Some(vec![GatewayRemoteWorkerHealth {
                         worker_id: 0,
                         websocket_url: "ws://127.0.0.1:8081".to_string(),
@@ -602,7 +627,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002,"reconnectBackoffRemainingSeconds":1}],"projectWorkerRoutes":[]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002,"reconnectBackoffRemainingSeconds":1}],"projectWorkerRoutes":[]}"#
         );
     }
 
@@ -693,6 +718,10 @@ mod tests {
                         last_connection_pending_server_request_count: 2,
                         last_connection_answered_but_unresolved_server_request_count: 1,
                     },
+                    pending_server_request_count: 0,
+                    pending_server_request_kind_counts: std::collections::BTreeMap::new(),
+                    pending_server_request_route_counts: Vec::new(),
+                    pending_server_request_oldest_at: None,
                     remote_workers: Some(vec![GatewayRemoteWorkerHealth {
                         worker_id: 0,
                         websocket_url: "ws://127.0.0.1:8081".to_string(),
@@ -749,7 +778,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionDurationMs":2500,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingClientRequestCount":4,"lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null,"reconnectBackoffRemainingSeconds":null}],"projectWorkerRoutes":[]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionDurationMs":2500,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingClientRequestCount":4,"lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null,"reconnectBackoffRemainingSeconds":null}],"projectWorkerRoutes":[]}"#
         );
     }
 
@@ -882,6 +911,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_turn_route_propagates_fail_closed_account_capacity_error() {
+        let app = router(
+            Arc::new(FakeRuntime {
+                start_turn_error: Some(
+                    "thread thread-123 is pinned to worker 1 with exhausted account capacity for turn/start"
+                        .to_string(),
+                ),
+                ..FakeRuntime::default()
+            }),
+            GatewayAuth::Disabled,
+            GatewayAdmissionController::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/threads/thread-123/turns")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).expect("utf8"),
+            r#"{"error":"thread thread-123 is pinned to worker 1 with exhausted account capacity for turn/start"}"#
+        );
+    }
+
+    #[tokio::test]
     async fn interrupt_turn_route_returns_accepted_payload() {
         let app = router(
             Arc::new(FakeRuntime::default()),
@@ -907,6 +972,41 @@ mod tests {
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
             r#"{"status":"accepted"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_route_propagates_fail_closed_account_capacity_error() {
+        let app = router(
+            Arc::new(FakeRuntime {
+                interrupt_turn_error: Some(
+                    "thread thread-123 is pinned to worker 1 with exhausted account capacity for turn/interrupt"
+                        .to_string(),
+                ),
+                ..FakeRuntime::default()
+            }),
+            GatewayAuth::Disabled,
+            GatewayAdmissionController::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/threads/thread-123/turns/turn-456/interrupt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).expect("utf8"),
+            r#"{"error":"thread thread-123 is pinned to worker 1 with exhausted account capacity for turn/interrupt"}"#
         );
     }
 
@@ -939,6 +1039,44 @@ mod tests {
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
             r#"{"status":"accepted"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_server_request_route_propagates_fail_closed_account_capacity_error() {
+        let app = router(
+            Arc::new(FakeRuntime {
+                resolve_server_request_error: Some(
+                    "thread thread-123 is pinned to worker 1 with exhausted account capacity for serverRequest/respond"
+                        .to_string(),
+                ),
+                ..FakeRuntime::default()
+            }),
+            GatewayAuth::Disabled,
+            GatewayAdmissionController::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/server-requests/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"requestId":"req-1","type":"toolRequestUserInput","answers":{}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).expect("utf8"),
+            r#"{"error":"thread thread-123 is pinned to worker 1 with exhausted account capacity for serverRequest/respond"}"#
         );
     }
 
@@ -1057,6 +1195,10 @@ mod tests {
                         max_pending_client_requests: 64,
                     },
                     v2_connections: default_v2_connections(),
+                    pending_server_request_count: 0,
+                    pending_server_request_kind_counts: std::collections::BTreeMap::new(),
+                    pending_server_request_route_counts: Vec::new(),
+                    pending_server_request_oldest_at: None,
                     remote_workers: None,
                     project_worker_routes: None,
                 }
@@ -1232,6 +1374,10 @@ mod tests {
                         max_pending_client_requests: 64,
                     },
                     v2_connections: default_v2_connections(),
+                    pending_server_request_count: 0,
+                    pending_server_request_kind_counts: std::collections::BTreeMap::new(),
+                    pending_server_request_route_counts: Vec::new(),
+                    pending_server_request_oldest_at: None,
                     remote_workers: Some(Vec::new()),
                     project_worker_routes: Some(Vec::new()),
                 }

@@ -20,6 +20,7 @@ use crate::api::ThreadResponse;
 use crate::api::TurnResponse;
 use crate::error::GatewayError;
 use crate::event::GatewayEvent;
+use crate::observability::GatewayObservability;
 use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
@@ -38,6 +39,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tracing::warn;
 
 #[async_trait]
 /// Runtime interface that backs the gateway's northbound HTTP surface.
@@ -93,6 +95,7 @@ pub struct AppServerGatewayRuntime {
     remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
     v2_transport: GatewayV2TransportConfig,
     v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
+    observability: GatewayObservability,
 }
 
 #[derive(Clone)]
@@ -100,6 +103,7 @@ pub struct GatewayRuntimeHealthConfig {
     pub remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
     pub v2_transport: GatewayV2TransportConfig,
     pub v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
+    pub observability: GatewayObservability,
 }
 
 impl AppServerGatewayRuntime {
@@ -138,6 +142,7 @@ impl AppServerGatewayRuntime {
             remote_worker_health: health_config.remote_worker_health,
             v2_transport: health_config.v2_transport,
             v2_connection_health: health_config.v2_connection_health,
+            observability: health_config.observability,
         }
     }
 
@@ -168,6 +173,7 @@ impl AppServerGatewayRuntime {
                 request_id,
                 request.kind(),
                 context,
+                request.thread_id().to_string(),
                 self.worker_id,
             );
     }
@@ -340,7 +346,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
     ) -> Result<ResolveServerRequestResponse, GatewayError> {
         let Some(pending_request) = self
             .scope_registry
-            .take_pending_server_request(&request.request_id)
+            .pending_server_request(&request.request_id)
         else {
             return Err(GatewayError::NotFound(format!(
                 "server request not found: {}",
@@ -356,20 +362,64 @@ impl GatewayRuntime for AppServerGatewayRuntime {
         }
 
         if request.response.kind() != pending_request.kind {
+            let response_kind = request.response.kind().metric_tag();
+            self.observability.record_server_request_lifecycle_event(
+                "client_server_request_invalid_response",
+                response_kind,
+            );
+            warn!(
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                expected_response_kind = pending_request.kind.metric_tag(),
+                response_kind,
+                request_id = %request.request_id,
+                thread_id = pending_request.thread_id.as_str(),
+                "gateway HTTP rejected server request response because its type does not match the pending request"
+            );
             return Err(GatewayError::InvalidRequest(
                 "server request response type does not match pending request".to_string(),
             ));
         }
 
+        let request_id = request.request_id.clone();
+        let response_kind = request.response.kind().metric_tag();
         let result = request.response.into_result().map_err(|err| {
             GatewayError::InvalidRequest(format!("invalid server request response payload: {err}"))
         })?;
-        self.app_server
-            .resolve_server_request(request.request_id, result)
+        self.observability
+            .record_server_request_lifecycle_event("client_server_request_answered", response_kind);
+        if let Err(err) = self
+            .app_server
+            .resolve_server_request(request_id.clone(), result)
             .await
-            .map_err(|err| {
-                GatewayError::Upstream(format!("server request resolve failed: {err}"))
-            })?;
+        {
+            let error = err.to_string();
+            self.observability.record_server_request_lifecycle_event(
+                "client_server_request_delivery_failed",
+                response_kind,
+            );
+            self.observability
+                .record_server_request_answer_delivery_failure(response_kind);
+            warn!(
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                response_kind,
+                worker_id = self.worker_id,
+                request_id = %request_id,
+                thread_id = pending_request.thread_id.as_str(),
+                error = error.as_str(),
+                "gateway HTTP failed to deliver server request response to app-server"
+            );
+            return Err(GatewayError::Upstream(format!(
+                "server request resolve failed: {err}"
+            )));
+        }
+        self.observability.record_server_request_lifecycle_event(
+            "client_server_request_delivered",
+            response_kind,
+        );
+        self.scope_registry
+            .clear_pending_server_request(&request_id);
 
         Ok(ResolveServerRequestResponse { status: "accepted" })
     }
@@ -382,6 +432,16 @@ impl GatewayRuntime for AppServerGatewayRuntime {
             v2_compatibility: GatewayV2CompatibilityMode::Embedded,
             v2_transport: self.v2_transport,
             v2_connections: self.v2_connection_health.snapshot(),
+            pending_server_request_count: self.scope_registry.pending_server_request_count(),
+            pending_server_request_kind_counts: self
+                .scope_registry
+                .pending_server_request_kind_counts(),
+            pending_server_request_route_counts: self
+                .scope_registry
+                .pending_server_request_route_counts(),
+            pending_server_request_oldest_at: self
+                .scope_registry
+                .pending_server_request_oldest_at(),
             remote_workers: None,
             project_worker_routes: None,
         }

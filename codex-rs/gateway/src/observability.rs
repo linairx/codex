@@ -22,6 +22,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 const REQUEST_COUNT_METRIC: &str = "gateway_http_requests";
 const REQUEST_DURATION_METRIC: &str = "gateway_http_request_duration";
 const ACCOUNT_CAPACITY_EVENT_COUNT_METRIC: &str = "gateway_account_capacity_events";
+const SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC: &str =
+    "gateway_server_request_answer_delivery_failures";
+const SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC: &str = "gateway_server_request_lifecycle_events";
 const V2_REQUEST_COUNT_METRIC: &str = "gateway_v2_requests";
 const V2_REQUEST_DURATION_METRIC: &str = "gateway_v2_request_duration";
 const V2_CONNECTION_COUNT_METRIC: &str = "gateway_v2_connections";
@@ -127,6 +130,32 @@ impl GatewayObservability {
             && let Err(err) = metrics.counter(ACCOUNT_CAPACITY_EVENT_COUNT_METRIC, 1, &tags)
         {
             tracing::warn!("failed to record gateway account capacity event metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_server_request_answer_delivery_failure(&self, response_kind: &str) {
+        let tags = [("response_kind", response_kind)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(
+                SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC,
+                1,
+                &tags,
+            )
+        {
+            tracing::warn!(
+                "failed to record gateway server-request answer delivery failure metric: {err}"
+            );
+        }
+    }
+
+    pub(crate) fn record_server_request_lifecycle_event(&self, event: &str, method: &str) {
+        let tags = [("event", event), ("method", method)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway server-request lifecycle metric: {err}");
         }
     }
 
@@ -727,6 +756,8 @@ mod tests {
     use super::GatewayObservability;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
+    use super::SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC;
+    use super::SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC;
     use super::V2_ACCOUNT_CAPACITY_EVENT_COUNT_METRIC;
     use super::V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC;
     use super::V2_CLIENT_RESPONSE_SEND_FAILURE_COUNT_METRIC;
@@ -1429,6 +1460,138 @@ mod tests {
                         _ => panic!("unexpected account capacity event count aggregation"),
                     },
                     _ => panic!("unexpected account capacity event count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_server_request_lifecycle_metrics_with_event_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_server_request_lifecycle_event(
+            "client_server_request_delivery_failed",
+            "toolRequestUserInput",
+        );
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == SERVER_REQUEST_LIFECYCLE_EVENT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    (
+                                        "event".to_string(),
+                                        "client_server_request_delivery_failed".to_string(),
+                                    ),
+                                    ("method".to_string(), "toolRequestUserInput".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected server-request lifecycle count aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_server_request_answer_delivery_failure_metrics_with_response_kind_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_server_request_answer_delivery_failure("toolRequestUserInput");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([(
+                                    "response_kind".to_string(),
+                                    "toolRequestUserInput".to_string(),
+                                )])
+                            );
+                        }
+                        _ => panic!("unexpected server-request delivery failure aggregation"),
+                    },
+                    _ => panic!("unexpected server-request delivery failure type"),
                 }
             }
         }

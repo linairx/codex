@@ -1,4 +1,5 @@
 use crate::api::GatewayAccountCapacityStatus;
+use crate::api::GatewayPendingServerRequestRouteCounts;
 use crate::api::GatewayProjectWorkerRoute;
 use crate::api::GatewayServerRequestKind;
 use crate::error::GatewayError;
@@ -8,6 +9,7 @@ use axum::http::HeaderMap;
 use axum::http::HeaderName;
 use axum::http::request::Parts;
 use codex_app_server_protocol::RequestId;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::ready;
 use std::path::Path;
@@ -16,6 +18,8 @@ use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 const DEFAULT_TENANT_ID: &str = "default";
 const TENANT_HEADER: HeaderName = HeaderName::from_static("x-codex-tenant-id");
@@ -76,7 +80,9 @@ where
 pub struct PendingServerRequest {
     pub kind: GatewayServerRequestKind,
     pub context: GatewayRequestContext,
+    pub thread_id: String,
     pub worker_id: Option<usize>,
+    pub registered_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,8 +321,11 @@ impl GatewayScopeRegistry {
         request_id: RequestId,
         kind: GatewayServerRequestKind,
         context: GatewayRequestContext,
+        thread_id: String,
     ) {
-        self.register_pending_server_request_with_worker(request_id, kind, context, None);
+        self.register_pending_server_request_with_worker(
+            request_id, kind, context, thread_id, None,
+        );
     }
 
     pub fn register_pending_server_request_with_worker(
@@ -324,16 +333,73 @@ impl GatewayScopeRegistry {
         request_id: RequestId,
         kind: GatewayServerRequestKind,
         context: GatewayRequestContext,
+        thread_id: String,
         worker_id: Option<usize>,
     ) {
+        let registered_at = unix_timestamp_now();
         write_guard(&self.pending_server_requests).insert(
             request_id,
             PendingServerRequest {
                 kind,
                 context,
+                thread_id,
                 worker_id,
+                registered_at,
             },
         );
+    }
+
+    pub fn pending_server_request(&self, request_id: &RequestId) -> Option<PendingServerRequest> {
+        read_guard(&self.pending_server_requests)
+            .get(request_id)
+            .cloned()
+    }
+
+    pub fn pending_server_request_count(&self) -> usize {
+        read_guard(&self.pending_server_requests).len()
+    }
+
+    pub fn pending_server_request_kind_counts(&self) -> BTreeMap<String, usize> {
+        read_guard(&self.pending_server_requests).values().fold(
+            BTreeMap::new(),
+            |mut counts, request| {
+                *counts
+                    .entry(request.kind.metric_tag().to_string())
+                    .or_default() += 1;
+                counts
+            },
+        )
+    }
+
+    pub fn pending_server_request_route_counts(
+        &self,
+    ) -> Vec<GatewayPendingServerRequestRouteCounts> {
+        let grouped = read_guard(&self.pending_server_requests).values().fold(
+            BTreeMap::<Option<usize>, GatewayPendingServerRequestRouteCounts>::new(),
+            |mut grouped, request| {
+                let entry = grouped.entry(request.worker_id).or_insert_with(|| {
+                    GatewayPendingServerRequestRouteCounts {
+                        worker_id: request.worker_id,
+                        count: 0,
+                        kind_counts: BTreeMap::new(),
+                    }
+                });
+                entry.count += 1;
+                *entry
+                    .kind_counts
+                    .entry(request.kind.metric_tag().to_string())
+                    .or_default() += 1;
+                grouped
+            },
+        );
+        grouped.into_values().collect()
+    }
+
+    pub fn pending_server_request_oldest_at(&self) -> Option<i64> {
+        read_guard(&self.pending_server_requests)
+            .values()
+            .map(|request| request.registered_at)
+            .min()
     }
 
     pub fn take_pending_server_request(
@@ -382,6 +448,13 @@ fn account_route_key(worker_id: usize, account_id: Option<String>) -> String {
     account_id
         .map(|account_id| format!("account:{account_id}"))
         .unwrap_or_else(|| format!("worker:{worker_id}"))
+}
+
+fn unix_timestamp_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn read_guard<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -460,8 +533,10 @@ mod tests {
             RequestId::String("req-1".to_string()),
             GatewayServerRequestKind::ToolRequestUserInput,
             tenant_a.clone(),
+            "thread-a".to_string(),
         );
 
+        assert_eq!(registry.pending_server_request_count(), 1);
         assert_eq!(registry.thread_visible_to(&tenant_a, "thread-a"), true);
         assert_eq!(registry.thread_visible_to(&tenant_b, "thread-a"), false);
         assert_eq!(
@@ -489,6 +564,7 @@ mod tests {
                 .context,
             tenant_a
         );
+        assert_eq!(registry.pending_server_request_count(), 0);
     }
 
     #[test]
@@ -499,17 +575,20 @@ mod tests {
             RequestId::String("req-1".to_string()),
             GatewayServerRequestKind::ToolRequestUserInput,
             context.clone(),
+            "thread-1".to_string(),
             Some(1),
         );
         registry.register_pending_server_request_with_worker(
             RequestId::String("req-2".to_string()),
             GatewayServerRequestKind::ToolRequestUserInput,
             context,
+            "thread-2".to_string(),
             Some(2),
         );
 
         registry.clear_pending_server_requests_for_worker(1);
 
+        assert_eq!(registry.pending_server_request_count(), 1);
         assert_eq!(
             registry.take_pending_server_request(&RequestId::String("req-1".to_string())),
             None
@@ -519,6 +598,87 @@ mod tests {
                 .take_pending_server_request(&RequestId::String("req-2".to_string()))
                 .is_some(),
             true
+        );
+    }
+
+    #[test]
+    fn counts_pending_server_requests_by_kind() {
+        let registry = GatewayScopeRegistry::default();
+        let context = GatewayRequestContext::default();
+        assert_eq!(registry.pending_server_request_oldest_at(), None);
+        registry.register_pending_server_request(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-1".to_string(),
+        );
+        registry.register_pending_server_request(
+            RequestId::String("req-2".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-2".to_string(),
+        );
+        registry.register_pending_server_request(
+            RequestId::String("req-3".to_string()),
+            GatewayServerRequestKind::CommandExecutionApproval,
+            context,
+            "thread-3".to_string(),
+        );
+
+        assert_eq!(
+            registry.pending_server_request_kind_counts(),
+            [
+                ("commandExecutionApproval".to_string(), 1),
+                ("toolRequestUserInput".to_string(), 2),
+            ]
+            .into()
+        );
+        assert!(registry.pending_server_request_oldest_at().is_some());
+    }
+
+    #[test]
+    fn counts_pending_server_requests_by_worker_route() {
+        let registry = GatewayScopeRegistry::default();
+        let context = GatewayRequestContext::default();
+        registry.register_pending_server_request(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-1".to_string(),
+        );
+        registry.register_pending_server_request_with_worker(
+            RequestId::String("req-2".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-2".to_string(),
+            Some(2),
+        );
+        registry.register_pending_server_request_with_worker(
+            RequestId::String("req-3".to_string()),
+            GatewayServerRequestKind::CommandExecutionApproval,
+            context,
+            "thread-3".to_string(),
+            Some(2),
+        );
+
+        assert_eq!(
+            registry.pending_server_request_route_counts(),
+            vec![
+                crate::api::GatewayPendingServerRequestRouteCounts {
+                    worker_id: None,
+                    count: 1,
+                    kind_counts: [("toolRequestUserInput".to_string(), 1)].into(),
+                },
+                crate::api::GatewayPendingServerRequestRouteCounts {
+                    worker_id: Some(2),
+                    count: 2,
+                    kind_counts: [
+                        ("commandExecutionApproval".to_string(), 1),
+                        ("toolRequestUserInput".to_string(), 1),
+                    ]
+                    .into(),
+                },
+            ]
         );
     }
 

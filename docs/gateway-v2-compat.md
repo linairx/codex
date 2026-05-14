@@ -2120,7 +2120,56 @@ Operational notes:
   state from
   `account/rateLimits/read` / `account/rateLimits/updated` when workers report
   current rate-limit buckets. The HTTP operator-event path is covered by a real
-  remote-runtime regression that watches `/v1/events` during quota failover. v2
+  remote-runtime regression that watches `/v1/events` during quota failover.
+  HTTP `turn/start` also fails closed when a visible thread is already pinned
+  to an exhausted account-backed worker, emitting
+  `gateway_account_capacity_events{event="active_thread_handoff_failure"}` and
+  `gateway/accountActiveThreadHandoffFailed` instead of moving live context;
+  downstream quota-like `turn/start` failures mark that owning account-backed
+  worker exhausted and publish `gateway/accountCapacityExhausted` for later
+  active-thread requests. HTTP `turn/interrupt` now uses the same exhausted
+  account guard and operator event for active turn control. HTTP
+  `serverRequest/respond` also records the pending request thread id and fails
+  closed with the same operator event before forwarding approval or user-input
+  responses to an exhausted account-backed worker; this is covered by a real
+  remote HTTP regression that first marks another same-account worker exhausted
+  through a 429 `thread/start` response. The HTTP gateway also keeps pending
+  server requests registered until the downstream response is successfully
+  forwarded, so route or transport failures do not silently drop partially
+  completed approval or user-input lifecycles. Those HTTP delivery failures
+  now also emit `gateway_server_request_lifecycle_events` for answered and
+  delivery-failed stages plus
+  `gateway_server_request_answer_delivery_failures`, with structured route
+  diagnostics in warning logs; embedded and remote runtime paths both keep the
+  pending request registered until the downstream response is accepted. HTTP
+  `serverRequest/respond` now also checks exhausted account capacity directly
+  from the pending server-request worker route, preserving fail-closed behavior
+  even if the visible thread route is missing; that fail-closed branch now also
+  emits the same answered / delivery-failed lifecycle metrics and direct
+  answer-delivery-failure counter as other HTTP response delivery failures.
+  HTTP `serverRequest/respond` now also emits
+  `client_server_request_invalid_response` lifecycle metrics and structured
+  tenant/project logs when a client answers with a response type that does not
+  match the pending request, while keeping that pending request registered.
+  HTTP `thread/read` now also treats a visible thread id as a bounded account
+  restoration surface: if the cached route points at an exhausted
+  account-backed worker, the gateway attempts the read on another healthy
+  worker with available account capacity, updates the sticky route on success,
+  and publishes `gateway/accountThreadHandoffSucceeded`; if no replacement
+  restores the read, or if a replacement returns a different thread id than
+  the requested one, it records `thread_read_handoff_failure` account-capacity
+  metrics and publishes `gateway/accountThreadHandoffFailed`.
+  `/healthz` now exposes `pendingServerRequestCount` and
+  `pendingServerRequestKindCounts` for the gateway HTTP/SSE surface, so
+  operators can see partially completed approval and user-input lifecycles
+  while they are waiting for successful downstream delivery or explicit
+  resolution, without exposing individual request ids. `/healthz` also exposes
+  `pendingServerRequestRouteCounts`, grouped by owning worker route and
+  response kind, so operators can identify worker-local buildup without
+  exposing individual request ids. `/healthz` now also exposes
+  `pendingServerRequestOldestAt`, giving operators the Unix timestamp of the
+  oldest partially completed HTTP/SSE server-request lifecycle without
+  exposing individual request ids. v2
   new-thread failover emits
   `gateway_v2_account_capacity_events` and structured logs for exhausted
   workers plus successful replacement routes. Thread-scoped v2 requests for

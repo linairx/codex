@@ -20,6 +20,9 @@ use crate::api::ThreadResponse;
 use crate::api::TurnResponse;
 use crate::config::GatewayRemoteSelectionPolicy;
 use crate::error::GatewayError;
+use crate::event::GatewayAccountActiveThreadHandoffFailed;
+use crate::event::GatewayAccountThreadHandoffFailed;
+use crate::event::GatewayAccountThreadHandoffSucceeded;
 use crate::event::GatewayEvent;
 use crate::observability::GatewayObservability;
 use crate::remote_health::RemoteWorkerHealthRegistry;
@@ -163,6 +166,110 @@ impl RemoteWorkerGatewayRuntime {
             )));
         };
         self.worker(worker_id)
+    }
+
+    fn fail_if_active_thread_account_exhausted(
+        &self,
+        context: &GatewayRequestContext,
+        method: &str,
+        thread_id: &str,
+    ) -> Result<(), GatewayError> {
+        if !self.scope_registry.thread_visible_to(context, thread_id) {
+            return Ok(());
+        }
+        let Some(worker_id) = self.scope_registry.thread_worker_id(thread_id) else {
+            return Ok(());
+        };
+        self.fail_if_worker_account_exhausted(context, method, thread_id, worker_id)
+    }
+
+    fn fail_if_worker_account_exhausted(
+        &self,
+        context: &GatewayRequestContext,
+        method: &str,
+        thread_id: &str,
+        worker_id: usize,
+    ) -> Result<(), GatewayError> {
+        if self.worker_health.account_capacity(worker_id)
+            != Some(GatewayAccountCapacityStatus::Exhausted)
+        {
+            return Ok(());
+        }
+
+        let message = format!(
+            "thread {thread_id} is pinned to worker {worker_id} with exhausted account capacity for {method}"
+        );
+        self.observability
+            .record_account_capacity_event(worker_id, "active_thread_handoff_failure");
+        let _ = self
+            .events
+            .send(GatewayEvent::account_active_thread_handoff_failed(
+                GatewayAccountActiveThreadHandoffFailed {
+                    tenant_id: context.tenant_id.as_str(),
+                    project_id: context.project_id.as_deref(),
+                    method,
+                    thread_id,
+                    exhausted_worker_id: worker_id,
+                    exhausted_account_id: self.worker_health.account_id(worker_id),
+                    reason: message.as_str(),
+                },
+            ));
+        warn!(
+            method,
+            account_capacity_event = "active_thread_handoff_failure",
+            tenant_id = context.tenant_id.as_str(),
+            project_id = context.project_id.as_deref(),
+            thread_id,
+            exhausted_worker_id = worker_id,
+            exhausted_account_id = self.worker_health.account_id(worker_id),
+            "gateway HTTP failed closed for an active thread request pinned to an exhausted account because no protocol-visible context handoff was requested"
+        );
+
+        Err(GatewayError::Upstream(message))
+    }
+
+    fn mark_account_capacity_exhausted(
+        &self,
+        context: &GatewayRequestContext,
+        method: &str,
+        worker_id: usize,
+        reason: String,
+    ) {
+        self.observability
+            .record_account_capacity_event(worker_id, "exhausted");
+        warn!(
+            method,
+            tenant_id = context.tenant_id.as_str(),
+            project_id = context.project_id.as_deref(),
+            exhausted_worker_id = worker_id,
+            exhausted_account_id = self.worker_health.account_id(worker_id),
+            reason = reason.as_str(),
+            "gateway HTTP marked account-backed worker exhausted after downstream request failure"
+        );
+        let _ = self.events.send(GatewayEvent::account_capacity_exhausted(
+            context.tenant_id.as_str(),
+            context.project_id.as_deref(),
+            worker_id,
+            self.worker_health.account_id(worker_id),
+            reason.as_str(),
+        ));
+        self.worker_health
+            .mark_account_exhausted_for_worker(worker_id, reason);
+    }
+
+    fn record_server_request_delivery_failure(&self, response_kind: &str) {
+        self.observability
+            .record_server_request_lifecycle_event("client_server_request_answered", response_kind);
+        self.record_server_request_delivery_failure_after_answer(response_kind);
+    }
+
+    fn record_server_request_delivery_failure_after_answer(&self, response_kind: &str) {
+        self.observability.record_server_request_lifecycle_event(
+            "client_server_request_delivery_failed",
+            response_kind,
+        );
+        self.observability
+            .record_server_request_answer_delivery_failure(response_kind);
     }
 
     fn worker(&self, worker_id: usize) -> Result<&GatewayRemoteWorker, GatewayError> {
@@ -322,26 +429,12 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                 }
                 Err(error) => {
                     if let Some(reason) = account_capacity_error_reason(&error) {
-                        self.observability
-                            .record_account_capacity_event(worker.id(), "exhausted");
-                        warn!(
-                            method = "thread/start",
-                            tenant_id = context.tenant_id.as_str(),
-                            project_id = context.project_id.as_deref(),
-                            exhausted_worker_id = worker.id(),
-                            exhausted_account_id = self.worker_health.account_id(worker.id()),
-                            reason = reason.as_str(),
-                            "gateway HTTP marked account-backed worker exhausted after downstream thread/start failure"
-                        );
-                        let _ = self.events.send(GatewayEvent::account_capacity_exhausted(
-                            context.tenant_id.as_str(),
-                            context.project_id.as_deref(),
+                        self.mark_account_capacity_exhausted(
+                            &context,
+                            "thread/start",
                             worker.id(),
-                            self.worker_health.account_id(worker.id()),
-                            reason.as_str(),
-                        ));
-                        self.worker_health
-                            .mark_account_exhausted_for_worker(worker.id(), reason);
+                            reason,
+                        );
                         exhausted_worker_ids.push(worker.id());
                         continue;
                     }
@@ -414,6 +507,121 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
         thread_id: String,
     ) -> Result<ThreadResponse, GatewayError> {
         let worker = self.worker_for_thread(&context, &thread_id)?;
+        let worker_id = worker.id();
+        if self.worker_health.account_capacity(worker_id)
+            == Some(GatewayAccountCapacityStatus::Exhausted)
+        {
+            let mut first_error = None::<String>;
+            for replacement in &self.workers {
+                let replacement_worker_id = replacement.id();
+                if replacement_worker_id == worker_id
+                    || !self.worker_health.is_healthy(replacement_worker_id)
+                    || !self
+                        .worker_health
+                        .account_has_capacity(replacement_worker_id)
+                {
+                    continue;
+                }
+
+                match replacement
+                    .request_handle()
+                    .request_typed::<ThreadReadResponse>(thread_read_request(
+                        self.next_request_id(),
+                        thread_id.clone(),
+                    ))
+                    .await
+                {
+                    Ok(response) => {
+                        if response.thread.id != thread_id {
+                            if first_error.is_none() {
+                                first_error = Some(format!(
+                                    "replacement worker returned thread {} while restoring {thread_id}",
+                                    response.thread.id
+                                ));
+                            }
+                            continue;
+                        }
+                        self.scope_registry.register_thread_with_worker(
+                            response.thread.id.clone(),
+                            context.clone(),
+                            Some(replacement_worker_id),
+                        );
+                        self.observability.record_account_capacity_event(
+                            replacement_worker_id,
+                            "thread_read_handoff_success",
+                        );
+                        let _ = self
+                            .events
+                            .send(GatewayEvent::account_thread_handoff_succeeded(
+                                GatewayAccountThreadHandoffSucceeded {
+                                    tenant_id: context.tenant_id.as_str(),
+                                    project_id: context.project_id.as_deref(),
+                                    method: "thread/read",
+                                    thread_id: thread_id.as_str(),
+                                    exhausted_worker_id: worker_id,
+                                    exhausted_account_id: self.worker_health.account_id(worker_id),
+                                    replacement_worker_id,
+                                    replacement_account_id: self
+                                        .worker_health
+                                        .account_id(replacement_worker_id),
+                                },
+                            ));
+                        info!(
+                            method = "thread/read",
+                            tenant_id = context.tenant_id.as_str(),
+                            project_id = context.project_id.as_deref(),
+                            thread_id = thread_id.as_str(),
+                            exhausted_worker_id = worker_id,
+                            exhausted_account_id = self.worker_health.account_id(worker_id),
+                            replacement_worker_id,
+                            replacement_account_id =
+                                self.worker_health.account_id(replacement_worker_id),
+                            "gateway HTTP restored a thread/read request on another account-backed worker after account capacity exhaustion"
+                        );
+                        return Ok(ThreadResponse {
+                            thread: response.thread.into(),
+                        });
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+
+            let reason = first_error
+                .map(|error| format!("replacement worker failed to read thread: {error}"))
+                .unwrap_or_else(|| "no replacement worker restored the context".to_string());
+            self.observability
+                .record_account_capacity_event(worker_id, "thread_read_handoff_failure");
+            let _ = self
+                .events
+                .send(GatewayEvent::account_thread_handoff_failed(
+                    GatewayAccountThreadHandoffFailed {
+                        tenant_id: context.tenant_id.as_str(),
+                        project_id: context.project_id.as_deref(),
+                        method: "thread/read",
+                        thread_id: thread_id.as_str(),
+                        exhausted_worker_id: worker_id,
+                        exhausted_account_id: self.worker_health.account_id(worker_id),
+                        reason: reason.as_str(),
+                    },
+                ));
+            warn!(
+                method = "thread/read",
+                account_capacity_event = "thread_read_handoff_failure",
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                thread_id = thread_id.as_str(),
+                exhausted_worker_id = worker_id,
+                exhausted_account_id = self.worker_health.account_id(worker_id),
+                reason = reason.as_str(),
+                "gateway HTTP failed closed because no replacement account-backed worker restored thread/read"
+            );
+            return Err(GatewayError::Upstream(reason));
+        }
+
         let response: ThreadReadResponse = worker
             .request_handle()
             .request_typed(thread_read_request(self.next_request_id(), thread_id))
@@ -435,15 +643,26 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                 "turn input must not be empty".to_string(),
             ));
         }
+        self.fail_if_active_thread_account_exhausted(&context, "turn/start", &thread_id)?;
         let worker = self.worker_for_thread(&context, &thread_id)?;
-        let response: TurnStartResponse = worker
+        let worker_id = worker.id();
+        let response: TurnStartResponse = match worker
             .request_handle()
             .request_typed(turn_start_request(
                 self.next_request_id(),
                 thread_id,
                 request,
             ))
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(reason) = account_capacity_error_reason(&error) {
+                    self.mark_account_capacity_exhausted(&context, "turn/start", worker_id, reason);
+                }
+                return Err(GatewayError::from(error));
+            }
+        };
 
         Ok(TurnResponse {
             turn: response.turn.into(),
@@ -456,15 +675,31 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
         thread_id: String,
         turn_id: String,
     ) -> Result<InterruptTurnResponse, GatewayError> {
+        self.fail_if_active_thread_account_exhausted(&context, "turn/interrupt", &thread_id)?;
         let worker = self.worker_for_thread(&context, &thread_id)?;
-        let _: AppServerTurnInterruptResponse = worker
+        let worker_id = worker.id();
+        let _: AppServerTurnInterruptResponse = match worker
             .request_handle()
             .request_typed(turn_interrupt_request(
                 self.next_request_id(),
                 thread_id,
                 turn_id,
             ))
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(reason) = account_capacity_error_reason(&error) {
+                    self.mark_account_capacity_exhausted(
+                        &context,
+                        "turn/interrupt",
+                        worker_id,
+                        reason,
+                    );
+                }
+                return Err(GatewayError::from(error));
+            }
+        };
 
         Ok(InterruptTurnResponse { status: "accepted" })
     }
@@ -476,7 +711,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
     ) -> Result<ResolveServerRequestResponse, GatewayError> {
         let Some(pending_request) = self
             .scope_registry
-            .take_pending_server_request(&request.request_id)
+            .pending_server_request(&request.request_id)
         else {
             return Err(GatewayError::NotFound(format!(
                 "server request not found: {}",
@@ -492,28 +727,121 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
         }
 
         if request.response.kind() != pending_request.kind {
+            let response_kind = request.response.kind().metric_tag();
+            self.observability.record_server_request_lifecycle_event(
+                "client_server_request_invalid_response",
+                response_kind,
+            );
+            warn!(
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                expected_response_kind = pending_request.kind.metric_tag(),
+                response_kind,
+                request_id = %request.request_id,
+                thread_id = pending_request.thread_id.as_str(),
+                "gateway HTTP rejected server request response because its type does not match the pending request"
+            );
             return Err(GatewayError::InvalidRequest(
                 "server request response type does not match pending request".to_string(),
             ));
         }
 
+        let request_id = request.request_id.clone();
+        let response_kind = request.response.kind().metric_tag();
         let Some(worker_id) = pending_request.worker_id else {
+            self.record_server_request_delivery_failure(response_kind);
+            warn!(
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                response_kind,
+                request_id = %request_id,
+                thread_id = pending_request.thread_id.as_str(),
+                "gateway HTTP could not deliver server request response because the pending request has no remote worker route"
+            );
             return Err(GatewayError::Upstream(format!(
                 "server request {} is missing a remote worker route",
                 request.request_id
             )));
         };
-        let worker = self.worker(worker_id)?;
+        if let Err(error) = self.fail_if_worker_account_exhausted(
+            &context,
+            "serverRequest/respond",
+            &pending_request.thread_id,
+            worker_id,
+        ) {
+            self.record_server_request_delivery_failure(response_kind);
+            warn!(
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                response_kind,
+                worker_id,
+                worker_websocket_url = self
+                    .workers
+                    .get(worker_id)
+                    .map(GatewayRemoteWorker::websocket_url)
+                    .unwrap_or("unavailable"),
+                request_id = %request_id,
+                thread_id = pending_request.thread_id.as_str(),
+                error = ?error,
+                "gateway HTTP could not deliver server request response because the owning account is exhausted"
+            );
+            return Err(error);
+        }
+        let worker = match self.worker(worker_id) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.record_server_request_delivery_failure(response_kind);
+                warn!(
+                    tenant_id = context.tenant_id.as_str(),
+                    project_id = context.project_id.as_deref(),
+                    response_kind,
+                    worker_id,
+                    worker_websocket_url = self
+                        .workers
+                        .get(worker_id)
+                        .map(GatewayRemoteWorker::websocket_url)
+                        .unwrap_or("unavailable"),
+                    request_id = %request_id,
+                    thread_id = pending_request.thread_id.as_str(),
+                    error = ?error,
+                    "gateway HTTP could not deliver server request response because the remote worker route is unavailable"
+                );
+                return Err(error);
+            }
+        };
         let result = request.response.into_result().map_err(|err| {
             GatewayError::InvalidRequest(format!("invalid server request response payload: {err}"))
         })?;
-        worker
+        self.observability
+            .record_server_request_lifecycle_event("client_server_request_answered", response_kind);
+        if let Err(err) = worker
             .request_handle()
-            .resolve_server_request(request.request_id, result)
+            .resolve_server_request(request_id.clone(), result)
             .await
-            .map_err(|err| {
-                GatewayError::Upstream(format!("server request resolve failed: {err}"))
-            })?;
+        {
+            let error = err.to_string();
+            self.record_server_request_delivery_failure_after_answer(response_kind);
+            warn!(
+                tenant_id = context.tenant_id.as_str(),
+                project_id = context.project_id.as_deref(),
+                response_kind,
+                worker_id,
+                worker_websocket_url = worker.websocket_url(),
+                request_id = %request_id,
+                thread_id = pending_request.thread_id.as_str(),
+                error = error.as_str(),
+                "gateway HTTP failed to deliver server request response to remote worker"
+            );
+            return Err(GatewayError::Upstream(format!(
+                "server request resolve failed: {err}"
+            )));
+        }
+        self.observability.record_server_request_lifecycle_event(
+            "client_server_request_delivered",
+            response_kind,
+        );
+        self.scope_registry
+            .clear_pending_server_request(&request_id);
 
         Ok(ResolveServerRequestResponse { status: "accepted" })
     }
@@ -539,6 +867,16 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
             },
             v2_transport: self.v2_transport,
             v2_connections: self.v2_connection_health.snapshot(),
+            pending_server_request_count: self.scope_registry.pending_server_request_count(),
+            pending_server_request_kind_counts: self
+                .scope_registry
+                .pending_server_request_kind_counts(),
+            pending_server_request_route_counts: self
+                .scope_registry
+                .pending_server_request_route_counts(),
+            pending_server_request_oldest_at: self
+                .scope_registry
+                .pending_server_request_oldest_at(),
             remote_workers: Some(remote_workers),
             project_worker_routes: Some(self.scope_registry.project_worker_routes(
                 |worker_id| self.worker_health.is_healthy(worker_id),
@@ -591,8 +929,11 @@ fn is_account_capacity_error(error: &JSONRPCErrorError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::RemoteWorkerGatewayRuntime;
+    use crate::api::GatewayAccountCapacityStatus;
     use crate::api::GatewayExecutionMode;
     use crate::api::GatewayHealthStatus;
+    use crate::api::GatewayServerRequestKind;
+    use crate::api::GatewayServerRequestResponse;
     use crate::api::GatewaySortDirection;
     use crate::api::GatewayThread;
     use crate::api::GatewayThreadSortKey;
@@ -601,6 +942,7 @@ mod tests {
     use crate::api::GatewayV2ConnectionHealth;
     use crate::api::GatewayV2TransportConfig;
     use crate::api::ListThreadsRequest;
+    use crate::api::ResolveServerRequestRequest;
     use crate::config::GatewayRemoteSelectionPolicy;
     use crate::error::GatewayError;
     use crate::observability::GatewayObservability;
@@ -609,8 +951,14 @@ mod tests {
     use crate::scope::GatewayRequestContext;
     use crate::scope::GatewayScopeRegistry;
     use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
+    use codex_app_server_protocol::CommandExecutionApprovalDecision;
     use codex_app_server_protocol::JSONRPCErrorError;
+    use codex_app_server_protocol::RequestId;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::AtomicUsize;
@@ -631,6 +979,159 @@ mod tests {
 
     fn empty_v2_connection_health() -> Arc<GatewayV2ConnectionHealthRegistry> {
         Arc::new(GatewayV2ConnectionHealthRegistry::default())
+    }
+
+    fn test_metrics() -> codex_otel::MetricsClient {
+        codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics")
+    }
+
+    fn assert_server_request_lifecycle_and_delivery_failure_metrics(
+        metrics: &codex_otel::MetricsClient,
+        response_kind: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let expected_lifecycle_points = vec![
+            (
+                BTreeMap::from([
+                    (
+                        "event".to_string(),
+                        "client_server_request_answered".to_string(),
+                    ),
+                    ("method".to_string(), response_kind.to_string()),
+                ]),
+                1_u64,
+            ),
+            (
+                BTreeMap::from([
+                    (
+                        "event".to_string(),
+                        "client_server_request_delivery_failed".to_string(),
+                    ),
+                    ("method".to_string(), response_kind.to_string()),
+                ]),
+                1_u64,
+            ),
+        ];
+        let mut lifecycle_points = Vec::new();
+        let mut saw_delivery_failure_count = false;
+
+        for metric in metrics {
+            match metric.name() {
+                "gateway_server_request_lifecycle_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            lifecycle_points.extend(sum.data_points().map(|point| {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (attributes, point.value())
+                            }));
+                        }
+                        _ => panic!("unexpected server-request lifecycle aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle metric type"),
+                },
+                "gateway_server_request_answer_delivery_failures" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([(
+                                    "response_kind".to_string(),
+                                    response_kind.to_string()
+                                )])
+                            );
+                            assert_eq!(point.value(), 1);
+                            saw_delivery_failure_count = true;
+                        }
+                        _ => panic!("unexpected server-request delivery failure aggregation"),
+                    },
+                    _ => panic!("unexpected server-request delivery failure metric type"),
+                },
+                _ => {}
+            }
+        }
+
+        lifecycle_points.sort();
+        assert_eq!(lifecycle_points, expected_lifecycle_points);
+        assert!(saw_delivery_failure_count);
+    }
+
+    fn assert_server_request_lifecycle_metric(
+        metrics: &codex_otel::MetricsClient,
+        event: &str,
+        method: &str,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        let expected_attributes = BTreeMap::from([
+            ("event".to_string(), event.to_string()),
+            ("method".to_string(), method.to_string()),
+        ]);
+        let mut saw_count = false;
+
+        for metric in metrics {
+            if metric.name() == "gateway_server_request_lifecycle_events" {
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            for point in sum.data_points() {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                if attributes == expected_attributes {
+                                    assert_eq!(point.value(), 1);
+                                    saw_count = true;
+                                }
+                            }
+                        }
+                        _ => panic!("unexpected server-request lifecycle aggregation"),
+                    },
+                    _ => panic!("unexpected server-request lifecycle metric type"),
+                }
+            }
+        }
+
+        assert!(
+            saw_count,
+            "missing gateway_server_request_lifecycle_events metric point: {expected_attributes:?}"
+        );
     }
 
     #[test]
@@ -778,6 +1279,496 @@ mod tests {
     }
 
     #[test]
+    fn active_thread_request_fails_closed_when_account_capacity_is_exhausted() {
+        let (events, mut event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread_with_worker(
+            "thread-1".to_string(),
+            context.clone(),
+            Some(1),
+        );
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            (
+                "ws://127.0.0.1:8082".to_string(),
+                Some("acct-b".to_string()),
+            ),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota exceeded".to_string());
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry,
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        let error = runtime
+            .fail_if_active_thread_account_exhausted(&context, "turn/start", "thread-1")
+            .expect_err("active thread request should fail closed");
+
+        assert!(matches!(
+            error,
+            GatewayError::Upstream(message)
+                if message == "thread thread-1 is pinned to worker 1 with exhausted account capacity for turn/start"
+        ));
+        let event = event_rx.try_recv().expect("handoff event");
+        assert_eq!(event.method, "gateway/accountActiveThreadHandoffFailed");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "turn/start",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-1 is pinned to worker 1 with exhausted account capacity for turn/start",
+            })
+        );
+    }
+
+    #[test]
+    fn downstream_turn_start_capacity_error_marks_account_exhausted() {
+        let (events, mut event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![(
+            "ws://127.0.0.1:8081".to_string(),
+            Some("acct-a".to_string()),
+        )]));
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        runtime.mark_account_capacity_exhausted(
+            &context,
+            "turn/start",
+            0,
+            "rate limit exceeded".to_string(),
+        );
+
+        assert_eq!(
+            runtime.worker_health.account_capacity(0),
+            Some(GatewayAccountCapacityStatus::Exhausted)
+        );
+        let event = event_rx.try_recv().expect("capacity event");
+        assert_eq!(event.method, "gateway/accountCapacityExhausted");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "workerId": 0,
+                "accountId": "acct-a",
+                "reason": "rate limit exceeded",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_turn_fails_closed_when_account_capacity_is_exhausted() {
+        let (events, mut event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread_with_worker(
+            "thread-1".to_string(),
+            context.clone(),
+            Some(0),
+        );
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![(
+            "ws://127.0.0.1:8081".to_string(),
+            Some("acct-a".to_string()),
+        )]));
+        worker_health.mark_account_exhausted_for_worker(0, "quota exceeded".to_string());
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry,
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        let error = runtime
+            .interrupt_turn(context, "thread-1".to_string(), "turn-1".to_string())
+            .await
+            .expect_err("interrupt should fail closed before worker lookup");
+
+        assert!(matches!(
+            error,
+            GatewayError::Upstream(message)
+                if message == "thread thread-1 is pinned to worker 0 with exhausted account capacity for turn/interrupt"
+        ));
+        let event = event_rx.try_recv().expect("handoff event");
+        assert_eq!(event.method, "gateway/accountActiveThreadHandoffFailed");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "turn/interrupt",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 0,
+                "exhaustedAccountId": "acct-a",
+                "reason": "thread thread-1 is pinned to worker 0 with exhausted account capacity for turn/interrupt",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn server_request_response_fails_closed_when_account_capacity_is_exhausted() {
+        let (events, mut event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread_with_worker(
+            "thread-1".to_string(),
+            context.clone(),
+            Some(0),
+        );
+        scope_registry.register_pending_server_request_with_worker(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-1".to_string(),
+            Some(0),
+        );
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![(
+            "ws://127.0.0.1:8081".to_string(),
+            Some("acct-a".to_string()),
+        )]));
+        worker_health.mark_account_exhausted_for_worker(0, "quota exceeded".to_string());
+        let metrics = test_metrics();
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry: scope_registry.clone(),
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
+        };
+
+        let request_id = RequestId::String("req-1".to_string());
+        let error = runtime
+            .resolve_server_request(
+                context,
+                ResolveServerRequestRequest {
+                    request_id: request_id.clone(),
+                    response: GatewayServerRequestResponse::ToolRequestUserInput {
+                        answers: HashMap::new(),
+                    },
+                },
+            )
+            .await
+            .expect_err("server request response should fail closed before worker lookup");
+
+        assert!(matches!(
+            error,
+            GatewayError::Upstream(message)
+                if message == "thread thread-1 is pinned to worker 0 with exhausted account capacity for serverRequest/respond"
+        ));
+        assert!(scope_registry.pending_server_request(&request_id).is_some());
+        let event = event_rx.try_recv().expect("handoff event");
+        assert_eq!(event.method, "gateway/accountActiveThreadHandoffFailed");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "serverRequest/respond",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 0,
+                "exhaustedAccountId": "acct-a",
+                "reason": "thread thread-1 is pinned to worker 0 with exhausted account capacity for serverRequest/respond",
+            })
+        );
+        assert_server_request_lifecycle_and_delivery_failure_metrics(
+            &metrics,
+            "toolRequestUserInput",
+        );
+    }
+
+    #[tokio::test]
+    async fn server_request_response_fails_closed_using_pending_worker_without_thread_route() {
+        let (events, mut event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_pending_server_request_with_worker(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-1".to_string(),
+            Some(0),
+        );
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![(
+            "ws://127.0.0.1:8081".to_string(),
+            Some("acct-a".to_string()),
+        )]));
+        worker_health.mark_account_exhausted_for_worker(0, "quota exceeded".to_string());
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry: scope_registry.clone(),
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        let request_id = RequestId::String("req-1".to_string());
+        let error = runtime
+            .resolve_server_request(
+                context,
+                ResolveServerRequestRequest {
+                    request_id: request_id.clone(),
+                    response: GatewayServerRequestResponse::ToolRequestUserInput {
+                        answers: HashMap::new(),
+                    },
+                },
+            )
+            .await
+            .expect_err("server request response should fail closed before worker lookup");
+
+        assert!(matches!(
+            error,
+            GatewayError::Upstream(message)
+                if message == "thread thread-1 is pinned to worker 0 with exhausted account capacity for serverRequest/respond"
+        ));
+        assert!(scope_registry.pending_server_request(&request_id).is_some());
+        let event = event_rx.try_recv().expect("handoff event");
+        assert_eq!(event.method, "gateway/accountActiveThreadHandoffFailed");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "serverRequest/respond",
+                "threadId": "thread-1",
+                "exhaustedWorkerId": 0,
+                "exhaustedAccountId": "acct-a",
+                "reason": "thread thread-1 is pinned to worker 0 with exhausted account capacity for serverRequest/respond",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn server_request_response_type_mismatch_records_invalid_response_lifecycle() {
+        let (events, _event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_pending_server_request_with_worker(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-1".to_string(),
+            Some(0),
+        );
+        let metrics = test_metrics();
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry: scope_registry.clone(),
+            worker_health: Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(Vec::new())),
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::new(Some(metrics.clone()), true),
+        };
+
+        let request_id = RequestId::String("req-1".to_string());
+        let error = runtime
+            .resolve_server_request(
+                context,
+                ResolveServerRequestRequest {
+                    request_id: request_id.clone(),
+                    response: GatewayServerRequestResponse::CommandExecutionApproval {
+                        decision: CommandExecutionApprovalDecision::Decline,
+                    },
+                },
+            )
+            .await
+            .expect_err("mismatched response type should be rejected");
+
+        assert!(matches!(
+            error,
+            GatewayError::InvalidRequest(message)
+                if message == "server request response type does not match pending request"
+        ));
+        assert!(scope_registry.pending_server_request(&request_id).is_some());
+        assert_server_request_lifecycle_metric(
+            &metrics,
+            "client_server_request_invalid_response",
+            "commandExecutionApproval",
+        );
+    }
+
+    #[tokio::test]
+    async fn server_request_response_keeps_pending_request_when_remote_worker_route_is_missing() {
+        let (events, _event_rx) = broadcast::channel(4);
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_thread_with_worker(
+            "thread-1".to_string(),
+            context.clone(),
+            Some(9),
+        );
+        scope_registry.register_pending_server_request_with_worker(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            context.clone(),
+            "thread-1".to_string(),
+            Some(9),
+        );
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(Vec::new()));
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events,
+            scope_registry: scope_registry.clone(),
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        let request_id = RequestId::String("req-1".to_string());
+        let error = runtime
+            .resolve_server_request(
+                context,
+                ResolveServerRequestRequest {
+                    request_id: request_id.clone(),
+                    response: GatewayServerRequestResponse::ToolRequestUserInput {
+                        answers: HashMap::new(),
+                    },
+                },
+            )
+            .await
+            .expect_err("server request response should fail before clearing pending request");
+
+        assert!(matches!(
+            error,
+            GatewayError::Upstream(message)
+                if message == "remote worker route 9 is unavailable"
+        ));
+        let pending_request = scope_registry
+            .pending_server_request(&request_id)
+            .expect("pending request should still be registered");
+        assert_eq!(
+            pending_request.kind,
+            GatewayServerRequestKind::ToolRequestUserInput
+        );
+        assert_eq!(
+            pending_request.context,
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            }
+        );
+        assert_eq!(pending_request.thread_id, "thread-1");
+        assert_eq!(pending_request.worker_id, Some(9));
+        assert!(pending_request.registered_at > 0);
+    }
+
+    #[test]
     fn reports_degraded_remote_health_when_some_workers_are_unhealthy() {
         let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
             ("ws://127.0.0.1:8081".to_string(), None),
@@ -794,6 +1785,16 @@ mod tests {
                 project_id: Some("project-a".to_string()),
             },
             1,
+        );
+        scope_registry.register_pending_server_request_with_worker(
+            RequestId::String("req-1".to_string()),
+            GatewayServerRequestKind::ToolRequestUserInput,
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            "thread-1".to_string(),
+            Some(1),
         );
         let runtime = RemoteWorkerGatewayRuntime {
             workers: Vec::new(),
@@ -851,6 +1852,20 @@ mod tests {
                 last_connection_answered_but_unresolved_server_request_count: 0,
             }
         );
+        assert_eq!(health.pending_server_request_count, 1);
+        assert_eq!(
+            health.pending_server_request_kind_counts,
+            [("toolRequestUserInput".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health.pending_server_request_route_counts,
+            vec![crate::api::GatewayPendingServerRequestRouteCounts {
+                worker_id: Some(1),
+                count: 1,
+                kind_counts: [("toolRequestUserInput".to_string(), 1)].into(),
+            }]
+        );
+        assert!(health.pending_server_request_oldest_at.is_some());
         let remote_workers = health.remote_workers.expect("remote workers");
         assert_eq!(remote_workers.len(), 2);
         assert_eq!(

@@ -30,6 +30,7 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -132,8 +133,20 @@ pub struct GatewayHealthResponse {
     pub v2_compatibility: GatewayV2CompatibilityMode,
     pub v2_transport: GatewayV2TransportConfig,
     pub v2_connections: GatewayV2ConnectionHealth,
+    pub pending_server_request_count: usize,
+    pub pending_server_request_kind_counts: BTreeMap<String, usize>,
+    pub pending_server_request_route_counts: Vec<GatewayPendingServerRequestRouteCounts>,
+    pub pending_server_request_oldest_at: Option<i64>,
     pub remote_workers: Option<Vec<GatewayRemoteWorkerHealth>>,
     pub project_worker_routes: Option<Vec<GatewayProjectWorkerRoute>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayPendingServerRequestRouteCounts {
+    pub worker_id: Option<usize>,
+    pub count: usize,
+    pub kind_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +521,17 @@ pub enum GatewayServerRequestKind {
     FileChangeApproval,
     PermissionsApproval,
     ToolRequestUserInput,
+}
+
+impl GatewayServerRequestKind {
+    pub(crate) fn metric_tag(self) -> &'static str {
+        match self {
+            Self::CommandExecutionApproval => "commandExecutionApproval",
+            Self::FileChangeApproval => "fileChangeApproval",
+            Self::PermissionsApproval => "permissionsApproval",
+            Self::ToolRequestUserInput => "toolRequestUserInput",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
