@@ -1,4 +1,5 @@
 use crate::admission::GatewayAdmissionController;
+use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
 use crate::auth::GatewayAuth;
 use crate::auth::GatewayAuthError;
 use crate::error::GatewayError;
@@ -81,6 +82,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -200,6 +202,10 @@ fn update_active_v2_connection_pending_counts(
                     answered_but_unresolved_server_request_count(
                         &event_state.resolved_server_requests,
                     ),
+                server_request_backlog_worker_counts: server_request_backlog_worker_counts(
+                    &event_state.pending_server_requests,
+                    &event_state.resolved_server_requests,
+                ),
             },
         );
 }
@@ -210,6 +216,7 @@ struct GatewayV2ConnectionRunResult {
     pending_client_request_count: usize,
     pending_server_request_count: usize,
     answered_but_unresolved_server_request_count: usize,
+    server_request_backlog_worker_counts: Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
     result: io::Result<()>,
 }
 
@@ -1007,6 +1014,7 @@ async fn run_websocket_connection(
                     pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_worker_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1017,6 +1025,7 @@ async fn run_websocket_connection(
                     pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_worker_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1062,6 +1071,7 @@ async fn run_websocket_connection(
                     pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_worker_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1123,6 +1133,7 @@ async fn run_websocket_connection(
                     pending_client_request_count: 0,
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_worker_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1507,6 +1518,10 @@ async fn run_websocket_connection(
         let pending_server_request_count = event_state.pending_server_requests.len();
         let answered_but_unresolved_server_request_count =
             answered_but_unresolved_server_request_count(&event_state.resolved_server_requests);
+        let server_request_backlog_worker_counts = server_request_backlog_worker_counts(
+            &event_state.pending_server_requests,
+            &event_state.resolved_server_requests,
+        );
 
         if (reject_pending_server_requests_on_exit
             || loop_result
@@ -1563,6 +1578,7 @@ async fn run_websocket_connection(
             pending_client_request_count,
             pending_server_request_count,
             answered_but_unresolved_server_request_count,
+            server_request_backlog_worker_counts,
             result,
         })
     }
@@ -1575,6 +1591,7 @@ async fn run_websocket_connection(
             pending_client_request_count: 0,
             pending_server_request_count: 0,
             answered_but_unresolved_server_request_count: 0,
+            server_request_backlog_worker_counts: Vec::new(),
             result: Err(err),
         },
     };
@@ -1589,6 +1606,7 @@ async fn run_websocket_connection(
             pending_server_request_count: run_result.pending_server_request_count,
             answered_but_unresolved_server_request_count: run_result
                 .answered_but_unresolved_server_request_count,
+            server_request_backlog_worker_counts: run_result.server_request_backlog_worker_counts,
         },
         connection_started_at.elapsed(),
     );
@@ -2198,22 +2216,63 @@ async fn deliver_client_server_request_answer(
     connection
         .observability
         .record_v2_server_request_lifecycle_event("client_server_request_answered", method_tag);
-    let result = match worker_for_server_request(downstream, worker_id) {
-        Ok(worker) => match answer {
-            ClientServerRequestAnswer::Response(result) => {
-                worker
-                    .request_handle
-                    .resolve_server_request(route.downstream_request_id, result)
-                    .await
-            }
-            ClientServerRequestAnswer::Error(error) => {
-                worker
-                    .request_handle
-                    .reject_server_request(route.downstream_request_id, error)
-                    .await
-            }
-        },
-        Err(err) => Err(err),
+    let result = if downstream.multi_worker_topology()
+        && let (Some(worker_id), Some(thread_id)) = (worker_id, thread_id.as_deref())
+        && !downstream.worker_account_has_capacity(worker_id)
+    {
+        let message = format!(
+            "thread {thread_id} is pinned to worker {worker_id} with exhausted account capacity for serverRequest/respond"
+        );
+        connection.observability.record_v2_account_capacity_event(
+            worker_id,
+            "active_thread_handoff_failure",
+            Some(connection.request_context),
+            Some(message.as_str()),
+        );
+        connection.observability.publish_operator_event(
+            GatewayEvent::account_active_thread_handoff_failed(
+                GatewayAccountActiveThreadHandoffFailed {
+                    tenant_id: connection.request_context.tenant_id.as_str(),
+                    project_id: connection.request_context.project_id.as_deref(),
+                    method: "serverRequest/respond",
+                    thread_id,
+                    exhausted_worker_id: worker_id,
+                    exhausted_account_id: downstream.worker_account_id(worker_id),
+                    reason: message.as_str(),
+                },
+            ),
+        );
+        warn!(
+            response_kind = method_tag,
+            account_capacity_event = "active_thread_handoff_failure",
+            tenant_id = connection.request_context.tenant_id.as_str(),
+            project_id = connection.request_context.project_id.as_deref(),
+            thread_id,
+            exhausted_worker_id = worker_id,
+            exhausted_account_id = downstream.worker_account_id(worker_id),
+            "gateway v2 failed closed for an answered server request pinned to an exhausted account because no protocol-visible context handoff was requested"
+        );
+        Err(io::Error::other(FailClosedMultiWorkerRouteError {
+            message,
+        }))
+    } else {
+        match worker_for_server_request(downstream, worker_id) {
+            Ok(worker) => match answer {
+                ClientServerRequestAnswer::Response(result) => {
+                    worker
+                        .request_handle
+                        .resolve_server_request(route.downstream_request_id, result)
+                        .await
+                }
+                ClientServerRequestAnswer::Error(error) => {
+                    worker
+                        .request_handle
+                        .reject_server_request(route.downstream_request_id, error)
+                        .await
+                }
+            },
+            Err(err) => Err(err),
+        }
     };
     let event = if result.is_ok() {
         "client_server_request_delivered"
@@ -6926,6 +6985,39 @@ fn answered_but_unresolved_server_request_count(
     resolved_server_requests.len()
 }
 
+fn server_request_backlog_worker_counts(
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+) -> Vec<GatewayV2ServerRequestBacklogWorkerCounts> {
+    let mut worker_counts = BTreeMap::new();
+    for route in pending_server_requests.values() {
+        let entry = worker_counts
+            .entry(route.worker_id)
+            .or_insert((0usize, 0usize));
+        entry.0 = entry.0.saturating_add(1);
+    }
+    for key in resolved_server_requests.keys() {
+        let entry = worker_counts
+            .entry(key.worker_id)
+            .or_insert((0usize, 0usize));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    worker_counts
+        .into_iter()
+        .map(
+            |(worker_id, (pending_count, answered_but_unresolved_count))| {
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id,
+                    pending_server_request_count: pending_count,
+                    answered_but_unresolved_server_request_count: answered_but_unresolved_count,
+                    server_request_backlog_count: pending_count
+                        .saturating_add(answered_but_unresolved_count),
+                }
+            },
+        )
+        .collect()
+}
+
 fn jsonrpc_error_outcome_code(code: i64) -> &'static str {
     match code {
         RATE_LIMITED_ERROR_CODE => "rate_limited",
@@ -6957,9 +7049,21 @@ fn observe_v2_connection(
 ) {
     observability
         .v2_connection_health()
-        .mark_connection_completed(connection_id, outcome, detail, duration, pending_counts);
-    observability.record_v2_connection(outcome, duration, pending_counts);
-    observability.emit_v2_connection_audit_log(outcome, duration, context, detail, pending_counts);
+        .mark_connection_completed(
+            connection_id,
+            outcome,
+            detail,
+            duration,
+            pending_counts.clone(),
+        );
+    observability.record_v2_connection(outcome, duration, pending_counts.clone());
+    observability.emit_v2_connection_audit_log(
+        outcome,
+        duration,
+        context,
+        detail,
+        pending_counts.clone(),
+    );
     observability.emit_v2_connection_log(outcome, duration, context, detail, pending_counts);
 }
 
@@ -9727,8 +9831,234 @@ mod tests {
                 ("client_server_request_answered", "response", 1),
                 ("client_server_request_delivery_failed", "response", 1),
             ],
-            "response",
+            &[("response", 1)],
         );
+    }
+
+    #[tokio::test]
+    async fn deliver_client_server_request_answer_fails_closed_when_account_is_exhausted() {
+        let (client_a, request_handle_a) = start_test_request_handle().await;
+        let (client_b, request_handle_b) = start_test_request_handle().await;
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let admission = GatewayAdmissionController::default();
+        let scope_registry = GatewayScopeRegistry::default();
+        let request_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &request_context,
+            client_send_timeout: Duration::from_secs(1),
+            max_pending_server_requests: 1,
+            max_pending_client_requests: 1,
+            opt_out_notification_methods: HashSet::new(),
+        };
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://worker-a.invalid".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            (
+                "ws://worker-b.invalid".to_string(),
+                Some("acct-b".to_string()),
+            ),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let downstream = GatewayV2DownstreamRouter {
+            workers: vec![
+                DownstreamWorkerHandle {
+                    worker_id: Some(0),
+                    worker_websocket_url: Some("ws://worker-a.invalid".to_string()),
+                    request_handle: request_handle_a,
+                },
+                DownstreamWorkerHandle {
+                    worker_id: Some(1),
+                    worker_websocket_url: Some("ws://worker-b.invalid".to_string()),
+                    request_handle: request_handle_b,
+                },
+            ],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: true,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory,
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: request_context.clone(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+
+        let mut err = None;
+        let logs = capture_logs_async(async {
+            err = Some(
+                super::deliver_client_server_request_answer(
+                    &downstream,
+                    &connection,
+                    RequestId::String("gateway-request".to_string()),
+                    super::PendingServerRequestRoute {
+                        worker_id: Some(1),
+                        worker_websocket_url: test_worker_websocket_url(Some(1)),
+                        downstream_request_id: RequestId::String("downstream-request".to_string()),
+                        thread_id: Some("thread-worker-b".to_string()),
+                    },
+                    super::ClientServerRequestAnswer::Response(serde_json::json!({
+                        "approved": true,
+                    })),
+                )
+                .await
+                .expect_err("exhausted owner account should fail closed"),
+            );
+        })
+        .await;
+        let err = err.expect("delivery should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for serverRequest/respond"
+        );
+        assert!(logs.contains("active_thread_handoff_failure"), "{logs}");
+        assert!(logs.contains("response_kind=\"response\""), "{logs}");
+        assert!(logs.contains("thread_id=\"thread-worker-b\""), "{logs}");
+        assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
+        assert!(logs.contains("exhausted_account_id=\"acct-b\""), "{logs}");
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("active thread handoff failure event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountActiveThreadHandoffFailed"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "serverRequest/respond",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for serverRequest/respond",
+            })
+        );
+
+        let mut err = None;
+        let logs = capture_logs_async(async {
+            err = Some(
+                super::deliver_client_server_request_answer(
+                    &downstream,
+                    &connection,
+                    RequestId::String("gateway-error-request".to_string()),
+                    super::PendingServerRequestRoute {
+                        worker_id: Some(1),
+                        worker_websocket_url: test_worker_websocket_url(Some(1)),
+                        downstream_request_id: RequestId::String(
+                            "downstream-error-request".to_string(),
+                        ),
+                        thread_id: Some("thread-worker-b".to_string()),
+                    },
+                    super::ClientServerRequestAnswer::Error(JSONRPCErrorError {
+                        code: -32000,
+                        message: "user rejected".to_string(),
+                        data: None,
+                    }),
+                )
+                .await
+                .expect_err("exhausted owner account should fail closed for error replies"),
+            );
+        })
+        .await;
+        let err = err.expect("error reply delivery should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for serverRequest/respond"
+        );
+        assert!(logs.contains("active_thread_handoff_failure"), "{logs}");
+        assert!(logs.contains("response_kind=\"error\""), "{logs}");
+        assert!(logs.contains("thread_id=\"thread-worker-b\""), "{logs}");
+        assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
+        assert!(logs.contains("exhausted_account_id=\"acct-b\""), "{logs}");
+        assert_v2_server_request_answer_account_exhaustion_metrics(
+            &metrics,
+            &[
+                ("client_server_request_answered", "error", 1),
+                ("client_server_request_answered", "response", 1),
+                ("client_server_request_delivery_failed", "error", 1),
+                ("client_server_request_delivery_failed", "response", 1),
+            ],
+            &[("error", 1), ("response", 1)],
+            &[(1, "active_thread_handoff_failure", 2)],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("active thread handoff failure event should be published for error reply");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountActiveThreadHandoffFailed"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+
+        client_a
+            .shutdown()
+            .await
+            .expect("client A should shut down");
+        client_b
+            .shutdown()
+            .await
+            .expect("client B should shut down");
     }
 
     #[tokio::test]
@@ -9818,7 +10148,7 @@ mod tests {
                 ("client_server_request_answered", "error", 1),
                 ("client_server_request_delivery_failed", "error", 1),
             ],
-            "error",
+            &[("error", 1)],
         );
     }
 
@@ -9939,6 +10269,90 @@ mod tests {
         assert_eq!(
             error.message,
             super::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE
+        );
+    }
+
+    #[test]
+    fn server_request_backlog_worker_counts_groups_pending_and_answered_routes() {
+        let pending_server_requests = HashMap::from([
+            (
+                RequestId::String("gateway-pending-a".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: Some(2),
+                    worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    downstream_request_id: RequestId::String("downstream-pending-a".to_string()),
+                    thread_id: Some("thread-a".to_string()),
+                },
+            ),
+            (
+                RequestId::String("gateway-pending-b".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: Some(1),
+                    worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                    downstream_request_id: RequestId::String("downstream-pending-b".to_string()),
+                    thread_id: Some("thread-b".to_string()),
+                },
+            ),
+            (
+                RequestId::String("gateway-pending-c".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: None,
+                    worker_websocket_url: "embedded".to_string(),
+                    downstream_request_id: RequestId::String("downstream-pending-c".to_string()),
+                    thread_id: None,
+                },
+            ),
+        ]);
+        let resolved_server_requests = HashMap::from([
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id: Some(2),
+                    request_id: RequestId::String("downstream-resolved-a".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String("gateway-resolved-a".to_string()),
+                    worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    thread_id: Some("thread-a".to_string()),
+                },
+            ),
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id: Some(2),
+                    request_id: RequestId::String("downstream-resolved-b".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String("gateway-resolved-b".to_string()),
+                    worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    thread_id: Some("thread-a".to_string()),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            super::server_request_backlog_worker_counts(
+                &pending_server_requests,
+                &resolved_server_requests
+            ),
+            vec![
+                crate::api::GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: None,
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 1,
+                },
+                crate::api::GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(1),
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 1,
+                },
+                crate::api::GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(2),
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 3,
+                },
+            ]
         );
     }
 
@@ -10647,6 +11061,7 @@ mod tests {
                 pending_client_request_count: 4,
                 pending_server_request_count: 2,
                 answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_worker_counts: Vec::new(),
             },
             Duration::from_millis(9),
         );
@@ -10875,6 +11290,7 @@ mod tests {
                     pending_client_request_count: 0,
                     pending_server_request_count: 1,
                     answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_worker_counts: Vec::new(),
                 },
                 Duration::from_millis(13),
             );
@@ -11933,7 +12349,21 @@ mod tests {
     fn assert_v2_server_request_lifecycle_and_answer_delivery_failure_metrics(
         metrics: &codex_otel::MetricsClient,
         expected_lifecycle: &[(&str, &str, u64)],
-        expected_response_kind: &str,
+        expected_delivery_failures: &[(&str, u64)],
+    ) {
+        assert_v2_server_request_answer_account_exhaustion_metrics(
+            metrics,
+            expected_lifecycle,
+            expected_delivery_failures,
+            &[],
+        );
+    }
+
+    fn assert_v2_server_request_answer_account_exhaustion_metrics(
+        metrics: &codex_otel::MetricsClient,
+        expected_lifecycle: &[(&str, &str, u64)],
+        expected_delivery_failures: &[(&str, u64)],
+        expected_account_events: &[(usize, &str, u64)],
     ) {
         let resource_metrics = metrics.snapshot().expect("snapshot");
         let metrics = resource_metrics
@@ -11953,9 +12383,33 @@ mod tests {
             })
             .collect::<Vec<_>>();
         expected_lifecycle_points.sort();
+        let mut expected_delivery_failure_points = expected_delivery_failures
+            .iter()
+            .map(|(response_kind, value)| {
+                (
+                    BTreeMap::from([("response_kind".to_string(), (*response_kind).to_string())]),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_delivery_failure_points.sort();
+        let mut expected_account_points = expected_account_events
+            .iter()
+            .map(|(worker_id, event, value)| {
+                (
+                    BTreeMap::from([
+                        ("event".to_string(), (*event).to_string()),
+                        ("worker_id".to_string(), worker_id.to_string()),
+                    ]),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_account_points.sort();
 
         let mut actual_lifecycle_points = Vec::new();
-        let mut saw_delivery_failure_count = false;
+        let mut actual_delivery_failure_points = Vec::new();
+        let mut actual_account_points = Vec::new();
         for metric in metrics {
             match metric.name() {
                 "gateway_v2_server_request_lifecycle_events" => match metric.data() {
@@ -11981,25 +12435,18 @@ mod tests {
                 "gateway_v2_server_request_answer_delivery_failures" => match metric.data() {
                     AggregatedMetrics::U64(data) => match data {
                         MetricData::Sum(sum) => {
-                            let point = sum.data_points().next().expect("count point");
-                            assert_eq!(point.value(), 1);
-                            let attributes: BTreeMap<String, String> = point
-                                .attributes()
-                                .map(|attribute| {
-                                    (
-                                        attribute.key.as_str().to_string(),
-                                        attribute.value.as_str().to_string(),
-                                    )
-                                })
-                                .collect();
-                            assert_eq!(
-                                attributes,
-                                BTreeMap::from([(
-                                    "response_kind".to_string(),
-                                    expected_response_kind.to_string(),
-                                )])
-                            );
-                            saw_delivery_failure_count = true;
+                            actual_delivery_failure_points.extend(sum.data_points().map(|point| {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (attributes, point.value())
+                            }));
                         }
                         _ => {
                             panic!("unexpected server-request answer delivery failure aggregation")
@@ -12007,12 +12454,38 @@ mod tests {
                     },
                     _ => panic!("unexpected server-request answer delivery failure count type"),
                 },
+                "gateway_v2_account_capacity_events" => match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            actual_account_points.extend(sum.data_points().map(|point| {
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                (attributes, point.value())
+                            }));
+                        }
+                        _ => panic!("unexpected account capacity event aggregation"),
+                    },
+                    _ => panic!("unexpected account capacity event type"),
+                },
                 _ => {}
             }
         }
         actual_lifecycle_points.sort();
         assert_eq!(actual_lifecycle_points, expected_lifecycle_points);
-        assert!(saw_delivery_failure_count);
+        actual_delivery_failure_points.sort();
+        assert_eq!(
+            actual_delivery_failure_points,
+            expected_delivery_failure_points
+        );
+        actual_account_points.sort();
+        assert_eq!(actual_account_points, expected_account_points);
     }
 
     fn assert_v2_server_request_lifecycle_and_rejection_delivery_failure_metrics(
@@ -36891,6 +37364,290 @@ mod tests {
             ))
             .await
             .expect("approval response should send");
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_fails_closed_when_server_request_answer_targets_exhausted_account() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let downstream_addr = listener.local_addr().expect("listener address");
+        let (downstream_answer_tx, downstream_answer_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket should accept");
+
+            expect_remote_initialize(&mut websocket).await;
+
+            let thread_start_request = read_websocket_request(&mut websocket).await;
+            assert_eq!(thread_start_request.method, "thread/start");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: thread_start_request.id,
+                        result: serde_json::json!({
+                            "thread": {
+                                "id": "thread-worker-a",
+                                "forkedFromId": null,
+                                "preview": "/tmp/worker-a",
+                                "ephemeral": true,
+                                "modelProvider": "openai",
+                                "createdAt": 1,
+                                "updatedAt": 1,
+                                "status": {
+                                    "type": "idle",
+                                },
+                                "path": null,
+                                "cwd": "/tmp/worker-a",
+                                "cliVersion": "0.0.0-test",
+                                "source": "cli",
+                                "agentNickname": null,
+                                "agentRole": null,
+                                "gitInfo": null,
+                                "name": null,
+                                "turns": [],
+                            },
+                            "model": "gpt-5",
+                            "modelProvider": "openai",
+                            "serviceTier": null,
+                            "cwd": "/tmp/worker-a",
+                            "instructionSources": [],
+                            "approvalPolicy": "never",
+                            "approvalsReviewer": "user",
+                            "sandbox": {
+                                "type": "dangerFullAccess",
+                            },
+                            "reasoningEffort": null,
+                        }),
+                    }))
+                    .expect("thread/start response should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("thread/start response should send");
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::String("srv-user-input".to_string()),
+                        method: "item/tool/requestUserInput".to_string(),
+                        params: Some(serde_json::json!({
+                            "threadId": "thread-worker-a",
+                            "turnId": "turn-worker-a",
+                            "itemId": "tool-call-worker-a",
+                            "questions": [{
+                                "id": "mode",
+                                "header": "Mode",
+                                "question": "Pick execution mode",
+                                "isOther": false,
+                                "isSecret": false,
+                                "options": [],
+                            }],
+                        })),
+                        trace: None,
+                    }))
+                    .expect("server request should serialize")
+                    .into(),
+                ))
+                .await
+                .expect("server request should send");
+
+            let maybe_response = timeout(Duration::from_millis(300), websocket.next())
+                .await
+                .ok()
+                .and_then(|frame| frame)
+                .and_then(Result::ok)
+                .and_then(|message| match message {
+                    Message::Text(text) => Some(text.to_string()),
+                    Message::Binary(bytes) => String::from_utf8(bytes.to_vec()).ok(),
+                    Message::Close(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+                        None
+                    }
+                });
+            downstream_answer_tx
+                .send(maybe_response)
+                .expect("downstream answer observation should send");
+        });
+
+        let worker_b = start_mock_remote_server_for_initialize().await;
+        let metrics = in_memory_metrics();
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                format!("ws://{downstream_addr}"),
+                Some("acct-a".to_string()),
+            ),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        let (addr, server_task) = spawn_test_server(GatewayV2State {
+            auth: GatewayAuth::Disabled,
+            admission: GatewayAdmissionController::default(),
+            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            session_factory: Some(Arc::new(
+                GatewayV2SessionFactory::remote_multi_with_account_ids(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: format!("ws://{downstream_addr}"),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                    vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+                )
+                .with_worker_health(worker_health.clone()),
+            )),
+            timeouts: GatewayV2Timeouts::default(),
+        })
+        .await;
+
+        let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("websocket should connect");
+
+        send_initialize(&mut websocket).await;
+        send_initialized(&mut websocket).await;
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Request(JSONRPCRequest {
+                    id: RequestId::String("thread-start".to_string()),
+                    method: "thread/start".to_string(),
+                    params: Some(serde_json::json!({
+                        "model": null,
+                        "modelProvider": null,
+                        "serviceTier": null,
+                        "cwd": "/tmp/worker-a",
+                        "approvalPolicy": null,
+                        "approvalsReviewer": null,
+                        "sandbox": null,
+                        "config": null,
+                        "serviceName": null,
+                        "baseInstructions": null,
+                        "developerInstructions": null,
+                        "personality": null,
+                        "ephemeral": true,
+                        "sessionStartSource": null,
+                        "dynamicTools": null,
+                        "experimentalRawEvents": false,
+                        "persistExtendedHistory": false,
+                    })),
+                    trace: None,
+                }))
+                .expect("thread/start request should serialize")
+                .into(),
+            ))
+            .await
+            .expect("thread/start request should send");
+
+        let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected thread/start response");
+        };
+        assert_eq!(response.id, RequestId::String("thread-start".to_string()));
+
+        let JSONRPCMessage::Request(user_input_request) =
+            read_websocket_message(&mut websocket).await
+        else {
+            panic!("expected forwarded user-input request");
+        };
+        assert_eq!(user_input_request.method, "item/tool/requestUserInput");
+        assert_eq!(
+            user_input_request.params,
+            Some(serde_json::json!({
+                "threadId": "thread-worker-a",
+                "turnId": "turn-worker-a",
+                "itemId": "tool-call-worker-a",
+                "questions": [{
+                    "id": "mode",
+                    "header": "Mode",
+                    "question": "Pick execution mode",
+                    "isOther": false,
+                    "isSecret": false,
+                    "options": [],
+                }],
+            }))
+        );
+
+        worker_health.mark_account_exhausted_for_worker(0, "quota reached".to_string());
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                    id: user_input_request.id,
+                    result: serde_json::json!({
+                        "answers": {
+                            "mode": {
+                                "answers": ["safe"],
+                            },
+                        },
+                    }),
+                }))
+                .expect("user-input response should serialize")
+                .into(),
+            ))
+            .await
+            .expect("user-input response should send");
+
+        match timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("websocket should close or reset")
+        {
+            Some(Ok(Message::Close(Some(close_frame)))) => {
+                assert_eq!(u16::from(close_frame.code), close_code::ERROR);
+                assert!(
+                    close_frame.reason.contains(
+                        "thread thread-worker-a is pinned to worker 0 with exhausted account capacity for serverRequest/respond"
+                    ),
+                    "{}",
+                    close_frame.reason
+                );
+            }
+            Some(Ok(Message::Close(None))) | None => {}
+            Some(Err(err)) => {
+                assert!(
+                    err.to_string().contains("reset without closing handshake"),
+                    "{err}"
+                );
+            }
+            Some(Ok(message)) => panic!("expected websocket close or reset, got {message:?}"),
+        }
+        assert_eq!(
+            downstream_answer_rx
+                .await
+                .expect("downstream answer observation should arrive"),
+            None
+        );
+        assert_v2_server_request_answer_account_exhaustion_metrics(
+            &metrics,
+            &[
+                ("client_server_request_answered", "response", 1),
+                ("client_server_request_delivery_failed", "response", 1),
+                (
+                    "downstream_server_request_forwarded",
+                    "item/tool/requestUserInput",
+                    1,
+                ),
+            ],
+            &[("response", 1)],
+            &[(0, "active_thread_handoff_failure", 1)],
+        );
 
         server_task.abort();
         let _ = server_task.await;

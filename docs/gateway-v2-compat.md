@@ -1924,8 +1924,10 @@ Operational notes:
   `v2Connections.activeConnectionServerRequestBacklogCount`,
   `v2Connections.activeConnectionMaxServerRequestBacklogCount`,
   `v2Connections.activeConnectionServerRequestBacklogStartedAt`,
+  `v2Connections.activeConnectionServerRequestBacklogWorkerCounts`,
   `v2Connections.lastConnectionServerRequestBacklogCount`,
   `v2Connections.lastConnectionServerRequestBacklogStartedAt`,
+  `v2Connections.lastConnectionServerRequestBacklogWorkerCounts`,
   `v2Connections.accountCapacityEventCounts`,
   `v2Connections.accountCapacityEventWorkerCounts`,
   `v2Connections.lastAccountCapacityEvent`,
@@ -1940,6 +1942,10 @@ Operational notes:
   sessions, making live background client-request and server-request buildup
   visible before a session closes and updates the latest completed connection
   fields
+- the per-worker backlog counts split pending and answered-but-unresolved
+  server-request buildup by owning worker id, so multi-worker operators can
+  identify which downstream app-server session is accumulating unresolved
+  prompts without exposing individual request ids
 - initialize timeout and downstream disconnects surface as explicit WebSocket
   close frames, not silent socket drops
 - tune `--v2-initialize-timeout-seconds` and
@@ -2019,9 +2025,12 @@ Current status:
   transport profile
 - the gateway establishes one downstream app-server session per configured
   worker and exposes `RemoteMultiWorker` from `/healthz`
-- aggregated `thread/list`, `thread/loaded/list`, and threadless `app/list`
-  responses plus translated server-request IDs are supported, but broader
-  parity and hardening work are still in progress
+- the current supported surface includes gateway-owned aggregation, fanout,
+  primary-worker routing, worker discovery, thread-sticky routing, translated
+  server-request IDs, bounded account handoff for explicit restore surfaces, and
+  fail-closed behavior for live active-context requests; the method matrix is
+  the source of truth for which route class applies to each method in the
+  validated build
 - project-aware account routing is active but still short of the final
   release-quality multi-worker profile: project-scoped `thread/start` requests
   reuse recorded project-to-worker routes for cache affinity, different
@@ -2155,8 +2164,14 @@ Current status:
   `thread/shellCommand`, `thread/backgroundTerminals/clean`,
   `thread/realtime/start`, `thread/realtime/appendText`,
   `thread/realtime/appendAudio`, `thread/realtime/stop`,
-  `mcpServer/resource/read`, `mcpServer/tool/call`, and `review/start`, rather
-  than silently replaying live or side-effecting work on a different account.
+  `mcpServer/resource/read`, `mcpServer/tool/call`, `review/start`, and client
+  replies to pending thread-scoped approval / user-input / elicitation server
+  requests, rather than silently replaying live or side-effecting work on a
+  different account. The server-request answer branch now also has real
+  northbound WebSocket coverage proving that an answer sent after the owning
+  worker account is marked exhausted closes the shared client session, is not
+  delivered to the exhausted downstream worker, and records matching
+  account-capacity plus server-request lifecycle metrics.
   The same harness now also validates the successful explicit thread-id fork
   restoration path through the same real client session and operator-event
   stream. The same harness now also validates the fail-closed branches for
@@ -2183,8 +2198,15 @@ Operational notes:
   closed at upgrade time
 - current multi-worker v2 routing is still an incremental Stage B transport:
   use it for development and targeted validation, not broad drop-in rollout
-- remaining work is broader request/notification parity plus more operational
-  hardening for reconnect and load behavior across multiple workers
+- before a specific multi-worker deployment is described as release-quality,
+  validate the method route classes in the matrix for that build: aggregation,
+  fanout, primary-worker affinity, worker discovery, thread-sticky routing,
+  bounded account handoff, and fail-closed live active-context behavior
+- remaining release work is to repeat that validation under the deployment's
+  steady-state, reconnect, degraded-route, slow-client, overload, and
+  account-capacity conditions, then keep the promotion scoped to the exact
+  worker topology, account labels, auth mode, timeout settings,
+  pending-request limits, and v2 method families that were exercised
 - account-backed worker pools have moved beyond identity observability:
   workers can be labeled with an account id for health and affinity
   inspection, account capacity is tracked separately from worker process
@@ -2341,7 +2363,7 @@ Operational notes:
   is supplied
 - remote-worker entries in `/healthz` also include `accountId`, giving
   operators the same account label on raw worker health and project-affinity
-  route views before quota-aware routing is implemented
+  route views that the quota-aware selection and bounded handoff paths use
 - remote-worker entries in `/healthz` now include `accountCapacity`,
   `accountCapacityReason`, and `accountCapacityLastChangedAt`; project-affinity
   route entries also include `accountCapacity`, making it visible when a cached
@@ -2368,6 +2390,11 @@ Operational notes:
   answered-but-unresolved server-request counts, matching the `/healthz` v2
   connection snapshot and connection metrics used to diagnose background
   command saturation and stranded prompt lifecycles
+- `/healthz.v2Connections` also exposes active and last-completed
+  server-request backlog worker counts, grouping pending and
+  answered-but-unresolved prompt lifecycle buildup by owning worker id so
+  multi-worker rollouts can correlate backlog pressure with downstream worker
+  health and reconnect state
 - connection-level metrics now also include
   `gateway_v2_connection_pending_client_requests{outcome}`, so post-teardown
   dashboards can track background client-request buildup with the same outcome
@@ -3206,6 +3233,10 @@ Promotion evidence for multi-worker remote:
 - record the exact gateway and worker configuration, including every
   `--remote-websocket-url`, `--remote-account-id`, auth mode, v2 timeout, and
   pending-request limit used during validation
+- record which methods are expected to aggregate, fan out, stay primary-worker
+  affine, use worker discovery, remain sticky to an owning thread route, or use
+  a bounded account-handoff surface, and compare those expectations with the
+  method matrix for the validated build
 - capture `/healthz` before traffic, during steady-state traffic, while a
   worker is reconnecting, after recovery, and after an induced account-capacity
   event
@@ -3225,6 +3256,10 @@ Promotion evidence for multi-worker remote:
   health/events/metrics disagree about the affected worker or account, or if a
   live active-context request silently succeeds on a replacement account
   without an explicit restore surface
+- keep the promotion scoped to the exact topology and method families that
+  were validated; adding workers, changing account labels, changing timeout or
+  pending-request limits, or enabling new v2 methods should trigger another
+  evidence pass before the deployment is described as release-quality
 
 ## Testing Plan
 

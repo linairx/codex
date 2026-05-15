@@ -2815,16 +2815,42 @@ Phase 6 is in progress with:
   configuration, `/healthz` snapshots, `/v1/events` captures, metric exports,
   client transcripts, and documented fail-closed outcomes must agree on the
   affected worker, account, tenant/project scope, and handoff result
+- the multi-worker promotion evidence now also requires an explicit method
+  routing expectation for the validated build, covering which methods aggregate,
+  fan out, stay primary-worker affine, use worker discovery, remain thread
+  sticky, or use a bounded account-handoff surface, and keeps promotion scoped
+  to the exact topology, account labels, timeout settings, pending-request
+  limits, and v2 method families that were exercised
+- the multi-worker rollout guidance now points operators back to the method
+  matrix as the source of truth for each method's route class, and requires the
+  same route-class expectations to be validated under steady-state, reconnect,
+  degraded-route, slow-client, overload, and account-capacity conditions before
+  a specific deployment shape is described as release-quality
+- v2 client replies to thread-scoped approval, user-input, and elicitation
+  server requests now also fail closed when the pending request's owning worker
+  account is exhausted, emitting the same active-thread no-handoff
+  account-capacity metric, structured log, and
+  `gateway/accountActiveThreadHandoffFailed` operator event instead of
+  delivering the answer to an exhausted account-backed worker
+- that v2 server-request answer fail-closed path now also has real northbound
+  WebSocket regression coverage: a multi-worker gateway forwards a
+  thread-scoped user-input request, the owning worker account is marked
+  exhausted before the client answers, the gateway closes the shared client
+  session without delivering the answer downstream, and the account-capacity
+  plus server-request lifecycle metrics identify the same worker and request
+  class
 - `/healthz.v2Connections` now also reports
   `activeConnectionServerRequestBacklogCount`,
   `activeConnectionMaxServerRequestBacklogCount`,
   `activeConnectionServerRequestBacklogStartedAt`,
+  `activeConnectionServerRequestBacklogWorkerCounts`,
   `lastConnectionServerRequestBacklogCount`, and
-  `lastConnectionServerRequestBacklogStartedAt`, giving operators the total
-  active backlog, the largest backlog on any one active connection, and the
-  timestamp for the current active v2 server-request backlog plus the last
-  completed connection's unresolved prompt backlog without exposing individual
-  request ids
+  `lastConnectionServerRequestBacklogStartedAt`, plus
+  `lastConnectionServerRequestBacklogWorkerCounts`, giving operators the total
+  active backlog, the largest backlog on any one active connection, the
+  timestamp for the current active v2 server-request backlog, and a per-worker
+  split of pending versus answered-but-unresolved prompt buildup without
+  exposing individual request ids
 
 The remaining Phase 6 work is:
 

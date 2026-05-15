@@ -1039,6 +1039,7 @@ mod tests {
                 pending_client_request_count: 3,
                 pending_server_request_count: 2,
                 answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_worker_counts: Vec::new(),
             },
         );
 
@@ -2829,6 +2830,7 @@ mod tests {
                     pending_client_request_count: 4,
                     pending_server_request_count: 2,
                     answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_worker_counts: Vec::new(),
                 },
             );
         });
@@ -2861,6 +2863,7 @@ mod tests {
                     pending_client_request_count: 5,
                     pending_server_request_count: 3,
                     answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_worker_counts: Vec::new(),
                 },
             );
         });
@@ -2893,6 +2896,7 @@ mod tests {
                     pending_client_request_count: 6,
                     pending_server_request_count: 4,
                     answered_but_unresolved_server_request_count: 3,
+                    server_request_backlog_worker_counts: Vec::new(),
                 },
             );
         });

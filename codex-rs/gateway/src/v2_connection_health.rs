@@ -1,5 +1,6 @@
 use crate::api::GatewayV2AccountCapacityWorkerEventCounts;
 use crate::api::GatewayV2ConnectionHealth;
+use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -9,11 +10,12 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayV2ConnectionPendingCounts {
     pub pending_client_request_count: usize,
     pub pending_server_request_count: usize,
     pub answered_but_unresolved_server_request_count: usize,
+    pub server_request_backlog_worker_counts: Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,6 +43,8 @@ struct GatewayV2ConnectionHealthState {
     last_connection_answered_but_unresolved_server_request_count: usize,
     last_connection_server_request_backlog_count: usize,
     last_connection_server_request_backlog_started_at: Option<i64>,
+    last_connection_server_request_backlog_worker_counts:
+        Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,6 +53,7 @@ struct ActiveGatewayV2ConnectionHealth {
     pending_server_request_count: usize,
     answered_but_unresolved_server_request_count: usize,
     server_request_backlog_started_at: Option<i64>,
+    server_request_backlog_worker_counts: Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +100,8 @@ impl GatewayV2ConnectionHealthRegistry {
             connection.pending_server_request_count = counts.pending_server_request_count;
             connection.answered_but_unresolved_server_request_count =
                 counts.answered_but_unresolved_server_request_count;
+            connection.server_request_backlog_worker_counts =
+                counts.server_request_backlog_worker_counts;
         }
     }
 
@@ -150,6 +157,8 @@ impl GatewayV2ConnectionHealthRegistry {
             .saturating_add(counts.answered_but_unresolved_server_request_count);
         state.last_connection_server_request_backlog_started_at = completed_connection
             .and_then(|connection| connection.server_request_backlog_started_at);
+        state.last_connection_server_request_backlog_worker_counts =
+            counts.server_request_backlog_worker_counts;
     }
 
     pub fn snapshot(&self) -> GatewayV2ConnectionHealth {
@@ -187,6 +196,34 @@ impl GatewayV2ConnectionHealthRegistry {
             })
             .max()
             .unwrap_or(0);
+        let mut active_connection_server_request_backlog_worker_counts = BTreeMap::new();
+        for connection in state.active_connections.values() {
+            for counts in &connection.server_request_backlog_worker_counts {
+                let entry = active_connection_server_request_backlog_worker_counts
+                    .entry(counts.worker_id)
+                    .or_insert((0usize, 0usize));
+                entry.0 = entry.0.saturating_add(counts.pending_server_request_count);
+                entry.1 = entry
+                    .1
+                    .saturating_add(counts.answered_but_unresolved_server_request_count);
+            }
+        }
+        let active_connection_server_request_backlog_worker_counts =
+            active_connection_server_request_backlog_worker_counts
+                .into_iter()
+                .map(
+                    |(worker_id, (pending_count, answered_but_unresolved_count))| {
+                        GatewayV2ServerRequestBacklogWorkerCounts {
+                            worker_id,
+                            pending_server_request_count: pending_count,
+                            answered_but_unresolved_server_request_count:
+                                answered_but_unresolved_count,
+                            server_request_backlog_count: pending_count
+                                .saturating_add(answered_but_unresolved_count),
+                        }
+                    },
+                )
+                .collect();
         GatewayV2ConnectionHealth {
             active_connection_count: state.active_connection_count,
             active_connection_pending_client_request_count,
@@ -195,6 +232,7 @@ impl GatewayV2ConnectionHealthRegistry {
             active_connection_server_request_backlog_count,
             active_connection_max_server_request_backlog_count,
             active_connection_server_request_backlog_started_at,
+            active_connection_server_request_backlog_worker_counts,
             account_capacity_event_counts: state.account_capacity_event_counts.clone(),
             account_capacity_event_worker_counts: state
                 .account_capacity_event_worker_counts
@@ -233,6 +271,9 @@ impl GatewayV2ConnectionHealthRegistry {
                 .last_connection_server_request_backlog_count,
             last_connection_server_request_backlog_started_at: state
                 .last_connection_server_request_backlog_started_at,
+            last_connection_server_request_backlog_worker_counts: state
+                .last_connection_server_request_backlog_worker_counts
+                .clone(),
         }
     }
 }
@@ -263,6 +304,7 @@ mod tests {
     use super::GatewayV2ConnectionHealthRegistry;
     use super::GatewayV2ConnectionPendingCounts;
     use crate::api::GatewayV2ConnectionHealth;
+    use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -281,6 +323,7 @@ mod tests {
                 active_connection_server_request_backlog_count: 0,
                 active_connection_max_server_request_backlog_count: 0,
                 active_connection_server_request_backlog_started_at: None,
+                active_connection_server_request_backlog_worker_counts: Vec::new(),
                 account_capacity_event_counts: BTreeMap::new(),
                 account_capacity_event_worker_counts: Vec::new(),
                 last_account_capacity_event: None,
@@ -301,6 +344,7 @@ mod tests {
                 last_connection_answered_but_unresolved_server_request_count: 0,
                 last_connection_server_request_backlog_count: 0,
                 last_connection_server_request_backlog_started_at: None,
+                last_connection_server_request_backlog_worker_counts: Vec::new(),
             }
         );
     }
@@ -317,6 +361,20 @@ mod tests {
                 pending_client_request_count: 7,
                 pending_server_request_count: 3,
                 answered_but_unresolved_server_request_count: 2,
+                server_request_backlog_worker_counts: vec![
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: Some(1),
+                        pending_server_request_count: 2,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 3,
+                    },
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: Some(2),
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 2,
+                    },
+                ],
             },
         );
         registry.update_connection_pending_counts(
@@ -325,6 +383,20 @@ mod tests {
                 pending_client_request_count: 11,
                 pending_server_request_count: 5,
                 answered_but_unresolved_server_request_count: 4,
+                server_request_backlog_worker_counts: vec![
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: None,
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 0,
+                        server_request_backlog_count: 1,
+                    },
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: Some(2),
+                        pending_server_request_count: 4,
+                        answered_but_unresolved_server_request_count: 4,
+                        server_request_backlog_count: 8,
+                    },
+                ],
             },
         );
         let active_snapshot = registry.snapshot();
@@ -348,6 +420,29 @@ mod tests {
         assert_eq!(
             active_snapshot.active_connection_max_server_request_backlog_count,
             9
+        );
+        assert_eq!(
+            active_snapshot.active_connection_server_request_backlog_worker_counts,
+            vec![
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: None,
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 1,
+                },
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(1),
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_count: 3,
+                },
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(2),
+                    pending_server_request_count: 5,
+                    answered_but_unresolved_server_request_count: 5,
+                    server_request_backlog_count: 10,
+                },
+            ]
         );
         assert_eq!(
             active_snapshot
@@ -379,6 +474,20 @@ mod tests {
                 pending_client_request_count: 7,
                 pending_server_request_count: 3,
                 answered_but_unresolved_server_request_count: 2,
+                server_request_backlog_worker_counts: vec![
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: Some(1),
+                        pending_server_request_count: 2,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 3,
+                    },
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: Some(2),
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 2,
+                    },
+                ],
             },
         );
 
@@ -414,6 +523,23 @@ mod tests {
         );
         assert_eq!(snapshot.last_connection_server_request_backlog_count, 5);
         assert_eq!(
+            snapshot.last_connection_server_request_backlog_worker_counts,
+            vec![
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(1),
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_count: 3,
+                },
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(2),
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_count: 2,
+                },
+            ]
+        );
+        assert_eq!(
             snapshot
                 .last_connection_server_request_backlog_started_at
                 .is_some(),
@@ -434,6 +560,7 @@ mod tests {
                 pending_client_request_count: 0,
                 pending_server_request_count: 1,
                 answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
             },
         );
         assert_eq!(
@@ -461,6 +588,7 @@ mod tests {
                 pending_client_request_count: 0,
                 pending_server_request_count: 0,
                 answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_worker_counts: Vec::new(),
             },
         );
         assert_eq!(

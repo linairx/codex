@@ -28,6 +28,10 @@ Stage B rollout gate:
 - multi-worker remote remains a bounded validation profile until broad
   steady-state, reconnect, degraded-route, and slow-client coverage is
   exercised for the deployment shape being promoted
+- the deployment evidence must identify which methods aggregate, fan out, stay
+  primary-worker affine, use worker discovery, remain sticky to thread routes,
+  or use bounded account-handoff surfaces, and must show those route classes
+  behaved as documented for the validated build
 - account-backed multi-worker validation requires every worker to be labeled
   with `--remote-account-id`, plus explicit checks for same-project affinity,
   cross-project account distribution, quota-aware new-thread failover, and
@@ -40,6 +44,18 @@ Stage B rollout gate:
   health, reconnect state, account-capacity events, and fail-closed decisions
   before multi-worker remote is documented as equivalent to embedded or
   single-worker remote
+
+Stage B route-class validation checklist:
+
+| Route class | Validate with | Evidence to capture |
+| --- | --- | --- |
+| aggregation | `account/read`, `model/list`, `thread/list`, `thread/loaded/list`, `skills/list`, `thread/realtime/listVoices` | merged response shape, duplicate handling, fail-closed behavior while required workers are unavailable, and recovered-worker re-add on the same northbound session |
+| fanout mutation | `account/login/start` for external auth, `config/batchWrite`, `config/value/write`, `skills/config/write`, `fs/watch`, `fs/unwatch` | every configured worker receives the mutation, duplicate notifications are suppressed, and the request fails closed instead of updating only surviving workers during reconnect backoff |
+| primary-worker affinity | managed login, `account/login/cancel`, `feedback/upload`, `account/sendAddCreditsNudgeEmail`, standalone command control, streaming fuzzy-file-search sessions | side effects are not duplicated across workers, the primary worker is reconnected before routing, and primary-worker backoff produces the documented fail-closed error |
+| worker discovery | `plugin/read`, `plugin/install`, `plugin/uninstall`, `mcpServer/oauth/login`, legacy `gitDiffToRemote` | first successful worker selection, incomplete-worker-set fail-closed behavior, and recovered-worker discovery on a later request |
+| thread-sticky routing | `thread/read`, thread mutation methods, `turn/start`, `turn/steer`, `turn/interrupt`, thread-scoped MCP calls | route ownership stays pinned to the visible thread owner, lazy route recovery behaves as documented, and hidden or unavailable routes fail closed |
+| bounded account handoff | `thread/read`, `thread/resume`, `thread/fork`, rollout-path `thread/resume` / `thread/fork`, legacy `getConversationSummary` variants | replacement-account success preserves the requested thread id or rollout path, updates sticky routing, emits the expected `/v1/events` account event, and records matching account-capacity metrics |
+| live active-context fail-closed | `turn/start`, `turn/steer`, `turn/interrupt`, realtime append/stop, thread-scoped MCP calls, approval and elicitation replies | exhausted owner accounts do not silently replay live or side-effecting work on another worker; client-visible errors, `/v1/events`, health fields, metrics, and audit logs identify the same worker/account/scope |
 
 Status legend:
 
@@ -611,6 +627,21 @@ Additional transport behavior:
   verifies that a later client request can reconnect a missing worker and then
   still forward subsequent server requests from that recovered worker over the
   same shared northbound session
+- thread-scoped server-request answers are also guarded by the live
+  active-context fail-closed policy: if the pending request's owning worker
+  account is marked exhausted before the client answers, the gateway now
+  rejects the answer locally, emits
+  `gateway_v2_account_capacity_events{event="active_thread_handoff_failure"}`,
+  publishes `gateway/accountActiveThreadHandoffFailed`, and does not deliver
+  the approval, user-input, or elicitation answer to the exhausted
+  account-backed worker. Dedicated northbound WebSocket regression coverage now
+  pins that behavior on the real shared client session, including the absence
+  of downstream delivery and the matching server-request lifecycle metrics.
+- `/healthz.v2Connections` now also groups active and last-completed
+  server-request backlog by owning worker id, splitting pending prompts from
+  answered-but-unresolved prompts so Stage B rollout evidence can identify
+  which downstream session is accumulating unresolved server-request state
+  without exposing individual request ids.
 
 - if a northbound v2 connection ends while a forwarded server request is still
   pending, including client disconnects and malformed-payload protocol closes,
