@@ -1840,6 +1840,17 @@ mod tests {
                 active_connection_pending_client_request_count: 0,
                 active_connection_pending_server_request_count: 0,
                 active_connection_answered_but_unresolved_server_request_count: 0,
+                active_connection_server_request_backlog_count: 0,
+                active_connection_max_server_request_backlog_count: 0,
+                active_connection_server_request_backlog_started_at: None,
+                account_capacity_event_counts: std::collections::BTreeMap::new(),
+                account_capacity_event_worker_counts: Vec::new(),
+                last_account_capacity_event: None,
+                last_account_capacity_event_worker_id: None,
+                last_account_capacity_event_tenant_id: None,
+                last_account_capacity_event_project_id: None,
+                last_account_capacity_event_reason: None,
+                last_account_capacity_event_at: None,
                 peak_active_connection_count: 0,
                 total_connection_count: 0,
                 last_connection_started_at: None,
@@ -1850,6 +1861,8 @@ mod tests {
                 last_connection_pending_client_request_count: 0,
                 last_connection_pending_server_request_count: 0,
                 last_connection_answered_but_unresolved_server_request_count: 0,
+                last_connection_server_request_backlog_count: 0,
+                last_connection_server_request_backlog_started_at: None,
             }
         );
         assert_eq!(health.pending_server_request_count, 1);

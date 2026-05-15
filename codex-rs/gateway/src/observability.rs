@@ -514,7 +514,21 @@ impl GatewayObservability {
         }
     }
 
-    pub(crate) fn record_v2_account_capacity_event(&self, worker_id: usize, event: &str) {
+    pub(crate) fn record_v2_account_capacity_event(
+        &self,
+        worker_id: usize,
+        event: &str,
+        context: Option<&GatewayRequestContext>,
+        reason: Option<&str>,
+    ) {
+        self.v2_connection_health.record_account_capacity_event(
+            worker_id,
+            event,
+            context.map(|context| context.tenant_id.as_str()),
+            context.and_then(|context| context.project_id.as_deref()),
+            reason,
+        );
+
         let worker_id = worker_id.to_string();
         let tags = [("worker_id", worker_id.as_str()), ("event", event)];
 
@@ -1614,7 +1628,15 @@ mod tests {
         .expect("metrics");
         let observability = GatewayObservability::new(Some(metrics), true);
 
-        observability.record_v2_account_capacity_event(7, "exhausted");
+        observability.record_v2_account_capacity_event(7, "exhausted", None, None);
+        observability.record_v2_account_capacity_event(7, "exhausted", None, None);
+        assert_eq!(
+            observability
+                .v2_connection_health()
+                .snapshot()
+                .account_capacity_event_counts,
+            BTreeMap::from([("exhausted".to_string(), 2)])
+        );
 
         let resource_metrics = observability
             .metrics
@@ -1634,7 +1656,7 @@ mod tests {
                     AggregatedMetrics::U64(data) => match data {
                         MetricData::Sum(sum) => {
                             let point = sum.data_points().next().expect("count point");
-                            assert_eq!(point.value(), 1);
+                            assert_eq!(point.value(), 2);
                             let attributes: BTreeMap<String, String> = point
                                 .attributes()
                                 .map(|attribute| {

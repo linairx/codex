@@ -4121,14 +4121,13 @@ async fn handle_client_request(
             .await;
         }
 
-        if matches!(
-            request.method.as_str(),
-            "thread/resume" | "thread/fork" | "getConversationSummary"
-        ) && request_thread_id(&request).is_some_and(|thread_id| {
-            connection
-                .scope_registry
-                .thread_visible_to(connection.request_context, thread_id)
-        }) {
+        if thread_id_account_handoff_metrics(request.method.as_str()).is_some()
+            && request_thread_id(&request).is_some_and(|thread_id| {
+                connection
+                    .scope_registry
+                    .thread_visible_to(connection.request_context, thread_id)
+            })
+        {
             return route_thread_id_request_with_account_handoff(downstream, connection, request)
                 .await;
         }
@@ -4195,9 +4194,12 @@ fn fail_closed_active_thread_request_if_account_exhausted(
         "thread {thread_id} is pinned to worker {worker_id} with exhausted account capacity for {}",
         request.method
     );
-    connection
-        .observability
-        .record_v2_account_capacity_event(worker_id, "active_thread_handoff_failure");
+    connection.observability.record_v2_account_capacity_event(
+        worker_id,
+        "active_thread_handoff_failure",
+        Some(connection.request_context),
+        Some(message.as_str()),
+    );
     connection.observability.publish_operator_event(
         GatewayEvent::account_active_thread_handoff_failed(
             GatewayAccountActiveThreadHandoffFailed {
@@ -4266,6 +4268,8 @@ async fn route_thread_start_request_with_account_capacity_failover(
                         connection.observability.record_v2_account_capacity_event(
                             worker_id,
                             "thread_start_failover_success",
+                            Some(connection.request_context),
+                            Some("thread/start restored on a replacement account-backed worker"),
                         );
                         info!(
                             method = method.as_str(),
@@ -4288,9 +4292,12 @@ async fn route_thread_start_request_with_account_capacity_failover(
             }
             Err(error) if is_account_capacity_error(&error) => {
                 if let Some(worker_id) = worker.worker_id {
-                    connection
-                        .observability
-                        .record_v2_account_capacity_event(worker_id, "exhausted");
+                    connection.observability.record_v2_account_capacity_event(
+                        worker_id,
+                        "exhausted",
+                        Some(connection.request_context),
+                        Some(error.message.as_str()),
+                    );
                     warn!(
                         method = method.as_str(),
                         tenant_id = connection.request_context.tenant_id.as_str(),
@@ -4333,17 +4340,11 @@ async fn route_thread_id_request_with_account_handoff(
     request: JSONRPCRequest,
 ) -> io::Result<Result<Value, JSONRPCErrorError>> {
     let method = request.method.clone();
-    let (success_metric, failure_metric) = match method.as_str() {
-        "getConversationSummary" => (
-            "conversation_summary_handoff_success",
-            "conversation_summary_handoff_failure",
-        ),
-        "thread/fork" => ("thread_fork_handoff_success", "thread_fork_handoff_failure"),
-        "thread/resume" => (
-            "thread_resume_handoff_success",
-            "thread_resume_handoff_failure",
-        ),
-        _ => ("thread_id_handoff_success", "thread_id_handoff_failure"),
+    let Some((success_metric, failure_metric)) = thread_id_account_handoff_metrics(method.as_str())
+    else {
+        return Err(io::Error::other(format!(
+            "gateway v2 {method} handoff is not supported"
+        )));
     };
     let Some(thread_id) = request_thread_id(&request).map(str::to_string) else {
         return Err(io::Error::other(format!(
@@ -4399,9 +4400,33 @@ async fn route_thread_id_request_with_account_handoff(
             .await?;
         match response {
             Ok(result) => {
-                connection
-                    .observability
-                    .record_v2_account_capacity_event(replacement_worker_id, success_metric);
+                if matches!(
+                    method.as_str(),
+                    "getConversationSummary"
+                        | "thread/metadata/update"
+                        | "thread/read"
+                        | "thread/resume"
+                        | "thread/rollback"
+                        | "thread/unarchive"
+                ) && response_thread_id(&result) != Some(thread_id.as_str())
+                {
+                    if first_error.is_none() {
+                        first_error = Some(JSONRPCErrorError {
+                            code: INVALID_PARAMS_CODE,
+                            message: format!(
+                                "replacement worker returned a different thread while restoring {thread_id}"
+                            ),
+                            data: None,
+                        });
+                    }
+                    continue;
+                }
+                connection.observability.record_v2_account_capacity_event(
+                    replacement_worker_id,
+                    success_metric,
+                    Some(connection.request_context),
+                    Some("thread id request restored on a replacement account-backed worker"),
+                );
                 connection.observability.publish_operator_event(
                     GatewayEvent::account_thread_handoff_succeeded(
                         GatewayAccountThreadHandoffSucceeded {
@@ -4417,6 +4442,23 @@ async fn route_thread_id_request_with_account_handoff(
                         },
                     ),
                 );
+                if matches!(
+                    method.as_str(),
+                    "thread/archive"
+                        | "thread/decrement_elicitation"
+                        | "thread/increment_elicitation"
+                        | "thread/inject_items"
+                        | "thread/memoryMode/set"
+                        | "thread/name/set"
+                        | "thread/rollback"
+                        | "thread/turns/list"
+                ) {
+                    connection.scope_registry.register_thread_with_worker(
+                        thread_id.clone(),
+                        connection.request_context.clone(),
+                        worker.worker_id,
+                    );
+                }
                 info!(
                     method = method.as_str(),
                     tenant_id = connection.request_context.tenant_id.as_str(),
@@ -4447,9 +4489,12 @@ async fn route_thread_id_request_with_account_handoff(
     let message = format!(
         "thread {thread_id} is pinned to worker {exhausted_worker_id} with exhausted account capacity for {method}, and no replacement worker restored the context"
     );
-    connection
-        .observability
-        .record_v2_account_capacity_event(exhausted_worker_id, failure_metric);
+    connection.observability.record_v2_account_capacity_event(
+        exhausted_worker_id,
+        failure_metric,
+        Some(connection.request_context),
+        Some(message.as_str()),
+    );
     connection
         .observability
         .publish_operator_event(GatewayEvent::account_thread_handoff_failed(
@@ -4477,6 +4522,62 @@ async fn route_thread_id_request_with_account_handoff(
     Err(io::Error::other(FailClosedMultiWorkerRouteError {
         message,
     }))
+}
+
+fn thread_id_account_handoff_metrics(method: &str) -> Option<(&'static str, &'static str)> {
+    match method {
+        "getConversationSummary" => Some((
+            "conversation_summary_handoff_success",
+            "conversation_summary_handoff_failure",
+        )),
+        "thread/archive" => Some((
+            "thread_archive_handoff_success",
+            "thread_archive_handoff_failure",
+        )),
+        "thread/decrement_elicitation" => Some((
+            "thread_decrement_elicitation_handoff_success",
+            "thread_decrement_elicitation_handoff_failure",
+        )),
+        "thread/fork" => Some(("thread_fork_handoff_success", "thread_fork_handoff_failure")),
+        "thread/increment_elicitation" => Some((
+            "thread_increment_elicitation_handoff_success",
+            "thread_increment_elicitation_handoff_failure",
+        )),
+        "thread/inject_items" => Some((
+            "thread_inject_items_handoff_success",
+            "thread_inject_items_handoff_failure",
+        )),
+        "thread/memoryMode/set" => Some((
+            "thread_memory_mode_set_handoff_success",
+            "thread_memory_mode_set_handoff_failure",
+        )),
+        "thread/metadata/update" => Some((
+            "thread_metadata_update_handoff_success",
+            "thread_metadata_update_handoff_failure",
+        )),
+        "thread/name/set" => Some((
+            "thread_name_set_handoff_success",
+            "thread_name_set_handoff_failure",
+        )),
+        "thread/read" => Some(("thread_read_handoff_success", "thread_read_handoff_failure")),
+        "thread/resume" => Some((
+            "thread_resume_handoff_success",
+            "thread_resume_handoff_failure",
+        )),
+        "thread/rollback" => Some((
+            "thread_rollback_handoff_success",
+            "thread_rollback_handoff_failure",
+        )),
+        "thread/turns/list" => Some((
+            "thread_turns_list_handoff_success",
+            "thread_turns_list_handoff_failure",
+        )),
+        "thread/unarchive" => Some((
+            "thread_unarchive_handoff_success",
+            "thread_unarchive_handoff_failure",
+        )),
+        _ => None,
+    }
 }
 
 async fn send_thread_request_to_worker(
@@ -4880,12 +4981,29 @@ async fn first_successful_scoped_path_thread_request(
             .await?;
         match response {
             Ok(result) => {
+                if let Some(thread_path) = request_thread_path(&request)
+                    && path_handoff_response_must_match_request(&request)
+                    && response_thread_path(&result) != Some(thread_path)
+                {
+                    if first_error.is_none() {
+                        first_error = Some(JSONRPCErrorError {
+                            code: INVALID_PARAMS_CODE,
+                            message: format!(
+                                "replacement worker returned a different rollout path while restoring {thread_path}"
+                            ),
+                            data: None,
+                        });
+                    }
+                    continue;
+                }
                 if let (Some(exhausted_worker_id), Some(replacement_worker_id)) =
                     (exhausted_route_worker_id, worker.worker_id)
                 {
                     observability.record_v2_account_capacity_event(
                         replacement_worker_id,
                         "path_thread_handoff_success",
+                        Some(context),
+                        Some("path-based thread request restored on a replacement account-backed worker"),
                     );
                     if let Some(thread_path) = request_thread_path(&request) {
                         observability.publish_operator_event(
@@ -4941,7 +5059,12 @@ async fn first_successful_scoped_path_thread_request(
             "thread path {thread_path} is pinned to worker {worker_id} with exhausted account capacity for {}, and no replacement worker restored the context",
             request.method
         );
-        observability.record_v2_account_capacity_event(worker_id, "path_thread_handoff_failure");
+        observability.record_v2_account_capacity_event(
+            worker_id,
+            "path_thread_handoff_failure",
+            Some(context),
+            Some(message.as_str()),
+        );
         observability.publish_operator_event(GatewayEvent::account_path_handoff_failed(
             GatewayAccountPathHandoffFailed {
                 tenant_id: context.tenant_id.as_str(),
@@ -4974,6 +5097,13 @@ async fn first_successful_scoped_path_thread_request(
             "gateway v2 connection has no downstream app-server sessions",
         )),
     }
+}
+
+fn path_handoff_response_must_match_request(request: &JSONRPCRequest) -> bool {
+    matches!(
+        request.method.as_str(),
+        "getConversationSummary" | "thread/resume"
+    )
 }
 
 fn worker_for_request<'a>(
@@ -6405,7 +6535,20 @@ fn apply_response_scope_policy(
     mut result: Value,
 ) -> io::Result<Value> {
     match method {
-        "thread/start" | "thread/resume" | "thread/fork" | "thread/read" => {
+        "thread/start"
+        | "thread/resume"
+        | "thread/fork"
+        | "thread/archive"
+        | "thread/decrement_elicitation"
+        | "thread/increment_elicitation"
+        | "thread/inject_items"
+        | "thread/memoryMode/set"
+        | "thread/metadata/update"
+        | "thread/name/set"
+        | "thread/read"
+        | "thread/rollback"
+        | "thread/turns/list"
+        | "thread/unarchive" => {
             if let Some(thread_id) = response_thread_id(&result) {
                 scope_registry.register_thread_with_worker(
                     thread_id.to_string(),
@@ -6669,6 +6812,12 @@ fn response_thread_path(result: &Value) -> Option<&str> {
         .get("thread")
         .and_then(|thread| thread.get("path"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("summary")
+                .and_then(|summary| summary.get("path"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn format_lagged_close_reason(skipped: usize) -> String {
@@ -6705,6 +6854,12 @@ fn response_thread_id(result: &Value) -> Option<&str> {
         .get("thread")
         .and_then(|thread| thread.get("id"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("summary")
+                .and_then(|summary| summary.get("conversationId"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn notification_thread_id(params: &Value) -> Option<&str> {
@@ -23728,6 +23883,2407 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_id_resume_rejects_replacement_worker_returning_wrong_thread() {
+        let thread_resume_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "path": null,
+            "history": null,
+            "model": null,
+            "modelProvider": null,
+            "cwd": null,
+            "approvalPolicy": null,
+            "approvalsReviewer": null,
+            "sandbox": null,
+            "config": null,
+            "baseInstructions": null,
+            "developerInstructions": null,
+            "personality": null,
+            "persistExtendedHistory": false,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/resume",
+            thread_resume_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-a",
+                    "name": "Wrong restored thread",
+                    "cwd": "/tmp/worker-a",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-resume".to_string()),
+                method: "thread/resume".to_string(),
+                params: Some(thread_resume_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/resume should fail closed when replacement returns wrong thread");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), None);
+        assert_v2_account_capacity_event_metrics(&metrics, &[(1, "thread_resume_handoff_failure")]);
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread resume handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/resume",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_read_uses_replacement_worker_when_pinned_account_is_exhausted() {
+        let thread_read_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "includeTurns": false,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/read",
+            thread_read_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-b",
+                    "name": "Worker A restored thread",
+                    "cwd": "/tmp/worker-a",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-read".to_string()),
+                method: "thread/read".to_string(),
+                params: Some(thread_read_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/read should try a replacement worker")
+        .expect("thread/read should restore from replacement worker");
+
+        assert_eq!(
+            super::response_thread_id(&response),
+            Some("thread-worker-b")
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(&metrics, &[(0, "thread_read_handoff_success")]);
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread read handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/read",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_read_rejects_replacement_worker_returning_wrong_thread() {
+        let thread_read_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "includeTurns": false,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/read",
+            thread_read_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-a",
+                    "name": "Wrong worker thread",
+                    "cwd": "/tmp/worker-a",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-read".to_string()),
+                method: "thread/read".to_string(),
+                params: Some(thread_read_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/read should fail closed when replacement returns wrong thread");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/read, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(&metrics, &[(1, "thread_read_handoff_failure")]);
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread read handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/read",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/read, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_unarchive_uses_replacement_worker_when_pinned_account_is_exhausted() {
+        let thread_unarchive_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/unarchive",
+            thread_unarchive_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-b",
+                    "name": "Worker A restored thread",
+                    "cwd": "/tmp/worker-a",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-unarchive".to_string()),
+                method: "thread/unarchive".to_string(),
+                params: Some(thread_unarchive_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/unarchive should try a replacement worker")
+        .expect("thread/unarchive should restore from replacement worker");
+
+        assert_eq!(
+            super::response_thread_id(&response),
+            Some("thread-worker-b")
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(0, "thread_unarchive_handoff_success")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread unarchive handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/unarchive",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_unarchive_rejects_replacement_worker_returning_wrong_thread() {
+        let thread_unarchive_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/unarchive",
+            thread_unarchive_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-a",
+                    "name": "Wrong worker thread",
+                    "cwd": "/tmp/worker-a",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-unarchive".to_string()),
+                method: "thread/unarchive".to_string(),
+                params: Some(thread_unarchive_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/unarchive should fail closed when replacement returns wrong thread");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/unarchive, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "thread_unarchive_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread unarchive handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/unarchive",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/unarchive, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_metadata_update_uses_replacement_worker_when_pinned_account_is_exhausted() {
+        let thread_metadata_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "gitInfo": {
+                "sha": "abc123",
+                "branch": "main",
+                "originUrl": null,
+            },
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/metadata/update",
+            thread_metadata_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-b",
+                    "name": "Worker A restored thread",
+                    "cwd": "/tmp/worker-a",
+                    "gitInfo": {
+                        "commitHash": "abc123",
+                        "branchName": "main",
+                        "remoteUrl": null,
+                    },
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-metadata-update".to_string()),
+                method: "thread/metadata/update".to_string(),
+                params: Some(thread_metadata_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/metadata/update should try a replacement worker")
+        .expect("thread/metadata/update should restore from replacement worker");
+
+        assert_eq!(
+            super::response_thread_id(&response),
+            Some("thread-worker-b")
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(0, "thread_metadata_update_handoff_success")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread metadata update handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/metadata/update",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_metadata_update_rejects_replacement_worker_returning_wrong_thread() {
+        let thread_metadata_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "gitInfo": {
+                "sha": "abc123",
+                "branch": "main",
+                "originUrl": null,
+            },
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/metadata/update",
+            thread_metadata_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-a",
+                    "name": "Wrong worker thread",
+                    "cwd": "/tmp/worker-a",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-metadata-update".to_string()),
+                method: "thread/metadata/update".to_string(),
+                params: Some(thread_metadata_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err(
+            "thread/metadata/update should fail closed when replacement returns wrong thread",
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/metadata/update, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "thread_metadata_update_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread metadata update handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/metadata/update",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/metadata/update, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_rollback_uses_replacement_worker_when_pinned_account_is_exhausted() {
+        let thread_rollback_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "numTurns": 2,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/rollback",
+            thread_rollback_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-b",
+                    "name": "Worker A restored thread",
+                    "turns": [],
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-rollback".to_string()),
+                method: "thread/rollback".to_string(),
+                params: Some(thread_rollback_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/rollback should try a replacement worker")
+        .expect("thread/rollback should restore from replacement worker");
+
+        assert_eq!(
+            super::response_thread_id(&response),
+            Some("thread-worker-b")
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(0, "thread_rollback_handoff_success")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread rollback handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/rollback",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_rollback_rejects_replacement_worker_returning_wrong_thread() {
+        let thread_rollback_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "numTurns": 2,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/rollback",
+            thread_rollback_params.clone(),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-a",
+                    "name": "Wrong worker thread",
+                    "turns": [],
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-rollback".to_string()),
+                method: "thread/rollback".to_string(),
+                params: Some(thread_rollback_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/rollback should fail closed when replacement returns wrong thread");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/rollback, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "thread_rollback_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread rollback handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/rollback",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/rollback, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_archive_uses_replacement_worker_when_pinned_account_is_exhausted() {
+        let thread_archive_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/archive",
+            thread_archive_params.clone(),
+            serde_json::json!({}),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-archive".to_string()),
+                method: "thread/archive".to_string(),
+                params: Some(thread_archive_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/archive should try a replacement worker")
+        .expect("thread/archive should restore from replacement worker");
+
+        assert_eq!(response, serde_json::json!({}));
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(0, "thread_archive_handoff_success")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread archive handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/archive",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_archive_records_handoff_failure_when_no_replacement_restores_context() {
+        let thread_archive_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+            "thread/archive",
+            thread_archive_params.clone(),
+            JSONRPCErrorError {
+                code: super::INVALID_PARAMS_CODE,
+                message: "thread not found: thread-worker-b".to_string(),
+                data: None,
+            },
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-archive".to_string()),
+                method: "thread/archive".to_string(),
+                params: Some(thread_archive_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/archive should fail closed without replacement");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/archive, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "thread_archive_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread archive handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/archive",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/archive, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_turns_list_uses_replacement_worker_when_pinned_account_is_exhausted() {
+        let thread_turns_list_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "cursor": null,
+            "limit": 20,
+            "sortDirection": "desc",
+        });
+        let turns_response = serde_json::json!({
+            "data": [{
+                "id": "turn-worker-b",
+                "items": [],
+                "status": "completed",
+                "error": null,
+                "startedAt": 1,
+                "completedAt": 2,
+                "durationMs": 1,
+            }],
+            "nextCursor": null,
+            "backwardsCursor": null,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/turns/list",
+            thread_turns_list_params.clone(),
+            turns_response.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-turns-list".to_string()),
+                method: "thread/turns/list".to_string(),
+                params: Some(thread_turns_list_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/turns/list should try a replacement worker")
+        .expect("thread/turns/list should restore from replacement worker");
+
+        assert_eq!(response, turns_response);
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(0, "thread_turns_list_handoff_success")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread turns list handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/turns/list",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_turns_list_records_handoff_failure_when_no_replacement_restores_context() {
+        let thread_turns_list_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+            "cursor": null,
+            "limit": 20,
+            "sortDirection": "desc",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+            "thread/turns/list",
+            thread_turns_list_params.clone(),
+            JSONRPCErrorError {
+                code: super::INVALID_PARAMS_CODE,
+                message: "thread not found: thread-worker-b".to_string(),
+                data: None,
+            },
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-turns-list".to_string()),
+                method: "thread/turns/list".to_string(),
+                params: Some(thread_turns_list_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/turns/list should fail closed without replacement");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/turns/list, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "thread_turns_list_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread turns list handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/turns/list",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/turns/list, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_increment_elicitation_uses_replacement_worker_when_pinned_account_is_exhausted()
+    {
+        let thread_increment_elicitation_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+        });
+        let increment_response = serde_json::json!({
+            "count": 2,
+            "paused": true,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/increment_elicitation",
+            thread_increment_elicitation_params.clone(),
+            increment_response.clone(),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let response = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-increment-elicitation".to_string()),
+                method: "thread/increment_elicitation".to_string(),
+                params: Some(thread_increment_elicitation_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect("thread/increment_elicitation should try a replacement worker")
+        .expect("thread/increment_elicitation should restore from replacement worker");
+
+        assert_eq!(response, increment_response);
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(0, "thread_increment_elicitation_handoff_success")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread increment elicitation handoff success event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountThreadHandoffSucceeded"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/increment_elicitation",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "replacementWorkerId": 0,
+                "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn thread_increment_elicitation_records_handoff_failure_when_no_replacement_restores_context()
+     {
+        let thread_increment_elicitation_params = serde_json::json!({
+            "threadId": "thread-worker-b",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+            "thread/increment_elicitation",
+            thread_increment_elicitation_params.clone(),
+            JSONRPCErrorError {
+                code: super::INVALID_PARAMS_CODE,
+                message: "thread not found: thread-worker-b".to_string(),
+                data: None,
+            },
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(
+            "thread-worker-b".to_string(),
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-increment-elicitation".to_string()),
+                method: "thread/increment_elicitation".to_string(),
+                params: Some(thread_increment_elicitation_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("thread/increment_elicitation should fail closed without replacement");
+
+        assert_eq!(
+            error.to_string(),
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/increment_elicitation, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "thread_increment_elicitation_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("thread increment elicitation handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/increment_elicitation",
+                "threadId": "thread-worker-b",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/increment_elicitation, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn additional_thread_id_controls_use_replacement_worker_when_pinned_account_is_exhausted()
+    {
+        let cases = vec![
+            (
+                "thread/name/set",
+                "thread-name-set",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "name": "Renamed thread",
+                }),
+                serde_json::json!({}),
+                "thread_name_set_handoff_success",
+            ),
+            (
+                "thread/memoryMode/set",
+                "thread-memory-mode-set",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "mode": "enabled",
+                }),
+                serde_json::json!({}),
+                "thread_memory_mode_set_handoff_success",
+            ),
+            (
+                "thread/decrement_elicitation",
+                "thread-decrement-elicitation",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+                serde_json::json!({
+                    "count": 1,
+                    "paused": false,
+                }),
+                "thread_decrement_elicitation_handoff_success",
+            ),
+            (
+                "thread/inject_items",
+                "thread-inject-items",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "items": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Injected reply",
+                            "annotations": [],
+                        }],
+                    }],
+                }),
+                serde_json::json!({}),
+                "thread_inject_items_handoff_success",
+            ),
+        ];
+
+        for (method, request_id, params, expected_response, success_metric) in cases {
+            let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+                method,
+                params.clone(),
+                expected_response.clone(),
+            )
+            .await;
+            let worker_b = start_mock_remote_server_for_idle_session().await;
+            let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+                (worker_a.clone(), Some("acct-a".to_string())),
+                (worker_b.clone(), Some("acct-b".to_string())),
+            ]));
+            worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            };
+            scope_registry.register_thread_with_worker(
+                "thread-worker-b".to_string(),
+                context.clone(),
+                Some(1),
+            );
+
+            let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+                vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+            )
+            .with_worker_health(worker_health);
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            let admission = GatewayAdmissionController::default();
+            let metrics = in_memory_metrics();
+            let (operator_events_tx, _) = broadcast::channel(4);
+            let mut operator_events_rx = operator_events_tx.subscribe();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false)
+                .with_operator_events(operator_events_tx);
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
+            };
+
+            let response = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(request_id.to_string()),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{method} should try a replacement worker"))
+            .unwrap_or_else(|_| panic!("{method} should restore from replacement worker"));
+
+            assert_eq!(response, expected_response);
+            assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
+            assert_v2_account_capacity_event_metrics(&metrics, &[(0, success_metric)]);
+            let handoff_event = operator_events_rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| panic!("{method} handoff success event should be published"));
+            assert_eq!(
+                handoff_event.method,
+                "gateway/accountThreadHandoffSucceeded"
+            );
+            assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+            assert_eq!(
+                handoff_event.data,
+                serde_json::json!({
+                    "tenantId": "tenant-a",
+                    "projectId": "project-a",
+                    "method": method,
+                    "threadId": "thread-worker-b",
+                    "exhaustedWorkerId": 1,
+                    "exhaustedAccountId": "acct-b",
+                    "replacementWorkerId": 0,
+                    "replacementAccountId": "acct-a",
+                })
+            );
+
+            router.shutdown().await.expect("router shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn additional_thread_id_controls_record_handoff_failure_when_no_replacement_restores_context()
+     {
+        let cases = vec![
+            (
+                "thread/name/set",
+                "thread-name-set",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "name": "Renamed thread",
+                }),
+                "thread_name_set_handoff_failure",
+            ),
+            (
+                "thread/memoryMode/set",
+                "thread-memory-mode-set",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "mode": "enabled",
+                }),
+                "thread_memory_mode_set_handoff_failure",
+            ),
+            (
+                "thread/decrement_elicitation",
+                "thread-decrement-elicitation",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+                "thread_decrement_elicitation_handoff_failure",
+            ),
+            (
+                "thread/inject_items",
+                "thread-inject-items",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "items": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Injected reply",
+                            "annotations": [],
+                        }],
+                    }],
+                }),
+                "thread_inject_items_handoff_failure",
+            ),
+        ];
+
+        for (method, request_id, params, failure_metric) in cases {
+            let worker_a = start_mock_remote_server_for_passthrough_request_with_error(
+                method,
+                params.clone(),
+                JSONRPCErrorError {
+                    code: super::INVALID_PARAMS_CODE,
+                    message: "thread not found: thread-worker-b".to_string(),
+                    data: None,
+                },
+            )
+            .await;
+            let worker_b = start_mock_remote_server_for_idle_session().await;
+            let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+                (worker_a.clone(), Some("acct-a".to_string())),
+                (worker_b.clone(), Some("acct-b".to_string())),
+            ]));
+            worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+            let scope_registry = Arc::new(GatewayScopeRegistry::default());
+            let context = GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            };
+            scope_registry.register_thread_with_worker(
+                "thread-worker-b".to_string(),
+                context.clone(),
+                Some(1),
+            );
+
+            let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+                vec![
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_a,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                    RemoteAppServerConnectArgs {
+                        websocket_url: worker_b,
+                        auth_token: None,
+                        client_name: "codex-gateway".to_string(),
+                        client_version: "0.0.0-test".to_string(),
+                        experimental_api: false,
+                        opt_out_notification_methods: Vec::new(),
+                        channel_capacity: 4,
+                    },
+                ],
+                test_initialize_response().await,
+                vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+            )
+            .with_worker_health(worker_health);
+            let initialize_params = InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-tui".to_string(),
+                    title: None,
+                    version: "0.0.0-test".to_string(),
+                },
+                capabilities: None,
+            };
+            let mut router =
+                GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                    .await
+                    .expect("downstream router should connect");
+            let admission = GatewayAdmissionController::default();
+            let metrics = in_memory_metrics();
+            let (operator_events_tx, _) = broadcast::channel(4);
+            let mut operator_events_rx = operator_events_tx.subscribe();
+            let observability = GatewayObservability::new(Some(metrics.clone()), false)
+                .with_operator_events(operator_events_tx);
+            let connection = GatewayV2ConnectionContext {
+                admission: &admission,
+                observability: &observability,
+                scope_registry: &scope_registry,
+                request_context: &context,
+                client_send_timeout: Duration::from_secs(10),
+                max_pending_server_requests: 4,
+                max_pending_client_requests: 4,
+                opt_out_notification_methods: HashSet::new(),
+            };
+
+            let error = super::handle_client_request(
+                &mut router,
+                &connection,
+                JSONRPCRequest {
+                    id: RequestId::String(request_id.to_string()),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+            let expected_message = format!(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for {method}, and no replacement worker restored the context"
+            );
+            assert_eq!(error.to_string(), expected_message);
+            assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
+            assert_v2_account_capacity_event_metrics(&metrics, &[(1, failure_metric)]);
+            let handoff_event = operator_events_rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| panic!("{method} handoff failure event should be published"));
+            assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+            assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+            assert_eq!(
+                handoff_event.data,
+                serde_json::json!({
+                    "tenantId": "tenant-a",
+                    "projectId": "project-a",
+                    "method": method,
+                    "threadId": "thread-worker-b",
+                    "exhaustedWorkerId": 1,
+                    "exhaustedAccountId": "acct-b",
+                    "reason": expected_message,
+                })
+            );
+
+            router.shutdown().await.expect("router shutdown");
+        }
+    }
+
+    #[tokio::test]
     async fn thread_id_resume_records_handoff_failure_when_no_replacement_restores_context() {
         let thread_resume_params = serde_json::json!({
             "threadId": "thread-worker-b",
@@ -24499,6 +27055,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_based_thread_resume_rejects_replacement_worker_returning_wrong_path() {
+        let thread_resume_params = serde_json::json!({
+            "threadId": "ignored-thread-id",
+            "path": "/tmp/shared/rollout.jsonl",
+            "history": null,
+            "model": null,
+            "modelProvider": null,
+            "cwd": null,
+            "approvalPolicy": null,
+            "approvalsReviewer": null,
+            "sandbox": null,
+            "config": null,
+            "baseInstructions": null,
+            "developerInstructions": null,
+            "personality": null,
+            "persistExtendedHistory": false,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "thread/resume",
+            thread_resume_params,
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-worker-a",
+                    "name": "Wrong restored path",
+                    "cwd": "/tmp/worker-a",
+                    "path": "/tmp/other/rollout.jsonl",
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_path_with_worker(
+            "/tmp/shared/rollout.jsonl",
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("thread-resume-path".to_string()),
+                method: "thread/resume".to_string(),
+                params: Some(serde_json::json!({
+                    "threadId": "ignored-thread-id",
+                    "path": "/tmp/shared/rollout.jsonl",
+                })),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("path-based thread/resume should fail closed on wrong restored path");
+
+        assert_eq!(
+            error.to_string(),
+            "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), None);
+        assert_eq!(
+            scope_registry.thread_path_worker_id("/tmp/shared/rollout.jsonl"),
+            Some(1)
+        );
+        assert_eq!(
+            scope_registry.thread_path_worker_id("/tmp/other/rollout.jsonl"),
+            None
+        );
+        assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("path handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountPathHandoffFailed");
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "thread/resume",
+                "threadPath": "/tmp/shared/rollout.jsonl",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
     async fn path_based_thread_resume_records_handoff_failure_when_no_replacement_restores_context()
     {
         let thread_resume_params = serde_json::json!({
@@ -25176,6 +27886,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_summary_rejects_replacement_worker_returning_wrong_path() {
+        let summary_params = serde_json::json!({
+            "rolloutPath": "/tmp/shared/rollout.jsonl",
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "getConversationSummary",
+            summary_params.clone(),
+            serde_json::json!({
+                "summary": {
+                    "conversationId": "thread-worker-a",
+                    "path": "/tmp/other/rollout.jsonl",
+                    "preview": "Wrong worker summary",
+                    "timestamp": null,
+                    "updatedAt": null,
+                    "modelProvider": "openai",
+                    "cwd": "/tmp/worker-a",
+                    "cliVersion": "0.0.0-test",
+                    "source": "codex_cli",
+                    "gitInfo": null,
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_path_with_worker(
+            "/tmp/shared/rollout.jsonl",
+            context.clone(),
+            Some(1),
+        );
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("conversation-summary-path".to_string()),
+                method: "getConversationSummary".to_string(),
+                params: Some(summary_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("getConversationSummary should fail closed on wrong restored path");
+
+        assert_eq!(
+            error.to_string(),
+            "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"
+        );
+        assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), None);
+        assert_eq!(
+            scope_registry.thread_path_worker_id("/tmp/shared/rollout.jsonl"),
+            Some(1)
+        );
+        assert_eq!(
+            scope_registry.thread_path_worker_id("/tmp/other/rollout.jsonl"),
+            None
+        );
+        assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("path handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountPathHandoffFailed");
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "getConversationSummary",
+                "threadPath": "/tmp/shared/rollout.jsonl",
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
     async fn conversation_summary_records_handoff_failure_when_no_replacement_restores_context() {
         let summary_params = serde_json::json!({
             "rolloutPath": "/tmp/shared/rollout.jsonl",
@@ -25445,6 +28299,151 @@ mod tests {
                 "exhaustedAccountId": "acct-b",
                 "replacementWorkerId": 0,
                 "replacementAccountId": "acct-a",
+            })
+        );
+
+        router.shutdown().await.expect("router shutdown");
+    }
+
+    #[tokio::test]
+    async fn conversation_summary_by_id_rejects_replacement_worker_returning_wrong_thread() {
+        let thread_id = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let wrong_thread_id = "67e55044-10b1-426f-9247-bb680e5fe0c9";
+        let summary_params = serde_json::json!({
+            "conversationId": thread_id,
+        });
+        let worker_a = start_mock_remote_server_for_passthrough_request_with_result(
+            "getConversationSummary",
+            summary_params.clone(),
+            serde_json::json!({
+                "summary": {
+                    "conversationId": wrong_thread_id,
+                    "path": "/tmp/worker-a/rollout.jsonl",
+                    "preview": "Wrong worker summary",
+                    "timestamp": null,
+                    "updatedAt": null,
+                    "modelProvider": "openai",
+                    "cwd": "/tmp/worker-a",
+                    "cliVersion": "0.0.0-test",
+                    "source": "codex_cli",
+                    "gitInfo": null,
+                },
+            }),
+        )
+        .await;
+        let worker_b = start_mock_remote_server_for_idle_session().await;
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (worker_a.clone(), Some("acct-a".to_string())),
+            (worker_b.clone(), Some("acct-b".to_string())),
+        ]));
+        worker_health.mark_account_exhausted_for_worker(1, "quota reached".to_string());
+
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_thread_with_worker(thread_id.to_string(), context.clone(), Some(1));
+
+        let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_a,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+                RemoteAppServerConnectArgs {
+                    websocket_url: worker_b,
+                    auth_token: None,
+                    client_name: "codex-gateway".to_string(),
+                    client_version: "0.0.0-test".to_string(),
+                    experimental_api: false,
+                    opt_out_notification_methods: Vec::new(),
+                    channel_capacity: 4,
+                },
+            ],
+            test_initialize_response().await,
+            vec![Some("acct-a".to_string()), Some("acct-b".to_string())],
+        )
+        .with_worker_health(worker_health);
+        let initialize_params = InitializeParams {
+            client_info: ClientInfo {
+                name: "codex-tui".to_string(),
+                title: None,
+                version: "0.0.0-test".to_string(),
+            },
+            capabilities: None,
+        };
+        let mut router =
+            GatewayV2DownstreamRouter::connect(&session_factory, &initialize_params, &context)
+                .await
+                .expect("downstream router should connect");
+        let admission = GatewayAdmissionController::default();
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
+
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("conversation-summary-id".to_string()),
+                method: "getConversationSummary".to_string(),
+                params: Some(summary_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("getConversationSummary by id should fail closed on wrong conversation id");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"
+            )
+        );
+        assert_eq!(scope_registry.thread_worker_id(thread_id), Some(1));
+        assert_eq!(scope_registry.thread_worker_id(wrong_thread_id), None);
+        assert_eq!(
+            scope_registry.thread_path_worker_id("/tmp/worker-a/rollout.jsonl"),
+            None
+        );
+        assert_v2_account_capacity_event_metrics(
+            &metrics,
+            &[(1, "conversation_summary_handoff_failure")],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("conversation summary handoff failure event should be published");
+        assert_eq!(handoff_event.method, "gateway/accountThreadHandoffFailed");
+        assert_eq!(handoff_event.thread_id.as_deref(), Some(thread_id));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "method": "getConversationSummary",
+                "threadId": thread_id,
+                "exhaustedWorkerId": 1,
+                "exhaustedAccountId": "acct-b",
+                "reason": format!("thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"),
             })
         );
 
@@ -38772,28 +41771,138 @@ mod tests {
             Some(1),
         );
 
-        let err = match super::worker_for_request(
-            &mut router,
-            &scope_registry,
-            &context,
-            &JSONRPCRequest {
-                id: RequestId::String("turn-start".to_string()),
-                method: "turn/start".to_string(),
-                params: Some(serde_json::json!({
+        let cases = [
+            (
+                "turn/start",
+                serde_json::json!({
                     "threadId": "thread-worker-b",
                     "prompt": "continue",
-                })),
-                trace: None,
-            },
-        ) {
-            Ok(_) => panic!("thread-scoped request should fail closed instead of moving context"),
-            Err(err) => err,
-        };
+                }),
+            ),
+            (
+                "turn/steer",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "turnId": "turn-1",
+                    "message": "adjust course",
+                }),
+            ),
+            (
+                "turn/interrupt",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "turnId": "turn-1",
+                }),
+            ),
+            (
+                "app/list",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "cursor": null,
+                    "limit": 20,
+                }),
+            ),
+            (
+                "thread/unsubscribe",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+            ),
+            (
+                "thread/compact/start",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+            ),
+            (
+                "thread/shellCommand",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "command": "cargo test",
+                }),
+            ),
+            (
+                "thread/backgroundTerminals/clean",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+            ),
+            (
+                "thread/realtime/start",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+            ),
+            (
+                "thread/realtime/appendText",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "text": "hello",
+                }),
+            ),
+            (
+                "thread/realtime/appendAudio",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "audio": "AA==",
+                }),
+            ),
+            (
+                "thread/realtime/stop",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+            ),
+            (
+                "mcpServer/resource/read",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "server": "filesystem",
+                    "uri": "file:///tmp/notes.txt",
+                }),
+            ),
+            (
+                "mcpServer/tool/call",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                    "server": "filesystem",
+                    "tool": "read_file",
+                    "arguments": {},
+                }),
+            ),
+            (
+                "review/start",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+            ),
+        ];
 
-        assert_eq!(
-            err.to_string(),
-            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for turn/start"
-        );
+        for (method, params) in cases {
+            let err = match super::worker_for_request(
+                &mut router,
+                &scope_registry,
+                &context,
+                &JSONRPCRequest {
+                    id: RequestId::String(method.to_string()),
+                    method: method.to_string(),
+                    params: Some(params),
+                    trace: None,
+                },
+            ) {
+                Ok(_) => {
+                    panic!("{method} should fail closed instead of moving active context")
+                }
+                Err(err) => err,
+            };
+
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for {method}"
+                )
+            );
+        }
         client_a
             .shutdown()
             .await
@@ -38919,11 +42028,12 @@ mod tests {
                     &mut router,
                     &connection,
                     JSONRPCRequest {
-                        id: RequestId::String("turn-start".to_string()),
-                        method: "turn/start".to_string(),
+                        id: RequestId::String("app-list".to_string()),
+                        method: "app/list".to_string(),
                         params: Some(serde_json::json!({
                             "threadId": "thread-worker-b",
-                            "prompt": "continue",
+                            "cursor": null,
+                            "limit": 20,
                         })),
                         trace: None,
                     },
@@ -38937,7 +42047,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for turn/start"
+            "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for app/list"
         );
         assert!(logs.contains("active_thread_handoff_failure"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "active_thread_handoff_failure")]);
@@ -38955,11 +42065,11 @@ mod tests {
             serde_json::json!({
                 "tenantId": "tenant-a",
                 "projectId": "project-a",
-                "method": "turn/start",
+                "method": "app/list",
                 "threadId": "thread-worker-b",
                 "exhaustedWorkerId": 1,
                 "exhaustedAccountId": "acct-b",
-                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for turn/start",
+                "reason": "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for app/list",
             })
         );
 
@@ -43959,6 +47069,21 @@ mod tests {
         assert_eq!(super::request_thread_id(&request), None);
         assert_eq!(
             super::request_thread_path(&request),
+            Some("/tmp/rollout.jsonl")
+        );
+    }
+
+    #[test]
+    fn response_thread_path_uses_summary_path_for_conversation_summary() {
+        let response = serde_json::json!({
+            "summary": {
+                "conversationId": "thread-a",
+                "path": "/tmp/rollout.jsonl",
+            },
+        });
+
+        assert_eq!(
+            super::response_thread_path(&response),
             Some("/tmp/rollout.jsonl")
         );
     }
