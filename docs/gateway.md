@@ -1858,6 +1858,8 @@ Phase 6 is in progress with:
   `reconnectBackoffRemainingSeconds`; `/healthz` now also exposes
   `v2Connections.activeConnectionCount`,
   `v2Connections.activeConnectionPendingClientRequestCount`,
+  `v2Connections.activeConnectionPendingClientRequestWorkerCounts`,
+  `v2Connections.activeConnectionPendingClientRequestMethodCounts`,
   `v2Connections.activeConnectionPendingServerRequestCount`,
   `v2Connections.activeConnectionAnsweredButUnresolvedServerRequestCount`,
   `v2Connections.peakActiveConnectionCount`,
@@ -1865,6 +1867,8 @@ Phase 6 is in progress with:
   `v2Connections.lastConnectionStartedAt`,
   `v2Connections.lastConnectionDurationMs`,
   `v2Connections.lastConnectionPendingClientRequestCount`,
+  `v2Connections.lastConnectionPendingClientRequestWorkerCounts`,
+  `v2Connections.lastConnectionPendingClientRequestMethodCounts`,
   `v2Connections.lastConnectionPendingServerRequestCount`, and
   `v2Connections.lastConnectionAnsweredButUnresolvedServerRequestCount`, plus
   the latest completed v2 connection outcome/detail/timestamp; health, metrics,
@@ -1903,6 +1907,14 @@ Phase 6 is in progress with:
   connection-level telemetry with `/healthz` and structured logs so background
   command saturation is visible after connection teardown without relying only
   on the latest health snapshot
+- `/healthz.v2Connections` now also groups active-session and last-completed
+  pending client requests by downstream worker and client method via
+  `activeConnectionPendingClientRequestWorkerCounts`,
+  `activeConnectionPendingClientRequestMethodCounts`,
+  `lastConnectionPendingClientRequestWorkerCounts`, and
+  `lastConnectionPendingClientRequestMethodCounts`, so long-running
+  `command/exec` or other background request buildup can be tied directly to
+  the app-server session and method family causing pressure
 - v2 connection teardown now also emits a structured warning when pending
   background client requests are aborted, including tenant/project scope,
   terminal outcome/detail, request ids, methods, and downstream worker ids /
@@ -1910,9 +1922,10 @@ Phase 6 is in progress with:
   without reconstructing them only from aggregate terminal counts
 - if downstream app-server shutdown also fails after a gateway v2 connection
   error, teardown now emits a structured warning with tenant/project scope,
-  terminal outcome/detail, pending client-request count, pending
-  server-request count, answered-but-unresolved server-request count, and the
-  shutdown error detail, and increments
+  terminal outcome/detail, pending client-request count, pending client
+  request ids / methods / worker routes, pending server-request count,
+  answered-but-unresolved server-request count, backlog worker and method
+  count summaries, and the shutdown error detail, and increments
   `gateway_v2_downstream_shutdown_failures{outcome}` so cleanup failures are
   visible as a direct rollout signal
 - completed background client requests are now settled before their final
@@ -2118,10 +2131,11 @@ Phase 6 is in progress with:
   alerting counter alongside the broader lifecycle event stream
 - client-side cleanup rejections for still-pending server requests now also
   increment
-  `gateway_v2_server_request_rejection_delivery_failures{method="serverRequest/pending"}`
-  when the downstream handoff fails or the worker route is already unavailable,
-  so teardown-time prompt cleanup failures show up in the same direct alerting
-  channel as ordinary gateway-owned rejection delivery failures
+  `gateway_v2_server_request_rejection_delivery_failures{method}` with the
+  original server-request method when the downstream handoff fails or the
+  worker route is already unavailable, so teardown-time prompt cleanup failures
+  show up in the same direct alerting channel as ordinary gateway-owned
+  rejection delivery failures and remain distinguishable by prompt family
 - gateway v2 client request responses that fail during northbound delivery now
   emit structured warning logs with tenant/project scope, JSON-RPC request id,
   method, outcome, and send error detail, so response-path slow-client
@@ -2139,9 +2153,12 @@ Phase 6 is in progress with:
 - failed delivery of synthesized worker-cleanup `serverRequest/resolved`
   notifications now also increments
   `gateway_v2_notification_send_failures{method="serverRequest/resolved",outcome}`
-  and includes tenant/project scope in the structured cleanup warning, so
-  prompt-dismissal failures during worker loss are visible through the same
-  notification failure channel as ordinary downstream notification fan-in
+  and records
+  `gateway_v2_server_request_lifecycle_events{event="worker_cleanup_resolution_send_failed",method}`
+  with the original server-request method; the structured cleanup warning also
+  includes tenant/project scope and the prompt method, so prompt-dismissal
+  failures during worker loss are visible through notification telemetry and
+  remain distinguishable by prompt family in lifecycle dashboards
 - failed delivery of gateway-owned v2 WebSocket close frames now increments
   `gateway_v2_close_frame_send_failures{code,outcome}`, so operators can
   distinguish slow-client failures that prevent a terminal policy/protocol
@@ -2196,8 +2213,9 @@ Phase 6 is in progress with:
 - worker-loss cleanup now also emits
   `gateway_v2_server_request_lifecycle_events` counters for synthetic
   thread-scoped `serverRequest/resolved` notifications and stranded
-  connection-scoped server requests, so disconnect-driven prompt cleanup is
-  measurable in addition to the existing structured cleanup logs
+  connection-scoped server requests, tagged by the original server-request
+  method, so disconnect-driven prompt cleanup is measurable in addition to the
+  existing structured cleanup logs and remains distinguishable by prompt family
 - those worker-loss cleanup counters are recorded as soon as the gateway drains
   the affected routes, before any synthetic `serverRequest/resolved`
   notifications are sent, so slow-client send timeouts do not hide the cleanup
@@ -2228,13 +2246,14 @@ Phase 6 is in progress with:
 - worker-loss cleanup now also records a lifecycle event and structured
   warning when delivery of synthesized `serverRequest/resolved` notifications
   fails, so thread-scoped prompt cleanup failures are visible on the same
-  observability path as rejected pending prompts; the send-failure warning now
-  also includes the affected worker websocket URL
+  observability path as rejected pending prompts; that lifecycle event is
+  tagged by the original server-request method, and the send-failure warning
+  now also includes the affected worker websocket URL and method
 - successful delivery of those synthesized `serverRequest/resolved`
   notifications now also records a lifecycle event on the real northbound
-  WebSocket path, so worker-loss cleanup dashboards can distinguish prompts
-  that were resolved and delivered from prompts whose synthetic resolution
-  failed during client send
+  WebSocket path, tagged by the original server-request method, so worker-loss
+  cleanup dashboards can distinguish prompts that were resolved and delivered
+  from prompts whose synthetic resolution failed during client send
 - worker-loss cleanup warning logs now also include the affected thread ids for
   thread-scoped prompts that the gateway resolves synthetically after a
   downstream worker disappears, so operators can correlate those cleanup events
@@ -2844,13 +2863,62 @@ Phase 6 is in progress with:
   `activeConnectionMaxServerRequestBacklogCount`,
   `activeConnectionServerRequestBacklogStartedAt`,
   `activeConnectionServerRequestBacklogWorkerCounts`,
+  `activeConnectionServerRequestBacklogMethodCounts`,
   `lastConnectionServerRequestBacklogCount`, and
   `lastConnectionServerRequestBacklogStartedAt`, plus
-  `lastConnectionServerRequestBacklogWorkerCounts`, giving operators the total
+  `lastConnectionServerRequestBacklogWorkerCounts` and
+  `lastConnectionServerRequestBacklogMethodCounts`, giving operators the total
   active backlog, the largest backlog on any one active connection, the
-  timestamp for the current active v2 server-request backlog, and a per-worker
-  split of pending versus answered-but-unresolved prompt buildup without
-  exposing individual request ids
+  timestamp for the current active v2 server-request backlog, and per-worker
+  plus per-method splits of pending versus answered-but-unresolved prompt
+  buildup without exposing individual request ids
+- `/healthz.v2Connections` now also reports those v2 server-request backlog
+  method counts for active and last-completed connections, so approval,
+  user-input, elicitation, and ChatGPT token-refresh buildup can be identified
+  directly in health output and then correlated with lifecycle metrics and
+  worker-route logs
+- v2 teardown and failure diagnostics now include pending and
+  answered-but-unresolved server-request method lists alongside the existing
+  gateway ids, downstream ids, worker ids, worker WebSocket URLs, and thread
+  ids, so slow-client, backpressure, protocol-violation, duplicate downstream
+  request-id, saturation, and cleanup logs can be correlated with the same
+  prompt method families shown in `/healthz.v2Connections`
+- worker-loss cleanup diagnostics now also include the method families for
+  synthesized thread-scoped `serverRequest/resolved` notifications and stranded
+  connection-scoped prompts, so worker disconnect logs identify whether the
+  affected prompt lifecycle was approval, user-input, elicitation, or
+  token-refresh without reconstructing it from request payloads
+- v2 connection completion and audit logs now also include the summarized
+  server-request backlog worker and method count fields, so normal connection
+  teardown records the same prompt buildup dimensions exposed through
+  `/healthz.v2Connections`
+- v2 connection metrics now also include
+  `gateway_v2_connection_pending_server_requests_by_method` and
+  `gateway_v2_connection_answered_but_unresolved_server_requests_by_method`,
+  tagged by connection outcome and server-request method, so exported
+  dashboards can split terminal approval, user-input, elicitation, and
+  token-refresh backlog by prompt family without relying only on health
+  snapshots or logs
+- the multi-worker rollout evidence checklist now also requires validating
+  those v2 server-request backlog worker counts during approval, user-input,
+  elicitation, and ChatGPT token-refresh flows, so pending and
+  answered-but-unresolved prompt buildup can be tied back to the same worker
+  route reported by lifecycle metrics and logs before a deployment shape is
+  promoted
+- the real multi-worker concurrent server-request harness now leaves
+  user-input, permissions approval, MCP elicitation, and ChatGPT token-refresh
+  prompts pending on both workers long enough to verify
+  `/healthz.v2Connections` reports the matching per-worker and per-method
+  backlog counts; the same regression also verifies earlier
+  answered-but-unresolved prompts remain visible by worker and prompt family
+  while the next prompt class is pending, and now checks the completed
+  connection's last-backlog health snapshot so active and terminal rollout
+  evidence stay aligned for all four prompt families
+- the v2 rollout guidance now also includes concrete startup examples for the
+  embedded baseline, single-worker remote baseline, and account-labeled
+  multi-worker Stage B validation profile, including the auth and
+  `--remote-account-id` constraints operators must satisfy before collecting
+  promotion evidence
 
 The remaining Phase 6 work is:
 

@@ -811,6 +811,8 @@ mod tests {
     use crate::api::GatewayHealthResponse;
     use crate::api::GatewayHealthStatus;
     use crate::api::GatewayV2CompatibilityMode;
+    use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
+    use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
     use crate::api::ListThreadsResponse;
     use crate::api::ThreadResponse;
     use crate::config::GatewayConfig;
@@ -28402,15 +28404,87 @@ stream_max_retries = 0
             first_started.thread.id.clone(),
             second_started.thread.id.clone(),
         ]);
+        let health_client = reqwest::Client::new();
+        macro_rules! assert_concurrent_pending_server_request_health {
+            (
+                $stage:literal,
+                $backlog_count:expr,
+                $answered_count:expr,
+                $worker_answered_count:expr,
+                $method_counts:expr
+            ) => {{
+                let mut last_health = None;
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        let response = health_client
+                            .get(format!("http://{}/healthz", server.local_addr()))
+                            .send()
+                            .await
+                            .expect("healthz response");
+                        let health: GatewayHealthResponse =
+                            response.json().await.expect("health body");
+                        if health
+                            .v2_connections
+                            .active_connection_server_request_backlog_method_counts
+                            == $method_counts
+                        {
+                            assert_eq!(
+                                health
+                                    .v2_connections
+                                    .active_connection_server_request_backlog_count,
+                                $backlog_count
+                            );
+                            assert_eq!(
+                                health
+                                    .v2_connections
+                                    .active_connection_answered_but_unresolved_server_request_count,
+                                $answered_count
+                            );
+                            assert_eq!(
+                                health
+                                    .v2_connections
+                                    .active_connection_server_request_backlog_worker_counts,
+                                vec![
+                                    GatewayV2ServerRequestBacklogWorkerCounts {
+                                        worker_id: Some(0),
+                                        pending_server_request_count: 1,
+                                        answered_but_unresolved_server_request_count:
+                                            $worker_answered_count,
+                                        server_request_backlog_count: 1 + $worker_answered_count,
+                                    },
+                                    GatewayV2ServerRequestBacklogWorkerCounts {
+                                        worker_id: Some(1),
+                                        pending_server_request_count: 1,
+                                        answered_but_unresolved_server_request_count:
+                                            $worker_answered_count,
+                                        server_request_backlog_count: 1 + $worker_answered_count,
+                                    },
+                                ]
+                            );
+                            break;
+                        }
+                        last_health = Some(health);
+                        sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "concurrent server-request health should settle for {}: {:#?}",
+                        $stage, last_health
+                    )
+                });
+            }};
+        }
+
         let mut gateway_request_ids = HashSet::new();
         let mut user_input_threads = HashSet::new();
         let mut permissions_threads = HashSet::new();
         let mut mcp_threads = HashSet::new();
+        let mut refresh_accounts = HashSet::new();
+        let mut user_input_requests = Vec::new();
         timeout(Duration::from_secs(5), async {
-            while user_input_threads.len() < expected_threads.len()
-                || permissions_threads.len() < expected_threads.len()
-                || mcp_threads.len() < expected_threads.len()
-            {
+            while user_input_requests.len() < expected_threads.len() {
                 let event = client
                     .next_event()
                     .await
@@ -28429,28 +28503,61 @@ stream_max_retries = 0
                             gateway_request_ids.insert(request_id.clone()),
                             "gateway request ids should stay unique while both worker-local requests are pending"
                         );
-                        let answer = match params.thread_id.as_str() {
-                            "thread-worker-a" => "safe-a",
-                            "thread-worker-b" => "safe-b",
-                            thread_id => panic!("unexpected thread id: {thread_id}"),
-                        };
-                        let mut answers = HashMap::new();
-                        answers.insert(
-                            "mode".to_string(),
-                            ToolRequestUserInputAnswer {
-                                answers: vec![answer.to_string()],
-                            },
-                        );
-                        client
-                            .resolve_server_request(
-                                request_id,
-                                serde_json::to_value(ToolRequestUserInputResponse { answers })
-                                    .expect("server request response should serialize"),
-                            )
-                            .await
-                            .expect("server request should resolve");
-                        user_input_threads.insert(params.thread_id);
+                        user_input_requests.push((request_id, params.thread_id));
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ServerRequestResolved(_),
+                    ) => {}
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("concurrent user-input server requests should arrive from both workers");
+        assert_concurrent_pending_server_request_health!(
+            "user-input",
+            2,
+            0,
+            0,
+            vec![GatewayV2ServerRequestBacklogMethodCounts {
+                method: "item/tool/requestUserInput".to_string(),
+                pending_server_request_count: 2,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 2,
+            }]
+        );
+        for (request_id, thread_id) in user_input_requests {
+            let answer = match thread_id.as_str() {
+                "thread-worker-a" => "safe-a",
+                "thread-worker-b" => "safe-b",
+                thread_id => panic!("unexpected thread id: {thread_id}"),
+            };
+            let mut answers = HashMap::new();
+            answers.insert(
+                "mode".to_string(),
+                ToolRequestUserInputAnswer {
+                    answers: vec![answer.to_string()],
+                },
+            );
+            client
+                .resolve_server_request(
+                    request_id,
+                    serde_json::to_value(ToolRequestUserInputResponse { answers })
+                        .expect("server request response should serialize"),
+                )
+                .await
+                .expect("server request should resolve");
+            user_input_threads.insert(thread_id);
+        }
+
+        let mut permission_requests = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while permission_requests.len() < expected_threads.len() {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
                     AppServerEvent::ServerRequest(ServerRequest::PermissionsRequestApproval {
                         request_id,
                         params,
@@ -28469,23 +28576,63 @@ stream_max_retries = 0
                             gateway_request_ids.insert(request_id.clone()),
                             "gateway request ids should stay unique while both worker-local permission requests are pending"
                         );
-                        client
-                            .resolve_server_request(
-                                request_id,
-                                serde_json::to_value(PermissionsRequestApprovalResponse {
-                                    permissions:
-                                        codex_app_server_protocol::GrantedPermissionProfile {
-                                            network: params.permissions.network,
-                                            file_system: params.permissions.file_system,
-                                        },
-                                    scope: PermissionGrantScope::Turn,
-                                })
-                                .expect("permissions approval response should serialize"),
-                            )
-                            .await
-                            .expect("permissions approval should resolve");
-                        permissions_threads.insert(params.thread_id);
+                        permission_requests.push((request_id, params));
                     }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ServerRequestResolved(_),
+                    ) => {}
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("concurrent permission server requests should arrive from both workers");
+        assert_concurrent_pending_server_request_health!(
+            "permissions",
+            4,
+            2,
+            1,
+            vec![
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/permissions/requestApproval".to_string(),
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/tool/requestUserInput".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+            ]
+        );
+        for (request_id, params) in permission_requests {
+            client
+                .resolve_server_request(
+                    request_id,
+                    serde_json::to_value(PermissionsRequestApprovalResponse {
+                        permissions: codex_app_server_protocol::GrantedPermissionProfile {
+                            network: params.permissions.network,
+                            file_system: params.permissions.file_system,
+                        },
+                        scope: PermissionGrantScope::Turn,
+                    })
+                    .expect("permissions approval response should serialize"),
+                )
+                .await
+                .expect("permissions approval should resolve");
+            permissions_threads.insert(params.thread_id);
+        }
+
+        let mut mcp_requests = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while mcp_requests.len() < expected_threads.len() {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
                     AppServerEvent::ServerRequest(ServerRequest::McpServerElicitationRequest {
                         request_id,
                         params,
@@ -28500,21 +28647,7 @@ stream_max_retries = 0
                             gateway_request_ids.insert(request_id.clone()),
                             "gateway request ids should stay unique while both worker-local elicitation requests are pending"
                         );
-                        client
-                            .resolve_server_request(
-                                request_id,
-                                serde_json::to_value(McpServerElicitationRequestResponse {
-                                    action: McpServerElicitationAction::Accept,
-                                    content: Some(serde_json::json!({
-                                        "confirmed": true,
-                                    })),
-                                    meta: None,
-                                })
-                                .expect("mcp elicitation response should serialize"),
-                            )
-                            .await
-                            .expect("mcp elicitation should resolve");
-                        mcp_threads.insert(params.thread_id);
+                        mcp_requests.push((request_id, params));
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ServerRequestResolved(_),
@@ -28524,13 +28657,236 @@ stream_max_retries = 0
             }
         })
         .await
-        .expect("concurrent server requests should arrive from both workers");
+        .expect("concurrent mcp elicitation server requests should arrive from both workers");
+        assert_concurrent_pending_server_request_health!(
+            "mcp elicitation",
+            6,
+            4,
+            2,
+            vec![
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/permissions/requestApproval".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/tool/requestUserInput".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "mcpServer/elicitation/request".to_string(),
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 2,
+                },
+            ]
+        );
+        for (request_id, params) in mcp_requests {
+            client
+                .resolve_server_request(
+                    request_id,
+                    serde_json::to_value(McpServerElicitationRequestResponse {
+                        action: McpServerElicitationAction::Accept,
+                        content: Some(serde_json::json!({
+                            "confirmed": true,
+                        })),
+                        meta: None,
+                    })
+                    .expect("mcp elicitation response should serialize"),
+                )
+                .await
+                .expect("mcp elicitation should resolve");
+            mcp_threads.insert(params.thread_id);
+        }
+
+        let mut refresh_requests = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while refresh_requests.len() < expected_threads.len() {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open");
+                match event {
+                    AppServerEvent::ServerRequest(ServerRequest::ChatgptAuthTokensRefresh {
+                        request_id,
+                        params,
+                    }) => {
+                        let previous_account_id = params
+                            .previous_account_id
+                            .clone()
+                            .expect("refresh request should include previous account id");
+                        assert_ne!(
+                            request_id,
+                            RequestId::String("shared-concurrent-chatgpt-refresh-request".to_string())
+                        );
+                        assert!(
+                            gateway_request_ids.insert(request_id.clone()),
+                            "gateway request ids should stay unique while both worker-local refresh requests are pending"
+                        );
+                        refresh_requests.push((request_id, previous_account_id));
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ServerRequestResolved(_),
+                    ) => {}
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("concurrent ChatGPT token-refresh server requests should arrive from both workers");
+        assert_concurrent_pending_server_request_health!(
+            "ChatGPT token refresh",
+            8,
+            6,
+            3,
+            vec![
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "account/chatgptAuthTokens/refresh".to_string(),
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/permissions/requestApproval".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/tool/requestUserInput".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "mcpServer/elicitation/request".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+            ]
+        );
+        for (request_id, previous_account_id) in refresh_requests {
+            client
+                .resolve_server_request(
+                    request_id,
+                    serde_json::to_value(ChatgptAuthTokensRefreshResponse {
+                        access_token: format!("access-token-{previous_account_id}"),
+                        chatgpt_account_id: previous_account_id.clone(),
+                        chatgpt_plan_type: Some("pro".to_string()),
+                    })
+                    .expect("chatgpt refresh response should serialize"),
+                )
+                .await
+                .expect("chatgpt refresh should resolve");
+            refresh_accounts.insert(previous_account_id);
+        }
         assert_eq!(user_input_threads, expected_threads);
         assert_eq!(permissions_threads, expected_threads);
         assert_eq!(mcp_threads, expected_threads);
-        assert_eq!(gateway_request_ids.len(), 6);
+        assert_eq!(
+            refresh_accounts,
+            HashSet::from([
+                "account-thread-worker-a".to_string(),
+                "account-thread-worker-b".to_string(),
+            ])
+        );
+        assert_eq!(gateway_request_ids.len(), 8);
 
         assert_remote_client_shutdown(client.shutdown().await);
+        let settled_health = timeout(Duration::from_secs(15), async {
+            loop {
+                let response = health_client
+                    .get(format!("http://{}/healthz", server.local_addr()))
+                    .send()
+                    .await
+                    .expect("healthz response");
+                let health: GatewayHealthResponse = response.json().await.expect("health body");
+                if health.v2_connections.active_connection_count == 0
+                    && health
+                        .v2_connections
+                        .last_connection_server_request_backlog_method_counts
+                        .len()
+                        == 4
+                {
+                    break health;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("last connection server-request backlog health should settle");
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_count,
+            8
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_pending_server_request_count,
+            0
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_answered_but_unresolved_server_request_count,
+            8
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_worker_counts,
+            vec![
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(0),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 4,
+                    server_request_backlog_count: 4,
+                },
+                GatewayV2ServerRequestBacklogWorkerCounts {
+                    worker_id: Some(1),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 4,
+                    server_request_backlog_count: 4,
+                },
+            ]
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_method_counts,
+            vec![
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "account/chatgptAuthTokens/refresh".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/permissions/requestApproval".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/tool/requestUserInput".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+                GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "mcpServer/elicitation/request".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_count: 2,
+                },
+            ]
+        );
         server.shutdown().await.expect("shutdown");
     }
 
@@ -30646,6 +31002,44 @@ stream_max_retries = 0
         };
         assert_eq!(server_request.method, "account/chatgptAuthTokens/refresh");
 
+        let active_health = timeout(Duration::from_secs(5), async {
+            loop {
+                let response = health_client
+                    .get(format!("http://{}/healthz", server.local_addr()))
+                    .send()
+                    .await
+                    .expect("healthz response");
+                let health: GatewayHealthResponse = response.json().await.expect("health body");
+                if health
+                    .v2_connections
+                    .active_connection_server_request_backlog_method_counts
+                    == vec![GatewayV2ServerRequestBacklogMethodCounts {
+                        method: "account/chatgptAuthTokens/refresh".to_string(),
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 0,
+                        server_request_backlog_count: 1,
+                    }]
+                {
+                    break health;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("active server-request backlog method health should settle");
+        assert_eq!(active_health.v2_connections.active_connection_count, 1);
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_server_request_backlog_worker_counts,
+            vec![GatewayV2ServerRequestBacklogWorkerCounts {
+                worker_id: Some(0),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 1,
+            }]
+        );
+
         let settled_health = timeout(Duration::from_secs(60), async {
             loop {
                 let response = health_client
@@ -30700,6 +31094,28 @@ stream_max_retries = 0
                 .v2_connections
                 .last_connection_answered_but_unresolved_server_request_count,
             0
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_method_counts,
+            vec![GatewayV2ServerRequestBacklogMethodCounts {
+                method: "account/chatgptAuthTokens/refresh".to_string(),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 1,
+            }]
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_worker_counts,
+            vec![GatewayV2ServerRequestBacklogWorkerCounts {
+                worker_id: Some(0),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 1,
+            }]
         );
         assert_eq!(
             settled_health
@@ -30792,6 +31208,44 @@ stream_max_retries = 0
         };
         assert_eq!(server_request.method, "account/chatgptAuthTokens/refresh");
 
+        let active_health = timeout(Duration::from_secs(5), async {
+            loop {
+                let response = health_client
+                    .get(format!("http://{}/healthz", server.local_addr()))
+                    .send()
+                    .await
+                    .expect("healthz response");
+                let health: GatewayHealthResponse = response.json().await.expect("health body");
+                if health
+                    .v2_connections
+                    .active_connection_server_request_backlog_method_counts
+                    == vec![GatewayV2ServerRequestBacklogMethodCounts {
+                        method: "account/chatgptAuthTokens/refresh".to_string(),
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 0,
+                        server_request_backlog_count: 1,
+                    }]
+                {
+                    break health;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("active server-request backlog method health should settle");
+        assert_eq!(active_health.v2_connections.active_connection_count, 1);
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_server_request_backlog_worker_counts,
+            vec![GatewayV2ServerRequestBacklogWorkerCounts {
+                worker_id: Some(1),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 1,
+            }]
+        );
+
         let settled_health = timeout(Duration::from_secs(60), async {
             loop {
                 let response = health_client
@@ -30846,6 +31300,28 @@ stream_max_retries = 0
                 .v2_connections
                 .last_connection_answered_but_unresolved_server_request_count,
             0
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_method_counts,
+            vec![GatewayV2ServerRequestBacklogMethodCounts {
+                method: "account/chatgptAuthTokens/refresh".to_string(),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 1,
+            }]
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_worker_counts,
+            vec![GatewayV2ServerRequestBacklogWorkerCounts {
+                worker_id: Some(1),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_count: 1,
+            }]
         );
         assert_eq!(
             settled_health
@@ -43691,6 +44167,42 @@ stream_max_retries = 0
                                 "confirmed": true,
                             },
                             "_meta": null,
+                        })
+                    );
+
+                    request_barrier.wait().await;
+
+                    write_websocket_message(
+                        &mut websocket,
+                        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                            id: RequestId::String(
+                                "shared-concurrent-chatgpt-refresh-request".to_string(),
+                            ),
+                            method: "account/chatgptAuthTokens/refresh".to_string(),
+                            params: Some(serde_json::json!({
+                                "reason": "unauthorized",
+                                "previousAccountId": format!("account-{thread_id}"),
+                            })),
+                            trace: None,
+                        }),
+                    )
+                    .await;
+
+                    let JSONRPCMessage::Response(refresh_response) =
+                        read_websocket_message(&mut websocket).await
+                    else {
+                        panic!("expected ChatGPT token-refresh response");
+                    };
+                    assert_eq!(
+                        refresh_response.id,
+                        RequestId::String("shared-concurrent-chatgpt-refresh-request".to_string())
+                    );
+                    assert_eq!(
+                        refresh_response.result,
+                        serde_json::json!({
+                            "accessToken": format!("access-token-account-{thread_id}"),
+                            "chatgptAccountId": format!("account-{thread_id}"),
+                            "chatgptPlanType": "pro",
                         })
                     );
 

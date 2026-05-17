@@ -1,4 +1,7 @@
 use crate::admission::GatewayAdmissionController;
+use crate::api::GatewayV2PendingClientRequestMethodCounts;
+use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
 use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
 use crate::auth::GatewayAuth;
 use crate::auth::GatewayAuthError;
@@ -189,20 +192,30 @@ fn update_active_v2_connection_pending_counts(
     observability: &GatewayObservability,
     connection_id: u64,
     event_state: &GatewayV2EventState,
-    pending_client_request_count: usize,
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
 ) {
     observability
         .v2_connection_health()
         .update_connection_pending_counts(
             connection_id,
             GatewayV2ConnectionPendingCounts {
-                pending_client_request_count,
+                pending_client_request_count: pending_client_requests.len(),
+                pending_client_request_worker_counts: pending_client_request_worker_counts(
+                    pending_client_requests,
+                ),
+                pending_client_request_method_counts: pending_client_request_method_counts(
+                    pending_client_requests,
+                ),
                 pending_server_request_count: event_state.pending_server_requests.len(),
                 answered_but_unresolved_server_request_count:
                     answered_but_unresolved_server_request_count(
                         &event_state.resolved_server_requests,
                     ),
                 server_request_backlog_worker_counts: server_request_backlog_worker_counts(
+                    &event_state.pending_server_requests,
+                    &event_state.resolved_server_requests,
+                ),
+                server_request_backlog_method_counts: server_request_backlog_method_counts(
                     &event_state.pending_server_requests,
                     &event_state.resolved_server_requests,
                 ),
@@ -214,9 +227,12 @@ struct GatewayV2ConnectionRunResult {
     outcome: &'static str,
     detail: Option<String>,
     pending_client_request_count: usize,
+    pending_client_request_worker_counts: Vec<GatewayV2PendingClientRequestWorkerCounts>,
+    pending_client_request_method_counts: Vec<GatewayV2PendingClientRequestMethodCounts>,
     pending_server_request_count: usize,
     answered_but_unresolved_server_request_count: usize,
     server_request_backlog_worker_counts: Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
+    server_request_backlog_method_counts: Vec<GatewayV2ServerRequestBacklogMethodCounts>,
     result: io::Result<()>,
 }
 
@@ -284,6 +300,7 @@ struct PendingServerRequestRoute {
     worker_id: Option<usize>,
     worker_websocket_url: String,
     downstream_request_id: RequestId,
+    method: String,
     thread_id: Option<String>,
 }
 
@@ -319,19 +336,28 @@ struct DownstreamServerRequestKey {
 struct ResolvedServerRequestRoute {
     gateway_request_id: RequestId,
     worker_websocket_url: String,
+    method: String,
     thread_id: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq)]
 struct WorkerServerRequestCleanup {
-    resolved_notifications: Vec<ServerRequestResolvedNotification>,
+    resolved_notifications: Vec<WorkerCleanupResolvedNotification>,
     resolved_thread_scoped_requests: usize,
     resolved_thread_scoped_request_ids: Vec<RequestId>,
     resolved_thread_scoped_downstream_request_ids: Vec<RequestId>,
+    resolved_thread_scoped_methods: Vec<String>,
     resolved_thread_scoped_thread_ids: Vec<String>,
     stranded_connection_scoped_requests: usize,
     stranded_connection_scoped_request_ids: Vec<RequestId>,
     stranded_connection_scoped_downstream_request_ids: Vec<RequestId>,
+    stranded_connection_scoped_methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WorkerCleanupResolvedNotification {
+    notification: ServerRequestResolvedNotification,
+    method: String,
 }
 
 impl WorkerServerRequestCleanup {
@@ -1012,9 +1038,12 @@ async fn run_websocket_connection(
                     outcome: "initialize_timed_out",
                     detail: Some(INITIALIZE_TIMEOUT_CLOSE_REASON.to_string()),
                     pending_client_request_count: 0,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1023,9 +1052,12 @@ async fn run_websocket_connection(
                     outcome: "invalid_client_payload",
                     detail: Some(err.to_string()),
                     pending_client_request_count: 0,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1069,9 +1101,12 @@ async fn run_websocket_connection(
                     outcome: "initialize_invalid_request",
                     detail: Some(detail),
                     pending_client_request_count: 0,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1131,9 +1166,12 @@ async fn run_websocket_connection(
                     outcome: request_outcome,
                     detail: Some(detail),
                     pending_client_request_count: 0,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
                     pending_server_request_count: 0,
                     answered_but_unresolved_server_request_count: 0,
                     server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
                     result: Ok(()),
                 });
             }
@@ -1243,7 +1281,7 @@ async fn run_websocket_connection(
                                 &observability,
                                 connection_id,
                                 &event_state,
-                                pending_client_responses.count,
+                                &pending_client_responses.active,
                             );
                         }
                         Ok(WebSocketMessage::Binary(bytes)) => {
@@ -1283,7 +1321,7 @@ async fn run_websocket_connection(
                                 &observability,
                                 connection_id,
                                 &event_state,
-                                pending_client_responses.count,
+                                &pending_client_responses.active,
                             );
                         }
                         Ok(WebSocketMessage::Close(_)) => {
@@ -1339,19 +1377,19 @@ async fn run_websocket_connection(
                     if let Some(close) = should_close {
                         reject_pending_server_requests_on_exit = close.reject_pending_server_requests;
                         update_active_v2_connection_pending_counts(
-                                &observability,
-                                connection_id,
-                                &event_state,
-                                pending_client_responses.count,
-                            );
+                            &observability,
+                            connection_id,
+                            &event_state,
+                            &pending_client_responses.active,
+                        );
                         break (Ok(()), close.outcome);
                     }
                     update_active_v2_connection_pending_counts(
-                                &observability,
-                                connection_id,
-                                &event_state,
-                                pending_client_responses.count,
-                            );
+                        &observability,
+                        connection_id,
+                        &event_state,
+                        &pending_client_responses.active,
+                    );
                 }
                 pending_response = pending_client_response_rx.recv() => {
                     let Some(pending_response) = pending_response else {
@@ -1363,7 +1401,7 @@ async fn run_websocket_connection(
                         &observability,
                         connection_id,
                         &event_state,
-                        pending_client_responses.count,
+                        &pending_client_responses.active,
                     );
                     match pending_response.result {
                         Ok(Ok(result)) => {
@@ -1498,6 +1536,10 @@ async fn run_websocket_connection(
         }
 
         let pending_client_request_count = pending_client_responses.count;
+        let pending_client_request_worker_counts =
+            pending_client_request_worker_counts(&pending_client_responses.active);
+        let pending_client_request_method_counts =
+            pending_client_request_method_counts(&pending_client_responses.active);
         if !pending_client_responses.active.is_empty() {
             log_aborted_pending_client_requests(
                 connection.request_context,
@@ -1519,6 +1561,10 @@ async fn run_websocket_connection(
         let answered_but_unresolved_server_request_count =
             answered_but_unresolved_server_request_count(&event_state.resolved_server_requests);
         let server_request_backlog_worker_counts = server_request_backlog_worker_counts(
+            &event_state.pending_server_requests,
+            &event_state.resolved_server_requests,
+        );
+        let server_request_backlog_method_counts = server_request_backlog_method_counts(
             &event_state.pending_server_requests,
             &event_state.resolved_server_requests,
         );
@@ -1559,13 +1605,25 @@ async fn run_websocket_connection(
                 connection_detail = Some(err.to_string());
                 if let Err(shutdown_err) = shutdown_result {
                     observability.record_v2_downstream_shutdown_failure(connection_outcome);
+                    let pending_counts = GatewayV2ConnectionPendingCounts {
+                        pending_client_request_count,
+                        pending_client_request_worker_counts: pending_client_request_worker_counts
+                            .clone(),
+                        pending_client_request_method_counts: pending_client_request_method_counts
+                            .clone(),
+                        pending_server_request_count,
+                        answered_but_unresolved_server_request_count,
+                        server_request_backlog_worker_counts: server_request_backlog_worker_counts
+                            .clone(),
+                        server_request_backlog_method_counts: server_request_backlog_method_counts
+                            .clone(),
+                    };
                     log_downstream_shutdown_failure(
                         connection.request_context,
                         connection_outcome,
                         connection_detail.as_deref(),
-                        pending_client_request_count,
-                        pending_server_request_count,
-                        answered_but_unresolved_server_request_count,
+                        &pending_client_responses.active,
+                        &pending_counts,
                         &shutdown_err,
                     );
                 }
@@ -1576,9 +1634,12 @@ async fn run_websocket_connection(
             outcome: connection_outcome,
             detail: connection_detail,
             pending_client_request_count,
+            pending_client_request_worker_counts,
+            pending_client_request_method_counts,
             pending_server_request_count,
             answered_but_unresolved_server_request_count,
             server_request_backlog_worker_counts,
+            server_request_backlog_method_counts,
             result,
         })
     }
@@ -1589,9 +1650,12 @@ async fn run_websocket_connection(
             outcome: classify_v2_connection_error(&err),
             detail: Some(err.to_string()),
             pending_client_request_count: 0,
+            pending_client_request_worker_counts: Vec::new(),
+            pending_client_request_method_counts: Vec::new(),
             pending_server_request_count: 0,
             answered_but_unresolved_server_request_count: 0,
             server_request_backlog_worker_counts: Vec::new(),
+            server_request_backlog_method_counts: Vec::new(),
             result: Err(err),
         },
     };
@@ -1603,10 +1667,15 @@ async fn run_websocket_connection(
         run_result.detail.as_deref(),
         GatewayV2ConnectionPendingCounts {
             pending_client_request_count: run_result.pending_client_request_count,
+            pending_client_request_worker_counts: run_result
+                .pending_client_request_worker_counts,
+            pending_client_request_method_counts: run_result
+                .pending_client_request_method_counts,
             pending_server_request_count: run_result.pending_server_request_count,
             answered_but_unresolved_server_request_count: run_result
                 .answered_but_unresolved_server_request_count,
             server_request_backlog_worker_counts: run_result.server_request_backlog_worker_counts,
+            server_request_backlog_method_counts: run_result.server_request_backlog_method_counts,
         },
         connection_started_at.elapsed(),
     );
@@ -2131,6 +2200,7 @@ async fn handle_client_message(
                 ResolvedServerRequestRoute {
                     gateway_request_id: gateway_request_id.clone(),
                     worker_websocket_url: route.worker_websocket_url.clone(),
+                    method: route.method.clone(),
                     thread_id: route.thread_id.clone(),
                 },
             );
@@ -2184,6 +2254,7 @@ async fn handle_client_message(
                 ResolvedServerRequestRoute {
                     gateway_request_id: gateway_request_id.clone(),
                     worker_websocket_url: route.worker_websocket_url.clone(),
+                    method: route.method.clone(),
                     thread_id: route.thread_id.clone(),
                 },
             );
@@ -2683,6 +2754,7 @@ async fn handle_app_server_event(
                         worker_id,
                         worker_websocket_url: worker_websocket_url.clone(),
                         downstream_request_id,
+                        method: request.method.clone(),
                         thread_id: request_thread_id(&request).map(str::to_string),
                     },
                 );
@@ -2888,13 +2960,14 @@ async fn resolve_server_requests_for_worker(
 
     record_worker_server_request_cleanup_metrics(connection.observability, &cleanup);
 
-    for notification in cleanup.resolved_notifications.iter().cloned() {
-        let thread_id = notification.thread_id.clone();
-        let request_id = notification.request_id.clone();
+    for resolved_notification in &cleanup.resolved_notifications {
+        let method = resolved_notification.method.as_str();
         if let Err(err) = send_jsonrpc(
             socket,
             JSONRPCMessage::Notification(tagged_type_to_notification(
-                ServerNotification::ServerRequestResolved(notification),
+                ServerNotification::ServerRequestResolved(
+                    resolved_notification.notification.clone(),
+                ),
             )?),
             connection.client_send_timeout,
         )
@@ -2905,8 +2978,7 @@ async fn resolve_server_requests_for_worker(
                 connection.request_context,
                 worker_id,
                 worker_websocket_url,
-                &thread_id,
-                &request_id,
+                resolved_notification,
                 &err,
             );
             return Err(err);
@@ -2915,7 +2987,7 @@ async fn resolve_server_requests_for_worker(
             .observability
             .record_v2_server_request_lifecycle_event(
                 "worker_cleanup_resolution_delivered",
-                "serverRequest/resolved",
+                method,
             );
     }
 
@@ -2927,23 +2999,23 @@ fn record_worker_cleanup_resolution_send_failure(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
     worker_websocket_url: &str,
-    thread_id: &str,
-    request_id: &RequestId,
+    resolved_notification: &WorkerCleanupResolvedNotification,
     err: &io::Error,
 ) {
     let outcome = classify_v2_connection_error(err);
+    let notification = &resolved_notification.notification;
+    let method = resolved_notification.method.as_str();
     observability.record_v2_notification_send_failure("serverRequest/resolved", outcome);
-    observability.record_v2_server_request_lifecycle_event(
-        "worker_cleanup_resolution_send_failed",
-        "serverRequest/resolved",
-    );
+    observability
+        .record_v2_server_request_lifecycle_event("worker_cleanup_resolution_send_failed", method);
     warn!(
         tenant_id = %request_context.tenant_id,
         project_id = ?request_context.project_id,
         worker_id = ?worker_id,
         worker_websocket_url,
-        thread_id,
-        gateway_request_id = ?request_id,
+        thread_id = notification.thread_id.as_str(),
+        gateway_request_id = ?notification.request_id,
+        method,
         outcome,
         %err,
         "failed to deliver synthesized serverRequest/resolved during worker cleanup"
@@ -2954,15 +3026,15 @@ fn record_worker_server_request_cleanup_metrics(
     observability: &GatewayObservability,
     cleanup: &WorkerServerRequestCleanup,
 ) {
-    observability.record_v2_server_request_lifecycle_events(
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
         "worker_cleanup_resolved_thread_scoped",
-        "serverRequest/resolved",
-        cleanup.resolved_thread_scoped_requests as i64,
+        &server_request_method_counts(&cleanup.resolved_thread_scoped_methods),
     );
-    observability.record_v2_server_request_lifecycle_events(
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
         "worker_cleanup_stranded_connection_scoped",
-        "connectionScopedServerRequest",
-        cleanup.stranded_connection_scoped_requests as i64,
+        &server_request_method_counts(&cleanup.stranded_connection_scoped_methods),
     );
 }
 
@@ -2980,9 +3052,12 @@ fn collect_server_request_cleanup_for_worker(
         if let Some(thread_id) = route.thread_id.clone() {
             cleanup
                 .resolved_notifications
-                .push(ServerRequestResolvedNotification {
-                    thread_id: thread_id.clone(),
-                    request_id: gateway_request_id.clone(),
+                .push(WorkerCleanupResolvedNotification {
+                    notification: ServerRequestResolvedNotification {
+                        thread_id: thread_id.clone(),
+                        request_id: gateway_request_id.clone(),
+                    },
+                    method: route.method.clone(),
                 });
             cleanup.resolved_thread_scoped_requests += 1;
             cleanup
@@ -2991,6 +3066,9 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .resolved_thread_scoped_downstream_request_ids
                 .push(route.downstream_request_id.clone());
+            cleanup
+                .resolved_thread_scoped_methods
+                .push(route.method.clone());
             cleanup.resolved_thread_scoped_thread_ids.push(thread_id);
         } else {
             cleanup.stranded_connection_scoped_requests += 1;
@@ -3000,6 +3078,9 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .stranded_connection_scoped_downstream_request_ids
                 .push(route.downstream_request_id.clone());
+            cleanup
+                .stranded_connection_scoped_methods
+                .push(route.method.clone());
         }
         false
     });
@@ -3011,9 +3092,12 @@ fn collect_server_request_cleanup_for_worker(
         if let Some(thread_id) = route.thread_id.clone() {
             cleanup
                 .resolved_notifications
-                .push(ServerRequestResolvedNotification {
-                    thread_id: thread_id.clone(),
-                    request_id: route.gateway_request_id.clone(),
+                .push(WorkerCleanupResolvedNotification {
+                    notification: ServerRequestResolvedNotification {
+                        thread_id: thread_id.clone(),
+                        request_id: route.gateway_request_id.clone(),
+                    },
+                    method: route.method.clone(),
                 });
             cleanup.resolved_thread_scoped_requests += 1;
             cleanup
@@ -3022,6 +3106,9 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .resolved_thread_scoped_downstream_request_ids
                 .push(key.request_id.clone());
+            cleanup
+                .resolved_thread_scoped_methods
+                .push(route.method.clone());
             cleanup.resolved_thread_scoped_thread_ids.push(thread_id);
         } else {
             cleanup.stranded_connection_scoped_requests += 1;
@@ -3031,6 +3118,9 @@ fn collect_server_request_cleanup_for_worker(
             cleanup
                 .stranded_connection_scoped_downstream_request_ids
                 .push(key.request_id.clone());
+            cleanup
+                .stranded_connection_scoped_methods
+                .push(route.method.clone());
         }
         false
     });
@@ -3052,6 +3142,9 @@ fn log_worker_server_request_cleanup(
         .resolved_thread_scoped_downstream_request_ids
         .clone();
     resolved_thread_scoped_downstream_request_ids.sort();
+    let mut resolved_thread_scoped_methods = cleanup.resolved_thread_scoped_methods.clone();
+    resolved_thread_scoped_methods.sort();
+    resolved_thread_scoped_methods.dedup();
     let mut resolved_thread_scoped_thread_ids = cleanup.resolved_thread_scoped_thread_ids.clone();
     resolved_thread_scoped_thread_ids.sort();
     resolved_thread_scoped_thread_ids.dedup();
@@ -3062,6 +3155,9 @@ fn log_worker_server_request_cleanup(
         .stranded_connection_scoped_downstream_request_ids
         .clone();
     stranded_connection_scoped_downstream_request_ids.sort();
+    let mut stranded_connection_scoped_methods = cleanup.stranded_connection_scoped_methods.clone();
+    stranded_connection_scoped_methods.sort();
+    stranded_connection_scoped_methods.dedup();
 
     warn!(
         worker_id = ?worker_id,
@@ -3070,11 +3166,13 @@ fn log_worker_server_request_cleanup(
         resolved_thread_scoped_server_request_count = cleanup.resolved_thread_scoped_requests,
         resolved_thread_scoped_server_request_ids = ?resolved_thread_scoped_request_ids,
         resolved_thread_scoped_downstream_server_request_ids = ?resolved_thread_scoped_downstream_request_ids,
+        resolved_thread_scoped_server_request_methods = ?resolved_thread_scoped_methods,
         resolved_thread_scoped_thread_ids = ?resolved_thread_scoped_thread_ids,
         stranded_connection_scoped_server_request_count = cleanup
             .stranded_connection_scoped_requests,
         stranded_connection_scoped_server_request_ids = ?stranded_connection_scoped_request_ids,
         stranded_connection_scoped_downstream_server_request_ids = ?stranded_connection_scoped_downstream_request_ids,
+        stranded_connection_scoped_server_request_methods = ?stranded_connection_scoped_methods,
         disconnect_message,
         "{message}"
     );
@@ -3098,12 +3196,14 @@ fn log_unexpected_client_server_request_response(
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
         answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         answered_but_unresolved_worker_websocket_urls =
@@ -3134,6 +3234,7 @@ fn log_rejected_saturated_server_request(
         method,
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
@@ -3199,12 +3300,14 @@ fn log_downstream_backpressure_close(
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
         answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         answered_but_unresolved_worker_websocket_urls =
@@ -3254,12 +3357,14 @@ fn log_client_send_timeout(
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
         answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         answered_but_unresolved_worker_websocket_urls =
@@ -3272,19 +3377,47 @@ fn log_downstream_shutdown_failure(
     request_context: &GatewayRequestContext,
     connection_outcome: &str,
     connection_detail: Option<&str>,
-    pending_client_request_count: usize,
-    pending_server_request_count: usize,
-    answered_but_unresolved_server_request_count: usize,
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+    pending_counts: &GatewayV2ConnectionPendingCounts,
     err: &io::Error,
 ) {
+    let mut pending_client_request_ids: Vec<RequestId> =
+        pending_client_requests.keys().cloned().collect();
+    pending_client_request_ids.sort();
+    let mut pending_client_request_methods: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect();
+    pending_client_request_methods.sort();
+    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
+        .values()
+        .filter_map(|route| route.worker_id)
+        .collect();
+    pending_client_request_worker_ids.sort_unstable();
+    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.worker_websocket_url.clone())
+        .collect();
+    pending_client_request_worker_websocket_urls.sort();
+    let server_request_backlog_worker_counts = &pending_counts.server_request_backlog_worker_counts;
+    let server_request_backlog_method_counts = &pending_counts.server_request_backlog_method_counts;
+
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         connection_outcome,
         connection_detail,
-        pending_client_request_count,
-        pending_server_request_count,
-        answered_but_unresolved_server_request_count,
+        pending_client_request_count = pending_counts.pending_client_request_count,
+        pending_client_request_ids = ?pending_client_request_ids,
+        pending_client_request_methods = ?pending_client_request_methods,
+        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_worker_websocket_urls =
+            ?pending_client_request_worker_websocket_urls,
+        pending_server_request_count = pending_counts.pending_server_request_count,
+        answered_but_unresolved_server_request_count =
+            pending_counts.answered_but_unresolved_server_request_count,
+        server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
+        server_request_backlog_method_counts = ?server_request_backlog_method_counts,
         shutdown_error = %err,
         "gateway v2 websocket downstream shutdown also failed after connection error"
     );
@@ -3406,6 +3539,7 @@ fn log_duplicate_downstream_server_request(
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
@@ -3431,6 +3565,7 @@ fn log_dropped_duplicate_resolved_server_request(
         remaining_resolved_route_count = resolved_log_fields.gateway_request_ids.len(),
         remaining_resolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         remaining_resolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        remaining_resolved_server_request_methods = ?resolved_log_fields.methods,
         remaining_resolved_thread_ids = ?resolved_log_fields.thread_ids,
         remaining_resolved_worker_ids = ?resolved_log_fields.worker_ids,
         remaining_resolved_worker_websocket_urls = ?resolved_log_fields.worker_websocket_urls,
@@ -3529,12 +3664,14 @@ fn log_downstream_protocol_violation(
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         pending_thread_ids = ?pending_log_fields.thread_ids,
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
         answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         answered_but_unresolved_worker_websocket_urls =
@@ -3703,14 +3840,16 @@ async fn reject_pending_server_requests(
     );
 
     let mut first_rejection_error = None;
-    let mut skipped_unavailable_worker_rejections = 0;
-    let mut failed_rejections = 0;
-    let mut delivered_rejections = 0;
+    let mut skipped_unavailable_worker_rejections = BTreeMap::new();
+    let mut failed_rejections = BTreeMap::new();
+    let mut delivered_rejections = BTreeMap::new();
     for (gateway_request_id, route) in pending_server_requests.drain() {
         let Ok(worker) = worker_for_server_request(downstream, route.worker_id) else {
-            skipped_unavailable_worker_rejections += 1;
+            *skipped_unavailable_worker_rejections
+                .entry(route.method.clone())
+                .or_insert(0) += 1;
             observability
-                .record_v2_server_request_rejection_delivery_failure("serverRequest/pending");
+                .record_v2_server_request_rejection_delivery_failure(route.method.as_str());
             warn!(
                 tenant_id = request_context.tenant_id.as_str(),
                 project_id = request_context.project_id.as_deref(),
@@ -3718,6 +3857,7 @@ async fn reject_pending_server_requests(
                 worker_websocket_url = route.worker_websocket_url.as_str(),
                 gateway_request_id = ?gateway_request_id,
                 downstream_request_id = ?route.downstream_request_id,
+                method = route.method.as_str(),
                 "skipping pending server-request rejection because the downstream worker route is unavailable"
             );
             continue;
@@ -3740,11 +3880,14 @@ async fn reject_pending_server_requests(
             .await
         {
             Ok(()) => {
-                delivered_rejections += 1;
+                *delivered_rejections
+                    .entry(route.method.clone())
+                    .or_insert(0) += 1;
             }
             Err(err) => {
                 observability
-                    .record_v2_server_request_rejection_delivery_failure("serverRequest/pending");
+                    .record_v2_server_request_rejection_delivery_failure(route.method.as_str());
+                *failed_rejections.entry(route.method.clone()).or_insert(0) += 1;
                 warn!(
                     tenant_id = request_context.tenant_id.as_str(),
                     project_id = request_context.project_id.as_deref(),
@@ -3752,10 +3895,10 @@ async fn reject_pending_server_requests(
                     worker_websocket_url,
                     gateway_request_id = ?gateway_request_id,
                     downstream_request_id = ?route.downstream_request_id,
+                    method = route.method.as_str(),
                     %err,
                     "failed to reject pending downstream server request during gateway v2 connection cleanup"
                 );
-                failed_rejections += 1;
                 if first_rejection_error.is_none() {
                     first_rejection_error = Some(err);
                 }
@@ -3763,27 +3906,21 @@ async fn reject_pending_server_requests(
         }
     }
 
-    if delivered_rejections > 0 {
-        observability.record_v2_server_request_lifecycle_events(
-            "client_cleanup_rejection_delivered",
-            "serverRequest/pending",
-            delivered_rejections,
-        );
-    }
-    if skipped_unavailable_worker_rejections > 0 {
-        observability.record_v2_server_request_lifecycle_events(
-            "client_cleanup_rejection_skipped_unavailable_worker",
-            "serverRequest/pending",
-            skipped_unavailable_worker_rejections,
-        );
-    }
-    if failed_rejections > 0 {
-        observability.record_v2_server_request_lifecycle_events(
-            "client_cleanup_rejection_failed",
-            "serverRequest/pending",
-            failed_rejections,
-        );
-    }
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
+        "client_cleanup_rejection_delivered",
+        &delivered_rejections,
+    );
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
+        "client_cleanup_rejection_skipped_unavailable_worker",
+        &skipped_unavailable_worker_rejections,
+    );
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
+        "client_cleanup_rejection_failed",
+        &failed_rejections,
+    );
 
     if let Some(err) = first_rejection_error {
         return Err(err);
@@ -3796,29 +3933,55 @@ fn record_client_server_request_cleanup_metrics(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
-    let rejected_thread_scoped_requests = pending_server_requests
-        .values()
-        .filter(|route| route.thread_id.is_some())
-        .count();
-    let rejected_connection_scoped_requests = pending_server_requests
-        .values()
-        .filter(|route| route.thread_id.is_none())
-        .count();
-    observability.record_v2_server_request_lifecycle_events(
+    let mut rejected_thread_scoped_requests = BTreeMap::new();
+    let mut rejected_connection_scoped_requests = BTreeMap::new();
+    for route in pending_server_requests.values() {
+        let counts = if route.thread_id.is_some() {
+            &mut rejected_thread_scoped_requests
+        } else {
+            &mut rejected_connection_scoped_requests
+        };
+        *counts.entry(route.method.clone()).or_insert(0) += 1;
+    }
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
         "client_cleanup_rejected_thread_scoped",
-        "serverRequest/pending",
-        rejected_thread_scoped_requests as i64,
+        &rejected_thread_scoped_requests,
     );
-    observability.record_v2_server_request_lifecycle_events(
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
         "client_cleanup_rejected_connection_scoped",
-        "serverRequest/pending",
-        rejected_connection_scoped_requests as i64,
+        &rejected_connection_scoped_requests,
     );
-    observability.record_v2_server_request_lifecycle_events(
+    let mut answered_but_unresolved_requests = BTreeMap::new();
+    for route in resolved_server_requests.values() {
+        *answered_but_unresolved_requests
+            .entry(route.method.clone())
+            .or_insert(0) += 1;
+    }
+    record_v2_server_request_lifecycle_method_counts(
+        observability,
         "client_cleanup_answered_but_unresolved",
-        "serverRequest/resolved",
-        resolved_server_requests.len() as i64,
+        &answered_but_unresolved_requests,
     );
+}
+
+fn record_v2_server_request_lifecycle_method_counts(
+    observability: &GatewayObservability,
+    event: &str,
+    method_counts: &BTreeMap<String, i64>,
+) {
+    for (method, count) in method_counts {
+        observability.record_v2_server_request_lifecycle_events(event, method, *count);
+    }
+}
+
+fn server_request_method_counts(methods: &[String]) -> BTreeMap<String, i64> {
+    let mut method_counts = BTreeMap::new();
+    for method in methods {
+        *method_counts.entry(method.clone()).or_insert(0) += 1;
+    }
+    method_counts
 }
 
 fn log_rejected_pending_server_requests(
@@ -3846,6 +4009,7 @@ fn log_rejected_pending_server_requests(
         connection_scoped_pending_server_request_count = pending_log_fields.connection_scoped_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
         thread_scoped_pending_server_request_ids = ?pending_log_fields.thread_scoped_request_ids,
         connection_scoped_pending_server_request_ids = ?pending_log_fields.connection_scoped_request_ids,
         thread_ids = ?pending_log_fields.thread_ids,
@@ -3854,6 +4018,7 @@ fn log_rejected_pending_server_requests(
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
         answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
         answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
         answered_but_unresolved_worker_websocket_urls =
@@ -3866,6 +4031,7 @@ fn log_rejected_pending_server_requests(
 struct PendingServerRequestLogFields {
     gateway_request_ids: Vec<RequestId>,
     downstream_request_ids: Vec<RequestId>,
+    methods: Vec<String>,
     thread_scoped_request_ids: Vec<RequestId>,
     connection_scoped_request_ids: Vec<RequestId>,
     thread_ids: Vec<String>,
@@ -3884,6 +4050,13 @@ fn pending_server_request_log_fields(
         .map(|route| route.downstream_request_id.clone())
         .collect::<Vec<_>>();
     downstream_request_ids.sort();
+
+    let mut methods = pending_server_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect::<Vec<_>>();
+    methods.sort();
+    methods.dedup();
 
     let mut thread_scoped_request_ids = pending_server_requests
         .iter()
@@ -3923,6 +4096,7 @@ fn pending_server_request_log_fields(
     PendingServerRequestLogFields {
         gateway_request_ids,
         downstream_request_ids,
+        methods,
         thread_scoped_request_ids,
         connection_scoped_request_ids,
         thread_ids,
@@ -3935,6 +4109,7 @@ fn pending_server_request_log_fields(
 struct ResolvedServerRequestLogFields {
     gateway_request_ids: Vec<RequestId>,
     downstream_request_ids: Vec<RequestId>,
+    methods: Vec<String>,
     thread_ids: Vec<String>,
     worker_ids: Vec<usize>,
     worker_websocket_urls: Vec<String>,
@@ -3954,6 +4129,13 @@ fn resolved_server_request_log_fields(
         .map(|key| key.request_id.clone())
         .collect::<Vec<_>>();
     downstream_request_ids.sort();
+
+    let mut methods = resolved_server_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect::<Vec<_>>();
+    methods.sort();
+    methods.dedup();
 
     let mut worker_ids = resolved_server_requests
         .keys()
@@ -3979,6 +4161,7 @@ fn resolved_server_request_log_fields(
     ResolvedServerRequestLogFields {
         gateway_request_ids,
         downstream_request_ids,
+        methods,
         thread_ids,
         worker_ids,
         worker_websocket_urls,
@@ -6985,6 +7168,44 @@ fn answered_but_unresolved_server_request_count(
     resolved_server_requests.len()
 }
 
+fn pending_client_request_worker_counts(
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+) -> Vec<GatewayV2PendingClientRequestWorkerCounts> {
+    let mut worker_counts = BTreeMap::new();
+    for route in pending_client_requests.values() {
+        let entry = worker_counts.entry(route.worker_id).or_insert(0usize);
+        *entry = entry.saturating_add(1);
+    }
+    worker_counts
+        .into_iter()
+        .map(
+            |(worker_id, pending_count)| GatewayV2PendingClientRequestWorkerCounts {
+                worker_id,
+                pending_client_request_count: pending_count,
+            },
+        )
+        .collect()
+}
+
+fn pending_client_request_method_counts(
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+) -> Vec<GatewayV2PendingClientRequestMethodCounts> {
+    let mut method_counts = BTreeMap::new();
+    for route in pending_client_requests.values() {
+        let entry = method_counts.entry(route.method.clone()).or_insert(0usize);
+        *entry = entry.saturating_add(1);
+    }
+    method_counts
+        .into_iter()
+        .map(
+            |(method, pending_count)| GatewayV2PendingClientRequestMethodCounts {
+                method,
+                pending_client_request_count: pending_count,
+            },
+        )
+        .collect()
+}
+
 fn server_request_backlog_worker_counts(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
@@ -7015,6 +7236,37 @@ fn server_request_backlog_worker_counts(
                 }
             },
         )
+        .collect()
+}
+
+fn server_request_backlog_method_counts(
+    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+) -> Vec<GatewayV2ServerRequestBacklogMethodCounts> {
+    let mut method_counts = BTreeMap::new();
+    for route in pending_server_requests.values() {
+        let entry = method_counts
+            .entry(route.method.clone())
+            .or_insert((0usize, 0usize));
+        entry.0 = entry.0.saturating_add(1);
+    }
+    for route in resolved_server_requests.values() {
+        let entry = method_counts
+            .entry(route.method.clone())
+            .or_insert((0usize, 0usize));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    method_counts
+        .into_iter()
+        .map(|(method, (pending_count, answered_but_unresolved_count))| {
+            GatewayV2ServerRequestBacklogMethodCounts {
+                method,
+                pending_server_request_count: pending_count,
+                answered_but_unresolved_server_request_count: answered_but_unresolved_count,
+                server_request_backlog_count: pending_count
+                    .saturating_add(answered_but_unresolved_count),
+            }
+        })
         .collect()
 }
 
@@ -9787,6 +10039,7 @@ mod tests {
                         worker_id: Some(0),
                         worker_websocket_url: test_worker_websocket_url(Some(0)),
                         downstream_request_id: RequestId::String("downstream-request".to_string()),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                     super::ClientServerRequestAnswer::Response(serde_json::json!({
@@ -9949,6 +10202,7 @@ mod tests {
                         worker_id: Some(1),
                         worker_websocket_url: test_worker_websocket_url(Some(1)),
                         downstream_request_id: RequestId::String("downstream-request".to_string()),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-worker-b".to_string()),
                     },
                     super::ClientServerRequestAnswer::Response(serde_json::json!({
@@ -10006,6 +10260,7 @@ mod tests {
                         downstream_request_id: RequestId::String(
                             "downstream-error-request".to_string(),
                         ),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-worker-b".to_string()),
                     },
                     super::ClientServerRequestAnswer::Error(JSONRPCErrorError {
@@ -10103,6 +10358,7 @@ mod tests {
                         worker_id: Some(0),
                         worker_websocket_url: test_worker_websocket_url(Some(0)),
                         downstream_request_id: RequestId::String("downstream-request".to_string()),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                     super::ClientServerRequestAnswer::Error(JSONRPCErrorError {
@@ -10281,6 +10537,7 @@ mod tests {
                     worker_id: Some(2),
                     worker_websocket_url: "ws://worker-c.invalid".to_string(),
                     downstream_request_id: RequestId::String("downstream-pending-a".to_string()),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-a".to_string()),
                 },
             ),
@@ -10290,6 +10547,7 @@ mod tests {
                     worker_id: Some(1),
                     worker_websocket_url: "ws://worker-b.invalid".to_string(),
                     downstream_request_id: RequestId::String("downstream-pending-b".to_string()),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-b".to_string()),
                 },
             ),
@@ -10299,6 +10557,7 @@ mod tests {
                     worker_id: None,
                     worker_websocket_url: "embedded".to_string(),
                     downstream_request_id: RequestId::String("downstream-pending-c".to_string()),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: None,
                 },
             ),
@@ -10312,6 +10571,7 @@ mod tests {
                 super::ResolvedServerRequestRoute {
                     gateway_request_id: RequestId::String("gateway-resolved-a".to_string()),
                     worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-a".to_string()),
                 },
             ),
@@ -10323,6 +10583,7 @@ mod tests {
                 super::ResolvedServerRequestRoute {
                     gateway_request_id: RequestId::String("gateway-resolved-b".to_string()),
                     worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-a".to_string()),
                 },
             ),
@@ -10386,6 +10647,7 @@ mod tests {
             super::ResolvedServerRequestRoute {
                 gateway_request_id: gateway_request_id.clone(),
                 worker_websocket_url: test_worker_websocket_url(worker_id),
+                method: "item/tool/requestUserInput".to_string(),
                 thread_id: Some("thread-worker-1".to_string()),
             },
         )]);
@@ -10467,6 +10729,7 @@ mod tests {
                     downstream_request_id: RequestId::String(
                         "downstream-thread-pending".to_string(),
                     ),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-owned".to_string()),
                 },
             ),
@@ -10478,6 +10741,7 @@ mod tests {
                     downstream_request_id: RequestId::String(
                         "downstream-connection-pending".to_string(),
                     ),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: None,
                 },
             ),
@@ -10487,6 +10751,7 @@ mod tests {
                     worker_id: other_worker_id,
                     worker_websocket_url: test_worker_websocket_url(other_worker_id),
                     downstream_request_id: RequestId::String("downstream-other-worker".to_string()),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-other".to_string()),
                 },
             ),
@@ -10500,6 +10765,7 @@ mod tests {
                 super::ResolvedServerRequestRoute {
                     gateway_request_id: RequestId::String("gateway-thread-resolved".to_string()),
                     worker_websocket_url: test_worker_websocket_url(worker_id),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-owned".to_string()),
                 },
             ),
@@ -10513,6 +10779,7 @@ mod tests {
                         "gateway-connection-resolved".to_string(),
                     ),
                     worker_websocket_url: test_worker_websocket_url(worker_id),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: None,
                 },
             ),
@@ -10526,6 +10793,7 @@ mod tests {
                         "gateway-other-worker-resolved".to_string(),
                     ),
                     worker_websocket_url: test_worker_websocket_url(other_worker_id),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-other".to_string()),
                 },
             ),
@@ -10551,6 +10819,13 @@ mod tests {
             vec!["thread-owned".to_string(), "thread-owned".to_string()]
         );
         assert_eq!(
+            cleanup.resolved_thread_scoped_methods,
+            vec![
+                "item/tool/requestUserInput".to_string(),
+                "item/tool/requestUserInput".to_string(),
+            ]
+        );
+        assert_eq!(
             cleanup.stranded_connection_scoped_request_ids,
             vec![
                 RequestId::String("gateway-connection-pending".to_string()),
@@ -10558,15 +10833,28 @@ mod tests {
             ]
         );
         assert_eq!(
+            cleanup.stranded_connection_scoped_methods,
+            vec![
+                "item/tool/requestUserInput".to_string(),
+                "item/tool/requestUserInput".to_string(),
+            ]
+        );
+        assert_eq!(
             cleanup.resolved_notifications,
             vec![
-                ServerRequestResolvedNotification {
-                    thread_id: "thread-owned".to_string(),
-                    request_id: RequestId::String("gateway-thread-pending".to_string()),
+                super::WorkerCleanupResolvedNotification {
+                    notification: ServerRequestResolvedNotification {
+                        thread_id: "thread-owned".to_string(),
+                        request_id: RequestId::String("gateway-thread-pending".to_string()),
+                    },
+                    method: "item/tool/requestUserInput".to_string(),
                 },
-                ServerRequestResolvedNotification {
-                    thread_id: "thread-owned".to_string(),
-                    request_id: RequestId::String("gateway-thread-resolved".to_string()),
+                super::WorkerCleanupResolvedNotification {
+                    notification: ServerRequestResolvedNotification {
+                        thread_id: "thread-owned".to_string(),
+                        request_id: RequestId::String("gateway-thread-resolved".to_string()),
+                    },
+                    method: "item/tool/requestUserInput".to_string(),
                 },
             ]
         );
@@ -10602,7 +10890,14 @@ mod tests {
         let observability = GatewayObservability::new(Some(metrics.clone()), false);
         let cleanup = super::WorkerServerRequestCleanup {
             resolved_thread_scoped_requests: 2,
+            resolved_thread_scoped_methods: vec![
+                "item/tool/requestUserInput".to_string(),
+                "item/tool/requestUserInput".to_string(),
+            ],
             stranded_connection_scoped_requests: 1,
+            stranded_connection_scoped_methods: vec![
+                "account/chatgptAuthTokens/refresh".to_string(),
+            ],
             ..Default::default()
         };
 
@@ -10613,12 +10908,12 @@ mod tests {
             &[
                 (
                     "worker_cleanup_resolved_thread_scoped",
-                    "serverRequest/resolved",
+                    "item/tool/requestUserInput",
                     2,
                 ),
                 (
                     "worker_cleanup_stranded_connection_scoped",
-                    "connectionScopedServerRequest",
+                    "account/chatgptAuthTokens/refresh",
                     1,
                 ),
             ],
@@ -10650,6 +10945,7 @@ mod tests {
                         downstream_request_id: RequestId::String(
                             "downstream-thread-pending".to_string(),
                         ),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-owned".to_string()),
                     },
                 ),
@@ -10661,6 +10957,7 @@ mod tests {
                         downstream_request_id: RequestId::String(
                             "downstream-connection-pending".to_string(),
                         ),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: None,
                     },
                 ),
@@ -10673,6 +10970,7 @@ mod tests {
                 super::ResolvedServerRequestRoute {
                     gateway_request_id: RequestId::String("gateway-resolved".to_string()),
                     worker_websocket_url: test_worker_websocket_url(Some(0)),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-owned".to_string()),
                 },
             )]),
@@ -10683,17 +10981,17 @@ mod tests {
             &[
                 (
                     "client_cleanup_rejected_thread_scoped",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "client_cleanup_rejected_connection_scoped",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "client_cleanup_answered_but_unresolved",
-                    "serverRequest/resolved",
+                    "item/tool/requestUserInput",
                     1,
                 ),
             ],
@@ -10733,6 +11031,7 @@ mod tests {
                 worker_id: Some(0),
                 worker_websocket_url: test_worker_websocket_url(Some(0)),
                 downstream_request_id: RequestId::String("downstream-delivered".to_string()),
+                method: "item/tool/requestUserInput".to_string(),
                 thread_id: Some("thread-owned".to_string()),
             },
         )]);
@@ -10755,12 +11054,12 @@ mod tests {
             &[
                 (
                     "client_cleanup_rejected_thread_scoped",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "client_cleanup_rejection_delivered",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
             ],
@@ -10844,6 +11143,7 @@ mod tests {
                     worker_id: Some(0),
                     worker_websocket_url: test_worker_websocket_url(Some(0)),
                     downstream_request_id: RequestId::String("downstream-failed".to_string()),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: Some("thread-owned".to_string()),
                 },
             ),
@@ -10853,6 +11153,7 @@ mod tests {
                     worker_id: Some(1),
                     worker_websocket_url: test_worker_websocket_url(Some(1)),
                     downstream_request_id: RequestId::String("downstream-skipped".to_string()),
+                    method: "item/tool/requestUserInput".to_string(),
                     thread_id: None,
                 },
             ),
@@ -10887,26 +11188,26 @@ mod tests {
             &[
                 (
                     "client_cleanup_rejected_thread_scoped",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "client_cleanup_rejected_connection_scoped",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "client_cleanup_rejection_failed",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "client_cleanup_rejection_skipped_unavailable_worker",
-                    "serverRequest/pending",
+                    "item/tool/requestUserInput",
                     1,
                 ),
             ],
-            "serverRequest/pending",
+            "item/tool/requestUserInput",
             2,
         );
     }
@@ -10927,8 +11228,13 @@ mod tests {
                 },
                 Some(2),
                 "ws://worker-c.invalid",
-                "thread-visible",
-                &request_id,
+                &super::WorkerCleanupResolvedNotification {
+                    notification: ServerRequestResolvedNotification {
+                        thread_id: "thread-visible".to_string(),
+                        request_id,
+                    },
+                    method: "item/tool/requestUserInput".to_string(),
+                },
                 &err,
             );
         });
@@ -10942,10 +11248,12 @@ mod tests {
         assert!(logs.contains("worker_websocket_url=\"ws://worker-c.invalid\""));
         assert!(logs.contains("thread_id=\"thread-visible\""));
         assert!(logs.contains("gateway_request_id=String(\"gateway-srv-1\")"));
+        assert!(logs.contains("method=\"item/tool/requestUserInput\""));
         assert!(logs.contains("outcome=\"client_send_timed_out\""));
         assert_worker_cleanup_resolution_send_failure_metrics(
             &metrics,
             "worker_cleanup_resolution_send_failed",
+            "item/tool/requestUserInput",
             "client_send_timed_out",
         );
     }
@@ -11059,9 +11367,12 @@ mod tests {
             None,
             super::GatewayV2ConnectionPendingCounts {
                 pending_client_request_count: 4,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
                 pending_server_request_count: 2,
                 answered_but_unresolved_server_request_count: 1,
                 server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
             },
             Duration::from_millis(9),
         );
@@ -11288,9 +11599,12 @@ mod tests {
                 Some("unexpected gateway websocket server-request response"),
                 super::GatewayV2ConnectionPendingCounts {
                     pending_client_request_count: 0,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
                     pending_server_request_count: 1,
                     answered_but_unresolved_server_request_count: 2,
                     server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
                 },
                 Duration::from_millis(13),
             );
@@ -12218,6 +12532,7 @@ mod tests {
     fn assert_worker_cleanup_resolution_send_failure_metrics(
         metrics: &codex_otel::MetricsClient,
         lifecycle_event: &str,
+        lifecycle_method: &str,
         notification_outcome: &str,
     ) {
         let resource_metrics = metrics.snapshot().expect("snapshot");
@@ -12247,7 +12562,7 @@ mod tests {
                                 attributes,
                                 BTreeMap::from([
                                     ("event".to_string(), lifecycle_event.to_string()),
-                                    ("method".to_string(), "serverRequest/resolved".to_string()),
+                                    ("method".to_string(), lifecycle_method.to_string()),
                                 ])
                             );
                             saw_lifecycle_count = true;
@@ -15840,6 +16155,7 @@ mod tests {
                                         "gateway-resolved-1".to_string(),
                                     ),
                                     worker_websocket_url: test_worker_websocket_url(Some(2)),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
@@ -16065,12 +16381,12 @@ mod tests {
                 ),
                 (
                     "client_cleanup_rejected_thread_scoped",
-                    "serverRequest/pending",
+                    "item/commandExecution/requestApproval",
                     1,
                 ),
                 (
                     "client_cleanup_rejection_delivered",
-                    "serverRequest/pending",
+                    "item/commandExecution/requestApproval",
                     1,
                 ),
             ],
@@ -16970,12 +17286,12 @@ mod tests {
                 ),
                 (
                     "client_cleanup_rejected_thread_scoped",
-                    "serverRequest/pending",
+                    "item/commandExecution/requestApproval",
                     1,
                 ),
                 (
                     "client_cleanup_rejection_delivered",
-                    "serverRequest/pending",
+                    "item/commandExecution/requestApproval",
                     1,
                 ),
             ],
@@ -17195,7 +17511,7 @@ mod tests {
                 ("client_server_request_delivered", "response", 1),
                 (
                     "client_cleanup_answered_but_unresolved",
-                    "serverRequest/resolved",
+                    "item/commandExecution/requestApproval",
                     1,
                 ),
             ],
@@ -43595,8 +43911,8 @@ mod tests {
                         worker_websocket_url: test_worker_websocket_url(Some(0)),
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
-                                    ),
-                                    thread_id: Some("thread-visible".to_string()),
+                                    ),                        method: "item/tool/requestUserInput".to_string(),
+                        thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
                             resolved_server_requests: HashMap::new(),
@@ -43735,8 +44051,8 @@ mod tests {
                         worker_websocket_url: test_worker_websocket_url(Some(0)),
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
-                                    ),
-                                    thread_id: Some("thread-visible".to_string()),
+                                    ),                        method: "item/tool/requestUserInput".to_string(),
+                        thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
                             resolved_server_requests: HashMap::new(),
@@ -43906,6 +44222,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -44034,6 +44351,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -44166,6 +44484,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -44281,6 +44600,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -44397,6 +44717,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
@@ -44473,12 +44794,12 @@ mod tests {
             &[
                 (
                     "worker_cleanup_resolved_thread_scoped",
-                    "serverRequest/resolved",
+                    "item/tool/requestUserInput",
                     1,
                 ),
                 (
                     "worker_cleanup_resolution_delivered",
-                    "serverRequest/resolved",
+                    "item/tool/requestUserInput",
                     1,
                 ),
             ],
@@ -44549,6 +44870,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
@@ -44673,6 +44995,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
@@ -44813,6 +45136,7 @@ mod tests {
                                         "gateway-srv-1".to_string(),
                                     ),
                                     worker_websocket_url: test_worker_websocket_url(Some(0)),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -44945,6 +45269,7 @@ mod tests {
                                         "gateway-srv-1".to_string(),
                                     ),
                                     worker_websocket_url: test_worker_websocket_url(Some(0)),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
@@ -45073,6 +45398,7 @@ mod tests {
                                         "gateway-srv-1".to_string(),
                                     ),
                                     worker_websocket_url: test_worker_websocket_url(Some(0)),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -45203,6 +45529,7 @@ mod tests {
                                         "gateway-srv-1".to_string(),
                                     ),
                                     worker_websocket_url: test_worker_websocket_url(Some(0)),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -45346,6 +45673,7 @@ mod tests {
                                     downstream_request_id: RequestId::String(
                                         "downstream-request-1".to_string(),
                                     ),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: None,
                                 },
                             )]),
@@ -45492,6 +45820,7 @@ mod tests {
                                         "gateway-srv-1".to_string(),
                                     ),
                                     worker_websocket_url: test_worker_websocket_url(Some(0)),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     thread_id: Some("thread-visible".to_string()),
                                 },
                             )]),
@@ -49056,9 +49385,12 @@ mod tests {
                 1,
                 Some("worker-b lost"),
                 &super::WorkerServerRequestCleanup {
-                    resolved_notifications: vec![ServerRequestResolvedNotification {
-                        thread_id: "thread-visible".to_string(),
-                        request_id: RequestId::String("gateway-thread-1".to_string()),
+                    resolved_notifications: vec![super::WorkerCleanupResolvedNotification {
+                        notification: ServerRequestResolvedNotification {
+                            thread_id: "thread-visible".to_string(),
+                            request_id: RequestId::String("gateway-thread-1".to_string()),
+                        },
+                        method: "item/tool/requestUserInput".to_string(),
                     }],
                     resolved_thread_scoped_requests: 1,
                     resolved_thread_scoped_request_ids: vec![RequestId::String(
@@ -49067,6 +49399,7 @@ mod tests {
                     resolved_thread_scoped_downstream_request_ids: vec![RequestId::String(
                         "downstream-thread-1".to_string(),
                     )],
+                    resolved_thread_scoped_methods: vec!["item/tool/requestUserInput".to_string()],
                     resolved_thread_scoped_thread_ids: vec!["thread-visible".to_string()],
                     stranded_connection_scoped_requests: 1,
                     stranded_connection_scoped_request_ids: vec![RequestId::String(
@@ -49075,6 +49408,9 @@ mod tests {
                     stranded_connection_scoped_downstream_request_ids: vec![RequestId::String(
                         "downstream-connection-1".to_string(),
                     )],
+                    stranded_connection_scoped_methods: vec![
+                        "account/chatgptAuthTokens/refresh".to_string(),
+                    ],
                 },
                 "downstream worker disconnected within shared gateway v2 session",
             );
@@ -49095,6 +49431,9 @@ mod tests {
         assert!(logs.contains(
             "resolved_thread_scoped_downstream_server_request_ids=[String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains(
+            "resolved_thread_scoped_server_request_methods=[\"item/tool/requestUserInput\"]"
+        ));
         assert!(logs.contains("resolved_thread_scoped_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("stranded_connection_scoped_server_request_count=1"));
         assert!(logs.contains(
@@ -49102,6 +49441,9 @@ mod tests {
         ));
         assert!(logs.contains(
             "stranded_connection_scoped_downstream_server_request_ids=[String(\"downstream-connection-1\")]"
+        ));
+        assert!(logs.contains(
+            "stranded_connection_scoped_server_request_methods=[\"account/chatgptAuthTokens/refresh\"]"
         ));
     }
 
@@ -49124,6 +49466,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -49135,6 +49478,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -49147,6 +49491,7 @@ mod tests {
                     super::ResolvedServerRequestRoute {
                         gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
                         worker_websocket_url: test_worker_websocket_url(Some(1)),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
@@ -49169,6 +49514,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains(
@@ -49180,6 +49526,9 @@ mod tests {
         ));
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
+        ));
+        assert!(logs.contains(
+            "answered_but_unresolved_server_request_methods=[\"item/tool/requestUserInput\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
@@ -49209,6 +49558,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -49220,6 +49570,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -49232,6 +49583,7 @@ mod tests {
                     super::ResolvedServerRequestRoute {
                         gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
                         worker_websocket_url: test_worker_websocket_url(Some(1)),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
@@ -49254,6 +49606,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains(
@@ -49265,6 +49618,9 @@ mod tests {
         ));
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
+        ));
+        assert!(logs.contains(
+            "answered_but_unresolved_server_request_methods=[\"item/tool/requestUserInput\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
@@ -49296,6 +49652,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -49307,6 +49664,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -49332,6 +49690,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains(
@@ -49575,6 +49934,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -49586,6 +49946,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -49598,6 +49959,7 @@ mod tests {
                     super::ResolvedServerRequestRoute {
                         gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
                         worker_websocket_url: test_worker_websocket_url(Some(2)),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
@@ -49619,6 +49981,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains(
@@ -49630,6 +49993,9 @@ mod tests {
         ));
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
+        ));
+        assert!(logs.contains(
+            "answered_but_unresolved_server_request_methods=[\"item/tool/requestUserInput\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[2]"));
@@ -49671,6 +50037,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -49682,6 +50049,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -49694,6 +50062,7 @@ mod tests {
                     super::ResolvedServerRequestRoute {
                         gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
                         worker_websocket_url: test_worker_websocket_url(Some(1)),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
@@ -49722,6 +50091,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains(
@@ -49733,6 +50103,9 @@ mod tests {
         ));
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
+        ));
+        assert!(logs.contains(
+            "answered_but_unresolved_server_request_methods=[\"item/tool/requestUserInput\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
@@ -49753,9 +50126,52 @@ mod tests {
                 },
                 "client_send_timed_out",
                 Some("gateway websocket send timed out"),
-                1,
-                2,
-                3,
+                &HashMap::from([(
+                    RequestId::String("command-exec-1".to_string()),
+                    super::PendingClientRequestRoute {
+                        method: "command/exec".to_string(),
+                        request_context: GatewayRequestContext {
+                            tenant_id: "tenant-visible".to_string(),
+                            project_id: Some("project-visible".to_string()),
+                        },
+                        worker_id: Some(1),
+                        worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                        started_at: Instant::now(),
+                    },
+                )]),
+                &crate::v2_connection_health::GatewayV2ConnectionPendingCounts {
+                    pending_client_request_count: 1,
+                    pending_client_request_worker_counts: vec![
+                        crate::api::GatewayV2PendingClientRequestWorkerCounts {
+                            worker_id: Some(1),
+                            pending_client_request_count: 1,
+                        },
+                    ],
+                    pending_client_request_method_counts: vec![
+                        crate::api::GatewayV2PendingClientRequestMethodCounts {
+                            method: "command/exec".to_string(),
+                            pending_client_request_count: 1,
+                        },
+                    ],
+                    pending_server_request_count: 2,
+                    answered_but_unresolved_server_request_count: 3,
+                    server_request_backlog_worker_counts: vec![
+                        crate::api::GatewayV2ServerRequestBacklogWorkerCounts {
+                            worker_id: Some(2),
+                            pending_server_request_count: 2,
+                            answered_but_unresolved_server_request_count: 3,
+                            server_request_backlog_count: 5,
+                        },
+                    ],
+                    server_request_backlog_method_counts: vec![
+                        crate::api::GatewayV2ServerRequestBacklogMethodCounts {
+                            method: "item/tool/requestUserInput".to_string(),
+                            pending_server_request_count: 2,
+                            answered_but_unresolved_server_request_count: 3,
+                            server_request_backlog_count: 5,
+                        },
+                    ],
+                },
                 &std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "downstream shutdown channel closed",
@@ -49771,8 +50187,20 @@ mod tests {
         assert!(logs.contains("connection_outcome=\"client_send_timed_out\""));
         assert!(logs.contains("connection_detail=\"gateway websocket send timed out\""));
         assert!(logs.contains("pending_client_request_count=1"));
+        assert!(logs.contains("pending_client_request_ids=[String(\"command-exec-1\")]"));
+        assert!(logs.contains("pending_client_request_methods=[\"command/exec\"]"));
+        assert!(logs.contains("pending_client_request_worker_ids=[1]"));
+        assert!(
+            logs.contains(
+                "pending_client_request_worker_websocket_urls=[\"ws://worker-b.invalid\"]"
+            )
+        );
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
+        assert!(logs.contains("server_request_backlog_worker_counts=["));
+        assert!(logs.contains("worker_id: Some(2)"));
+        assert!(logs.contains("server_request_backlog_method_counts=["));
+        assert!(logs.contains("method: \"item/tool/requestUserInput\""));
         assert!(logs.contains("downstream shutdown channel closed"));
     }
 
@@ -49988,6 +50416,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -49999,6 +50428,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -50011,6 +50441,7 @@ mod tests {
                     super::ResolvedServerRequestRoute {
                         gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
                         worker_websocket_url: test_worker_websocket_url(Some(1)),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
@@ -50036,6 +50467,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(
             logs.contains(
                 "thread_scoped_pending_server_request_ids=[String(\"gateway-thread-1\")]"
@@ -50055,6 +50487,9 @@ mod tests {
         ));
         assert!(logs.contains(
             "answered_but_unresolved_downstream_request_ids=[String(\"downstream-resolved-1\")]"
+        ));
+        assert!(logs.contains(
+            "answered_but_unresolved_server_request_methods=[\"item/tool/requestUserInput\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("answered_but_unresolved_worker_ids=[1]"));
@@ -50081,6 +50516,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-connection-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: None,
                         },
                     ),
@@ -50092,6 +50528,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-thread-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     ),
@@ -50115,6 +50552,7 @@ mod tests {
         assert!(logs.contains(
             "pending_downstream_server_request_ids=[String(\"downstream-connection-1\"), String(\"downstream-thread-1\")]"
         ));
+        assert!(logs.contains("pending_server_request_methods=[\"item/tool/requestUserInput\"]"));
         assert!(logs.contains("pending_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("pending_worker_ids=[0, 1]"));
         assert!(logs.contains(
@@ -50141,6 +50579,7 @@ mod tests {
                     super::ResolvedServerRequestRoute {
                         gateway_request_id: RequestId::String("gateway-remaining".to_string()),
                         worker_websocket_url: test_worker_websocket_url(Some(2)),
+                        method: "item/tool/requestUserInput".to_string(),
                         thread_id: Some("thread-visible".to_string()),
                     },
                 )]),
@@ -50161,6 +50600,9 @@ mod tests {
         );
         assert!(logs.contains(
             "remaining_resolved_downstream_request_ids=[String(\"downstream-remaining\")]"
+        ));
+        assert!(logs.contains(
+            "remaining_resolved_server_request_methods=[\"item/tool/requestUserInput\"]"
         ));
         assert!(logs.contains("remaining_resolved_thread_ids=[\"thread-visible\"]"));
         assert!(logs.contains("remaining_resolved_worker_ids=[2]"));
@@ -50299,6 +50741,7 @@ mod tests {
                             downstream_request_id: RequestId::String(
                                 "downstream-pending-1".to_string(),
                             ),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     )]),
@@ -50310,6 +50753,7 @@ mod tests {
                         super::ResolvedServerRequestRoute {
                             gateway_request_id: RequestId::String("gateway-resolved-1".to_string()),
                             worker_websocket_url: test_worker_websocket_url(Some(1)),
+                            method: "item/tool/requestUserInput".to_string(),
                             thread_id: Some("thread-visible".to_string()),
                         },
                     )]),

@@ -110,6 +110,10 @@ pub struct GatewayV2TransportConfig {
 pub struct GatewayV2ConnectionHealth {
     pub active_connection_count: usize,
     pub active_connection_pending_client_request_count: usize,
+    pub active_connection_pending_client_request_worker_counts:
+        Vec<GatewayV2PendingClientRequestWorkerCounts>,
+    pub active_connection_pending_client_request_method_counts:
+        Vec<GatewayV2PendingClientRequestMethodCounts>,
     pub active_connection_pending_server_request_count: usize,
     pub active_connection_answered_but_unresolved_server_request_count: usize,
     pub active_connection_server_request_backlog_count: usize,
@@ -117,6 +121,8 @@ pub struct GatewayV2ConnectionHealth {
     pub active_connection_server_request_backlog_started_at: Option<i64>,
     pub active_connection_server_request_backlog_worker_counts:
         Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
+    pub active_connection_server_request_backlog_method_counts:
+        Vec<GatewayV2ServerRequestBacklogMethodCounts>,
     pub account_capacity_event_counts: BTreeMap<String, usize>,
     pub account_capacity_event_worker_counts: Vec<GatewayV2AccountCapacityWorkerEventCounts>,
     pub last_account_capacity_event: Option<String>,
@@ -133,12 +139,32 @@ pub struct GatewayV2ConnectionHealth {
     pub last_connection_outcome: Option<String>,
     pub last_connection_detail: Option<String>,
     pub last_connection_pending_client_request_count: usize,
+    pub last_connection_pending_client_request_worker_counts:
+        Vec<GatewayV2PendingClientRequestWorkerCounts>,
+    pub last_connection_pending_client_request_method_counts:
+        Vec<GatewayV2PendingClientRequestMethodCounts>,
     pub last_connection_pending_server_request_count: usize,
     pub last_connection_answered_but_unresolved_server_request_count: usize,
     pub last_connection_server_request_backlog_count: usize,
     pub last_connection_server_request_backlog_started_at: Option<i64>,
     pub last_connection_server_request_backlog_worker_counts:
         Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
+    pub last_connection_server_request_backlog_method_counts:
+        Vec<GatewayV2ServerRequestBacklogMethodCounts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2PendingClientRequestWorkerCounts {
+    pub worker_id: Option<usize>,
+    pub pending_client_request_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2PendingClientRequestMethodCounts {
+    pub method: String,
+    pub pending_client_request_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +178,15 @@ pub struct GatewayV2AccountCapacityWorkerEventCounts {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayV2ServerRequestBacklogWorkerCounts {
     pub worker_id: Option<usize>,
+    pub pending_server_request_count: usize,
+    pub answered_but_unresolved_server_request_count: usize,
+    pub server_request_backlog_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ServerRequestBacklogMethodCounts {
+    pub method: String,
     pub pending_server_request_count: usize,
     pub answered_but_unresolved_server_request_count: usize,
     pub server_request_backlog_count: usize,

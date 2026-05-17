@@ -35,6 +35,10 @@ const V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_pending_server_requests";
 const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_answered_but_unresolved_server_requests";
+const V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC: &str =
+    "gateway_v2_connection_pending_server_requests_by_method";
+const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_BY_METHOD_METRIC: &str =
+    "gateway_v2_connection_answered_but_unresolved_server_requests_by_method";
 const V2_SERVER_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_server_request_rejections";
 const V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_client_request_rejections";
 const V2_WORKER_RECONNECT_COUNT_METRIC: &str = "gateway_v2_worker_reconnects";
@@ -221,6 +225,29 @@ impl GatewayObservability {
                 tracing::warn!(
                     "failed to record gateway v2 connection answered-but-unresolved server request metric: {err}"
                 );
+            }
+            for counts in &pending_counts.server_request_backlog_method_counts {
+                let method_tags = [("outcome", outcome), ("method", counts.method.as_str())];
+                if let Err(err) = metrics.histogram(
+                    V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC,
+                    counts.pending_server_request_count.min(i64::MAX as usize) as i64,
+                    &method_tags,
+                ) {
+                    tracing::warn!(
+                        "failed to record gateway v2 connection pending server request by method metric: {err}"
+                    );
+                }
+                if let Err(err) = metrics.histogram(
+                    V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_BY_METHOD_METRIC,
+                    counts
+                        .answered_but_unresolved_server_request_count
+                        .min(i64::MAX as usize) as i64,
+                    &method_tags,
+                ) {
+                    tracing::warn!(
+                        "failed to record gateway v2 connection answered-but-unresolved server request by method metric: {err}"
+                    );
+                }
             }
         }
     }
@@ -616,6 +643,10 @@ impl GatewayObservability {
         let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         let tenant_id = context.tenant_id.as_str();
         let project_id = context.project_id.as_deref();
+        let server_request_backlog_worker_counts =
+            &pending_counts.server_request_backlog_worker_counts;
+        let server_request_backlog_method_counts =
+            &pending_counts.server_request_backlog_method_counts;
 
         tracing::event!(
             target: "codex_gateway.audit",
@@ -629,6 +660,8 @@ impl GatewayObservability {
             pending_server_request_count = pending_counts.pending_server_request_count,
             answered_but_unresolved_server_request_count =
                 pending_counts.answered_but_unresolved_server_request_count,
+            server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
+            server_request_backlog_method_counts = ?server_request_backlog_method_counts,
             "gateway v2 connection completed"
         );
     }
@@ -644,6 +677,10 @@ impl GatewayObservability {
         let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         let tenant_id = context.tenant_id.as_str();
         let project_id = context.project_id.as_deref();
+        let server_request_backlog_worker_counts =
+            &pending_counts.server_request_backlog_worker_counts;
+        let server_request_backlog_method_counts =
+            &pending_counts.server_request_backlog_method_counts;
         match (v2_connection_log_level(outcome), detail) {
             (Level::INFO, Some(detail)) => tracing::event!(
                 target: "codex_gateway.v2",
@@ -657,6 +694,8 @@ impl GatewayObservability {
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
+                server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
+                server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
             ),
             (Level::INFO, None) => tracing::event!(
@@ -670,6 +709,8 @@ impl GatewayObservability {
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
+                server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
+                server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
             ),
             (Level::WARN, Some(detail)) => tracing::event!(
@@ -684,6 +725,8 @@ impl GatewayObservability {
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
+                server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
+                server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
             ),
             (Level::WARN, None) => tracing::event!(
@@ -697,6 +740,8 @@ impl GatewayObservability {
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
+                server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
+                server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
             ),
             _ => unreachable!("v2 connection log level should stay within info/warn"),
@@ -777,10 +822,12 @@ mod tests {
     use super::V2_CLIENT_RESPONSE_SEND_FAILURE_COUNT_METRIC;
     use super::V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC;
     use super::V2_CLOSE_FRAME_SEND_FAILURE_COUNT_METRIC;
+    use super::V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_BY_METHOD_METRIC;
     use super::V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC;
     use super::V2_CONNECTION_COUNT_METRIC;
     use super::V2_CONNECTION_DURATION_METRIC;
     use super::V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC;
+    use super::V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC;
     use super::V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC;
     use super::V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC;
@@ -801,6 +848,10 @@ mod tests {
     use super::V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC;
     use super::V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC;
     use super::V2_WORKER_RECONNECT_COUNT_METRIC;
+    use crate::api::GatewayV2PendingClientRequestMethodCounts;
+    use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+    use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
+    use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
     use crate::scope::GatewayRequestContext;
     use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -1037,9 +1088,19 @@ mod tests {
             Duration::from_millis(14),
             GatewayV2ConnectionPendingCounts {
                 pending_client_request_count: 3,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
                 pending_server_request_count: 2,
                 answered_but_unresolved_server_request_count: 1,
                 server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: vec![
+                    GatewayV2ServerRequestBacklogMethodCounts {
+                        method: "item/tool/requestUserInput".to_string(),
+                        pending_server_request_count: 2,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 3,
+                    },
+                ],
             },
         );
 
@@ -1058,6 +1119,8 @@ mod tests {
         let mut saw_pending_client_requests = false;
         let mut saw_pending_server_requests = false;
         let mut saw_answered_but_unresolved_server_requests = false;
+        let mut saw_pending_server_requests_by_method = false;
+        let mut saw_answered_but_unresolved_server_requests_by_method = false;
         for metric in metrics {
             match metric.name() {
                 name if name == V2_CONNECTION_COUNT_METRIC => {
@@ -1215,6 +1278,86 @@ mod tests {
                         _ => panic!("unexpected answered-but-unresolved server request type"),
                     }
                 }
+                name if name == V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC => {
+                    saw_pending_server_requests_by_method = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 2.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        (
+                                            "outcome".to_string(),
+                                            "downstream_session_ended".to_string(),
+                                        ),
+                                        (
+                                            "method".to_string(),
+                                            "item/tool/requestUserInput".to_string(),
+                                        ),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected pending server request by method aggregation"),
+                        },
+                        _ => panic!("unexpected pending server request by method type"),
+                    }
+                }
+                name if name
+                    == V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_BY_METHOD_METRIC =>
+                {
+                    saw_answered_but_unresolved_server_requests_by_method = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 1.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        (
+                                            "outcome".to_string(),
+                                            "downstream_session_ended".to_string(),
+                                        ),
+                                        (
+                                            "method".to_string(),
+                                            "item/tool/requestUserInput".to_string(),
+                                        ),
+                                    ])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected answered-but-unresolved server request by method aggregation"
+                            ),
+                        },
+                        _ => panic!(
+                            "unexpected answered-but-unresolved server request by method type"
+                        ),
+                    }
+                }
                 _ => {}
             }
         }
@@ -1224,6 +1367,8 @@ mod tests {
         assert!(saw_pending_client_requests);
         assert!(saw_pending_server_requests);
         assert!(saw_answered_but_unresolved_server_requests);
+        assert!(saw_pending_server_requests_by_method);
+        assert!(saw_answered_but_unresolved_server_requests_by_method);
     }
 
     #[test]
@@ -2828,9 +2973,36 @@ mod tests {
                 None,
                 GatewayV2ConnectionPendingCounts {
                     pending_client_request_count: 4,
+                    pending_client_request_worker_counts: vec![
+                        GatewayV2PendingClientRequestWorkerCounts {
+                            worker_id: Some(2),
+                            pending_client_request_count: 4,
+                        },
+                    ],
+                    pending_client_request_method_counts: vec![
+                        GatewayV2PendingClientRequestMethodCounts {
+                            method: "command/exec".to_string(),
+                            pending_client_request_count: 4,
+                        },
+                    ],
                     pending_server_request_count: 2,
                     answered_but_unresolved_server_request_count: 1,
-                    server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_worker_counts: vec![
+                        GatewayV2ServerRequestBacklogWorkerCounts {
+                            worker_id: Some(2),
+                            pending_server_request_count: 2,
+                            answered_but_unresolved_server_request_count: 1,
+                            server_request_backlog_count: 3,
+                        },
+                    ],
+                    server_request_backlog_method_counts: vec![
+                        GatewayV2ServerRequestBacklogMethodCounts {
+                            method: "item/tool/requestUserInput".to_string(),
+                            pending_server_request_count: 2,
+                            answered_but_unresolved_server_request_count: 1,
+                            server_request_backlog_count: 3,
+                        },
+                    ],
                 },
             );
         });
@@ -2844,6 +3016,10 @@ mod tests {
         assert!(logs.contains("pending_client_request_count=4"));
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains("server_request_backlog_worker_counts=["));
+        assert!(logs.contains("worker_id: Some(2)"));
+        assert!(logs.contains("server_request_backlog_method_counts=["));
+        assert!(logs.contains("method: \"item/tool/requestUserInput\""));
     }
 
     #[test]
@@ -2861,9 +3037,12 @@ mod tests {
                 Some("downstream app-server event stream lagged"),
                 GatewayV2ConnectionPendingCounts {
                     pending_client_request_count: 5,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
                     pending_server_request_count: 3,
                     answered_but_unresolved_server_request_count: 2,
                     server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
                 },
             );
         });
@@ -2894,9 +3073,36 @@ mod tests {
                 Some("gateway websocket send timed out"),
                 GatewayV2ConnectionPendingCounts {
                     pending_client_request_count: 6,
+                    pending_client_request_worker_counts: vec![
+                        GatewayV2PendingClientRequestWorkerCounts {
+                            worker_id: Some(7),
+                            pending_client_request_count: 6,
+                        },
+                    ],
+                    pending_client_request_method_counts: vec![
+                        GatewayV2PendingClientRequestMethodCounts {
+                            method: "command/exec".to_string(),
+                            pending_client_request_count: 6,
+                        },
+                    ],
                     pending_server_request_count: 4,
                     answered_but_unresolved_server_request_count: 3,
-                    server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_worker_counts: vec![
+                        GatewayV2ServerRequestBacklogWorkerCounts {
+                            worker_id: Some(7),
+                            pending_server_request_count: 4,
+                            answered_but_unresolved_server_request_count: 3,
+                            server_request_backlog_count: 7,
+                        },
+                    ],
+                    server_request_backlog_method_counts: vec![
+                        GatewayV2ServerRequestBacklogMethodCounts {
+                            method: "serverRequest/elicitation".to_string(),
+                            pending_server_request_count: 4,
+                            answered_but_unresolved_server_request_count: 3,
+                            server_request_backlog_count: 7,
+                        },
+                    ],
                 },
             );
         });
@@ -2911,6 +3117,10 @@ mod tests {
         assert!(logs.contains("pending_client_request_count=6"));
         assert!(logs.contains("pending_server_request_count=4"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
+        assert!(logs.contains("server_request_backlog_worker_counts=["));
+        assert!(logs.contains("worker_id: Some(7)"));
+        assert!(logs.contains("server_request_backlog_method_counts=["));
+        assert!(logs.contains("method: \"serverRequest/elicitation\""));
     }
 
     #[derive(Clone, Default)]

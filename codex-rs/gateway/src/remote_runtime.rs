@@ -1838,12 +1838,15 @@ mod tests {
             GatewayV2ConnectionHealth {
                 active_connection_count: 0,
                 active_connection_pending_client_request_count: 0,
+                active_connection_pending_client_request_worker_counts: Vec::new(),
+                active_connection_pending_client_request_method_counts: Vec::new(),
                 active_connection_pending_server_request_count: 0,
                 active_connection_answered_but_unresolved_server_request_count: 0,
                 active_connection_server_request_backlog_count: 0,
                 active_connection_max_server_request_backlog_count: 0,
                 active_connection_server_request_backlog_started_at: None,
                 active_connection_server_request_backlog_worker_counts: Vec::new(),
+                active_connection_server_request_backlog_method_counts: Vec::new(),
                 account_capacity_event_counts: std::collections::BTreeMap::new(),
                 account_capacity_event_worker_counts: Vec::new(),
                 last_account_capacity_event: None,
@@ -1860,11 +1863,14 @@ mod tests {
                 last_connection_outcome: None,
                 last_connection_detail: None,
                 last_connection_pending_client_request_count: 0,
+                last_connection_pending_client_request_worker_counts: Vec::new(),
+                last_connection_pending_client_request_method_counts: Vec::new(),
                 last_connection_pending_server_request_count: 0,
                 last_connection_answered_but_unresolved_server_request_count: 0,
                 last_connection_server_request_backlog_count: 0,
                 last_connection_server_request_backlog_started_at: None,
                 last_connection_server_request_backlog_worker_counts: Vec::new(),
+                last_connection_server_request_backlog_method_counts: Vec::new(),
             }
         );
         assert_eq!(health.pending_server_request_count, 1);
