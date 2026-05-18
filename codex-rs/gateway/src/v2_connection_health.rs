@@ -45,6 +45,8 @@ struct GatewayV2ConnectionHealthState {
     last_connection_outcome: Option<String>,
     last_connection_detail: Option<String>,
     last_connection_pending_client_request_count: usize,
+    last_connection_max_pending_client_request_count: usize,
+    last_connection_pending_client_request_started_at: Option<i64>,
     last_connection_pending_client_request_worker_counts:
         Vec<GatewayV2PendingClientRequestWorkerCounts>,
     last_connection_pending_client_request_method_counts:
@@ -52,6 +54,7 @@ struct GatewayV2ConnectionHealthState {
     last_connection_pending_server_request_count: usize,
     last_connection_answered_but_unresolved_server_request_count: usize,
     last_connection_server_request_backlog_count: usize,
+    last_connection_max_server_request_backlog_count: usize,
     last_connection_server_request_backlog_started_at: Option<i64>,
     last_connection_server_request_backlog_worker_counts:
         Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
@@ -62,10 +65,13 @@ struct GatewayV2ConnectionHealthState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ActiveGatewayV2ConnectionHealth {
     pending_client_request_count: usize,
+    max_pending_client_request_count: usize,
+    pending_client_request_started_at: Option<i64>,
     pending_client_request_worker_counts: Vec<GatewayV2PendingClientRequestWorkerCounts>,
     pending_client_request_method_counts: Vec<GatewayV2PendingClientRequestMethodCounts>,
     pending_server_request_count: usize,
     answered_but_unresolved_server_request_count: usize,
+    max_server_request_backlog_count: usize,
     server_request_backlog_started_at: Option<i64>,
     server_request_backlog_worker_counts: Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
     server_request_backlog_method_counts: Vec<GatewayV2ServerRequestBacklogMethodCounts>,
@@ -100,7 +106,17 @@ impl GatewayV2ConnectionHealthRegistry {
     ) {
         let mut state = write_guard(&self.state);
         if let Some(connection) = state.active_connections.get_mut(&connection_id) {
+            if connection.pending_client_request_count == 0
+                && counts.pending_client_request_count > 0
+            {
+                connection.pending_client_request_started_at = Some(unix_timestamp_now());
+            } else if counts.pending_client_request_count == 0 {
+                connection.pending_client_request_started_at = None;
+            }
             connection.pending_client_request_count = counts.pending_client_request_count;
+            connection.max_pending_client_request_count = connection
+                .max_pending_client_request_count
+                .max(counts.pending_client_request_count);
             connection.pending_client_request_worker_counts =
                 counts.pending_client_request_worker_counts;
             connection.pending_client_request_method_counts =
@@ -116,6 +132,9 @@ impl GatewayV2ConnectionHealthRegistry {
             } else if server_request_backlog_count == 0 {
                 connection.server_request_backlog_started_at = None;
             }
+            connection.max_server_request_backlog_count = connection
+                .max_server_request_backlog_count
+                .max(server_request_backlog_count);
             connection.pending_server_request_count = counts.pending_server_request_count;
             connection.answered_but_unresolved_server_request_count =
                 counts.answered_but_unresolved_server_request_count;
@@ -164,12 +183,31 @@ impl GatewayV2ConnectionHealthRegistry {
         let mut state = write_guard(&self.state);
         let completed_connection = state.active_connections.remove(&connection_id);
         state.active_connection_count = state.active_connections.len();
-        state.last_connection_completed_at = Some(unix_timestamp_now());
+        let completed_at = unix_timestamp_now();
+        state.last_connection_completed_at = Some(completed_at);
         state.last_connection_duration_ms =
             Some(duration.as_millis().min(u128::from(u64::MAX)) as u64);
         state.last_connection_outcome = Some(outcome.to_string());
         state.last_connection_detail = detail.map(ToString::to_string);
         state.last_connection_pending_client_request_count = counts.pending_client_request_count;
+        state.last_connection_max_pending_client_request_count = completed_connection
+            .as_ref()
+            .map_or(counts.pending_client_request_count, |connection| {
+                connection
+                    .max_pending_client_request_count
+                    .max(counts.pending_client_request_count)
+            });
+        let pending_client_request_started_at = completed_connection
+            .as_ref()
+            .and_then(|connection| connection.pending_client_request_started_at);
+        state.last_connection_pending_client_request_started_at = pending_client_request_started_at
+            .or({
+                if counts.pending_client_request_count > 0 {
+                    Some(completed_at)
+                } else {
+                    None
+                }
+            });
         state.last_connection_pending_client_request_worker_counts =
             counts.pending_client_request_worker_counts;
         state.last_connection_pending_client_request_method_counts =
@@ -180,8 +218,25 @@ impl GatewayV2ConnectionHealthRegistry {
         state.last_connection_server_request_backlog_count = counts
             .pending_server_request_count
             .saturating_add(counts.answered_but_unresolved_server_request_count);
-        state.last_connection_server_request_backlog_started_at = completed_connection
+        state.last_connection_max_server_request_backlog_count =
+            completed_connection.as_ref().map_or(
+                state.last_connection_server_request_backlog_count,
+                |connection| {
+                    connection
+                        .max_server_request_backlog_count
+                        .max(state.last_connection_server_request_backlog_count)
+                },
+            );
+        let server_request_backlog_started_at = completed_connection
             .and_then(|connection| connection.server_request_backlog_started_at);
+        state.last_connection_server_request_backlog_started_at = server_request_backlog_started_at
+            .or({
+                if state.last_connection_server_request_backlog_count > 0 {
+                    Some(completed_at)
+                } else {
+                    None
+                }
+            });
         state.last_connection_server_request_backlog_worker_counts =
             counts.server_request_backlog_worker_counts;
         state.last_connection_server_request_backlog_method_counts =
@@ -195,8 +250,25 @@ impl GatewayV2ConnectionHealthRegistry {
             .values()
             .map(|connection| connection.pending_client_request_count)
             .sum();
+        let active_connection_max_pending_client_request_count = state
+            .active_connections
+            .values()
+            .map(|connection| connection.pending_client_request_count)
+            .max()
+            .unwrap_or(0);
+        let active_connection_peak_pending_client_request_count = state
+            .active_connections
+            .values()
+            .map(|connection| connection.max_pending_client_request_count)
+            .max()
+            .unwrap_or(0);
         let mut active_connection_pending_client_request_worker_counts = BTreeMap::new();
         let mut active_connection_pending_client_request_method_counts = BTreeMap::new();
+        let active_connection_pending_client_request_started_at = state
+            .active_connections
+            .values()
+            .filter_map(|connection| connection.pending_client_request_started_at)
+            .min();
         for connection in state.active_connections.values() {
             for counts in &connection.pending_client_request_worker_counts {
                 let entry = active_connection_pending_client_request_worker_counts
@@ -259,6 +331,12 @@ impl GatewayV2ConnectionHealthRegistry {
             })
             .max()
             .unwrap_or(0);
+        let active_connection_peak_server_request_backlog_count = state
+            .active_connections
+            .values()
+            .map(|connection| connection.max_server_request_backlog_count)
+            .max()
+            .unwrap_or(0);
         let mut active_connection_server_request_backlog_worker_counts = BTreeMap::new();
         let mut active_connection_server_request_backlog_method_counts = BTreeMap::new();
         for connection in state.active_connections.values() {
@@ -313,12 +391,16 @@ impl GatewayV2ConnectionHealthRegistry {
         GatewayV2ConnectionHealth {
             active_connection_count: state.active_connection_count,
             active_connection_pending_client_request_count,
+            active_connection_max_pending_client_request_count,
+            active_connection_peak_pending_client_request_count,
+            active_connection_pending_client_request_started_at,
             active_connection_pending_client_request_worker_counts,
             active_connection_pending_client_request_method_counts,
             active_connection_pending_server_request_count,
             active_connection_answered_but_unresolved_server_request_count,
             active_connection_server_request_backlog_count,
             active_connection_max_server_request_backlog_count,
+            active_connection_peak_server_request_backlog_count,
             active_connection_server_request_backlog_started_at,
             active_connection_server_request_backlog_worker_counts,
             active_connection_server_request_backlog_method_counts,
@@ -352,6 +434,10 @@ impl GatewayV2ConnectionHealthRegistry {
             last_connection_detail: state.last_connection_detail.clone(),
             last_connection_pending_client_request_count: state
                 .last_connection_pending_client_request_count,
+            last_connection_max_pending_client_request_count: state
+                .last_connection_max_pending_client_request_count,
+            last_connection_pending_client_request_started_at: state
+                .last_connection_pending_client_request_started_at,
             last_connection_pending_client_request_worker_counts: state
                 .last_connection_pending_client_request_worker_counts
                 .clone(),
@@ -364,6 +450,8 @@ impl GatewayV2ConnectionHealthRegistry {
                 .last_connection_answered_but_unresolved_server_request_count,
             last_connection_server_request_backlog_count: state
                 .last_connection_server_request_backlog_count,
+            last_connection_max_server_request_backlog_count: state
+                .last_connection_max_server_request_backlog_count,
             last_connection_server_request_backlog_started_at: state
                 .last_connection_server_request_backlog_started_at,
             last_connection_server_request_backlog_worker_counts: state
@@ -419,12 +507,16 @@ mod tests {
             GatewayV2ConnectionHealth {
                 active_connection_count: 0,
                 active_connection_pending_client_request_count: 0,
+                active_connection_max_pending_client_request_count: 0,
+                active_connection_peak_pending_client_request_count: 0,
+                active_connection_pending_client_request_started_at: None,
                 active_connection_pending_client_request_worker_counts: Vec::new(),
                 active_connection_pending_client_request_method_counts: Vec::new(),
                 active_connection_pending_server_request_count: 0,
                 active_connection_answered_but_unresolved_server_request_count: 0,
                 active_connection_server_request_backlog_count: 0,
                 active_connection_max_server_request_backlog_count: 0,
+                active_connection_peak_server_request_backlog_count: 0,
                 active_connection_server_request_backlog_started_at: None,
                 active_connection_server_request_backlog_worker_counts: Vec::new(),
                 active_connection_server_request_backlog_method_counts: Vec::new(),
@@ -444,11 +536,14 @@ mod tests {
                 last_connection_outcome: None,
                 last_connection_detail: None,
                 last_connection_pending_client_request_count: 0,
+                last_connection_max_pending_client_request_count: 0,
+                last_connection_pending_client_request_started_at: None,
                 last_connection_pending_client_request_worker_counts: Vec::new(),
                 last_connection_pending_client_request_method_counts: Vec::new(),
                 last_connection_pending_server_request_count: 0,
                 last_connection_answered_but_unresolved_server_request_count: 0,
                 last_connection_server_request_backlog_count: 0,
+                last_connection_max_server_request_backlog_count: 0,
                 last_connection_server_request_backlog_started_at: None,
                 last_connection_server_request_backlog_worker_counts: Vec::new(),
                 last_connection_server_request_backlog_method_counts: Vec::new(),
@@ -571,6 +666,20 @@ mod tests {
             18
         );
         assert_eq!(
+            active_snapshot.active_connection_max_pending_client_request_count,
+            11
+        );
+        assert_eq!(
+            active_snapshot.active_connection_peak_pending_client_request_count,
+            11
+        );
+        assert_eq!(
+            active_snapshot
+                .active_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
             active_snapshot.active_connection_pending_client_request_worker_counts,
             vec![
                 GatewayV2PendingClientRequestWorkerCounts {
@@ -614,6 +723,10 @@ mod tests {
         );
         assert_eq!(
             active_snapshot.active_connection_max_server_request_backlog_count,
+            9
+        );
+        assert_eq!(
+            active_snapshot.active_connection_peak_server_request_backlog_count,
             9
         );
         assert_eq!(
@@ -736,6 +849,20 @@ mod tests {
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.active_connection_count, 1);
         assert_eq!(snapshot.active_connection_pending_client_request_count, 11);
+        assert_eq!(
+            snapshot.active_connection_max_pending_client_request_count,
+            11
+        );
+        assert_eq!(
+            snapshot.active_connection_peak_pending_client_request_count,
+            11
+        );
+        assert_eq!(
+            snapshot
+                .active_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
         assert_eq!(snapshot.active_connection_pending_server_request_count, 5);
         assert_eq!(
             snapshot.active_connection_answered_but_unresolved_server_request_count,
@@ -744,6 +871,10 @@ mod tests {
         assert_eq!(snapshot.active_connection_server_request_backlog_count, 9);
         assert_eq!(
             snapshot.active_connection_max_server_request_backlog_count,
+            9
+        );
+        assert_eq!(
+            snapshot.active_connection_peak_server_request_backlog_count,
             9
         );
         assert_eq!(snapshot.peak_active_connection_count, 2);
@@ -758,6 +889,13 @@ mod tests {
         );
         assert_eq!(snapshot.last_connection_duration_ms, Some(42));
         assert_eq!(snapshot.last_connection_pending_client_request_count, 7);
+        assert_eq!(snapshot.last_connection_max_pending_client_request_count, 7);
+        assert_eq!(
+            snapshot
+                .last_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
         assert_eq!(
             snapshot.last_connection_pending_client_request_worker_counts,
             vec![
@@ -784,6 +922,7 @@ mod tests {
             2
         );
         assert_eq!(snapshot.last_connection_server_request_backlog_count, 5);
+        assert_eq!(snapshot.last_connection_max_server_request_backlog_count, 5);
         assert_eq!(
             snapshot.last_connection_server_request_backlog_worker_counts,
             vec![
@@ -882,6 +1021,346 @@ mod tests {
                 .active_connection_server_request_backlog_started_at
                 .is_some(),
             true
+        );
+    }
+
+    #[test]
+    fn active_server_request_backlog_timestamp_survives_when_another_connection_clears() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let first_connection_id = registry.mark_connection_started();
+        let second_connection_id = registry.mark_connection_started();
+
+        registry.update_connection_pending_counts(
+            first_connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 0,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 2,
+                answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+        registry.update_connection_pending_counts(
+            second_connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 0,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 4,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+
+        registry.update_connection_pending_counts(
+            first_connection_id,
+            GatewayV2ConnectionPendingCounts::default(),
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.active_connection_pending_server_request_count, 1);
+        assert_eq!(
+            snapshot.active_connection_answered_but_unresolved_server_request_count,
+            4
+        );
+        assert_eq!(snapshot.active_connection_server_request_backlog_count, 5);
+        assert_eq!(
+            snapshot.active_connection_max_server_request_backlog_count,
+            5
+        );
+        assert_eq!(
+            snapshot.active_connection_peak_server_request_backlog_count,
+            5
+        );
+        assert_eq!(
+            snapshot
+                .active_connection_server_request_backlog_started_at
+                .is_some(),
+            true
+        );
+    }
+
+    #[test]
+    fn pending_client_request_timestamp_resets_when_queue_clears() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let connection_id = registry.mark_connection_started();
+
+        registry.update_connection_pending_counts(
+            connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 1,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 0,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .active_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+
+        registry.update_connection_pending_counts(
+            connection_id,
+            GatewayV2ConnectionPendingCounts::default(),
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .active_connection_pending_client_request_started_at,
+            None
+        );
+    }
+
+    #[test]
+    fn active_pending_client_timestamp_survives_when_another_connection_clears() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let first_connection_id = registry.mark_connection_started();
+        let second_connection_id = registry.mark_connection_started();
+
+        registry.update_connection_pending_counts(
+            first_connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 3,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 0,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+        registry.update_connection_pending_counts(
+            second_connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 5,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 0,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+
+        registry.update_connection_pending_counts(
+            first_connection_id,
+            GatewayV2ConnectionPendingCounts::default(),
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.active_connection_pending_client_request_count, 5);
+        assert_eq!(
+            snapshot.active_connection_max_pending_client_request_count,
+            5
+        );
+        assert_eq!(
+            snapshot.active_connection_peak_pending_client_request_count,
+            5
+        );
+        assert_eq!(
+            snapshot
+                .active_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+    }
+
+    #[test]
+    fn completion_backfills_backlog_timestamp_when_counts_arrive_at_teardown() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let connection_id = registry.mark_connection_started();
+
+        registry.mark_connection_completed(
+            connection_id,
+            "client_disconnected",
+            None,
+            Duration::from_millis(1),
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 0,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.last_connection_server_request_backlog_count, 2);
+        assert_eq!(snapshot.last_connection_max_server_request_backlog_count, 2);
+        assert_eq!(
+            snapshot
+                .last_connection_server_request_backlog_started_at
+                .is_some(),
+            true
+        );
+    }
+
+    #[test]
+    fn completion_backfills_pending_client_timestamp_when_counts_arrive_at_teardown() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let connection_id = registry.mark_connection_started();
+
+        registry.mark_connection_completed(
+            connection_id,
+            "client_send_timed_out",
+            None,
+            Duration::from_millis(1),
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 2,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 0,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.last_connection_pending_client_request_count, 2);
+        assert_eq!(snapshot.last_connection_max_pending_client_request_count, 2);
+        assert_eq!(
+            snapshot
+                .last_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+    }
+
+    #[test]
+    fn pending_client_request_peak_survives_queue_clear_and_completion() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let connection_id = registry.mark_connection_started();
+
+        registry.update_connection_pending_counts(
+            connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 6,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 0,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+        registry.update_connection_pending_counts(
+            connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 2,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 0,
+                answered_but_unresolved_server_request_count: 0,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+
+        let active_snapshot = registry.snapshot();
+        assert_eq!(
+            active_snapshot.active_connection_pending_client_request_count,
+            2
+        );
+        assert_eq!(
+            active_snapshot.active_connection_max_pending_client_request_count,
+            2
+        );
+        assert_eq!(
+            active_snapshot.active_connection_peak_pending_client_request_count,
+            6
+        );
+
+        registry.mark_connection_completed(
+            connection_id,
+            "client_disconnected",
+            None,
+            Duration::from_millis(1),
+            GatewayV2ConnectionPendingCounts::default(),
+        );
+
+        let completed_snapshot = registry.snapshot();
+        assert_eq!(
+            completed_snapshot.last_connection_pending_client_request_count,
+            0
+        );
+        assert_eq!(
+            completed_snapshot.last_connection_max_pending_client_request_count,
+            6
+        );
+    }
+
+    #[test]
+    fn server_request_backlog_peak_survives_queue_clear_and_completion() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let connection_id = registry.mark_connection_started();
+
+        registry.update_connection_pending_counts(
+            connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 0,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 4,
+                answered_but_unresolved_server_request_count: 3,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+        registry.update_connection_pending_counts(
+            connection_id,
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 0,
+                pending_client_request_worker_counts: Vec::new(),
+                pending_client_request_method_counts: Vec::new(),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 2,
+                server_request_backlog_worker_counts: Vec::new(),
+                server_request_backlog_method_counts: Vec::new(),
+            },
+        );
+
+        let active_snapshot = registry.snapshot();
+        assert_eq!(
+            active_snapshot.active_connection_server_request_backlog_count,
+            3
+        );
+        assert_eq!(
+            active_snapshot.active_connection_max_server_request_backlog_count,
+            3
+        );
+        assert_eq!(
+            active_snapshot.active_connection_peak_server_request_backlog_count,
+            7
+        );
+
+        registry.mark_connection_completed(
+            connection_id,
+            "client_disconnected",
+            None,
+            Duration::from_millis(1),
+            GatewayV2ConnectionPendingCounts::default(),
+        );
+
+        let completed_snapshot = registry.snapshot();
+        assert_eq!(
+            completed_snapshot.last_connection_server_request_backlog_count,
+            0
+        );
+        assert_eq!(
+            completed_snapshot.last_connection_max_server_request_backlog_count,
+            7
         );
     }
 

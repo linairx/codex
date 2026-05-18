@@ -1858,6 +1858,9 @@ Phase 6 is in progress with:
   `reconnectBackoffRemainingSeconds`; `/healthz` now also exposes
   `v2Connections.activeConnectionCount`,
   `v2Connections.activeConnectionPendingClientRequestCount`,
+  `v2Connections.activeConnectionMaxPendingClientRequestCount`,
+  `v2Connections.activeConnectionPeakPendingClientRequestCount`,
+  `v2Connections.activeConnectionPendingClientRequestStartedAt`,
   `v2Connections.activeConnectionPendingClientRequestWorkerCounts`,
   `v2Connections.activeConnectionPendingClientRequestMethodCounts`,
   `v2Connections.activeConnectionPendingServerRequestCount`,
@@ -1867,6 +1870,8 @@ Phase 6 is in progress with:
   `v2Connections.lastConnectionStartedAt`,
   `v2Connections.lastConnectionDurationMs`,
   `v2Connections.lastConnectionPendingClientRequestCount`,
+  `v2Connections.lastConnectionMaxPendingClientRequestCount`,
+  `v2Connections.lastConnectionPendingClientRequestStartedAt`,
   `v2Connections.lastConnectionPendingClientRequestWorkerCounts`,
   `v2Connections.lastConnectionPendingClientRequestMethodCounts`,
   `v2Connections.lastConnectionPendingServerRequestCount`, and
@@ -1898,15 +1903,31 @@ Phase 6 is in progress with:
   regression coverage, pinning the fields and outcome mapping that rollout
   debugging relies on
 - v2 connection completion and audit logs now also include terminal detail plus
-  pending client-request, pending server-request, and answered-but-unresolved
-  server-request counts, so ordinary connection outcome logs carry the same
-  background-command and stranded-prompt summary that `/healthz` and metrics
-  expose
+  pending client-request, pending server-request, answered-but-unresolved
+  server-request, and combined server-request backlog counts, so ordinary
+  connection outcome logs carry the same background-command and stranded-prompt
+  summary that `/healthz` and metrics expose
+- those v2 connection completion and audit logs now also include pending
+  client-request worker and method count summaries, so terminal logs can be
+  correlated directly with the matching `/healthz.v2Connections` fields when
+  background `command/exec` or other long-running client requests remain
+  in-flight during teardown
 - v2 connection metrics now also emit
   `gateway_v2_connection_pending_client_requests{outcome}`, aligning
   connection-level telemetry with `/healthz` and structured logs so background
   command saturation is visible after connection teardown without relying only
   on the latest health snapshot
+- v2 connection metrics now also include
+  `gateway_v2_connection_pending_client_requests_by_method`, tagged by
+  connection outcome and client request method, so exported dashboards can
+  split terminal background client-request buildup by `command/exec` or other
+  long-running request families instead of relying only on the aggregate
+  pending-client count
+- v2 connection metrics now also include
+  `gateway_v2_connection_pending_client_requests_by_worker`, tagged by
+  connection outcome and downstream worker id, so terminal background
+  client-request buildup can be correlated with the same worker route exposed
+  through `/healthz.v2Connections` and structured completion logs
 - `/healthz.v2Connections` now also groups active-session and last-completed
   pending client requests by downstream worker and client method via
   `activeConnectionPendingClientRequestWorkerCounts`,
@@ -1915,6 +1936,31 @@ Phase 6 is in progress with:
   `lastConnectionPendingClientRequestMethodCounts`, so long-running
   `command/exec` or other background request buildup can be tied directly to
   the app-server session and method family causing pressure
+- `/healthz.v2Connections` now also exposes
+  `activeConnectionMaxPendingClientRequestCount`, so operators can distinguish
+  broad background client-request pressure across many active sessions from a
+  single stalled session accumulating most of the pending `command/exec` or
+  other long-running client requests
+- `/healthz.v2Connections` now also exposes
+  `activeConnectionPeakPendingClientRequestCount` and
+  `lastConnectionMaxPendingClientRequestCount`, so short-lived
+  background-client buildup remains visible even if the queue drains before
+  the active snapshot or the completed connection's terminal pending count
+- `/healthz.v2Connections` now also exposes
+  `activeConnectionPendingClientRequestStartedAt` and
+  `lastConnectionPendingClientRequestStartedAt`, so operators can tell whether
+  background `command/exec` or other long-running client-request buildup is
+  fresh or has persisted across a meaningful part of the connection lifetime
+- the real northbound WebSocket slow-client `command/exec` regression now also
+  captures the active pending-client health snapshot while the downstream
+  request is still in flight, pinning the aggregate count, max-per-connection
+  count, buildup timestamp, worker split, and method split before the terminal
+  timeout path records the completed connection snapshot
+- last-completed v2 pending-client timestamps now also get a conservative
+  completion-time fallback when the terminal pending count is first observed
+  during teardown, so `/healthz.v2Connections` does not report nonzero
+  completed background client-request buildup with a missing
+  `lastConnectionPendingClientRequestStartedAt`
 - v2 connection teardown now also emits a structured warning when pending
   background client requests are aborted, including tenant/project scope,
   terminal outcome/detail, request ids, methods, and downstream worker ids /
@@ -2861,28 +2907,41 @@ Phase 6 is in progress with:
 - `/healthz.v2Connections` now also reports
   `activeConnectionServerRequestBacklogCount`,
   `activeConnectionMaxServerRequestBacklogCount`,
+  `activeConnectionPeakServerRequestBacklogCount`,
   `activeConnectionServerRequestBacklogStartedAt`,
   `activeConnectionServerRequestBacklogWorkerCounts`,
   `activeConnectionServerRequestBacklogMethodCounts`,
-  `lastConnectionServerRequestBacklogCount`, and
+  `lastConnectionServerRequestBacklogCount`,
+  `lastConnectionMaxServerRequestBacklogCount`, and
   `lastConnectionServerRequestBacklogStartedAt`, plus
   `lastConnectionServerRequestBacklogWorkerCounts` and
   `lastConnectionServerRequestBacklogMethodCounts`, giving operators the total
-  active backlog, the largest backlog on any one active connection, the
-  timestamp for the current active v2 server-request backlog, and per-worker
-  plus per-method splits of pending versus answered-but-unresolved prompt
-  buildup without exposing individual request ids
+  active backlog, the largest current backlog on any one active connection,
+  the active and last-completed lifecycle peaks, the timestamp for the current
+  active v2 server-request backlog, and per-worker plus per-method splits of
+  pending versus answered-but-unresolved prompt buildup without exposing
+  individual request ids
 - `/healthz.v2Connections` now also reports those v2 server-request backlog
   method counts for active and last-completed connections, so approval,
   user-input, elicitation, and ChatGPT token-refresh buildup can be identified
   directly in health output and then correlated with lifecycle metrics and
   worker-route logs
+- last-completed v2 server-request backlog timestamps now also get a
+  conservative completion-time fallback when the terminal pending counts are
+  first observed during teardown, so `/healthz.v2Connections` does not report a
+  nonzero completed prompt backlog with a missing
+  `lastConnectionServerRequestBacklogStartedAt`
 - v2 teardown and failure diagnostics now include pending and
   answered-but-unresolved server-request method lists alongside the existing
   gateway ids, downstream ids, worker ids, worker WebSocket URLs, and thread
   ids, so slow-client, backpressure, protocol-violation, duplicate downstream
   request-id, saturation, and cleanup logs can be correlated with the same
   prompt method families shown in `/healthz.v2Connections`
+- v2 slow-client, downstream-backpressure, unexpected client-reply, and
+  client-side cleanup logs now also include `server_request_backlog_count`
+  alongside pending and answered-but-unresolved prompt counts, so teardown
+  diagnostics can be compared directly with
+  `/healthz.v2Connections.*ServerRequestBacklogCount`
 - worker-loss cleanup diagnostics now also include the method families for
   synthesized thread-scoped `serverRequest/resolved` notifications and stranded
   connection-scoped prompts, so worker disconnect logs identify whether the
@@ -2892,13 +2951,31 @@ Phase 6 is in progress with:
   server-request backlog worker and method count fields, so normal connection
   teardown records the same prompt buildup dimensions exposed through
   `/healthz.v2Connections`
+- v2 downstream-shutdown failure logs now also include the summarized pending
+  client-request worker and method count fields alongside individual request
+  ids, methods, worker ids, and worker WebSocket URLs, so shutdown failures can
+  be correlated with the same background-command buildup dimensions exposed
+  through `/healthz.v2Connections`
+- v2 downstream-shutdown failure logs now also include
+  `server_request_backlog_count` alongside pending and answered-but-unresolved
+  prompt counts, so that failure path can be compared directly with
+  `/healthz.v2Connections.*ServerRequestBacklogCount`
+- v2 pending-client abort logs now also include summarized worker and method
+  count fields alongside individual background request ids, methods, worker
+  ids, and worker WebSocket URLs, so aborted `command/exec` or other
+  long-running requests leave the same route and method dimensions as health
+  snapshots and connection metrics
 - v2 connection metrics now also include
+  `gateway_v2_connection_pending_client_requests_by_worker`,
+  `gateway_v2_connection_pending_client_requests_by_method`,
+  `gateway_v2_connection_pending_server_requests_by_worker`,
+  `gateway_v2_connection_answered_but_unresolved_server_requests_by_worker`,
   `gateway_v2_connection_pending_server_requests_by_method` and
   `gateway_v2_connection_answered_but_unresolved_server_requests_by_method`,
-  tagged by connection outcome and server-request method, so exported
-  dashboards can split terminal approval, user-input, elicitation, and
-  token-refresh backlog by prompt family without relying only on health
-  snapshots or logs
+  tagged by connection outcome plus worker or method, so exported dashboards
+  can split terminal background client-request and prompt backlog by worker
+  route, command, approval, user-input, elicitation, and token-refresh family
+  without relying only on health snapshots or logs
 - the multi-worker rollout evidence checklist now also requires validating
   those v2 server-request backlog worker counts during approval, user-input,
   elicitation, and ChatGPT token-refresh flows, so pending and

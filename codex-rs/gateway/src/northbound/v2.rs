@@ -1667,10 +1667,8 @@ async fn run_websocket_connection(
         run_result.detail.as_deref(),
         GatewayV2ConnectionPendingCounts {
             pending_client_request_count: run_result.pending_client_request_count,
-            pending_client_request_worker_counts: run_result
-                .pending_client_request_worker_counts,
-            pending_client_request_method_counts: run_result
-                .pending_client_request_method_counts,
+            pending_client_request_worker_counts: run_result.pending_client_request_worker_counts,
+            pending_client_request_method_counts: run_result.pending_client_request_method_counts,
             pending_server_request_count: run_result.pending_server_request_count,
             answered_but_unresolved_server_request_count: run_result
                 .answered_but_unresolved_server_request_count,
@@ -3187,6 +3185,10 @@ fn log_unexpected_client_server_request_response(
 ) {
     let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
+    let server_request_backlog_count = pending_log_fields
+        .gateway_request_ids
+        .len()
+        .saturating_add(resolved_log_fields.gateway_request_ids.len());
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -3201,6 +3203,7 @@ fn log_unexpected_client_server_request_response(
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        server_request_backlog_count,
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
         answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
@@ -3290,6 +3293,10 @@ fn log_downstream_backpressure_close(
 ) {
     let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
+    let server_request_backlog_count = pending_log_fields
+        .gateway_request_ids
+        .len()
+        .saturating_add(resolved_log_fields.gateway_request_ids.len());
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -3305,6 +3312,7 @@ fn log_downstream_backpressure_close(
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        server_request_backlog_count,
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
         answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
@@ -3343,6 +3351,10 @@ fn log_client_send_timeout(
     pending_client_request_worker_websocket_urls.sort();
     let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
+    let server_request_backlog_count = pending_log_fields
+        .gateway_request_ids
+        .len()
+        .saturating_add(resolved_log_fields.gateway_request_ids.len());
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -3362,6 +3374,7 @@ fn log_client_send_timeout(
         pending_worker_ids = ?pending_log_fields.worker_ids,
         pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        server_request_backlog_count,
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
         answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
@@ -3399,6 +3412,11 @@ fn log_downstream_shutdown_failure(
         .map(|route| route.worker_websocket_url.clone())
         .collect();
     pending_client_request_worker_websocket_urls.sort();
+    let pending_client_request_worker_counts = &pending_counts.pending_client_request_worker_counts;
+    let pending_client_request_method_counts = &pending_counts.pending_client_request_method_counts;
+    let server_request_backlog_count = pending_counts
+        .pending_server_request_count
+        .saturating_add(pending_counts.answered_but_unresolved_server_request_count);
     let server_request_backlog_worker_counts = &pending_counts.server_request_backlog_worker_counts;
     let server_request_backlog_method_counts = &pending_counts.server_request_backlog_method_counts;
 
@@ -3413,9 +3431,12 @@ fn log_downstream_shutdown_failure(
         pending_client_request_worker_ids = ?pending_client_request_worker_ids,
         pending_client_request_worker_websocket_urls =
             ?pending_client_request_worker_websocket_urls,
+        pending_client_request_worker_counts = ?pending_client_request_worker_counts,
+        pending_client_request_method_counts = ?pending_client_request_method_counts,
         pending_server_request_count = pending_counts.pending_server_request_count,
         answered_but_unresolved_server_request_count =
             pending_counts.answered_but_unresolved_server_request_count,
+        server_request_backlog_count,
         server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
         server_request_backlog_method_counts = ?server_request_backlog_method_counts,
         shutdown_error = %err,
@@ -3447,6 +3468,10 @@ fn log_aborted_pending_client_requests(
         .map(|route| route.worker_websocket_url.clone())
         .collect();
     pending_client_request_worker_websocket_urls.sort();
+    let pending_client_request_worker_counts =
+        pending_client_request_worker_counts(pending_client_requests);
+    let pending_client_request_method_counts =
+        pending_client_request_method_counts(pending_client_requests);
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -3459,6 +3484,8 @@ fn log_aborted_pending_client_requests(
         pending_client_request_worker_ids = ?pending_client_request_worker_ids,
         pending_client_request_worker_websocket_urls =
             ?pending_client_request_worker_websocket_urls,
+        pending_client_request_worker_counts = ?pending_client_request_worker_counts,
+        pending_client_request_method_counts = ?pending_client_request_method_counts,
         "aborting pending gateway v2 client requests because the northbound connection ended"
     );
 }
@@ -3998,6 +4025,10 @@ fn log_rejected_pending_server_requests(
 
     let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
+    let server_request_backlog_count = pending_log_fields
+        .gateway_request_ids
+        .len()
+        .saturating_add(resolved_log_fields.gateway_request_ids.len());
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
@@ -4016,6 +4047,7 @@ fn log_rejected_pending_server_requests(
         worker_ids = ?pending_log_fields.worker_ids,
         worker_websocket_urls = ?pending_worker_websocket_urls,
         answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        server_request_backlog_count,
         answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
         answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
         answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
@@ -11368,7 +11400,16 @@ mod tests {
             super::GatewayV2ConnectionPendingCounts {
                 pending_client_request_count: 4,
                 pending_client_request_worker_counts: Vec::new(),
-                pending_client_request_method_counts: Vec::new(),
+                pending_client_request_method_counts: vec![
+                    crate::api::GatewayV2PendingClientRequestMethodCounts {
+                        method: "command/exec".to_string(),
+                        pending_client_request_count: 3,
+                    },
+                    crate::api::GatewayV2PendingClientRequestMethodCounts {
+                        method: "thread/read".to_string(),
+                        pending_client_request_count: 1,
+                    },
+                ],
                 pending_server_request_count: 2,
                 answered_but_unresolved_server_request_count: 1,
                 server_request_backlog_worker_counts: Vec::new(),
@@ -11389,6 +11430,29 @@ mod tests {
             4
         );
         assert_eq!(
+            health_snapshot.last_connection_max_pending_client_request_count,
+            4
+        );
+        assert_eq!(
+            health_snapshot
+                .last_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            health_snapshot.last_connection_pending_client_request_method_counts,
+            vec![
+                crate::api::GatewayV2PendingClientRequestMethodCounts {
+                    method: "command/exec".to_string(),
+                    pending_client_request_count: 3,
+                },
+                crate::api::GatewayV2PendingClientRequestMethodCounts {
+                    method: "thread/read".to_string(),
+                    pending_client_request_count: 1,
+                },
+            ]
+        );
+        assert_eq!(
             health_snapshot.last_connection_pending_server_request_count,
             2
         );
@@ -11407,6 +11471,7 @@ mod tests {
         let mut saw_count = false;
         let mut saw_duration = false;
         let mut saw_pending_client_requests = false;
+        let mut pending_client_request_method_points = Vec::new();
         let mut saw_pending_server_requests = false;
         let mut saw_answered_but_unresolved_server_requests = false;
         for metric in metrics {
@@ -11504,6 +11569,30 @@ mod tests {
                         _ => panic!("unexpected v2 connection pending client request type"),
                     }
                 }
+                "gateway_v2_connection_pending_client_requests_by_method" => match metric.data() {
+                    AggregatedMetrics::F64(data) => match data {
+                        MetricData::Histogram(histogram) => {
+                            pending_client_request_method_points.extend(
+                                histogram.data_points().map(|point| {
+                                    let attributes: BTreeMap<String, String> = point
+                                        .attributes()
+                                        .map(|attribute| {
+                                            (
+                                                attribute.key.as_str().to_string(),
+                                                attribute.value.as_str().to_string(),
+                                            )
+                                        })
+                                        .collect();
+                                    (attributes, point.count(), point.sum())
+                                }),
+                            );
+                        }
+                        _ => panic!(
+                            "unexpected v2 connection pending client request by method aggregation"
+                        ),
+                    },
+                    _ => panic!("unexpected v2 connection pending client request by method type"),
+                },
                 "gateway_v2_connection_pending_server_requests" => {
                     saw_pending_server_requests = true;
                     match metric.data() {
@@ -11575,6 +11664,28 @@ mod tests {
         assert!(saw_count);
         assert!(saw_duration);
         assert!(saw_pending_client_requests);
+        pending_client_request_method_points.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            pending_client_request_method_points,
+            vec![
+                (
+                    BTreeMap::from([
+                        ("method".to_string(), "command/exec".to_string()),
+                        ("outcome".to_string(), "client_send_timed_out".to_string()),
+                    ]),
+                    1,
+                    3.0,
+                ),
+                (
+                    BTreeMap::from([
+                        ("method".to_string(), "thread/read".to_string()),
+                        ("outcome".to_string(), "client_send_timed_out".to_string()),
+                    ]),
+                    1,
+                    1.0,
+                ),
+            ]
+        );
         assert!(saw_pending_server_requests);
         assert!(saw_answered_but_unresolved_server_requests);
     }
@@ -21742,10 +21853,11 @@ mod tests {
             });
 
             let initialize_response = test_initialize_response().await;
+            let observability = GatewayObservability::new(None, false);
             let (addr, server_task) = spawn_test_server(GatewayV2State {
                 auth: GatewayAuth::Disabled,
                 admission: GatewayAdmissionController::default(),
-                observability: GatewayObservability::new(None, false),
+                observability: observability.clone(),
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
@@ -21784,6 +21896,40 @@ mod tests {
             request_observed_rx
                 .await
                 .expect("command/exec should reach downstream");
+            let active_health = observability.v2_connection_health().snapshot();
+            assert_eq!(active_health.active_connection_count, 1);
+            assert_eq!(
+                active_health.active_connection_pending_client_request_count,
+                1
+            );
+            assert_eq!(
+                active_health.active_connection_max_pending_client_request_count,
+                1
+            );
+            assert_eq!(
+                active_health.active_connection_peak_pending_client_request_count,
+                1
+            );
+            assert_eq!(
+                active_health
+                    .active_connection_pending_client_request_started_at
+                    .is_some(),
+                true
+            );
+            assert_eq!(
+                active_health.active_connection_pending_client_request_worker_counts,
+                vec![crate::api::GatewayV2PendingClientRequestWorkerCounts {
+                    worker_id: Some(0),
+                    pending_client_request_count: 1,
+                }]
+            );
+            assert_eq!(
+                active_health.active_connection_pending_client_request_method_counts,
+                vec![crate::api::GatewayV2PendingClientRequestMethodCounts {
+                    method: "command/exec".to_string(),
+                    pending_client_request_count: 1,
+                }]
+            );
             timeout(Duration::from_secs(5), flood_started_rx)
                 .await
                 .expect("downstream flood should start")
@@ -49521,6 +49667,7 @@ mod tests {
             "pending_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains("server_request_backlog_count=3"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
         ));
@@ -49613,6 +49760,7 @@ mod tests {
             "pending_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains("server_request_backlog_count=3"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
         ));
@@ -49988,6 +50136,7 @@ mod tests {
             "pending_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains("server_request_backlog_count=3"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
         ));
@@ -50098,6 +50247,7 @@ mod tests {
             "pending_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains("server_request_backlog_count=3"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
         ));
@@ -50195,8 +50345,12 @@ mod tests {
                 "pending_client_request_worker_websocket_urls=[\"ws://worker-b.invalid\"]"
             )
         );
+        assert!(logs.contains("pending_client_request_worker_counts=["));
+        assert!(logs.contains("pending_client_request_count: 1"));
+        assert!(logs.contains("pending_client_request_method_counts=["));
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
+        assert!(logs.contains("server_request_backlog_count=5"));
         assert!(logs.contains("server_request_backlog_worker_counts=["));
         assert!(logs.contains("worker_id: Some(2)"));
         assert!(logs.contains("server_request_backlog_method_counts=["));
@@ -50327,6 +50481,11 @@ mod tests {
         assert!(logs.contains(
             "pending_client_request_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
         ));
+        assert!(logs.contains("pending_client_request_worker_counts=["));
+        assert!(logs.contains("worker_id: Some(0)"));
+        assert!(logs.contains("worker_id: Some(1)"));
+        assert!(logs.contains("pending_client_request_method_counts=["));
+        assert!(logs.contains("pending_client_request_count: 2"));
     }
 
     #[test]
@@ -50482,6 +50641,7 @@ mod tests {
             "worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
         ));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
+        assert!(logs.contains("server_request_backlog_count=3"));
         assert!(logs.contains(
             "answered_but_unresolved_gateway_request_ids=[String(\"gateway-resolved-1\")]"
         ));

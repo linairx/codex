@@ -110,6 +110,9 @@ pub struct GatewayV2TransportConfig {
 pub struct GatewayV2ConnectionHealth {
     pub active_connection_count: usize,
     pub active_connection_pending_client_request_count: usize,
+    pub active_connection_max_pending_client_request_count: usize,
+    pub active_connection_peak_pending_client_request_count: usize,
+    pub active_connection_pending_client_request_started_at: Option<i64>,
     pub active_connection_pending_client_request_worker_counts:
         Vec<GatewayV2PendingClientRequestWorkerCounts>,
     pub active_connection_pending_client_request_method_counts:
@@ -118,6 +121,7 @@ pub struct GatewayV2ConnectionHealth {
     pub active_connection_answered_but_unresolved_server_request_count: usize,
     pub active_connection_server_request_backlog_count: usize,
     pub active_connection_max_server_request_backlog_count: usize,
+    pub active_connection_peak_server_request_backlog_count: usize,
     pub active_connection_server_request_backlog_started_at: Option<i64>,
     pub active_connection_server_request_backlog_worker_counts:
         Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
@@ -139,6 +143,8 @@ pub struct GatewayV2ConnectionHealth {
     pub last_connection_outcome: Option<String>,
     pub last_connection_detail: Option<String>,
     pub last_connection_pending_client_request_count: usize,
+    pub last_connection_max_pending_client_request_count: usize,
+    pub last_connection_pending_client_request_started_at: Option<i64>,
     pub last_connection_pending_client_request_worker_counts:
         Vec<GatewayV2PendingClientRequestWorkerCounts>,
     pub last_connection_pending_client_request_method_counts:
@@ -146,6 +152,7 @@ pub struct GatewayV2ConnectionHealth {
     pub last_connection_pending_server_request_count: usize,
     pub last_connection_answered_but_unresolved_server_request_count: usize,
     pub last_connection_server_request_backlog_count: usize,
+    pub last_connection_max_server_request_backlog_count: usize,
     pub last_connection_server_request_backlog_started_at: Option<i64>,
     pub last_connection_server_request_backlog_worker_counts:
         Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
