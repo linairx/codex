@@ -1,3 +1,4 @@
+use crate::config::normalize_remote_account_id;
 use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::scope::GatewayRequestContext;
 use codex_app_server_client::AppServerClient;
@@ -71,7 +72,7 @@ impl GatewayV2SessionFactory {
         Self::RemoteSingle {
             connect_args: Box::new(connect_args),
             initialize_response: Arc::new(initialize_response),
-            account_id,
+            account_id: normalize_remote_account_id(account_id),
             worker_health: None,
         }
     }
@@ -93,7 +94,10 @@ impl GatewayV2SessionFactory {
             connect_args,
             initialize_response: Arc::new(initialize_response),
             next_server_request_id: Arc::new(AtomicU64::new(1)),
-            account_ids,
+            account_ids: account_ids
+                .into_iter()
+                .map(normalize_remote_account_id)
+                .collect(),
             worker_health: None,
         }
     }
@@ -312,10 +316,27 @@ pub fn gateway_initialize_response(config: &codex_core::config::Config) -> Initi
 
 #[cfg(test)]
 mod tests {
+    use super::GatewayV2SessionFactory;
     use super::apply_initialize_params;
+    use super::gateway_initialize_response;
+    use codex_app_server_client::RemoteAppServerConnectArgs;
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::InitializeCapabilities;
+    use codex_core::config::Config;
     use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    fn test_connect_args(url: &str) -> RemoteAppServerConnectArgs {
+        RemoteAppServerConnectArgs {
+            websocket_url: url.to_string(),
+            auth_token: None,
+            client_name: "codex-gateway".to_string(),
+            client_version: "0.0.0".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 4,
+        }
+    }
 
     #[test]
     fn initialize_params_override_connection_identity_and_capabilities() {
@@ -349,5 +370,36 @@ mod tests {
             opt_out_notification_methods,
             vec!["thread/started".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn remote_session_factory_normalizes_account_labels() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await
+        .expect("config should load");
+        let initialize_response = gateway_initialize_response(&config);
+
+        let single = GatewayV2SessionFactory::remote_single_with_account_id(
+            test_connect_args("ws://worker-a.invalid"),
+            initialize_response.clone(),
+            Some("  acct-a  ".to_string()),
+        );
+        let multi = GatewayV2SessionFactory::remote_multi_with_account_ids(
+            vec![
+                test_connect_args("ws://worker-a.invalid"),
+                test_connect_args("ws://worker-b.invalid"),
+            ],
+            initialize_response,
+            vec![Some("  acct-a  ".to_string()), Some("   ".to_string())],
+        );
+
+        assert_eq!(single.worker_account_id(0), Some("acct-a".to_string()));
+        assert_eq!(single.worker_account_id(1), None);
+        assert_eq!(multi.worker_account_id(0), Some("acct-a".to_string()));
+        assert_eq!(multi.worker_account_id(1), None);
     }
 }

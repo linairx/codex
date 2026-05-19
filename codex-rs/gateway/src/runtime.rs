@@ -443,6 +443,10 @@ impl GatewayRuntime for AppServerGatewayRuntime {
                 .scope_registry
                 .pending_server_request_oldest_at(),
             remote_workers: None,
+            remote_account_labels_complete: None,
+            remote_unlabeled_account_worker_count: None,
+            remote_unlabeled_account_worker_ids: None,
+            remote_unlabeled_account_workers: None,
             project_worker_routes: None,
         }
     }

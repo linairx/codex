@@ -21,6 +21,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const REQUEST_COUNT_METRIC: &str = "gateway_http_requests";
 const REQUEST_DURATION_METRIC: &str = "gateway_http_request_duration";
+const REMOTE_ACCOUNT_LABEL_EVENT_COUNT_METRIC: &str = "gateway_remote_account_label_events";
 const ACCOUNT_CAPACITY_EVENT_COUNT_METRIC: &str = "gateway_account_capacity_events";
 const SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC: &str =
     "gateway_server_request_answer_delivery_failures";
@@ -142,6 +143,17 @@ impl GatewayObservability {
             && let Err(err) = metrics.counter(ACCOUNT_CAPACITY_EVENT_COUNT_METRIC, 1, &tags)
         {
             tracing::warn!("failed to record gateway account capacity event metric: {err}");
+        }
+    }
+
+    pub(crate) fn record_remote_account_label_event(&self, worker_id: usize, event: &str) {
+        let worker_id = worker_id.to_string();
+        let tags = [("worker_id", worker_id.as_str()), ("event", event)];
+
+        if let Some(metrics) = &self.metrics
+            && let Err(err) = metrics.counter(REMOTE_ACCOUNT_LABEL_EVENT_COUNT_METRIC, 1, &tags)
+        {
+            tracing::warn!("failed to record gateway remote account label event metric: {err}");
         }
     }
 
@@ -334,6 +346,9 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_worker_reconnect(&self, worker_id: usize, outcome: &str) {
+        self.v2_connection_health
+            .record_worker_reconnect_event(worker_id, outcome);
+
         let worker_id = worker_id.to_string();
         let tags = [("worker_id", worker_id.as_str()), ("outcome", outcome)];
 
@@ -529,6 +544,9 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_protocol_violation(&self, phase: &str, reason: &str) {
+        self.v2_connection_health
+            .record_protocol_violation(phase, reason);
+
         let tags = [("phase", phase), ("reason", reason)];
 
         if let Some(metrics) = &self.metrics
@@ -903,6 +921,7 @@ fn v2_connection_log_level(outcome: &str) -> Level {
 mod tests {
     use super::ACCOUNT_CAPACITY_EVENT_COUNT_METRIC;
     use super::GatewayObservability;
+    use super::REMOTE_ACCOUNT_LABEL_EVENT_COUNT_METRIC;
     use super::REQUEST_COUNT_METRIC;
     use super::REQUEST_DURATION_METRIC;
     use super::SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC;
@@ -944,6 +963,7 @@ mod tests {
     use super::V2_WORKER_RECONNECT_COUNT_METRIC;
     use crate::api::GatewayV2PendingClientRequestMethodCounts;
     use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+    use crate::api::GatewayV2ProtocolViolationCounts;
     use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
     use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
     use crate::scope::GatewayRequestContext;
@@ -1911,6 +1931,17 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.worker_reconnect_event_counts,
+            BTreeMap::from([("success".to_string(), 1)])
+        );
+        assert_eq!(
+            health.last_worker_reconnect_event,
+            Some("success".to_string())
+        );
+        assert_eq!(health.last_worker_reconnect_event_worker_id, Some(7));
+        assert_eq!(health.last_worker_reconnect_event_at.is_some(), true);
     }
 
     #[test]
@@ -1969,6 +2000,69 @@ mod tests {
                         _ => panic!("unexpected account capacity event count aggregation"),
                     },
                     _ => panic!("unexpected account capacity event count type"),
+                }
+            }
+        }
+
+        assert!(saw_count);
+    }
+
+    #[test]
+    fn records_remote_account_label_event_metrics_with_worker_and_event_tags() {
+        let exporter = InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics), true);
+
+        observability.record_remote_account_label_event(3, "unlabeled");
+
+        let resource_metrics = observability
+            .metrics
+            .as_ref()
+            .expect("metrics client")
+            .snapshot()
+            .expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+        let mut saw_count = false;
+        for metric in metrics {
+            if metric.name() == REMOTE_ACCOUNT_LABEL_EVENT_COUNT_METRIC {
+                saw_count = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("worker_id".to_string(), "3".to_string()),
+                                    ("event".to_string(), "unlabeled".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected remote account label event count aggregation"),
+                    },
+                    _ => panic!("unexpected remote account label event count type"),
                 }
             }
         }
@@ -3012,6 +3106,24 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.protocol_violation_counts,
+            vec![GatewayV2ProtocolViolationCounts {
+                phase: "post_initialize".to_string(),
+                reason: "invalid_jsonrpc".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_protocol_violation_phase,
+            Some("post_initialize".to_string())
+        );
+        assert_eq!(
+            health.last_protocol_violation_reason,
+            Some("invalid_jsonrpc".to_string())
+        );
+        assert_eq!(health.last_protocol_violation_at.is_some(), true);
     }
 
     #[test]

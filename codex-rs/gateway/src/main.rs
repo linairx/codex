@@ -80,13 +80,21 @@ struct GatewayCli {
     #[arg(long = "v2-max-pending-client-requests", value_name = "COUNT")]
     v2_max_pending_client_requests: Option<usize>,
 
-    #[arg(long = "remote-websocket-url", value_name = "URL")]
+    #[arg(
+        long = "remote-websocket-url",
+        value_name = "URL",
+        value_parser = parse_remote_websocket_url
+    )]
     remote_websocket_url: Vec<String>,
 
     #[arg(long = "remote-auth-token", value_name = "TOKEN")]
     remote_auth_token: Option<String>,
 
-    #[arg(long = "remote-account-id", value_name = "ACCOUNT_ID")]
+    #[arg(
+        long = "remote-account-id",
+        value_name = "ACCOUNT_ID",
+        value_parser = parse_remote_account_id
+    )]
     remote_account_id: Vec<String>,
 }
 
@@ -97,6 +105,24 @@ struct TopCli {
 
     #[clap(flatten)]
     inner: GatewayCli,
+}
+
+fn parse_remote_account_id(value: &str) -> Result<String, String> {
+    let account_id = value.trim();
+    if account_id.is_empty() {
+        return Err("--remote-account-id must not be blank".to_string());
+    }
+
+    Ok(account_id.to_string())
+}
+
+fn parse_remote_websocket_url(value: &str) -> Result<String, String> {
+    let websocket_url = value.trim();
+    if websocket_url.is_empty() {
+        return Err("--remote-websocket-url must not be blank".to_string());
+    }
+
+    Ok(websocket_url.to_string())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -189,4 +215,43 @@ fn main() -> anyhow::Result<()> {
         server.shutdown().await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_remote_account_id;
+    use super::parse_remote_websocket_url;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn remote_account_id_parser_rejects_blank_values() {
+        assert_eq!(
+            parse_remote_account_id("   "),
+            Err("--remote-account-id must not be blank".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_id_parser_trims_valid_values() {
+        assert_eq!(
+            parse_remote_account_id("  acct-a  "),
+            Ok("acct-a".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_websocket_url_parser_rejects_blank_values() {
+        assert_eq!(
+            parse_remote_websocket_url("   "),
+            Err("--remote-websocket-url must not be blank".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_websocket_url_parser_trims_valid_values() {
+        assert_eq!(
+            parse_remote_websocket_url("  ws://127.0.0.1:9001  "),
+            Ok("ws://127.0.0.1:9001".to_string())
+        );
+    }
 }

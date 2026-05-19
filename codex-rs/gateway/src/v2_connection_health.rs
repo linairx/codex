@@ -2,8 +2,10 @@ use crate::api::GatewayV2AccountCapacityWorkerEventCounts;
 use crate::api::GatewayV2ConnectionHealth;
 use crate::api::GatewayV2PendingClientRequestMethodCounts;
 use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+use crate::api::GatewayV2ProtocolViolationCounts;
 use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
 use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
+use crate::api::GatewayV2WorkerReconnectWorkerEventCounts;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -37,6 +39,15 @@ struct GatewayV2ConnectionHealthState {
     last_account_capacity_event_project_id: Option<String>,
     last_account_capacity_event_reason: Option<String>,
     last_account_capacity_event_at: Option<i64>,
+    worker_reconnect_event_counts: BTreeMap<String, usize>,
+    worker_reconnect_event_worker_counts: BTreeMap<usize, BTreeMap<String, usize>>,
+    last_worker_reconnect_event: Option<String>,
+    last_worker_reconnect_event_worker_id: Option<usize>,
+    last_worker_reconnect_event_at: Option<i64>,
+    protocol_violation_counts: BTreeMap<(String, String), usize>,
+    last_protocol_violation_phase: Option<String>,
+    last_protocol_violation_reason: Option<String>,
+    last_protocol_violation_at: Option<i64>,
     peak_active_connection_count: usize,
     total_connection_count: u64,
     last_connection_started_at: Option<i64>,
@@ -170,6 +181,34 @@ impl GatewayV2ConnectionHealthRegistry {
         state.last_account_capacity_event_project_id = project_id.map(ToString::to_string);
         state.last_account_capacity_event_reason = reason.map(ToString::to_string);
         state.last_account_capacity_event_at = Some(unix_timestamp_now());
+    }
+
+    pub fn record_worker_reconnect_event(&self, worker_id: usize, event: &str) {
+        let mut state = write_guard(&self.state);
+        *state
+            .worker_reconnect_event_counts
+            .entry(event.to_string())
+            .or_insert(0) += 1;
+        *state
+            .worker_reconnect_event_worker_counts
+            .entry(worker_id)
+            .or_default()
+            .entry(event.to_string())
+            .or_insert(0) += 1;
+        state.last_worker_reconnect_event = Some(event.to_string());
+        state.last_worker_reconnect_event_worker_id = Some(worker_id);
+        state.last_worker_reconnect_event_at = Some(unix_timestamp_now());
+    }
+
+    pub fn record_protocol_violation(&self, phase: &str, reason: &str) {
+        let mut state = write_guard(&self.state);
+        *state
+            .protocol_violation_counts
+            .entry((phase.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
+        state.last_protocol_violation_phase = Some(phase.to_string());
+        state.last_protocol_violation_reason = Some(reason.to_string());
+        state.last_protocol_violation_at = Some(unix_timestamp_now());
     }
 
     pub fn mark_connection_completed(
@@ -425,6 +464,34 @@ impl GatewayV2ConnectionHealthRegistry {
                 .clone(),
             last_account_capacity_event_reason: state.last_account_capacity_event_reason.clone(),
             last_account_capacity_event_at: state.last_account_capacity_event_at,
+            worker_reconnect_event_counts: state.worker_reconnect_event_counts.clone(),
+            worker_reconnect_event_worker_counts: state
+                .worker_reconnect_event_worker_counts
+                .iter()
+                .map(
+                    |(worker_id, event_counts)| GatewayV2WorkerReconnectWorkerEventCounts {
+                        worker_id: *worker_id,
+                        event_counts: event_counts.clone(),
+                    },
+                )
+                .collect(),
+            last_worker_reconnect_event: state.last_worker_reconnect_event.clone(),
+            last_worker_reconnect_event_worker_id: state.last_worker_reconnect_event_worker_id,
+            last_worker_reconnect_event_at: state.last_worker_reconnect_event_at,
+            protocol_violation_counts: state
+                .protocol_violation_counts
+                .iter()
+                .map(
+                    |((phase, reason), count)| GatewayV2ProtocolViolationCounts {
+                        phase: phase.clone(),
+                        reason: reason.clone(),
+                        count: *count,
+                    },
+                )
+                .collect(),
+            last_protocol_violation_phase: state.last_protocol_violation_phase.clone(),
+            last_protocol_violation_reason: state.last_protocol_violation_reason.clone(),
+            last_protocol_violation_at: state.last_protocol_violation_at,
             peak_active_connection_count: state.peak_active_connection_count,
             total_connection_count: state.total_connection_count,
             last_connection_started_at: state.last_connection_started_at,
@@ -492,8 +559,10 @@ mod tests {
     use crate::api::GatewayV2ConnectionHealth;
     use crate::api::GatewayV2PendingClientRequestMethodCounts;
     use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+    use crate::api::GatewayV2ProtocolViolationCounts;
     use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
     use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
+    use crate::api::GatewayV2WorkerReconnectWorkerEventCounts;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -528,6 +597,15 @@ mod tests {
                 last_account_capacity_event_project_id: None,
                 last_account_capacity_event_reason: None,
                 last_account_capacity_event_at: None,
+                worker_reconnect_event_counts: BTreeMap::new(),
+                worker_reconnect_event_worker_counts: Vec::new(),
+                last_worker_reconnect_event: None,
+                last_worker_reconnect_event_worker_id: None,
+                last_worker_reconnect_event_at: None,
+                protocol_violation_counts: Vec::new(),
+                last_protocol_violation_phase: None,
+                last_protocol_violation_reason: None,
+                last_protocol_violation_at: None,
                 peak_active_connection_count: 0,
                 total_connection_count: 0,
                 last_connection_started_at: None,
@@ -786,6 +864,18 @@ mod tests {
         assert_eq!(active_snapshot.last_account_capacity_event_project_id, None);
         assert_eq!(active_snapshot.last_account_capacity_event_reason, None);
         assert_eq!(active_snapshot.last_account_capacity_event_at, None);
+        assert_eq!(
+            active_snapshot.worker_reconnect_event_counts,
+            BTreeMap::new()
+        );
+        assert_eq!(active_snapshot.worker_reconnect_event_worker_counts, vec![]);
+        assert_eq!(active_snapshot.last_worker_reconnect_event, None);
+        assert_eq!(active_snapshot.last_worker_reconnect_event_worker_id, None);
+        assert_eq!(active_snapshot.last_worker_reconnect_event_at, None);
+        assert_eq!(active_snapshot.protocol_violation_counts, vec![]);
+        assert_eq!(active_snapshot.last_protocol_violation_phase, None);
+        assert_eq!(active_snapshot.last_protocol_violation_reason, None);
+        assert_eq!(active_snapshot.last_protocol_violation_at, None);
         assert_eq!(active_snapshot.peak_active_connection_count, 2);
         assert_eq!(active_snapshot.total_connection_count, 2);
         assert_eq!(active_snapshot.last_connection_started_at.is_some(), true);
@@ -1449,5 +1539,83 @@ mod tests {
             Some("billing limit".to_string())
         );
         assert_eq!(snapshot.last_account_capacity_event_at.is_some(), true);
+    }
+
+    #[test]
+    fn snapshot_tracks_worker_reconnect_events() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+
+        registry.record_worker_reconnect_event(1, "attempt");
+        registry.record_worker_reconnect_event(2, "success");
+        registry.record_worker_reconnect_event(1, "connect_failure");
+
+        let snapshot = registry.snapshot();
+
+        assert_eq!(
+            snapshot.worker_reconnect_event_counts,
+            BTreeMap::from([
+                ("attempt".to_string(), 1),
+                ("connect_failure".to_string(), 1),
+                ("success".to_string(), 1),
+            ])
+        );
+        assert_eq!(
+            snapshot.worker_reconnect_event_worker_counts,
+            vec![
+                GatewayV2WorkerReconnectWorkerEventCounts {
+                    worker_id: 1,
+                    event_counts: BTreeMap::from([
+                        ("attempt".to_string(), 1),
+                        ("connect_failure".to_string(), 1),
+                    ]),
+                },
+                GatewayV2WorkerReconnectWorkerEventCounts {
+                    worker_id: 2,
+                    event_counts: BTreeMap::from([("success".to_string(), 1)]),
+                },
+            ]
+        );
+        assert_eq!(
+            snapshot.last_worker_reconnect_event,
+            Some("connect_failure".to_string())
+        );
+        assert_eq!(snapshot.last_worker_reconnect_event_worker_id, Some(1));
+        assert_eq!(snapshot.last_worker_reconnect_event_at.is_some(), true);
+    }
+
+    #[test]
+    fn snapshot_tracks_protocol_violations() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+
+        registry.record_protocol_violation("pre_initialize", "initialize_order");
+        registry.record_protocol_violation("post_initialize", "invalid_jsonrpc");
+        registry.record_protocol_violation("pre_initialize", "initialize_order");
+
+        let snapshot = registry.snapshot();
+
+        assert_eq!(
+            snapshot.protocol_violation_counts,
+            vec![
+                GatewayV2ProtocolViolationCounts {
+                    phase: "post_initialize".to_string(),
+                    reason: "invalid_jsonrpc".to_string(),
+                    count: 1,
+                },
+                GatewayV2ProtocolViolationCounts {
+                    phase: "pre_initialize".to_string(),
+                    reason: "initialize_order".to_string(),
+                    count: 2,
+                },
+            ]
+        );
+        assert_eq!(
+            snapshot.last_protocol_violation_phase,
+            Some("pre_initialize".to_string())
+        );
+        assert_eq!(
+            snapshot.last_protocol_violation_reason,
+            Some("initialize_order".to_string())
+        );
+        assert_eq!(snapshot.last_protocol_violation_at.is_some(), true);
     }
 }

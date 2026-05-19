@@ -8,6 +8,7 @@ use crate::api::GatewayAccountCapacityStatus;
 use crate::api::GatewayExecutionMode;
 use crate::api::GatewayHealthResponse;
 use crate::api::GatewayHealthStatus;
+use crate::api::GatewayRemoteUnlabeledAccountWorker;
 use crate::api::GatewayV2CompatibilityMode;
 use crate::api::GatewayV2TransportConfig;
 use crate::api::InterruptTurnResponse;
@@ -848,6 +849,31 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
 
     fn health(&self) -> GatewayHealthResponse {
         let remote_workers = self.worker_health.snapshot();
+        let remote_unlabeled_account_workers: Vec<GatewayRemoteUnlabeledAccountWorker> =
+            if remote_workers.len() > 1 {
+                remote_workers
+                    .iter()
+                    .filter(|worker| {
+                        worker
+                            .account_id
+                            .as_deref()
+                            .map(str::trim)
+                            .is_none_or(str::is_empty)
+                    })
+                    .map(|worker| GatewayRemoteUnlabeledAccountWorker {
+                        worker_id: worker.worker_id,
+                        websocket_url: worker.websocket_url.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let remote_unlabeled_account_worker_ids: Vec<usize> = remote_unlabeled_account_workers
+            .iter()
+            .map(|worker| worker.worker_id)
+            .collect();
+        let remote_unlabeled_account_worker_count = remote_unlabeled_account_workers.len();
+        let remote_account_labels_complete = remote_unlabeled_account_worker_ids.is_empty();
         let status = if remote_workers.iter().all(|worker| worker.healthy) {
             GatewayHealthStatus::Ok
         } else if remote_workers.iter().any(|worker| worker.healthy) {
@@ -878,6 +904,10 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                 .scope_registry
                 .pending_server_request_oldest_at(),
             remote_workers: Some(remote_workers),
+            remote_account_labels_complete: Some(remote_account_labels_complete),
+            remote_unlabeled_account_worker_count: Some(remote_unlabeled_account_worker_count),
+            remote_unlabeled_account_worker_ids: Some(remote_unlabeled_account_worker_ids),
+            remote_unlabeled_account_workers: Some(remote_unlabeled_account_workers),
             project_worker_routes: Some(self.scope_registry.project_worker_routes(
                 |worker_id| self.worker_health.is_healthy(worker_id),
                 |worker_id| self.worker_health.account_id(worker_id),
@@ -1859,6 +1889,15 @@ mod tests {
                 last_account_capacity_event_project_id: None,
                 last_account_capacity_event_reason: None,
                 last_account_capacity_event_at: None,
+                worker_reconnect_event_counts: std::collections::BTreeMap::new(),
+                worker_reconnect_event_worker_counts: Vec::new(),
+                last_worker_reconnect_event: None,
+                last_worker_reconnect_event_worker_id: None,
+                last_worker_reconnect_event_at: None,
+                protocol_violation_counts: Vec::new(),
+                last_protocol_violation_phase: None,
+                last_protocol_violation_reason: None,
+                last_protocol_violation_at: None,
                 peak_active_connection_count: 0,
                 total_connection_count: 0,
                 last_connection_started_at: None,
@@ -1894,6 +1933,16 @@ mod tests {
             }]
         );
         assert!(health.pending_server_request_oldest_at.is_some());
+        assert_eq!(health.remote_account_labels_complete, Some(false));
+        assert_eq!(health.remote_unlabeled_account_worker_count, Some(1));
+        assert_eq!(health.remote_unlabeled_account_worker_ids, Some(vec![0]));
+        assert_eq!(
+            health.remote_unlabeled_account_workers,
+            Some(vec![crate::api::GatewayRemoteUnlabeledAccountWorker {
+                worker_id: 0,
+                websocket_url: "ws://127.0.0.1:8081".to_string(),
+            }])
+        );
         let remote_workers = health.remote_workers.expect("remote workers");
         assert_eq!(remote_workers.len(), 2);
         assert_eq!(
@@ -1942,6 +1991,57 @@ mod tests {
     }
 
     #[test]
+    fn reports_complete_remote_account_labels_for_labeled_multi_worker_health() {
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            (
+                "ws://127.0.0.1:8082".to_string(),
+                Some("acct-b".to_string()),
+            ),
+        ]));
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events: broadcast::channel(4).0,
+            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        let health = runtime.health();
+
+        assert_eq!(
+            health.v2_compatibility,
+            GatewayV2CompatibilityMode::RemoteMultiWorker
+        );
+        assert_eq!(health.remote_account_labels_complete, Some(true));
+        assert_eq!(health.remote_unlabeled_account_worker_count, Some(0));
+        assert_eq!(health.remote_unlabeled_account_worker_ids, Some(Vec::new()));
+        assert_eq!(health.remote_unlabeled_account_workers, Some(Vec::new()));
+        let remote_workers = health.remote_workers.expect("remote workers");
+        assert_eq!(
+            remote_workers
+                .iter()
+                .map(|worker| worker.account_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("acct-a"), Some("acct-b")]
+        );
+    }
+
+    #[test]
     fn reports_reconnecting_remote_health_with_retry_metadata() {
         let worker_health = Arc::new(RemoteWorkerHealthRegistry::new(vec![
             "ws://127.0.0.1:8081".to_string(),
@@ -1977,6 +2077,10 @@ mod tests {
             health.v2_compatibility,
             GatewayV2CompatibilityMode::RemoteSingleWorker
         );
+        assert_eq!(health.remote_account_labels_complete, Some(true));
+        assert_eq!(health.remote_unlabeled_account_worker_count, Some(0));
+        assert_eq!(health.remote_unlabeled_account_worker_ids, Some(Vec::new()));
+        assert_eq!(health.remote_unlabeled_account_workers, Some(Vec::new()));
         let remote_workers = health.remote_workers.expect("remote workers");
         assert_eq!(remote_workers.len(), 1);
         assert_eq!(remote_workers[0].worker_id, 0);

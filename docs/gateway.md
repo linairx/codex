@@ -2858,6 +2858,39 @@ Phase 6 is in progress with:
   before widening traffic, bounded resumable-thread handoff should be verified
   only on explicit restore surfaces, and active live-context requests should
   be expected to fail closed when the owning account is exhausted
+- remote multi-worker startup now warns when any worker is missing
+  `--remote-account-id`, including the unlabeled worker ids and WebSocket URLs,
+  so account-aware validation does not silently proceed with routes that cannot
+  be tied back to account-capacity health or handoff evidence; blank account
+  labels are rejected by the CLI and treated as unlabeled for programmatic
+  remote runtime configuration, and blank remote worker WebSocket URLs are
+  rejected before remote runtime startup whether they come from the CLI or
+  programmatic gateway configuration; the normal remote startup log also
+  reports `remote_account_labels_complete` and
+  `remote_unlabeled_account_worker_count`, so complete and incomplete rollout
+  configurations are visible from startup logs without waiting for `/healthz`
+- `/healthz` now also exposes `remoteAccountLabelsComplete`,
+  `remoteUnlabeledAccountWorkerCount`, `remoteUnlabeledAccountWorkerIds`, and
+  `remoteUnlabeledAccountWorkers` for remote runtimes, so multi-worker rollout
+  checks can verify account-aware routing labels, alert on the direct
+  unlabeled-worker count, and inspect affected worker URLs from the health
+  snapshot instead of reconstructing the same guardrail from individual
+  `remoteWorkers[]` entries
+- remote multi-worker startup now also emits
+  `gateway_remote_account_label_events` metrics tagged by worker id and
+  `event=labeled` or `event=unlabeled` for every configured worker, giving
+  rollout dashboards the same account-label guardrail that startup logs and
+  `/healthz` expose while distinguishing a fully labeled pool from missing
+  metric data
+- the v2 method matrix now also treats account-label completeness as an
+  explicit Stage B rollout guardrail, and the real remote multi-worker
+  `/healthz` regression pins that a two-worker validation profile without
+  account labels reports both unlabeled worker routes through
+  `remoteUnlabeledAccountWorkers`
+- remote multi-worker `/healthz` coverage now also pins the fully labeled
+  account-route branch, verifying `remoteAccountLabelsComplete=true`,
+  `remoteUnlabeledAccountWorkerCount=0`, and empty unlabeled-worker lists when
+  every worker has a configured `accountId`
 - the v2 method matrix now also defines the Stage B rollout gate for
   multi-worker remote mode: steady-state, reconnect, degraded-route,
   slow-client, account-capacity, and fail-closed behavior must be validated in
@@ -2875,6 +2908,13 @@ Phase 6 is in progress with:
   failures while worker routes are unavailable, downstream backpressure, and
   slow-client timeouts, tying those dashboard checks back to `/healthz` worker
   state during staged validation
+- `/healthz.v2Connections` now also reports cumulative worker reconnect
+  outcome counts as `workerReconnectEventCounts`, per-worker splits as
+  `workerReconnectEventWorkerCounts`, and the newest reconnect outcome through
+  `lastWorkerReconnectEvent`, `lastWorkerReconnectEventWorkerId`, and
+  `lastWorkerReconnectEventAt`, so degraded-topology rollout evidence can
+  correlate the exported `gateway_v2_worker_reconnects` metric with the
+  current health snapshot instead of relying only on logs
 - the rollout guidance now also defines the promotion evidence required before
   multi-worker remote can be treated as release-quality: gateway and worker
   configuration, `/healthz` snapshots, `/v1/events` captures, metric exports,
@@ -2996,6 +3036,13 @@ Phase 6 is in progress with:
   multi-worker Stage B validation profile, including the auth and
   `--remote-account-id` constraints operators must satisfy before collecting
   promotion evidence
+- `/healthz.v2Connections` now also reports v2 protocol-violation health as
+  `protocolViolationCounts`, `lastProtocolViolationPhase`,
+  `lastProtocolViolationReason`, and `lastProtocolViolationAt`, mirroring
+  `gateway_v2_protocol_violations{phase,reason}` so rollout evidence can
+  identify malformed pre-initialize traffic, post-initialize client protocol
+  violations, and downstream app-server protocol regressions from health
+  snapshots without relying only on metrics export
 
 The remaining Phase 6 work is:
 

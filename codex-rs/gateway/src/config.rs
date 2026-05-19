@@ -82,6 +82,12 @@ pub struct GatewayRemoteWorkerConfig {
     pub account_id: Option<String>,
 }
 
+pub(crate) fn normalize_remote_account_id(account_id: Option<String>) -> Option<String> {
+    account_id
+        .map(|account_id| account_id.trim().to_string())
+        .filter(|account_id| !account_id.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::GatewayConfig;
@@ -89,6 +95,7 @@ mod tests {
     use super::GatewayRemoteSelectionPolicy;
     use super::GatewayRemoteWorkerConfig;
     use super::GatewayRuntimeMode;
+    use super::normalize_remote_account_id;
     use crate::auth::GatewayAuth;
     use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
     use codex_protocol::protocol::SessionSource;
@@ -142,5 +149,15 @@ mod tests {
         };
 
         assert_eq!(remote.clone(), remote);
+    }
+
+    #[test]
+    fn normalize_remote_account_id_trims_and_drops_blank_labels() {
+        assert_eq!(
+            normalize_remote_account_id(Some("  acct-a  ".to_string())),
+            Some("acct-a".to_string())
+        );
+        assert_eq!(normalize_remote_account_id(Some("   ".to_string())), None);
+        assert_eq!(normalize_remote_account_id(None), None);
     }
 }

@@ -4,8 +4,10 @@ use crate::api::GatewayExecutionMode;
 use crate::api::GatewayServerRequest;
 use crate::api::GatewayV2TransportConfig;
 use crate::config::GatewayConfig;
+use crate::config::GatewayRemoteRuntimeConfig;
 use crate::config::GatewayRemoteWorkerConfig;
 use crate::config::GatewayRuntimeMode;
+use crate::config::normalize_remote_account_id;
 use crate::event::GatewayEvent;
 use crate::northbound::http::router_with_observability;
 use crate::northbound::v2::GatewayV2Timeouts;
@@ -186,6 +188,10 @@ pub async fn start_gateway_server(
                     "remote gateway runtime does not support `--exec-server-url`; configure execution on the remote app-server workers instead",
                 ));
             }
+            let account_label_summary = gateway_config
+                .remote_runtime
+                .as_ref()
+                .map(remote_account_label_summary);
             tracing::info!(
                 runtime_mode = "remote",
                 execution_mode = "worker_managed",
@@ -209,6 +215,12 @@ pub async fn start_gateway_server(
                     .remote_runtime
                     .as_ref()
                     .map_or(0, |remote_runtime| remote_runtime.workers.len()),
+                remote_account_labels_complete = account_label_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.complete),
+                remote_unlabeled_account_worker_count = account_label_summary
+                    .as_ref()
+                    .map_or(0, RemoteAccountLabelSummary::unlabeled_worker_count),
                 "starting gateway with remote app-server workers"
             );
             start_remote_runtime_gateway_http_server(
@@ -261,6 +273,109 @@ fn missing_remote_runtime_config() -> io::Error {
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct UnlabeledRemoteAccountWorker {
+    worker_id: usize,
+    websocket_url: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemoteAccountLabelSummary {
+    complete: bool,
+    unlabeled_workers: Vec<UnlabeledRemoteAccountWorker>,
+}
+
+impl RemoteAccountLabelSummary {
+    fn unlabeled_worker_count(&self) -> usize {
+        self.unlabeled_workers.len()
+    }
+}
+
+fn unlabeled_remote_account_workers(
+    remote_runtime: &GatewayRemoteRuntimeConfig,
+) -> Vec<UnlabeledRemoteAccountWorker> {
+    if remote_runtime.workers.len() <= 1 {
+        return Vec::new();
+    }
+
+    remote_runtime
+        .workers
+        .iter()
+        .enumerate()
+        .filter(|(_, worker)| {
+            worker
+                .account_id
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+        })
+        .map(|(worker_id, worker)| UnlabeledRemoteAccountWorker {
+            worker_id,
+            websocket_url: worker.websocket_url.clone(),
+        })
+        .collect()
+}
+
+fn remote_account_label_summary(
+    remote_runtime: &GatewayRemoteRuntimeConfig,
+) -> RemoteAccountLabelSummary {
+    let unlabeled_workers = unlabeled_remote_account_workers(remote_runtime);
+    RemoteAccountLabelSummary {
+        complete: unlabeled_workers.is_empty(),
+        unlabeled_workers,
+    }
+}
+
+fn warn_unlabeled_remote_account_workers(
+    remote_runtime: &GatewayRemoteRuntimeConfig,
+    account_label_summary: &RemoteAccountLabelSummary,
+) {
+    let unlabeled_account_workers = &account_label_summary.unlabeled_workers;
+    if unlabeled_account_workers.is_empty() {
+        return;
+    }
+
+    let unlabeled_worker_ids: Vec<usize> = unlabeled_account_workers
+        .iter()
+        .map(|worker| worker.worker_id)
+        .collect();
+    let unlabeled_worker_websocket_urls: Vec<&str> = unlabeled_account_workers
+        .iter()
+        .map(|worker| worker.websocket_url.as_str())
+        .collect();
+    tracing::warn!(
+        total_worker_count = remote_runtime.workers.len(),
+        unlabeled_worker_count = unlabeled_account_workers.len(),
+        unlabeled_worker_ids = ?unlabeled_worker_ids,
+        unlabeled_worker_websocket_urls = ?unlabeled_worker_websocket_urls,
+        unlabeled_account_workers = ?unlabeled_account_workers,
+        "gateway remote multi-worker account labels are incomplete; configure --remote-account-id for every worker before validating account-aware routing"
+    );
+}
+
+fn record_remote_account_worker_label_metrics(
+    observability: &GatewayObservability,
+    remote_runtime: &GatewayRemoteRuntimeConfig,
+) {
+    if remote_runtime.workers.len() <= 1 {
+        return;
+    }
+
+    for (worker_id, worker) in remote_runtime.workers.iter().enumerate() {
+        let event = if worker
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            "unlabeled"
+        } else {
+            "labeled"
+        };
+        observability.record_remote_account_label_event(worker_id, event);
+    }
+}
+
 fn validate_gateway_config(gateway_config: &GatewayConfig) -> io::Result<()> {
     if gateway_config.v2_initialize_timeout.is_zero() {
         return Err(io::Error::new(
@@ -295,6 +410,17 @@ fn validate_gateway_config(gateway_config: &GatewayConfig) -> io::Result<()> {
             ErrorKind::InvalidInput,
             "gateway v2 max pending client requests must be greater than zero",
         ));
+    }
+
+    if let Some(remote_runtime) = &gateway_config.remote_runtime {
+        for (worker_id, worker) in remote_runtime.workers.iter().enumerate() {
+            if worker.websocket_url.trim().is_empty() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("remote worker {worker_id} websocket URL must not be blank"),
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -434,6 +560,20 @@ async fn start_remote_runtime_gateway_http_server(
     if remote_runtime.workers.is_empty() {
         return Err(missing_remote_runtime_config());
     }
+    let remote_runtime = GatewayRemoteRuntimeConfig {
+        selection_policy: remote_runtime.selection_policy,
+        workers: remote_runtime
+            .workers
+            .iter()
+            .map(|worker| GatewayRemoteWorkerConfig {
+                websocket_url: worker.websocket_url.trim().to_string(),
+                auth_token: worker.auth_token.clone(),
+                account_id: normalize_remote_account_id(worker.account_id.clone()),
+            })
+            .collect(),
+    };
+    let account_label_summary = remote_account_label_summary(&remote_runtime);
+    warn_unlabeled_remote_account_workers(&remote_runtime, &account_label_summary);
 
     let (events_tx, _events_rx) =
         tokio::sync::broadcast::channel(gateway_config.event_buffer_capacity);
@@ -442,6 +582,7 @@ async fn start_remote_runtime_gateway_http_server(
     let observability =
         GatewayObservability::from_otel(otel.as_ref(), gateway_config.audit_logs_enabled)
             .with_operator_events(events_tx.clone());
+    record_remote_account_worker_label_metrics(&observability, &remote_runtime);
     let v2_connection_health = observability.v2_connection_health();
     let admission = GatewayAdmissionController::new(GatewayAdmissionConfig {
         request_rate_limit_per_minute: gateway_config.request_rate_limit_per_minute,
@@ -802,14 +943,20 @@ async fn handle_app_server_event(
 
 #[cfg(test)]
 mod tests {
+    use super::UnlabeledRemoteAccountWorker;
     use super::gateway_environment_manager;
     use super::gateway_execution_mode;
+    use super::record_remote_account_worker_label_metrics;
+    use super::remote_account_label_summary;
     use super::start_embedded_gateway_server;
     use super::start_gateway_server;
+    use super::unlabeled_remote_account_workers;
+    use super::warn_unlabeled_remote_account_workers;
     use crate::api::CreateThreadRequest;
     use crate::api::GatewayExecutionMode;
     use crate::api::GatewayHealthResponse;
     use crate::api::GatewayHealthStatus;
+    use crate::api::GatewayRemoteUnlabeledAccountWorker;
     use crate::api::GatewayV2CompatibilityMode;
     use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
     use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
@@ -820,6 +967,7 @@ mod tests {
     use crate::config::GatewayRemoteSelectionPolicy;
     use crate::config::GatewayRemoteWorkerConfig;
     use crate::config::GatewayRuntimeMode;
+    use crate::observability::GatewayObservability;
     use app_test_support::ChatGptAuthFixture;
     use app_test_support::ChatGptIdTokenClaims;
     use app_test_support::create_apply_patch_sse_response;
@@ -1111,6 +1259,7 @@ mod tests {
     use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
     use tokio::io::AsyncRead;
     use tokio::io::AsyncWrite;
@@ -1128,6 +1277,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
     use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
+    use tracing_subscriber::layer::SubscriberExt;
 
     const EMBEDDED_CONNECTOR_ID: &str = "calendar";
     const EMBEDDED_CONNECTOR_NAME: &str = "Calendar";
@@ -1136,6 +1286,318 @@ mod tests {
     const EMBEDDED_TOOL_NAME: &str = "calendar_confirm_action";
     const EMBEDDED_TOOL_CALL_ID: &str = "call-calendar-confirm";
     const EMBEDDED_ELICITATION_MESSAGE: &str = "Allow this request?";
+
+    #[test]
+    fn unlabeled_remote_account_workers_ignores_single_worker_remote() {
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![GatewayRemoteWorkerConfig {
+                websocket_url: "ws://worker-a.invalid".to_string(),
+                auth_token: None,
+                account_id: None,
+            }],
+        };
+
+        assert_eq!(
+            unlabeled_remote_account_workers(&remote_runtime),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn unlabeled_remote_account_workers_ignores_fully_labeled_multi_worker_remote() {
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-a".to_string()),
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-b".to_string()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            unlabeled_remote_account_workers(&remote_runtime),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn unlabeled_remote_account_workers_reports_missing_multi_worker_account_labels() {
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-a".to_string()),
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    account_id: None,
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-c.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("   ".to_string()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            unlabeled_remote_account_workers(&remote_runtime),
+            vec![
+                UnlabeledRemoteAccountWorker {
+                    worker_id: 1,
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                },
+                UnlabeledRemoteAccountWorker {
+                    worker_id: 2,
+                    websocket_url: "ws://worker-c.invalid".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_account_label_summary_reports_rollout_guardrail_state() {
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-a".to_string()),
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("   ".to_string()),
+                },
+            ],
+        };
+
+        let summary = remote_account_label_summary(&remote_runtime);
+
+        assert!(!summary.complete);
+        assert_eq!(summary.unlabeled_worker_count(), 1);
+        assert_eq!(
+            summary.unlabeled_workers,
+            vec![UnlabeledRemoteAccountWorker {
+                worker_id: 1,
+                websocket_url: "ws://worker-b.invalid".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn warn_unlabeled_remote_account_workers_logs_route_identity() {
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-a".to_string()),
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    account_id: None,
+                },
+            ],
+        };
+        let account_label_summary = remote_account_label_summary(&remote_runtime);
+
+        let logs = capture_logs(|| {
+            warn_unlabeled_remote_account_workers(&remote_runtime, &account_label_summary);
+        });
+
+        assert!(logs.contains("gateway remote multi-worker account labels are incomplete"));
+        assert!(logs.contains("total_worker_count=2"));
+        assert!(logs.contains("unlabeled_worker_count=1"));
+        assert!(logs.contains("unlabeled_worker_ids=[1]"));
+        assert!(logs.contains("unlabeled_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
+    }
+
+    #[test]
+    fn remote_account_workers_record_startup_label_metrics() {
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), true);
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-a".to_string()),
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    account_id: None,
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-c.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-c".to_string()),
+                },
+            ],
+        };
+
+        record_remote_account_worker_label_metrics(&observability, &remote_runtime);
+
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let mut label_events = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == "gateway_remote_account_label_events")
+            .flat_map(|metric| match metric.data() {
+                opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
+                    opentelemetry_sdk::metrics::data::MetricData::Sum(sum),
+                ) => sum
+                    .data_points()
+                    .map(|point| {
+                        let attributes = point
+                            .attributes()
+                            .map(|attribute| {
+                                (
+                                    attribute.key.as_str().to_string(),
+                                    attribute.value.as_str().to_string(),
+                                )
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        (
+                            attributes
+                                .get("worker_id")
+                                .expect("worker_id attribute")
+                                .clone(),
+                            attributes.get("event").expect("event attribute").clone(),
+                            point.value(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        label_events.sort();
+
+        assert_eq!(
+            label_events,
+            vec![
+                ("0".to_string(), "labeled".to_string(), 1),
+                ("1".to_string(), "unlabeled".to_string(), 1),
+                ("2".to_string(), "labeled".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_account_workers_do_not_record_startup_label_metrics_for_single_worker() {
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                exporter,
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability = GatewayObservability::new(Some(metrics.clone()), true);
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![GatewayRemoteWorkerConfig {
+                websocket_url: "ws://worker-b.invalid".to_string(),
+                auth_token: None,
+                account_id: None,
+            }],
+        };
+
+        record_remote_account_worker_label_metrics(&observability, &remote_runtime);
+
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let label_event_count = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == "gateway_remote_account_label_events")
+            .map(|metric| match metric.data() {
+                opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
+                    opentelemetry_sdk::metrics::data::MetricData::Sum(sum),
+                ) => sum.data_points().count(),
+                _ => 0,
+            })
+            .sum::<usize>();
+
+        assert_eq!(label_event_count, 0);
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    impl std::io::Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let buffer = Arc::new(StdMutex::new(Vec::new()));
+        let writer = SharedWriter {
+            buffer: buffer.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false),
+        );
+
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.lock().expect("log buffer lock").clone();
+        String::from_utf8(bytes).expect("logs should be valid UTF-8")
+    }
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     struct TurnStreamingCoverage {
@@ -1386,6 +1848,45 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "remote gateway runtime does not support `--exec-server-url`; configure execution on the remote app-server workers instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_runtime_rejects_blank_worker_websocket_url() {
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+
+        let result = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![GatewayRemoteWorkerConfig {
+                        websocket_url: "   ".to_string(),
+                        auth_token: None,
+                        account_id: None,
+                    }],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_server) => panic!("remote runtime should reject blank worker websocket URL"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "remote worker 0 websocket URL must not be blank"
         );
     }
 
@@ -30574,6 +31075,16 @@ stream_max_retries = 0
         let worker_b =
             start_mock_remote_multi_connection_thread_server("thread-worker-b", "/tmp/worker-b")
                 .await;
+        let expected_unlabeled_account_workers = vec![
+            GatewayRemoteUnlabeledAccountWorker {
+                worker_id: 0,
+                websocket_url: worker_a.clone(),
+            },
+            GatewayRemoteUnlabeledAccountWorker {
+                worker_id: 1,
+                websocket_url: worker_b.clone(),
+            },
+        ];
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -30630,6 +31141,13 @@ stream_max_retries = 0
         assert_eq!(
             health.v2_compatibility,
             GatewayV2CompatibilityMode::RemoteMultiWorker
+        );
+        assert_eq!(health.remote_account_labels_complete, Some(false));
+        assert_eq!(health.remote_unlabeled_account_worker_count, Some(2));
+        assert_eq!(health.remote_unlabeled_account_worker_ids, Some(vec![0, 1]));
+        assert_eq!(
+            health.remote_unlabeled_account_workers,
+            Some(expected_unlabeled_account_workers)
         );
         assert_eq!(health.v2_connections.active_connection_count, 1);
         assert_eq!(health.v2_connections.peak_active_connection_count, 1);

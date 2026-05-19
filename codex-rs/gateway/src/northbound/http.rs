@@ -252,6 +252,7 @@ mod tests {
     use crate::api::GatewayExecutionMode;
     use crate::api::GatewayHealthResponse;
     use crate::api::GatewayHealthStatus;
+    use crate::api::GatewayRemoteUnlabeledAccountWorker;
     use crate::api::GatewayRemoteWorkerHealth;
     use crate::api::GatewayThread;
     use crate::api::GatewayThreadActiveFlag;
@@ -296,6 +297,7 @@ mod tests {
         start_turn_error: Option<String>,
         interrupt_turn_error: Option<String>,
         resolve_server_request_error: Option<String>,
+        health_response: Option<GatewayHealthResponse>,
     }
 
     impl Default for FakeRuntime {
@@ -306,6 +308,7 @@ mod tests {
                 start_turn_error: None,
                 interrupt_turn_error: None,
                 resolve_server_request_error: None,
+                health_response: None,
             }
         }
     }
@@ -335,6 +338,15 @@ mod tests {
             last_account_capacity_event_project_id: None,
             last_account_capacity_event_reason: None,
             last_account_capacity_event_at: None,
+            worker_reconnect_event_counts: std::collections::BTreeMap::new(),
+            worker_reconnect_event_worker_counts: Vec::new(),
+            last_worker_reconnect_event: None,
+            last_worker_reconnect_event_worker_id: None,
+            last_worker_reconnect_event_at: None,
+            protocol_violation_counts: Vec::new(),
+            last_protocol_violation_phase: None,
+            last_protocol_violation_reason: None,
+            last_protocol_violation_at: None,
             peak_active_connection_count: 0,
             total_connection_count: 0,
             last_connection_started_at: None,
@@ -462,6 +474,10 @@ mod tests {
         }
 
         fn health(&self) -> GatewayHealthResponse {
+            if let Some(health_response) = &self.health_response {
+                return health_response.clone();
+            }
+
             GatewayHealthResponse {
                 status: GatewayHealthStatus::Ok,
                 runtime_mode: "embedded".to_string(),
@@ -480,6 +496,10 @@ mod tests {
                 pending_server_request_route_counts: Vec::new(),
                 pending_server_request_oldest_at: None,
                 remote_workers: None,
+                remote_account_labels_complete: None,
+                remote_unlabeled_account_worker_count: None,
+                remote_unlabeled_account_worker_ids: None,
+                remote_unlabeled_account_workers: None,
                 project_worker_routes: None,
             }
         }
@@ -521,7 +541,111 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionMaxPendingClientRequestCount":0,"activeConnectionPeakPendingClientRequestCount":0,"activeConnectionPendingClientRequestStartedAt":null,"activeConnectionPendingClientRequestWorkerCounts":[],"activeConnectionPendingClientRequestMethodCounts":[],"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"activeConnectionServerRequestBacklogCount":0,"activeConnectionMaxServerRequestBacklogCount":0,"activeConnectionPeakServerRequestBacklogCount":0,"activeConnectionServerRequestBacklogStartedAt":null,"activeConnectionServerRequestBacklogWorkerCounts":[],"activeConnectionServerRequestBacklogMethodCounts":[],"accountCapacityEventCounts":{},"accountCapacityEventWorkerCounts":[],"lastAccountCapacityEvent":null,"lastAccountCapacityEventWorkerId":null,"lastAccountCapacityEventTenantId":null,"lastAccountCapacityEventProjectId":null,"lastAccountCapacityEventReason":null,"lastAccountCapacityEventAt":null,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionMaxPendingClientRequestCount":0,"lastConnectionPendingClientRequestStartedAt":null,"lastConnectionPendingClientRequestWorkerCounts":[],"lastConnectionPendingClientRequestMethodCounts":[],"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0,"lastConnectionServerRequestBacklogCount":0,"lastConnectionMaxServerRequestBacklogCount":0,"lastConnectionServerRequestBacklogStartedAt":null,"lastConnectionServerRequestBacklogWorkerCounts":[],"lastConnectionServerRequestBacklogMethodCounts":[]},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":null,"projectWorkerRoutes":null}"#
+            r#"{"status":"ok","runtimeMode":"embedded","executionMode":"inProcess","v2Compatibility":"embedded","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionMaxPendingClientRequestCount":0,"activeConnectionPeakPendingClientRequestCount":0,"activeConnectionPendingClientRequestStartedAt":null,"activeConnectionPendingClientRequestWorkerCounts":[],"activeConnectionPendingClientRequestMethodCounts":[],"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"activeConnectionServerRequestBacklogCount":0,"activeConnectionMaxServerRequestBacklogCount":0,"activeConnectionPeakServerRequestBacklogCount":0,"activeConnectionServerRequestBacklogStartedAt":null,"activeConnectionServerRequestBacklogWorkerCounts":[],"activeConnectionServerRequestBacklogMethodCounts":[],"accountCapacityEventCounts":{},"accountCapacityEventWorkerCounts":[],"lastAccountCapacityEvent":null,"lastAccountCapacityEventWorkerId":null,"lastAccountCapacityEventTenantId":null,"lastAccountCapacityEventProjectId":null,"lastAccountCapacityEventReason":null,"lastAccountCapacityEventAt":null,"workerReconnectEventCounts":{},"workerReconnectEventWorkerCounts":[],"lastWorkerReconnectEvent":null,"lastWorkerReconnectEventWorkerId":null,"lastWorkerReconnectEventAt":null,"protocolViolationCounts":[],"lastProtocolViolationPhase":null,"lastProtocolViolationReason":null,"lastProtocolViolationAt":null,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionMaxPendingClientRequestCount":0,"lastConnectionPendingClientRequestStartedAt":null,"lastConnectionPendingClientRequestWorkerCounts":[],"lastConnectionPendingClientRequestMethodCounts":[],"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0,"lastConnectionServerRequestBacklogCount":0,"lastConnectionMaxServerRequestBacklogCount":0,"lastConnectionServerRequestBacklogStartedAt":null,"lastConnectionServerRequestBacklogWorkerCounts":[],"lastConnectionServerRequestBacklogMethodCounts":[]},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":null,"remoteAccountLabelsComplete":null,"remoteUnlabeledAccountWorkerCount":null,"remoteUnlabeledAccountWorkerIds":null,"remoteUnlabeledAccountWorkers":null,"projectWorkerRoutes":null}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn health_route_serializes_incomplete_remote_account_labels() {
+        let app = router(
+            Arc::new(FakeRuntime {
+                health_response: Some(GatewayHealthResponse {
+                    status: GatewayHealthStatus::Ok,
+                    runtime_mode: "remote".to_string(),
+                    execution_mode: GatewayExecutionMode::WorkerManaged,
+                    v2_compatibility: GatewayV2CompatibilityMode::RemoteMultiWorker,
+                    v2_transport: GatewayV2TransportConfig {
+                        initialize_timeout_seconds: 30,
+                        client_send_timeout_seconds: 10,
+                        reconnect_retry_backoff_seconds: 1,
+                        max_pending_server_requests: 64,
+                        max_pending_client_requests: 64,
+                    },
+                    v2_connections: default_v2_connections(),
+                    pending_server_request_count: 0,
+                    pending_server_request_kind_counts: std::collections::BTreeMap::new(),
+                    pending_server_request_route_counts: Vec::new(),
+                    pending_server_request_oldest_at: None,
+                    remote_workers: Some(vec![
+                        GatewayRemoteWorkerHealth {
+                            worker_id: 0,
+                            websocket_url: "ws://127.0.0.1:8081".to_string(),
+                            account_id: Some("acct-a".to_string()),
+                            account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                            account_capacity_reason: None,
+                            account_capacity_last_changed_at: None,
+                            healthy: true,
+                            reconnecting: false,
+                            reconnect_attempt_count: 0,
+                            last_error: None,
+                            last_state_change_at: Some(1710000000),
+                            last_error_at: None,
+                            next_reconnect_at: None,
+                            reconnect_backoff_remaining_seconds: None,
+                        },
+                        GatewayRemoteWorkerHealth {
+                            worker_id: 1,
+                            websocket_url: "ws://127.0.0.1:8082".to_string(),
+                            account_id: None,
+                            account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                            account_capacity_reason: None,
+                            account_capacity_last_changed_at: None,
+                            healthy: true,
+                            reconnecting: false,
+                            reconnect_attempt_count: 0,
+                            last_error: None,
+                            last_state_change_at: Some(1710000000),
+                            last_error_at: None,
+                            next_reconnect_at: None,
+                            reconnect_backoff_remaining_seconds: None,
+                        },
+                    ]),
+                    remote_account_labels_complete: Some(false),
+                    remote_unlabeled_account_worker_count: Some(1),
+                    remote_unlabeled_account_worker_ids: Some(vec![1]),
+                    remote_unlabeled_account_workers: Some(vec![
+                        GatewayRemoteUnlabeledAccountWorker {
+                            worker_id: 1,
+                            websocket_url: "ws://127.0.0.1:8082".to_string(),
+                        },
+                    ]),
+                    project_worker_routes: Some(Vec::new()),
+                }),
+                ..FakeRuntime::default()
+            }),
+            GatewayAuth::Disabled,
+            GatewayAdmissionController::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("health response should be JSON");
+        assert_eq!(body["remoteAccountLabelsComplete"], false);
+        assert_eq!(body["remoteUnlabeledAccountWorkerCount"], 1);
+        assert_eq!(
+            body["remoteUnlabeledAccountWorkerIds"],
+            serde_json::json!([1])
+        );
+        assert_eq!(
+            body["remoteUnlabeledAccountWorkers"],
+            serde_json::json!([{"workerId":1,"websocketUrl":"ws://127.0.0.1:8082"}])
+        );
+        assert_eq!(
+            body["remoteWorkers"][1]["accountId"],
+            serde_json::Value::Null
         );
     }
 
@@ -615,6 +739,10 @@ mod tests {
                         next_reconnect_at: Some(1710000002),
                         reconnect_backoff_remaining_seconds: Some(1),
                     }]),
+                    remote_account_labels_complete: Some(true),
+                    remote_unlabeled_account_worker_count: Some(0),
+                    remote_unlabeled_account_worker_ids: Some(Vec::new()),
+                    remote_unlabeled_account_workers: Some(Vec::new()),
                     project_worker_routes: Some(Vec::new()),
                 }
             }
@@ -655,7 +783,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionMaxPendingClientRequestCount":0,"activeConnectionPeakPendingClientRequestCount":0,"activeConnectionPendingClientRequestStartedAt":null,"activeConnectionPendingClientRequestWorkerCounts":[],"activeConnectionPendingClientRequestMethodCounts":[],"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"activeConnectionServerRequestBacklogCount":0,"activeConnectionMaxServerRequestBacklogCount":0,"activeConnectionPeakServerRequestBacklogCount":0,"activeConnectionServerRequestBacklogStartedAt":null,"activeConnectionServerRequestBacklogWorkerCounts":[],"activeConnectionServerRequestBacklogMethodCounts":[],"accountCapacityEventCounts":{},"accountCapacityEventWorkerCounts":[],"lastAccountCapacityEvent":null,"lastAccountCapacityEventWorkerId":null,"lastAccountCapacityEventTenantId":null,"lastAccountCapacityEventProjectId":null,"lastAccountCapacityEventReason":null,"lastAccountCapacityEventAt":null,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionMaxPendingClientRequestCount":0,"lastConnectionPendingClientRequestStartedAt":null,"lastConnectionPendingClientRequestWorkerCounts":[],"lastConnectionPendingClientRequestMethodCounts":[],"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0,"lastConnectionServerRequestBacklogCount":0,"lastConnectionMaxServerRequestBacklogCount":0,"lastConnectionServerRequestBacklogStartedAt":null,"lastConnectionServerRequestBacklogWorkerCounts":[],"lastConnectionServerRequestBacklogMethodCounts":[]},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002,"reconnectBackoffRemainingSeconds":1}],"projectWorkerRoutes":[]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":10,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionMaxPendingClientRequestCount":0,"activeConnectionPeakPendingClientRequestCount":0,"activeConnectionPendingClientRequestStartedAt":null,"activeConnectionPendingClientRequestWorkerCounts":[],"activeConnectionPendingClientRequestMethodCounts":[],"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"activeConnectionServerRequestBacklogCount":0,"activeConnectionMaxServerRequestBacklogCount":0,"activeConnectionPeakServerRequestBacklogCount":0,"activeConnectionServerRequestBacklogStartedAt":null,"activeConnectionServerRequestBacklogWorkerCounts":[],"activeConnectionServerRequestBacklogMethodCounts":[],"accountCapacityEventCounts":{},"accountCapacityEventWorkerCounts":[],"lastAccountCapacityEvent":null,"lastAccountCapacityEventWorkerId":null,"lastAccountCapacityEventTenantId":null,"lastAccountCapacityEventProjectId":null,"lastAccountCapacityEventReason":null,"lastAccountCapacityEventAt":null,"workerReconnectEventCounts":{},"workerReconnectEventWorkerCounts":[],"lastWorkerReconnectEvent":null,"lastWorkerReconnectEventWorkerId":null,"lastWorkerReconnectEventAt":null,"protocolViolationCounts":[],"lastProtocolViolationPhase":null,"lastProtocolViolationReason":null,"lastProtocolViolationAt":null,"peakActiveConnectionCount":0,"totalConnectionCount":0,"lastConnectionStartedAt":null,"lastConnectionCompletedAt":null,"lastConnectionDurationMs":null,"lastConnectionOutcome":null,"lastConnectionDetail":null,"lastConnectionPendingClientRequestCount":0,"lastConnectionMaxPendingClientRequestCount":0,"lastConnectionPendingClientRequestStartedAt":null,"lastConnectionPendingClientRequestWorkerCounts":[],"lastConnectionPendingClientRequestMethodCounts":[],"lastConnectionPendingServerRequestCount":0,"lastConnectionAnsweredButUnresolvedServerRequestCount":0,"lastConnectionServerRequestBacklogCount":0,"lastConnectionMaxServerRequestBacklogCount":0,"lastConnectionServerRequestBacklogStartedAt":null,"lastConnectionServerRequestBacklogWorkerCounts":[],"lastConnectionServerRequestBacklogMethodCounts":[]},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":false,"reconnecting":true,"reconnectAttemptCount":2,"lastError":"remote app server event stream ended","lastStateChangeAt":1710000000,"lastErrorAt":1710000001,"nextReconnectAt":1710000002,"reconnectBackoffRemainingSeconds":1}],"remoteAccountLabelsComplete":true,"remoteUnlabeledAccountWorkerCount":0,"remoteUnlabeledAccountWorkerIds":[],"remoteUnlabeledAccountWorkers":[],"projectWorkerRoutes":[]}"#
         );
     }
 
@@ -768,6 +896,30 @@ mod tests {
                                 .to_string(),
                         ),
                         last_account_capacity_event_at: Some(1710000002),
+                        worker_reconnect_event_counts: std::collections::BTreeMap::from([(
+                            "success".to_string(),
+                            2,
+                        )]),
+                        worker_reconnect_event_worker_counts: vec![
+                            crate::api::GatewayV2WorkerReconnectWorkerEventCounts {
+                                worker_id: 3,
+                                event_counts: std::collections::BTreeMap::from([(
+                                    "success".to_string(),
+                                    2,
+                                )]),
+                            },
+                        ],
+                        last_worker_reconnect_event: Some("success".to_string()),
+                        last_worker_reconnect_event_worker_id: Some(3),
+                        last_worker_reconnect_event_at: Some(1710000002),
+                        protocol_violation_counts: vec![crate::api::GatewayV2ProtocolViolationCounts {
+                            phase: "post_initialize".to_string(),
+                            reason: "invalid_jsonrpc".to_string(),
+                            count: 2,
+                        }],
+                        last_protocol_violation_phase: Some("post_initialize".to_string()),
+                        last_protocol_violation_reason: Some("invalid_jsonrpc".to_string()),
+                        last_protocol_violation_at: Some(1710000002),
                         peak_active_connection_count: 3,
                         total_connection_count: 7,
                         last_connection_started_at: Some(1710000001),
@@ -834,6 +986,10 @@ mod tests {
                         next_reconnect_at: None,
                         reconnect_backoff_remaining_seconds: None,
                     }]),
+                    remote_account_labels_complete: Some(true),
+                    remote_unlabeled_account_worker_count: Some(0),
+                    remote_unlabeled_account_worker_ids: Some(Vec::new()),
+                    remote_unlabeled_account_workers: Some(Vec::new()),
                     project_worker_routes: Some(Vec::new()),
                 }
             }
@@ -874,7 +1030,7 @@ mod tests {
             .expect("body");
         assert_eq!(
             String::from_utf8(body.to_vec()).expect("utf8"),
-            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionMaxPendingClientRequestCount":0,"activeConnectionPeakPendingClientRequestCount":0,"activeConnectionPendingClientRequestStartedAt":null,"activeConnectionPendingClientRequestWorkerCounts":[],"activeConnectionPendingClientRequestMethodCounts":[],"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"activeConnectionServerRequestBacklogCount":0,"activeConnectionMaxServerRequestBacklogCount":0,"activeConnectionPeakServerRequestBacklogCount":0,"activeConnectionServerRequestBacklogStartedAt":null,"activeConnectionServerRequestBacklogWorkerCounts":[],"activeConnectionServerRequestBacklogMethodCounts":[],"accountCapacityEventCounts":{"active_thread_handoff_failure":2},"accountCapacityEventWorkerCounts":[{"workerId":3,"eventCounts":{"active_thread_handoff_failure":2}}],"lastAccountCapacityEvent":"active_thread_handoff_failure","lastAccountCapacityEventWorkerId":3,"lastAccountCapacityEventTenantId":"tenant-a","lastAccountCapacityEventProjectId":"project-a","lastAccountCapacityEventReason":"thread thread-a is pinned to worker 3 with exhausted account capacity","lastAccountCapacityEventAt":1710000002,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionDurationMs":2500,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingClientRequestCount":4,"lastConnectionMaxPendingClientRequestCount":6,"lastConnectionPendingClientRequestStartedAt":1710000002,"lastConnectionPendingClientRequestWorkerCounts":[{"workerId":3,"pendingClientRequestCount":4}],"lastConnectionPendingClientRequestMethodCounts":[{"method":"command/exec","pendingClientRequestCount":4}],"lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1,"lastConnectionServerRequestBacklogCount":3,"lastConnectionMaxServerRequestBacklogCount":5,"lastConnectionServerRequestBacklogStartedAt":1710000002,"lastConnectionServerRequestBacklogWorkerCounts":[{"workerId":3,"pendingServerRequestCount":2,"answeredButUnresolvedServerRequestCount":1,"serverRequestBacklogCount":3}],"lastConnectionServerRequestBacklogMethodCounts":[{"method":"item/tool/requestUserInput","pendingServerRequestCount":2,"answeredButUnresolvedServerRequestCount":1,"serverRequestBacklogCount":3}]},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null,"reconnectBackoffRemainingSeconds":null}],"projectWorkerRoutes":[]}"#
+            r#"{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteSingleWorker","v2Transport":{"initializeTimeoutSeconds":30,"clientSendTimeoutSeconds":1,"reconnectRetryBackoffSeconds":1,"maxPendingServerRequests":64,"maxPendingClientRequests":64},"v2Connections":{"activeConnectionCount":0,"activeConnectionPendingClientRequestCount":0,"activeConnectionMaxPendingClientRequestCount":0,"activeConnectionPeakPendingClientRequestCount":0,"activeConnectionPendingClientRequestStartedAt":null,"activeConnectionPendingClientRequestWorkerCounts":[],"activeConnectionPendingClientRequestMethodCounts":[],"activeConnectionPendingServerRequestCount":0,"activeConnectionAnsweredButUnresolvedServerRequestCount":0,"activeConnectionServerRequestBacklogCount":0,"activeConnectionMaxServerRequestBacklogCount":0,"activeConnectionPeakServerRequestBacklogCount":0,"activeConnectionServerRequestBacklogStartedAt":null,"activeConnectionServerRequestBacklogWorkerCounts":[],"activeConnectionServerRequestBacklogMethodCounts":[],"accountCapacityEventCounts":{"active_thread_handoff_failure":2},"accountCapacityEventWorkerCounts":[{"workerId":3,"eventCounts":{"active_thread_handoff_failure":2}}],"lastAccountCapacityEvent":"active_thread_handoff_failure","lastAccountCapacityEventWorkerId":3,"lastAccountCapacityEventTenantId":"tenant-a","lastAccountCapacityEventProjectId":"project-a","lastAccountCapacityEventReason":"thread thread-a is pinned to worker 3 with exhausted account capacity","lastAccountCapacityEventAt":1710000002,"workerReconnectEventCounts":{"success":2},"workerReconnectEventWorkerCounts":[{"workerId":3,"eventCounts":{"success":2}}],"lastWorkerReconnectEvent":"success","lastWorkerReconnectEventWorkerId":3,"lastWorkerReconnectEventAt":1710000002,"protocolViolationCounts":[{"phase":"post_initialize","reason":"invalid_jsonrpc","count":2}],"lastProtocolViolationPhase":"post_initialize","lastProtocolViolationReason":"invalid_jsonrpc","lastProtocolViolationAt":1710000002,"peakActiveConnectionCount":3,"totalConnectionCount":7,"lastConnectionStartedAt":1710000001,"lastConnectionCompletedAt":1710000003,"lastConnectionDurationMs":2500,"lastConnectionOutcome":"client_send_timed_out","lastConnectionDetail":"gateway websocket send timed out","lastConnectionPendingClientRequestCount":4,"lastConnectionMaxPendingClientRequestCount":6,"lastConnectionPendingClientRequestStartedAt":1710000002,"lastConnectionPendingClientRequestWorkerCounts":[{"workerId":3,"pendingClientRequestCount":4}],"lastConnectionPendingClientRequestMethodCounts":[{"method":"command/exec","pendingClientRequestCount":4}],"lastConnectionPendingServerRequestCount":2,"lastConnectionAnsweredButUnresolvedServerRequestCount":1,"lastConnectionServerRequestBacklogCount":3,"lastConnectionMaxServerRequestBacklogCount":5,"lastConnectionServerRequestBacklogStartedAt":1710000002,"lastConnectionServerRequestBacklogWorkerCounts":[{"workerId":3,"pendingServerRequestCount":2,"answeredButUnresolvedServerRequestCount":1,"serverRequestBacklogCount":3}],"lastConnectionServerRequestBacklogMethodCounts":[{"method":"item/tool/requestUserInput","pendingServerRequestCount":2,"answeredButUnresolvedServerRequestCount":1,"serverRequestBacklogCount":3}]},"pendingServerRequestCount":0,"pendingServerRequestKindCounts":{},"pendingServerRequestRouteCounts":[],"pendingServerRequestOldestAt":null,"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:8081","accountId":null,"accountCapacity":"available","accountCapacityReason":null,"accountCapacityLastChangedAt":null,"healthy":true,"reconnecting":false,"reconnectAttemptCount":0,"lastError":null,"lastStateChangeAt":1710000000,"lastErrorAt":null,"nextReconnectAt":null,"reconnectBackoffRemainingSeconds":null}],"remoteAccountLabelsComplete":true,"remoteUnlabeledAccountWorkerCount":0,"remoteUnlabeledAccountWorkerIds":[],"remoteUnlabeledAccountWorkers":[],"projectWorkerRoutes":[]}"#
         );
     }
 
@@ -1296,6 +1452,10 @@ mod tests {
                     pending_server_request_route_counts: Vec::new(),
                     pending_server_request_oldest_at: None,
                     remote_workers: None,
+                    remote_account_labels_complete: None,
+                    remote_unlabeled_account_worker_count: None,
+                    remote_unlabeled_account_worker_ids: None,
+                    remote_unlabeled_account_workers: None,
                     project_worker_routes: None,
                 }
             }
@@ -1475,6 +1635,10 @@ mod tests {
                     pending_server_request_route_counts: Vec::new(),
                     pending_server_request_oldest_at: None,
                     remote_workers: Some(Vec::new()),
+                    remote_account_labels_complete: Some(true),
+                    remote_unlabeled_account_worker_count: Some(0),
+                    remote_unlabeled_account_worker_ids: Some(Vec::new()),
+                    remote_unlabeled_account_workers: Some(Vec::new()),
                     project_worker_routes: Some(Vec::new()),
                 }
             }

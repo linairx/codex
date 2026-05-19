@@ -135,6 +135,15 @@ pub struct GatewayV2ConnectionHealth {
     pub last_account_capacity_event_project_id: Option<String>,
     pub last_account_capacity_event_reason: Option<String>,
     pub last_account_capacity_event_at: Option<i64>,
+    pub worker_reconnect_event_counts: BTreeMap<String, usize>,
+    pub worker_reconnect_event_worker_counts: Vec<GatewayV2WorkerReconnectWorkerEventCounts>,
+    pub last_worker_reconnect_event: Option<String>,
+    pub last_worker_reconnect_event_worker_id: Option<usize>,
+    pub last_worker_reconnect_event_at: Option<i64>,
+    pub protocol_violation_counts: Vec<GatewayV2ProtocolViolationCounts>,
+    pub last_protocol_violation_phase: Option<String>,
+    pub last_protocol_violation_reason: Option<String>,
+    pub last_protocol_violation_at: Option<i64>,
     pub peak_active_connection_count: usize,
     pub total_connection_count: u64,
     pub last_connection_started_at: Option<i64>,
@@ -183,6 +192,21 @@ pub struct GatewayV2AccountCapacityWorkerEventCounts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayV2WorkerReconnectWorkerEventCounts {
+    pub worker_id: usize,
+    pub event_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ProtocolViolationCounts {
+    pub phase: String,
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayV2ServerRequestBacklogWorkerCounts {
     pub worker_id: Option<usize>,
     pub pending_server_request_count: usize,
@@ -213,7 +237,18 @@ pub struct GatewayHealthResponse {
     pub pending_server_request_route_counts: Vec<GatewayPendingServerRequestRouteCounts>,
     pub pending_server_request_oldest_at: Option<i64>,
     pub remote_workers: Option<Vec<GatewayRemoteWorkerHealth>>,
+    pub remote_account_labels_complete: Option<bool>,
+    pub remote_unlabeled_account_worker_count: Option<usize>,
+    pub remote_unlabeled_account_worker_ids: Option<Vec<usize>>,
+    pub remote_unlabeled_account_workers: Option<Vec<GatewayRemoteUnlabeledAccountWorker>>,
     pub project_worker_routes: Option<Vec<GatewayProjectWorkerRoute>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRemoteUnlabeledAccountWorker {
+    pub worker_id: usize,
+    pub websocket_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3256,13 +3256,32 @@ When `--bearer-token` is configured, clients must use the same Bearer token
 for the v2 WebSocket upgrade and `/v1/*` HTTP routes. When
 `--remote-auth-token` is configured, the gateway uses that token for every
 configured remote worker connection. If any `--remote-account-id` is provided,
-provide exactly one account id for each `--remote-websocket-url`.
+provide exactly one non-blank account id for each non-blank
+`--remote-websocket-url`.
 
 Account-aware multi-worker guardrails:
 
 - configure `--remote-account-id` for every worker before validating
   account-aware routing, otherwise project distribution and account-capacity
-  diagnostics cannot identify account-backed routes
+  diagnostics cannot identify account-backed routes; remote multi-worker
+  CLI startup rejects blank account ids, and programmatic remote multi-worker
+  startup emits a warning with unlabeled worker ids and WebSocket URLs when any
+  worker is missing that label or has only a blank label. Blank remote worker
+  WebSocket URLs are rejected before remote runtime startup for both CLI and
+  programmatic gateway configuration paths. The normal remote startup log also
+  includes `remote_account_labels_complete` and
+  `remote_unlabeled_account_worker_count`, while `/healthz` reports
+  `remoteAccountLabelsComplete`,
+  `remoteUnlabeledAccountWorkerCount`,
+  `remoteUnlabeledAccountWorkerIds`, and
+  `remoteUnlabeledAccountWorkers` for remote runtimes so the same guardrail is
+  visible in rollout health snapshots without reconstructing affected
+  downstream routes from separate fields. Startup also records
+  `gateway_remote_account_label_events{event="labeled",worker_id=...}` or
+  `gateway_remote_account_label_events{event="unlabeled",worker_id=...}` for
+  every worker in a multi-worker pool, so dashboards can alert on incomplete
+  account labels and distinguish a fully labeled pool from missing metric data
+  without scraping logs or polling `/healthz`.
 - use same-project `thread/start` traffic to confirm cache affinity, and
   different-project `thread/start` traffic to confirm eligible accounts are
   distributed instead of concentrating unrelated projects on one account
@@ -3320,10 +3339,17 @@ Suggested validation checklist before widening traffic:
    `gateway_v2_upstream_request_failures`,
    `gateway_v2_downstream_backpressure_events`, and
    `gateway_v2_client_send_timeouts`. Reconnect attempt/success/failure counts
-   should match the worker-health changes visible in `/healthz`, fail-closed
+   should match the worker-health changes visible in `/healthz` and the
+   `v2Connections.workerReconnectEventCounts` /
+   `v2Connections.workerReconnectEventWorkerCounts` health fields, fail-closed
    counts should correspond to intentional degraded-session protection, and
    timeout/backpressure counters should stay at zero unless the validation
    deliberately uses a slow client or lagging downstream worker.
+   Protocol-violation counters should match
+   `v2Connections.protocolViolationCounts`,
+   `lastProtocolViolationPhase`, `lastProtocolViolationReason`, and
+   `lastProtocolViolationAt` so malformed client traffic and downstream
+   protocol regressions are visible in health snapshots as well as metrics.
 8. For account-backed multi-worker validation, induce one quota-like worker
    failure and verify `gateway_v2_account_capacity_events`,
    `/v1/events`, and `/healthz.v2Connections` agree on the exhausted worker,

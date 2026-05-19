@@ -1,5 +1,6 @@
 use crate::api::GatewayAccountCapacityStatus;
 use crate::api::GatewayRemoteWorkerHealth;
+use crate::config::normalize_remote_account_id;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
@@ -44,7 +45,7 @@ impl RemoteWorkerHealthRegistry {
                     .into_iter()
                     .map(|(websocket_url, account_id)| RemoteWorkerHealthState {
                         websocket_url,
-                        account_id,
+                        account_id: normalize_remote_account_id(account_id),
                         account_capacity: GatewayAccountCapacityStatus::Available,
                         account_capacity_reason: None,
                         account_capacity_last_changed_at: None,
@@ -294,6 +295,24 @@ mod tests {
         assert_eq!(snapshot[1].last_error_at.is_some(), true);
         assert_eq!(snapshot[1].next_reconnect_at, None);
         assert_eq!(snapshot[1].reconnect_backoff_remaining_seconds, None);
+    }
+
+    #[test]
+    fn worker_account_labels_are_normalized() {
+        let registry = RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("  acct-a  ".to_string()),
+            ),
+            ("ws://127.0.0.1:8082".to_string(), Some("   ".to_string())),
+        ]);
+
+        let snapshot = registry.snapshot();
+
+        assert_eq!(registry.account_id(0), Some("acct-a".to_string()));
+        assert_eq!(registry.account_id(1), None);
+        assert_eq!(snapshot[0].account_id, Some("acct-a".to_string()));
+        assert_eq!(snapshot[1].account_id, None);
     }
 
     #[test]
