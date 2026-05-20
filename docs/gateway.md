@@ -2827,6 +2827,15 @@ Phase 6 is in progress with:
   `item/mcpToolCall/progress`, `thread/compacted`, `model/rerouted`, and
   `rawResponseItem/completed`, so the release-quality remote baseline covers
   those forwarding paths through an unmodified `RemoteAppServerClient` session
+- the real embedded turn workflow harness now also observes
+  `item/reasoning/summaryPartAdded` from Responses summary-part events and
+  `thread/tokenUsage/updated` after a token-bearing Responses completion, so
+  those low-frequency notification forwarding paths are pinned through the
+  in-process release-quality baseline rather than only through remote or
+  targeted notification coverage
+- the real embedded plan-mode harness now also observes `item/plan/delta`
+  before the proposed-plan item completes, so streamed plan text is pinned
+  through the in-process release-quality baseline as well
 - the real multi-worker same-session bootstrap recovery harness now also
   observes `account/updated`, `account/rateLimits/updated`,
   `app/list/updated`, `warning`, `configWarning`, `deprecationNotice`, and
@@ -3031,18 +3040,132 @@ Phase 6 is in progress with:
   while the next prompt class is pending, and now checks the completed
   connection's last-backlog health snapshot so active and terminal rollout
   evidence stay aligned for all four prompt families
+- v2 worker-loss cleanup now also publishes a `/v1/events` operator event as
+  `gateway/v2ServerRequestCleanup` whenever cleanup resolves thread-scoped
+  prompts or finds stranded connection-scoped prompts, carrying the affected
+  worker route, remaining worker count, disconnect message, prompt counts,
+  prompt method families, resolved thread ids, and the gateway / downstream
+  server-request ids for the cleaned-up prompts; rollout evidence for pending
+  server-request cleanup can now be collected from the event stream in addition
+  to lifecycle metrics, health snapshots, and structured logs, and real
+  northbound WebSocket regressions now pin that event payload for both a
+  direct cleanup helper plus the pending and answered-but-unresolved
+  worker-loss paths that strand connection-scoped prompts; the cleanup log and
+  operator event are emitted as soon as the gateway removes the affected
+  routes, before synthesized `serverRequest/resolved` notifications are sent
+  to the northbound client, so a later slow-client send failure does not hide
+  the cleanup from `/v1/events`
 - the v2 rollout guidance now also includes concrete startup examples for the
   embedded baseline, single-worker remote baseline, and account-labeled
   multi-worker Stage B validation profile, including the auth and
   `--remote-account-id` constraints operators must satisfy before collecting
   promotion evidence
 - `/healthz.v2Connections` now also reports v2 protocol-violation health as
-  `protocolViolationCounts`, `lastProtocolViolationPhase`,
-  `lastProtocolViolationReason`, and `lastProtocolViolationAt`, mirroring
-  `gateway_v2_protocol_violations{phase,reason}` so rollout evidence can
-  identify malformed pre-initialize traffic, post-initialize client protocol
-  violations, and downstream app-server protocol regressions from health
-  snapshots without relying only on metrics export
+  `protocolViolationCounts`, `protocolViolationWorkerCounts`,
+  `lastProtocolViolationPhase`, `lastProtocolViolationReason`,
+  `lastProtocolViolationWorkerId`, and `lastProtocolViolationAt`, mirroring
+  `gateway_v2_protocol_violations{phase,reason}` while adding the affected
+  downstream worker split for rollout evidence, so operators can identify
+  malformed pre-initialize traffic, post-initialize client protocol
+  violations, and worker-specific downstream app-server protocol regressions
+  from health snapshots without relying only on metrics export or logs
+- `/healthz.v2Connections` now also mirrors v2 fail-closed route protection as
+  `failClosedRequestCounts`, `lastFailClosedRequestMethod`,
+  `lastFailClosedRequestReconnectBackoffActive`, and
+  `lastFailClosedRequestAt`, so degraded multi-worker rollout evidence can
+  reconcile `gateway_v2_fail_closed_requests{method,reconnect_backoff_active}`
+  with health snapshots when required worker routes are unavailable
+- `/healthz.v2Connections` now also mirrors v2 request outcomes as
+  `requestCounts`, `lastRequestMethod`, `lastRequestOutcome`,
+  `lastRequestDurationMs`, `maxRequestDurationMs`, and `lastRequestAt`, so
+  rollout evidence can reconcile ordinary success, policy, quota,
+  protocol-violation, and internal-error request counts with
+  `gateway_v2_requests{method,outcome}`, and compare the latest / largest
+  observed gateway request latency with `gateway_v2_request_duration` when
+  operators need a health-only latency sanity check
+- `/healthz.v2Connections` now also mirrors completed v2 connection outcomes
+  as `connectionOutcomeCounts` and tracks `maxConnectionDurationMs`, so
+  rollout evidence can reconcile `gateway_v2_connections{outcome}` and
+  `gateway_v2_connection_duration` with the same health snapshot that already
+  carries the latest connection outcome, detail, duration, and pending
+  request/backlog counts
+- the real embedded and remote v2 healthz regressions now also pin
+  `connectionOutcomeCounts` and `maxConnectionDurationMs` on actual
+  connection teardown paths: normal client shutdown records the
+  `client_closed` outcome in embedded, single-worker remote, and multi-worker
+  remote modes, and the real single-worker slow-client timeout harness records
+  the `client_send_timed_out` outcome alongside the gateway-owned timeout
+  detail and terminal server-request backlog
+- `/healthz.v2Connections` now also mirrors v2 request rejection diagnostics as
+  `clientRequestRejectionCounts`, `lastClientRequestRejectionMethod`,
+  `lastClientRequestRejectionReason`, `lastClientRequestRejectionAt`,
+  `serverRequestRejectionCounts`, `lastServerRequestRejectionMethod`,
+  `lastServerRequestRejectionReason`, and `lastServerRequestRejectionAt`, so
+  overload, pending-limit, and scope-policy rejections can be reconciled with
+  `gateway_v2_client_request_rejections{method,reason}` and
+  `gateway_v2_server_request_rejections{method,reason}` from the same health
+  snapshot used for fail-closed and transport-pressure rollout evidence
+- `/healthz.v2Connections` now also mirrors v2 upstream request failures as
+  `upstreamRequestFailureCounts`, `lastUpstreamRequestFailureMethod`,
+  `lastUpstreamRequestFailureReconnectBackoffActive`, and
+  `lastUpstreamRequestFailureAt`, so operators can correlate
+  `gateway_v2_upstream_request_failures{method,reconnect_backoff_active}`
+  with the same health snapshot used to diagnose degraded-route protection
+- `/healthz.v2Connections` now also mirrors v2 transport pressure as
+  `downstreamBackpressureCounts`, `lastDownstreamBackpressureWorkerId`,
+  `lastDownstreamBackpressureAt`, `clientSendTimeoutCount`, and
+  `lastClientSendTimeoutAt`, so rollout evidence can line up
+  `gateway_v2_downstream_backpressure_events{worker_id}` and
+  `gateway_v2_client_send_timeouts` with the terminal connection outcome
+  fields in the same health response
+- `/healthz.v2Connections` now also mirrors v2 multi-worker thread routing
+  diagnostics as `threadListDeduplicationCounts`,
+  `lastThreadListDeduplicationSelectedWorkerId`,
+  `lastThreadListDeduplicationAt`, `threadRouteRecoveryCounts`,
+  `lastThreadRouteRecoveryOutcome`, `lastThreadRouteRecoveryAt`,
+  `degradedThreadDiscoveryCounts`, `lastDegradedThreadDiscoveryMethod`,
+  `lastDegradedThreadDiscoveryReconnectBackoffActive`, and
+  `lastDegradedThreadDiscoveryAt`, so rollout snapshots can explain duplicate
+  thread-list selection, lazy route recovery, and intentionally degraded
+  visible-thread discovery without relying only on metrics export or logs
+- `/healthz.v2Connections` now also mirrors v2 suppressed notifications as
+  `suppressedNotificationCounts`, `lastSuppressedNotificationMethod`,
+  `lastSuppressedNotificationReason`, and `lastSuppressedNotificationAt`, so
+  duplicate notification suppression, pending-refresh suppression, client
+  opt-out drops, and hidden-thread notification drops can be reconciled with
+  `gateway_v2_suppressed_notifications` from health snapshots as well as
+  metrics and logs
+- `/healthz.v2Connections` now also mirrors v2 notification fan-in delivery as
+  `forwardedNotificationCounts`, `lastForwardedNotificationMethod`,
+  `lastForwardedNotificationAt`, `notificationSendFailureCounts`,
+  `lastNotificationSendFailureMethod`, `lastNotificationSendFailureOutcome`,
+  and `lastNotificationSendFailureAt`, so operators can reconcile
+  `gateway_v2_forwarded_notifications` and
+  `gateway_v2_notification_send_failures` with the same health snapshot used
+  to diagnose suppressed notifications and slow-client delivery failures
+- `/healthz.v2Connections` now also mirrors v2 transport and server-request
+  delivery failures as `clientResponseSendFailureCounts`,
+  `downstreamShutdownFailureCounts`, `closeFrameSendFailureCounts`,
+  `serverRequestForwardSendFailureCounts`,
+  `serverRequestAnswerDeliveryFailureCounts`, and
+  `serverRequestRejectionDeliveryFailureCounts`, plus corresponding `last*`
+  fields, so slow-client response writes, failed close frames, downstream
+  shutdown failures, and partially completed prompt delivery failures can be
+  reconciled with their metrics without relying only on logs
+- `/healthz.v2Connections` now also mirrors the broader v2 server-request
+  lifecycle stream as `serverRequestLifecycleEventCounts`,
+  `lastServerRequestLifecycleEvent`, `lastServerRequestLifecycleMethod`, and
+  `lastServerRequestLifecycleAt`, so forwarded, answered, delivered, resolved,
+  rejected, duplicate, cleanup, and delivery-failed prompt stages can be
+  reconciled with `gateway_v2_server_request_lifecycle_events` from the same
+  rollout health snapshot
+- the HTTP `/healthz` regression suite now also serializes a non-empty
+  `v2Connections` rollout snapshot containing connection outcomes, request
+  outcomes, request rejections, fail-closed routes, upstream failures,
+  transport pressure, routing diagnostics, notification delivery,
+  server-request delivery failures, lifecycle events, and worker-specific
+  protocol violations, so the new operator fields are covered at the
+  northbound API boundary rather than only in the in-memory health registry
 
 The remaining Phase 6 work is:
 

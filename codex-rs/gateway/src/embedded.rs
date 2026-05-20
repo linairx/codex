@@ -958,6 +958,7 @@ mod tests {
     use crate::api::GatewayHealthStatus;
     use crate::api::GatewayRemoteUnlabeledAccountWorker;
     use crate::api::GatewayV2CompatibilityMode;
+    use crate::api::GatewayV2ConnectionOutcomeCounts;
     use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
     use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
     use crate::api::ListThreadsResponse;
@@ -5025,6 +5026,10 @@ stream_max_retries = 0
             responses::ev_response_created("resp-1"),
             responses::ev_message_item_added("msg-1", ""),
             responses::ev_reasoning_item_added("reasoning-1", &[""]),
+            serde_json::json!({
+                "type": "response.reasoning_summary_part.added",
+                "summary_index": 0,
+            }),
             responses::ev_output_text_delta("Done"),
             responses::ev_reasoning_summary_text_delta("embedded summary"),
             responses::ev_reasoning_text_delta("embedded reasoning"),
@@ -5034,7 +5039,7 @@ stream_max_retries = 0
                 &["embedded summary"],
                 &["embedded reasoning"],
             ),
-            responses::ev_completed("resp-1"),
+            responses::ev_completed_with_tokens("resp-1", /*total_tokens*/ 42),
         ])])
         .await;
         let codex_home = tempdir().expect("tempdir");
@@ -5132,8 +5137,10 @@ stream_max_retries = 0
         let mut saw_turn_started = false;
         let mut saw_item_started = false;
         let mut saw_agent_delta = false;
+        let mut saw_reasoning_summary_part_added = false;
         let mut saw_reasoning_summary_delta = false;
         let mut saw_reasoning_text_delta = false;
+        let mut saw_thread_token_usage = false;
         let mut saw_item_completed = false;
         let mut saw_turn_completed = false;
 
@@ -5142,8 +5149,10 @@ stream_max_retries = 0
                 && saw_turn_started
                 && saw_item_started
                 && saw_agent_delta
+                && saw_reasoning_summary_part_added
                 && saw_reasoning_summary_delta
                 && saw_reasoning_text_delta
+                && saw_thread_token_usage
                 && saw_item_completed
                 && saw_turn_completed)
             {
@@ -5196,6 +5205,17 @@ stream_max_retries = 0
                         }
                     }
                     AppServerEvent::ServerNotification(
+                        ServerNotification::ReasoningSummaryPartAdded(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && notification.item_id == "reasoning-1"
+                            && notification.summary_index == 0
+                        {
+                            saw_reasoning_summary_part_added = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryTextDelta(notification),
                     ) => {
                         if notification.thread_id == started.thread.id
@@ -5215,6 +5235,17 @@ stream_max_retries = 0
                             && notification.content_index == 0
                         {
                             saw_reasoning_text_delta = true;
+                        }
+                    }
+                    AppServerEvent::ServerNotification(
+                        ServerNotification::ThreadTokenUsageUpdated(notification),
+                    ) => {
+                        if notification.thread_id == started.thread.id
+                            && notification.turn_id == turn_id
+                            && notification.token_usage.total.total_tokens == 42
+                            && notification.token_usage.last.total_tokens == 42
+                        {
+                            saw_thread_token_usage = true;
                         }
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
@@ -5381,11 +5412,13 @@ stream_max_retries = 0
         let turn_id = turn_started_response.turn.id.clone();
         let expected_plan_item_id = format!("{turn_id}-plan");
         let mut saw_plan_started = false;
+        let mut saw_plan_delta = false;
         let mut saw_plan_completed = false;
         let mut saw_turn_completed = false;
 
         timeout(Duration::from_secs(10), async {
-            while !(saw_plan_started && saw_plan_completed && saw_turn_completed) {
+            while !(saw_plan_started && saw_plan_delta && saw_plan_completed && saw_turn_completed)
+            {
                 let event = client
                     .next_event()
                     .await
@@ -5402,6 +5435,15 @@ stream_max_retries = 0
                         ) =>
                     {
                         saw_plan_started = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::PlanDelta(
+                        notification,
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && notification.item_id == expected_plan_item_id
+                        && notification.delta == "- Step 1\n" =>
+                    {
+                        saw_plan_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
@@ -5424,6 +5466,10 @@ stream_max_retries = 0
                         assert_eq!(
                             saw_plan_started, true,
                             "plan item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_plan_delta, true,
+                            "plan delta should arrive before turn completion"
                         );
                         assert_eq!(
                             saw_plan_completed, true,
@@ -30140,7 +30186,9 @@ stream_max_retries = 0
         assert_eq!(health.v2_connections.last_connection_started_at, None);
         assert_eq!(health.v2_connections.last_connection_completed_at, None);
         assert_eq!(health.v2_connections.last_connection_duration_ms, None);
+        assert_eq!(health.v2_connections.max_connection_duration_ms, None);
         assert_eq!(health.v2_connections.last_connection_outcome, None);
+        assert_eq!(health.v2_connections.connection_outcome_counts, vec![]);
         assert_eq!(health.v2_connections.last_connection_detail, None);
         assert_eq!(
             health
@@ -30210,7 +30258,9 @@ stream_max_retries = 0
         );
         assert_eq!(health.v2_connections.last_connection_completed_at, None);
         assert_eq!(health.v2_connections.last_connection_duration_ms, None);
+        assert_eq!(health.v2_connections.max_connection_duration_ms, None);
         assert_eq!(health.v2_connections.last_connection_outcome, None);
+        assert_eq!(health.v2_connections.connection_outcome_counts, vec![]);
 
         assert_remote_client_shutdown(connection.shutdown().await);
 
@@ -30262,6 +30312,17 @@ stream_max_retries = 0
                 .last_connection_duration_ms
                 .is_some(),
             true
+        );
+        assert_eq!(
+            settled_health.v2_connections.max_connection_duration_ms,
+            settled_health.v2_connections.last_connection_duration_ms
+        );
+        assert_eq!(
+            settled_health.v2_connections.connection_outcome_counts,
+            vec![GatewayV2ConnectionOutcomeCounts {
+                outcome: "client_closed".to_string(),
+                count: 1,
+            }]
         );
 
         server.shutdown().await.expect("shutdown");
@@ -31586,6 +31647,13 @@ stream_max_retries = 0
             Some("client_send_timed_out".to_string())
         );
         assert_eq!(
+            settled_health.v2_connections.connection_outcome_counts,
+            vec![GatewayV2ConnectionOutcomeCounts {
+                outcome: "client_send_timed_out".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
             settled_health.v2_connections.peak_active_connection_count,
             1
         );
@@ -31600,6 +31668,17 @@ stream_max_retries = 0
         assert_eq!(
             settled_health.v2_connections.last_connection_detail,
             Some("gateway websocket send timed out".to_string())
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_duration_ms
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health.v2_connections.max_connection_duration_ms,
+            settled_health.v2_connections.last_connection_duration_ms
         );
         assert_eq!(
             settled_health

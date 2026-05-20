@@ -105,7 +105,7 @@ pub struct GatewayV2TransportConfig {
     pub max_pending_client_requests: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayV2ConnectionHealth {
     pub active_connection_count: usize,
@@ -140,15 +140,95 @@ pub struct GatewayV2ConnectionHealth {
     pub last_worker_reconnect_event: Option<String>,
     pub last_worker_reconnect_event_worker_id: Option<usize>,
     pub last_worker_reconnect_event_at: Option<i64>,
+    pub request_counts: Vec<GatewayV2RequestCounts>,
+    pub last_request_method: Option<String>,
+    pub last_request_outcome: Option<String>,
+    pub last_request_duration_ms: Option<u64>,
+    pub max_request_duration_ms: Option<u64>,
+    pub last_request_at: Option<i64>,
+    pub client_request_rejection_counts: Vec<GatewayV2ClientRequestRejectionCounts>,
+    pub last_client_request_rejection_method: Option<String>,
+    pub last_client_request_rejection_reason: Option<String>,
+    pub last_client_request_rejection_at: Option<i64>,
+    pub server_request_rejection_counts: Vec<GatewayV2ServerRequestRejectionCounts>,
+    pub last_server_request_rejection_method: Option<String>,
+    pub last_server_request_rejection_reason: Option<String>,
+    pub last_server_request_rejection_at: Option<i64>,
+    pub server_request_lifecycle_event_counts: Vec<GatewayV2ServerRequestLifecycleEventCounts>,
+    pub last_server_request_lifecycle_event: Option<String>,
+    pub last_server_request_lifecycle_method: Option<String>,
+    pub last_server_request_lifecycle_at: Option<i64>,
+    pub fail_closed_request_counts: Vec<GatewayV2FailClosedRequestCounts>,
+    pub last_fail_closed_request_method: Option<String>,
+    pub last_fail_closed_request_reconnect_backoff_active: Option<bool>,
+    pub last_fail_closed_request_at: Option<i64>,
+    pub upstream_request_failure_counts: Vec<GatewayV2UpstreamRequestFailureCounts>,
+    pub last_upstream_request_failure_method: Option<String>,
+    pub last_upstream_request_failure_reconnect_backoff_active: Option<bool>,
+    pub last_upstream_request_failure_at: Option<i64>,
+    pub downstream_backpressure_counts: Vec<GatewayV2DownstreamBackpressureCounts>,
+    pub last_downstream_backpressure_worker_id: Option<usize>,
+    pub last_downstream_backpressure_at: Option<i64>,
+    pub client_send_timeout_count: usize,
+    pub last_client_send_timeout_at: Option<i64>,
+    pub thread_list_deduplication_counts: Vec<GatewayV2ThreadListDeduplicationCounts>,
+    pub last_thread_list_deduplication_selected_worker_id: Option<usize>,
+    pub last_thread_list_deduplication_at: Option<i64>,
+    pub thread_route_recovery_counts: Vec<GatewayV2ThreadRouteRecoveryCounts>,
+    pub last_thread_route_recovery_outcome: Option<String>,
+    pub last_thread_route_recovery_at: Option<i64>,
+    pub degraded_thread_discovery_counts: Vec<GatewayV2DegradedThreadDiscoveryCounts>,
+    pub last_degraded_thread_discovery_method: Option<String>,
+    pub last_degraded_thread_discovery_reconnect_backoff_active: Option<bool>,
+    pub last_degraded_thread_discovery_at: Option<i64>,
+    pub forwarded_notification_counts: Vec<GatewayV2ForwardedNotificationCounts>,
+    pub last_forwarded_notification_method: Option<String>,
+    pub last_forwarded_notification_at: Option<i64>,
+    pub notification_send_failure_counts: Vec<GatewayV2NotificationSendFailureCounts>,
+    pub last_notification_send_failure_method: Option<String>,
+    pub last_notification_send_failure_outcome: Option<String>,
+    pub last_notification_send_failure_at: Option<i64>,
+    pub client_response_send_failure_counts: Vec<GatewayV2ClientResponseSendFailureCounts>,
+    pub last_client_response_send_failure_method: Option<String>,
+    pub last_client_response_send_failure_outcome: Option<String>,
+    pub last_client_response_send_failure_at: Option<i64>,
+    pub downstream_shutdown_failure_counts: Vec<GatewayV2DownstreamShutdownFailureCounts>,
+    pub last_downstream_shutdown_failure_outcome: Option<String>,
+    pub last_downstream_shutdown_failure_at: Option<i64>,
+    pub close_frame_send_failure_counts: Vec<GatewayV2CloseFrameSendFailureCounts>,
+    pub last_close_frame_send_failure_code: Option<u16>,
+    pub last_close_frame_send_failure_outcome: Option<String>,
+    pub last_close_frame_send_failure_at: Option<i64>,
+    pub server_request_forward_send_failure_counts:
+        Vec<GatewayV2ServerRequestForwardSendFailureCounts>,
+    pub last_server_request_forward_send_failure_method: Option<String>,
+    pub last_server_request_forward_send_failure_outcome: Option<String>,
+    pub last_server_request_forward_send_failure_at: Option<i64>,
+    pub server_request_answer_delivery_failure_counts:
+        Vec<GatewayV2ServerRequestAnswerDeliveryFailureCounts>,
+    pub last_server_request_answer_delivery_failure_response_kind: Option<String>,
+    pub last_server_request_answer_delivery_failure_at: Option<i64>,
+    pub server_request_rejection_delivery_failure_counts:
+        Vec<GatewayV2ServerRequestRejectionDeliveryFailureCounts>,
+    pub last_server_request_rejection_delivery_failure_method: Option<String>,
+    pub last_server_request_rejection_delivery_failure_at: Option<i64>,
+    pub suppressed_notification_counts: Vec<GatewayV2SuppressedNotificationCounts>,
+    pub last_suppressed_notification_method: Option<String>,
+    pub last_suppressed_notification_reason: Option<String>,
+    pub last_suppressed_notification_at: Option<i64>,
     pub protocol_violation_counts: Vec<GatewayV2ProtocolViolationCounts>,
+    pub protocol_violation_worker_counts: Vec<GatewayV2ProtocolViolationWorkerCounts>,
     pub last_protocol_violation_phase: Option<String>,
     pub last_protocol_violation_reason: Option<String>,
+    pub last_protocol_violation_worker_id: Option<usize>,
     pub last_protocol_violation_at: Option<i64>,
+    pub connection_outcome_counts: Vec<GatewayV2ConnectionOutcomeCounts>,
     pub peak_active_connection_count: usize,
     pub total_connection_count: u64,
     pub last_connection_started_at: Option<i64>,
     pub last_connection_completed_at: Option<i64>,
     pub last_connection_duration_ms: Option<u64>,
+    pub max_connection_duration_ms: Option<u64>,
     pub last_connection_outcome: Option<String>,
     pub last_connection_detail: Option<String>,
     pub last_connection_pending_client_request_count: usize,
@@ -199,9 +279,168 @@ pub struct GatewayV2WorkerReconnectWorkerEventCounts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayV2RequestCounts {
+    pub method: String,
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ClientRequestRejectionCounts {
+    pub method: String,
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ServerRequestRejectionCounts {
+    pub method: String,
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ServerRequestLifecycleEventCounts {
+    pub event: String,
+    pub method: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2FailClosedRequestCounts {
+    pub method: String,
+    pub reconnect_backoff_active: bool,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2UpstreamRequestFailureCounts {
+    pub method: String,
+    pub reconnect_backoff_active: bool,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2DownstreamBackpressureCounts {
+    pub worker_id: Option<usize>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ThreadListDeduplicationCounts {
+    pub selected_worker_id: Option<usize>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ThreadRouteRecoveryCounts {
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2DegradedThreadDiscoveryCounts {
+    pub method: String,
+    pub reconnect_backoff_active: bool,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2SuppressedNotificationCounts {
+    pub method: String,
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ForwardedNotificationCounts {
+    pub method: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2NotificationSendFailureCounts {
+    pub method: String,
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ClientResponseSendFailureCounts {
+    pub method: String,
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2DownstreamShutdownFailureCounts {
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2CloseFrameSendFailureCounts {
+    pub code: u16,
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ServerRequestForwardSendFailureCounts {
+    pub method: String,
+    pub outcome: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ServerRequestAnswerDeliveryFailureCounts {
+    pub response_kind: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ServerRequestRejectionDeliveryFailureCounts {
+    pub method: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayV2ProtocolViolationCounts {
     pub phase: String,
     pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ProtocolViolationWorkerCounts {
+    pub worker_id: usize,
+    pub violation_counts: Vec<GatewayV2ProtocolViolationCounts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ConnectionOutcomeCounts {
+    pub outcome: String,
     pub count: usize,
 }
 

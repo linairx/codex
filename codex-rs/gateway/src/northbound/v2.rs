@@ -360,6 +360,13 @@ struct WorkerCleanupResolvedNotification {
     method: String,
 }
 
+struct WorkerServerRequestCleanupReport<'a> {
+    worker_websocket_url: &'a str,
+    remaining_worker_count: usize,
+    disconnect_message: Option<&'a str>,
+    message: &'a str,
+}
+
 impl WorkerServerRequestCleanup {
     fn has_stranded_connection_scoped_requests(&self) -> bool {
         self.stranded_connection_scoped_requests > 0
@@ -693,7 +700,11 @@ impl GatewayV2DownstreamRouter {
                             reason,
                             &detail,
                         );
-                        observability.record_v2_protocol_violation("downstream", reason);
+                        observability.record_v2_worker_protocol_violation(
+                            Some(worker_id),
+                            "downstream",
+                            reason,
+                        );
                     }
                     observability.record_v2_worker_reconnect(worker_id, "connect_failure");
                     warn!(
@@ -2435,22 +2446,17 @@ async fn handle_app_server_event(
             cleanup = resolve_server_requests_for_worker(
                 socket,
                 connection,
-                worker_websocket_url.as_str(),
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
                 worker_id,
+                WorkerServerRequestCleanupReport {
+                    worker_websocket_url: worker_websocket_url.as_str(),
+                    remaining_worker_count: downstream.worker_count(),
+                    disconnect_message: None,
+                    message: "downstream worker session ended within shared gateway v2 session",
+                },
             )
             .await?;
-            if cleanup.has_cleaned_up_requests() {
-                log_worker_server_request_cleanup(
-                    worker_id,
-                    worker_websocket_url.as_str(),
-                    downstream.worker_count(),
-                    None,
-                    &cleanup,
-                    "downstream worker session ended within shared gateway v2 session",
-                );
-            }
             if cleanup.has_stranded_connection_scoped_requests() {
                 send_observed_close_frame(
                     socket,
@@ -2473,22 +2479,17 @@ async fn handle_app_server_event(
             cleanup = resolve_server_requests_for_worker(
                 socket,
                 connection,
-                worker_websocket_url.as_str(),
                 &mut event_state.pending_server_requests,
                 &mut event_state.resolved_server_requests,
                 worker_id,
+                WorkerServerRequestCleanupReport {
+                    worker_websocket_url: worker_websocket_url.as_str(),
+                    remaining_worker_count: 0,
+                    disconnect_message: None,
+                    message: "downstream app-server session ended with unresolved gateway server requests",
+                },
             )
             .await?;
-            if cleanup.has_cleaned_up_requests() {
-                log_worker_server_request_cleanup(
-                    worker_id,
-                    worker_websocket_url.as_str(),
-                    0,
-                    None,
-                    &cleanup,
-                    "downstream app-server session ended with unresolved gateway server requests",
-                );
-            }
         }
         if cleanup.has_stranded_connection_scoped_requests() {
             send_observed_close_frame(
@@ -2842,29 +2843,24 @@ async fn handle_app_server_event(
                 );
                 connection
                     .observability
-                    .record_v2_protocol_violation("downstream", reason);
+                    .record_v2_worker_protocol_violation(worker_id, "downstream", reason);
             }
             let mut cleanup = WorkerServerRequestCleanup::default();
             if !downstream.single_worker() && downstream.remove_worker(worker_id) {
                 cleanup = resolve_server_requests_for_worker(
                     socket,
                     connection,
-                    worker_websocket_url.as_str(),
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
                     worker_id,
+                    WorkerServerRequestCleanupReport {
+                        worker_websocket_url: worker_websocket_url.as_str(),
+                        remaining_worker_count: downstream.worker_count(),
+                        disconnect_message: Some(message.as_str()),
+                        message: "downstream worker disconnected within shared gateway v2 session",
+                    },
                 )
                 .await?;
-                if cleanup.has_cleaned_up_requests() {
-                    log_worker_server_request_cleanup(
-                        worker_id,
-                        worker_websocket_url.as_str(),
-                        downstream.worker_count(),
-                        Some(message.as_str()),
-                        &cleanup,
-                        "downstream worker disconnected within shared gateway v2 session",
-                    );
-                }
                 if cleanup.has_stranded_connection_scoped_requests() {
                     send_observed_close_frame(
                         socket,
@@ -2887,22 +2883,17 @@ async fn handle_app_server_event(
                 cleanup = resolve_server_requests_for_worker(
                     socket,
                     connection,
-                    worker_websocket_url.as_str(),
                     &mut event_state.pending_server_requests,
                     &mut event_state.resolved_server_requests,
                     worker_id,
+                    WorkerServerRequestCleanupReport {
+                        worker_websocket_url: worker_websocket_url.as_str(),
+                        remaining_worker_count: 0,
+                        disconnect_message: Some(message.as_str()),
+                        message: "downstream app-server disconnected with unresolved gateway server requests",
+                    },
                 )
                 .await?;
-                if cleanup.has_cleaned_up_requests() {
-                    log_worker_server_request_cleanup(
-                        worker_id,
-                        worker_websocket_url.as_str(),
-                        0,
-                        Some(message.as_str()),
-                        &cleanup,
-                        "downstream app-server disconnected with unresolved gateway server requests",
-                    );
-                }
             }
             if cleanup.has_stranded_connection_scoped_requests() {
                 send_observed_close_frame(
@@ -2945,10 +2936,10 @@ async fn handle_app_server_event(
 async fn resolve_server_requests_for_worker(
     socket: &mut WebSocket,
     connection: &GatewayV2ConnectionContext<'_>,
-    worker_websocket_url: &str,
     pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
     worker_id: Option<usize>,
+    report: WorkerServerRequestCleanupReport<'_>,
 ) -> io::Result<WorkerServerRequestCleanup> {
     let cleanup = collect_server_request_cleanup_for_worker(
         pending_server_requests,
@@ -2957,6 +2948,14 @@ async fn resolve_server_requests_for_worker(
     );
 
     record_worker_server_request_cleanup_metrics(connection.observability, &cleanup);
+    if cleanup.has_cleaned_up_requests() {
+        report_worker_server_request_cleanup(
+            connection.observability,
+            worker_id,
+            &report,
+            &cleanup,
+        );
+    }
 
     for resolved_notification in &cleanup.resolved_notifications {
         let method = resolved_notification.method.as_str();
@@ -2975,7 +2974,7 @@ async fn resolve_server_requests_for_worker(
                 connection.observability,
                 connection.request_context,
                 worker_id,
-                worker_websocket_url,
+                report.worker_websocket_url,
                 resolved_notification,
                 &err,
             );
@@ -2990,6 +2989,30 @@ async fn resolve_server_requests_for_worker(
     }
 
     Ok(cleanup)
+}
+
+fn report_worker_server_request_cleanup(
+    observability: &GatewayObservability,
+    worker_id: Option<usize>,
+    report: &WorkerServerRequestCleanupReport<'_>,
+    cleanup: &WorkerServerRequestCleanup,
+) {
+    log_worker_server_request_cleanup(
+        worker_id,
+        report.worker_websocket_url,
+        report.remaining_worker_count,
+        report.disconnect_message,
+        cleanup,
+        report.message,
+    );
+    publish_worker_server_request_cleanup_event(
+        observability,
+        worker_id,
+        report.worker_websocket_url,
+        report.remaining_worker_count,
+        report.disconnect_message,
+        cleanup,
+    );
 }
 
 fn record_worker_cleanup_resolution_send_failure(
@@ -3174,6 +3197,59 @@ fn log_worker_server_request_cleanup(
         disconnect_message,
         "{message}"
     );
+}
+
+fn publish_worker_server_request_cleanup_event(
+    observability: &GatewayObservability,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    remaining_worker_count: usize,
+    disconnect_message: Option<&str>,
+    cleanup: &WorkerServerRequestCleanup,
+) {
+    let mut resolved_thread_scoped_request_ids = cleanup.resolved_thread_scoped_request_ids.clone();
+    resolved_thread_scoped_request_ids.sort();
+    let mut resolved_thread_scoped_downstream_request_ids = cleanup
+        .resolved_thread_scoped_downstream_request_ids
+        .clone();
+    resolved_thread_scoped_downstream_request_ids.sort();
+    let mut resolved_thread_scoped_methods = cleanup.resolved_thread_scoped_methods.clone();
+    resolved_thread_scoped_methods.sort();
+    resolved_thread_scoped_methods.dedup();
+    let mut resolved_thread_scoped_thread_ids = cleanup.resolved_thread_scoped_thread_ids.clone();
+    resolved_thread_scoped_thread_ids.sort();
+    resolved_thread_scoped_thread_ids.dedup();
+    let mut stranded_connection_scoped_request_ids =
+        cleanup.stranded_connection_scoped_request_ids.clone();
+    stranded_connection_scoped_request_ids.sort();
+    let mut stranded_connection_scoped_downstream_request_ids = cleanup
+        .stranded_connection_scoped_downstream_request_ids
+        .clone();
+    stranded_connection_scoped_downstream_request_ids.sort();
+    let mut stranded_connection_scoped_methods = cleanup.stranded_connection_scoped_methods.clone();
+    stranded_connection_scoped_methods.sort();
+    stranded_connection_scoped_methods.dedup();
+
+    observability.publish_operator_event(GatewayEvent {
+        method: "gateway/v2ServerRequestCleanup".to_string(),
+        thread_id: None,
+        data: serde_json::json!({
+            "workerId": worker_id,
+            "workerWebsocketUrl": worker_websocket_url,
+            "remainingWorkerCount": remaining_worker_count,
+            "disconnectMessage": disconnect_message,
+            "resolvedThreadScopedServerRequestCount": cleanup.resolved_thread_scoped_requests,
+            "resolvedThreadScopedServerRequestIds": resolved_thread_scoped_request_ids,
+            "resolvedThreadScopedDownstreamServerRequestIds": resolved_thread_scoped_downstream_request_ids,
+            "resolvedThreadScopedServerRequestMethods": resolved_thread_scoped_methods,
+            "resolvedThreadScopedThreadIds": resolved_thread_scoped_thread_ids,
+            "strandedConnectionScopedServerRequestCount": cleanup
+                .stranded_connection_scoped_requests,
+            "strandedConnectionScopedServerRequestIds": stranded_connection_scoped_request_ids,
+            "strandedConnectionScopedDownstreamServerRequestIds": stranded_connection_scoped_downstream_request_ids,
+            "strandedConnectionScopedServerRequestMethods": stranded_connection_scoped_methods,
+        }),
+    });
 }
 
 fn log_unexpected_client_server_request_response(
@@ -44429,15 +44505,19 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
+        let (operator_events_tx, mut operator_events_rx) = broadcast::channel(4);
+        let expected_worker_a_url = worker_a.clone();
         let app = Router::new().route(
             "/",
             any(move |websocket: WebSocketUpgrade| {
                 let worker_a = worker_a.clone();
                 let worker_b = worker_b.clone();
+                let operator_events_tx = operator_events_tx.clone();
                 async move {
                     websocket.on_upgrade(move |mut socket| async move {
                         let admission = GatewayAdmissionController::default();
-                        let observability = GatewayObservability::default();
+                        let observability = GatewayObservability::default()
+                            .with_operator_events(operator_events_tx);
                         let scope_registry = Arc::new(GatewayScopeRegistry::default());
                         let request_context = GatewayRequestContext::default();
                         let connection = GatewayV2ConnectionContext {
@@ -44563,6 +44643,32 @@ mod tests {
             logs.contains(
                 "stranded_connection_scoped_server_request_ids=[String(\"gateway-srv-1\")]"
             )
+        );
+        let cleanup_event = operator_events_rx
+            .try_recv()
+            .expect("worker cleanup event should publish");
+        assert_eq!(cleanup_event.method, "gateway/v2ServerRequestCleanup");
+        assert_eq!(
+            cleanup_event.data,
+            serde_json::json!({
+                "workerId": 0,
+                "workerWebsocketUrl": expected_worker_a_url,
+                "remainingWorkerCount": 1,
+                "disconnectMessage": "worker-a lost",
+                "resolvedThreadScopedServerRequestCount": 0,
+                "resolvedThreadScopedServerRequestIds": [],
+                "resolvedThreadScopedDownstreamServerRequestIds": [],
+                "resolvedThreadScopedServerRequestMethods": [],
+                "resolvedThreadScopedThreadIds": [],
+                "strandedConnectionScopedServerRequestCount": 1,
+                "strandedConnectionScopedServerRequestIds": ["gateway-srv-1"],
+                "strandedConnectionScopedDownstreamServerRequestIds": [
+                    "downstream-request-1"
+                ],
+                "strandedConnectionScopedServerRequestMethods": [
+                    "item/tool/requestUserInput"
+                ],
+            })
         );
     }
 
@@ -45602,15 +45708,19 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
+        let (operator_events_tx, mut operator_events_rx) = broadcast::channel(4);
+        let expected_worker_a_url = worker_a.clone();
         let app = Router::new().route(
             "/",
             any(move |websocket: WebSocketUpgrade| {
                 let worker_a = worker_a.clone();
                 let worker_b = worker_b.clone();
+                let operator_events_tx = operator_events_tx.clone();
                 async move {
                     websocket.on_upgrade(move |mut socket| async move {
                         let admission = GatewayAdmissionController::default();
-                        let observability = GatewayObservability::default();
+                        let observability = GatewayObservability::default()
+                            .with_operator_events(operator_events_tx);
                         let scope_registry = Arc::new(GatewayScopeRegistry::default());
                         let request_context = GatewayRequestContext::default();
                         let connection = GatewayV2ConnectionContext {
@@ -45740,6 +45850,32 @@ mod tests {
         assert!(logs.contains(
             "stranded_connection_scoped_downstream_server_request_ids=[String(\"downstream-request-1\")]"
         ));
+        let cleanup_event = operator_events_rx
+            .try_recv()
+            .expect("worker cleanup event should publish");
+        assert_eq!(cleanup_event.method, "gateway/v2ServerRequestCleanup");
+        assert_eq!(
+            cleanup_event.data,
+            serde_json::json!({
+                "workerId": 0,
+                "workerWebsocketUrl": expected_worker_a_url,
+                "remainingWorkerCount": 1,
+                "disconnectMessage": null,
+                "resolvedThreadScopedServerRequestCount": 0,
+                "resolvedThreadScopedServerRequestIds": [],
+                "resolvedThreadScopedDownstreamServerRequestIds": [],
+                "resolvedThreadScopedServerRequestMethods": [],
+                "resolvedThreadScopedThreadIds": [],
+                "strandedConnectionScopedServerRequestCount": 1,
+                "strandedConnectionScopedServerRequestIds": ["gateway-srv-1"],
+                "strandedConnectionScopedDownstreamServerRequestIds": [
+                    "downstream-request-1"
+                ],
+                "strandedConnectionScopedServerRequestMethods": [
+                    "item/tool/requestUserInput"
+                ],
+            })
+        );
     }
 
     #[tokio::test]
@@ -49591,6 +49727,146 @@ mod tests {
         assert!(logs.contains(
             "stranded_connection_scoped_server_request_methods=[\"account/chatgptAuthTokens/refresh\"]"
         ));
+    }
+
+    #[test]
+    fn worker_server_request_cleanup_publishes_operator_event() {
+        let (operator_events_tx, mut operator_events_rx) = broadcast::channel(4);
+        let observability =
+            GatewayObservability::default().with_operator_events(operator_events_tx);
+
+        super::publish_worker_server_request_cleanup_event(
+            &observability,
+            Some(1),
+            "ws://worker-b.invalid",
+            1,
+            Some("worker-b lost"),
+            &super::WorkerServerRequestCleanup {
+                resolved_notifications: Vec::new(),
+                resolved_thread_scoped_requests: 2,
+                resolved_thread_scoped_request_ids: vec![
+                    RequestId::String("gateway-thread-2".to_string()),
+                    RequestId::String("gateway-thread-1".to_string()),
+                ],
+                resolved_thread_scoped_downstream_request_ids: vec![
+                    RequestId::String("downstream-thread-2".to_string()),
+                    RequestId::String("downstream-thread-1".to_string()),
+                ],
+                resolved_thread_scoped_methods: vec![
+                    "item/tool/requestUserInput".to_string(),
+                    "item/tool/requestUserInput".to_string(),
+                ],
+                resolved_thread_scoped_thread_ids: vec![
+                    "thread-visible".to_string(),
+                    "thread-visible".to_string(),
+                ],
+                stranded_connection_scoped_requests: 1,
+                stranded_connection_scoped_request_ids: vec![RequestId::String(
+                    "gateway-connection-1".to_string(),
+                )],
+                stranded_connection_scoped_downstream_request_ids: vec![RequestId::String(
+                    "downstream-connection-1".to_string(),
+                )],
+                stranded_connection_scoped_methods: vec![
+                    "account/chatgptAuthTokens/refresh".to_string(),
+                ],
+            },
+        );
+
+        let event = operator_events_rx
+            .try_recv()
+            .expect("cleanup operator event should publish");
+        assert_eq!(event.method, "gateway/v2ServerRequestCleanup");
+        assert_eq!(event.thread_id, None);
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "workerId": 1,
+                "workerWebsocketUrl": "ws://worker-b.invalid",
+                "remainingWorkerCount": 1,
+                "disconnectMessage": "worker-b lost",
+                "resolvedThreadScopedServerRequestCount": 2,
+                "resolvedThreadScopedServerRequestIds": [
+                    "gateway-thread-1",
+                    "gateway-thread-2"
+                ],
+                "resolvedThreadScopedDownstreamServerRequestIds": [
+                    "downstream-thread-1",
+                    "downstream-thread-2"
+                ],
+                "resolvedThreadScopedServerRequestMethods": ["item/tool/requestUserInput"],
+                "resolvedThreadScopedThreadIds": ["thread-visible"],
+                "strandedConnectionScopedServerRequestCount": 1,
+                "strandedConnectionScopedServerRequestIds": ["gateway-connection-1"],
+                "strandedConnectionScopedDownstreamServerRequestIds": [
+                    "downstream-connection-1"
+                ],
+                "strandedConnectionScopedServerRequestMethods": [
+                    "account/chatgptAuthTokens/refresh"
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn worker_server_request_cleanup_report_logs_and_publishes_operator_event() {
+        let (operator_events_tx, mut operator_events_rx) = broadcast::channel(4);
+        let observability =
+            GatewayObservability::default().with_operator_events(operator_events_tx);
+        let cleanup = super::WorkerServerRequestCleanup {
+            resolved_notifications: vec![super::WorkerCleanupResolvedNotification {
+                notification: ServerRequestResolvedNotification {
+                    thread_id: "thread-visible".to_string(),
+                    request_id: RequestId::String("gateway-thread-1".to_string()),
+                },
+                method: "item/tool/requestUserInput".to_string(),
+            }],
+            resolved_thread_scoped_requests: 1,
+            resolved_thread_scoped_request_ids: vec![RequestId::String(
+                "gateway-thread-1".to_string(),
+            )],
+            resolved_thread_scoped_downstream_request_ids: vec![RequestId::String(
+                "downstream-thread-1".to_string(),
+            )],
+            resolved_thread_scoped_methods: vec!["item/tool/requestUserInput".to_string()],
+            resolved_thread_scoped_thread_ids: vec!["thread-visible".to_string()],
+            stranded_connection_scoped_requests: 1,
+            stranded_connection_scoped_request_ids: vec![RequestId::String(
+                "gateway-connection-1".to_string(),
+            )],
+            stranded_connection_scoped_downstream_request_ids: vec![RequestId::String(
+                "downstream-connection-1".to_string(),
+            )],
+            stranded_connection_scoped_methods: vec![
+                "account/chatgptAuthTokens/refresh".to_string(),
+            ],
+        };
+        let report = super::WorkerServerRequestCleanupReport {
+            worker_websocket_url: "ws://worker-b.invalid",
+            remaining_worker_count: 1,
+            disconnect_message: Some("worker-b lost"),
+            message: "downstream worker disconnected within shared gateway v2 session",
+        };
+
+        let logs = capture_logs(|| {
+            super::report_worker_server_request_cleanup(&observability, Some(1), &report, &cleanup);
+        });
+
+        assert!(logs.contains("downstream worker disconnected within shared gateway v2 session"));
+        assert!(logs.contains("worker_id=Some(1)"));
+        assert!(logs.contains("worker_websocket_url=\"ws://worker-b.invalid\""));
+        let event = operator_events_rx
+            .try_recv()
+            .expect("cleanup operator event should publish");
+        assert_eq!(event.method, "gateway/v2ServerRequestCleanup");
+        assert_eq!(
+            event.data["resolvedThreadScopedServerRequestIds"],
+            serde_json::json!(["gateway-thread-1"])
+        );
+        assert_eq!(
+            event.data["strandedConnectionScopedServerRequestIds"],
+            serde_json::json!(["gateway-connection-1"])
+        );
     }
 
     #[test]

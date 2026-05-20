@@ -686,6 +686,14 @@ Recent progress:
   turn, verifying proposed-plan `item/started` and `item/completed`
   notifications through the in-process gateway transport with an unmodified
   `RemoteAppServerClient` session
+- the real embedded turn workflow harness now also covers
+  `item/reasoning/summaryPartAdded` from Responses summary-part events and
+  `thread/tokenUsage/updated` after a token-bearing Responses completion, so
+  those low-frequency notification forwarding paths are part of the
+  in-process drop-in baseline
+- the real embedded plan-mode harness now also covers `item/plan/delta`
+  before the proposed-plan item completes, so streamed plan text is also part
+  of the in-process drop-in baseline
 - the real single-worker remote compatibility harness now also covers that same
   plan-mode turn path, verifying proposed-plan `item/started` and
   `item/completed` notifications through a gateway-backed remote worker session
@@ -3335,6 +3343,8 @@ Suggested validation checklist before widening traffic:
    `gateway_v2_server_request_lifecycle_events`.
 7. For remote and multi-worker rollout, also check the counters that explain
    degraded topology behavior: `gateway_v2_worker_reconnects`,
+   `gateway_v2_connections`,
+   `gateway_v2_requests`,
    `gateway_v2_fail_closed_requests`,
    `gateway_v2_upstream_request_failures`,
    `gateway_v2_downstream_backpressure_events`, and
@@ -3342,14 +3352,90 @@ Suggested validation checklist before widening traffic:
    should match the worker-health changes visible in `/healthz` and the
    `v2Connections.workerReconnectEventCounts` /
    `v2Connections.workerReconnectEventWorkerCounts` health fields, fail-closed
-   counts should correspond to intentional degraded-session protection, and
-   timeout/backpressure counters should stay at zero unless the validation
-   deliberately uses a slow client or lagging downstream worker.
+   counts should correspond to intentional degraded-session protection and the
+   matching `v2Connections.failClosedRequestCounts` /
+   `lastFailClosedRequest*` health fields, and
+   `gateway_v2_connections` should match
+   `v2Connections.connectionOutcomeCounts`, `lastConnectionOutcome`,
+   `lastConnectionDetail`, `lastConnectionDurationMs`, and
+   `maxConnectionDurationMs`, so terminal connection outcomes and recent /
+   peak connection durations can be reconciled from the same health snapshot
+   and checked against `gateway_v2_connection_duration`,
+   and the real embedded plus remote healthz regressions now pin
+   `connectionOutcomeCounts` and `maxConnectionDurationMs` on actual
+   client-close and slow-client-timeout teardown paths rather than only in
+   registry-level tests,
+   `gateway_v2_requests` should match `v2Connections.requestCounts`,
+   `lastRequestMethod`, `lastRequestOutcome`, `lastRequestDurationMs`,
+   `maxRequestDurationMs`, and `lastRequestAt`, so ordinary success, policy,
+   quota, protocol-violation, internal-error request outcomes, and recent /
+   peak gateway request latency can be reconciled from the same health
+   snapshot and checked against `gateway_v2_request_duration`,
+   request rejection counts should match
+   `v2Connections.clientRequestRejectionCounts`,
+   `lastClientRequestRejection*`,
+   `serverRequestRejectionCounts`, and
+   `lastServerRequestRejection*`, so pending-limit, overload, and
+   scope-policy rejections can be reconciled with
+   `gateway_v2_client_request_rejections` and
+   `gateway_v2_server_request_rejections`.
+   `gateway_v2_upstream_request_failures` should match
+   `v2Connections.upstreamRequestFailureCounts` /
+   `lastUpstreamRequestFailure*` health fields,
+   timeout/backpressure counters should match
+   `v2Connections.clientSendTimeoutCount`,
+   `lastClientSendTimeoutAt`, `downstreamBackpressureCounts`, and
+   `lastDownstreamBackpressure*` health fields, and should stay at zero unless
+   the validation deliberately uses a slow client or lagging downstream worker.
+   Thread routing diagnostics should match
+   `v2Connections.threadListDeduplicationCounts`,
+   `lastThreadListDeduplication*`, `threadRouteRecoveryCounts`,
+   `lastThreadRouteRecovery*`, `degradedThreadDiscoveryCounts`, and
+   `lastDegradedThreadDiscovery*`, so duplicate thread-list selection, lazy
+   route recovery, and intentionally degraded visible-thread discovery can be
+   reconciled with `gateway_v2_thread_list_deduplications`,
+   `gateway_v2_thread_route_recoveries`, and
+   `gateway_v2_degraded_thread_discovery`.
+   Suppressed notification counters should match
+   `v2Connections.suppressedNotificationCounts` and
+   `lastSuppressedNotification*`, so duplicate connection-state suppression,
+   pending-refresh suppression, client opt-out drops, and hidden-thread
+   notification drops can be reconciled with
+   `gateway_v2_suppressed_notifications`.
+   Forwarded notification and notification send-failure counters should match
+   `v2Connections.forwardedNotificationCounts`,
+   `lastForwardedNotification*`, `notificationSendFailureCounts`, and
+   `lastNotificationSendFailure*`, so successful fan-in and slow-client
+   delivery failures can be reconciled with
+   `gateway_v2_forwarded_notifications` and
+   `gateway_v2_notification_send_failures`.
+   Transport and server-request delivery failure counters should match
+   `v2Connections.clientResponseSendFailureCounts`,
+   `downstreamShutdownFailureCounts`, `closeFrameSendFailureCounts`,
+   `serverRequestForwardSendFailureCounts`,
+   `serverRequestAnswerDeliveryFailureCounts`,
+   `serverRequestRejectionDeliveryFailureCounts`, and their `last*` fields, so
+   response write failures, close-frame failures, shutdown cleanup failures,
+   and partially completed prompt delivery failures can be reconciled with the
+   corresponding `gateway_v2_*_failure*` metrics.
+   Server-request lifecycle counters should match
+   `v2Connections.serverRequestLifecycleEventCounts`,
+   `lastServerRequestLifecycleEvent`,
+   `lastServerRequestLifecycleMethod`, and
+   `lastServerRequestLifecycleAt`, so forwarded, answered, delivered,
+   resolved, rejected, duplicate, cleanup, and delivery-failed prompt stages
+   can be reconciled with `gateway_v2_server_request_lifecycle_events`.
    Protocol-violation counters should match
    `v2Connections.protocolViolationCounts`,
-   `lastProtocolViolationPhase`, `lastProtocolViolationReason`, and
-   `lastProtocolViolationAt` so malformed client traffic and downstream
-   protocol regressions are visible in health snapshots as well as metrics.
+   `protocolViolationWorkerCounts`, `lastProtocolViolationPhase`,
+   `lastProtocolViolationReason`, `lastProtocolViolationWorkerId`, and
+   `lastProtocolViolationAt` so malformed client traffic and worker-specific
+   downstream protocol regressions are visible in health snapshots as well as
+   metrics.
+   The gateway HTTP regression suite now also pins a representative non-empty
+   `/healthz.v2Connections` JSON response for these rollout diagnostics, so
+   operators can rely on the documented camelCase field names at the
+   northbound API boundary and not only on registry-level tests.
 8. For account-backed multi-worker validation, induce one quota-like worker
    failure and verify `gateway_v2_account_capacity_events`,
    `/v1/events`, and `/healthz.v2Connections` agree on the exhausted worker,
@@ -3371,6 +3457,18 @@ Suggested validation checklist before widening traffic:
    permissions approval, MCP elicitation, and ChatGPT token-refresh prompts
    across two workers, including the answered-but-unresolved counts left by
    earlier prompt classes.
+   Worker-loss cleanup now also publishes
+   `gateway/v2ServerRequestCleanup` on `/v1/events` when thread-scoped prompts
+   are resolved or connection-scoped prompts are stranded, so validation
+   evidence can tie cleanup counts, prompt method families, resolved thread
+   ids, and gateway / downstream server-request ids back to the same worker
+   route reported by health, metrics, and logs. Real northbound WebSocket
+   regressions now pin that event payload for both a direct cleanup helper and
+   the pending and answered-but-unresolved worker-loss paths that strand
+   connection-scoped prompts. The cleanup log and operator event are emitted
+   before synthesized `serverRequest/resolved` notifications are sent to the
+   northbound client, so a later slow-client send failure does not hide the
+   cleanup from `/v1/events`.
 
 During a healthy validation pass, forwarded-notification counts should line up
 with expected fan-in, suppression counts should match configured opt-outs or
@@ -3396,7 +3494,10 @@ Promotion evidence for multi-worker remote:
   window
 - capture the `/v1/events` stream for worker reconnect, account exhaustion,
   replacement-account handoff, active-thread no-handoff, and pending
-  server-request cleanup cases exercised during validation
+  server-request cleanup cases exercised during validation; for v2 worker-loss
+  cleanup, retain the `gateway/v2ServerRequestCleanup` event with the worker
+  route, remaining worker count, cleanup counts, prompt method families,
+  resolved thread ids, and gateway / downstream server-request ids
 - export the gateway metric series named in the checklist above for the same
   window, including zero-valued send-failure, backpressure, and timeout
   counters when those failures were not intentionally induced

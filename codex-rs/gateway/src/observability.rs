@@ -187,6 +187,9 @@ impl GatewayObservability {
         let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
         let tags = [("method", method), ("outcome", outcome)];
 
+        self.v2_connection_health
+            .record_request(method, outcome, duration);
+
         if let Some(metrics) = &self.metrics {
             if let Err(err) = metrics.counter(V2_REQUEST_COUNT_METRIC, 1, &tags) {
                 tracing::warn!("failed to record gateway v2 request count metric: {err}");
@@ -328,6 +331,9 @@ impl GatewayObservability {
     pub(crate) fn record_v2_server_request_rejection(&self, method: &str, reason: &str) {
         let tags = [("method", method), ("reason", reason)];
 
+        self.v2_connection_health
+            .record_server_request_rejection(method, reason);
+
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_SERVER_REQUEST_REJECTION_COUNT_METRIC, 1, &tags)
         {
@@ -337,6 +343,9 @@ impl GatewayObservability {
 
     pub(crate) fn record_v2_client_request_rejection(&self, method: &str, reason: &str) {
         let tags = [("method", method), ("reason", reason)];
+
+        self.v2_connection_health
+            .record_client_request_rejection(method, reason);
 
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC, 1, &tags)
@@ -364,6 +373,9 @@ impl GatewayObservability {
         method: &str,
         reconnect_backoff_active: bool,
     ) {
+        self.v2_connection_health
+            .record_fail_closed_request(method, reconnect_backoff_active);
+
         let reconnect_backoff_active = if reconnect_backoff_active {
             "true"
         } else {
@@ -386,6 +398,9 @@ impl GatewayObservability {
         method: &str,
         reconnect_backoff_active: bool,
     ) {
+        self.v2_connection_health
+            .record_upstream_request_failure(method, reconnect_backoff_active);
+
         let reconnect_backoff_active = if reconnect_backoff_active {
             "true"
         } else {
@@ -406,6 +421,9 @@ impl GatewayObservability {
     pub(crate) fn record_v2_client_response_send_failure(&self, method: &str, outcome: &str) {
         let tags = [("method", method), ("outcome", outcome)];
 
+        self.v2_connection_health
+            .record_client_response_send_failure(method, outcome);
+
         if let Some(metrics) = &self.metrics
             && let Err(err) =
                 metrics.counter(V2_CLIENT_RESPONSE_SEND_FAILURE_COUNT_METRIC, 1, &tags)
@@ -419,6 +437,9 @@ impl GatewayObservability {
     pub(crate) fn record_v2_downstream_shutdown_failure(&self, outcome: &str) {
         let tags = [("outcome", outcome)];
 
+        self.v2_connection_health
+            .record_downstream_shutdown_failure(outcome);
+
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_DOWNSTREAM_SHUTDOWN_FAILURE_COUNT_METRIC, 1, &tags)
         {
@@ -427,8 +448,11 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_close_frame_send_failure(&self, code: u16, outcome: &str) {
-        let code = code.to_string();
-        let tags = [("code", code.as_str()), ("outcome", outcome)];
+        let code_label = code.to_string();
+        let tags = [("code", code_label.as_str()), ("outcome", outcome)];
+
+        self.v2_connection_health
+            .record_close_frame_send_failure(code, outcome);
 
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_CLOSE_FRAME_SEND_FAILURE_COUNT_METRIC, 1, &tags)
@@ -440,6 +464,9 @@ impl GatewayObservability {
     pub(crate) fn record_v2_suppressed_notification(&self, method: &str, reason: &str) {
         let tags = [("method", method), ("reason", reason)];
 
+        self.v2_connection_health
+            .record_suppressed_notification(method, reason);
+
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_SUPPRESSED_NOTIFICATION_COUNT_METRIC, 1, &tags)
         {
@@ -450,6 +477,9 @@ impl GatewayObservability {
     pub(crate) fn record_v2_forwarded_notification(&self, method: &str) {
         let tags = [("method", method)];
 
+        self.v2_connection_health
+            .record_forwarded_notification(method);
+
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_FORWARDED_NOTIFICATION_COUNT_METRIC, 1, &tags)
         {
@@ -459,6 +489,9 @@ impl GatewayObservability {
 
     pub(crate) fn record_v2_notification_send_failure(&self, method: &str, outcome: &str) {
         let tags = [("method", method), ("outcome", outcome)];
+
+        self.v2_connection_health
+            .record_notification_send_failure(method, outcome);
 
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_NOTIFICATION_SEND_FAILURE_COUNT_METRIC, 1, &tags)
@@ -473,6 +506,9 @@ impl GatewayObservability {
         outcome: &str,
     ) {
         let tags = [("method", method), ("outcome", outcome)];
+
+        self.v2_connection_health
+            .record_server_request_forward_send_failure(method, outcome);
 
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(
@@ -490,6 +526,9 @@ impl GatewayObservability {
     pub(crate) fn record_v2_server_request_answer_delivery_failure(&self, response_kind: &str) {
         let tags = [("response_kind", response_kind)];
 
+        self.v2_connection_health
+            .record_server_request_answer_delivery_failure(response_kind);
+
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(
                 V2_SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC,
@@ -505,6 +544,9 @@ impl GatewayObservability {
 
     pub(crate) fn record_v2_server_request_rejection_delivery_failure(&self, method: &str) {
         let tags = [("method", method)];
+
+        self.v2_connection_health
+            .record_server_request_rejection_delivery_failure(method);
 
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(
@@ -533,6 +575,9 @@ impl GatewayObservability {
             return;
         }
 
+        self.v2_connection_health
+            .record_server_request_lifecycle_events(event, method, count as usize);
+
         let tags = [("event", event), ("method", method)];
 
         if let Some(metrics) = &self.metrics
@@ -547,6 +592,22 @@ impl GatewayObservability {
         self.v2_connection_health
             .record_protocol_violation(phase, reason);
 
+        self.record_v2_protocol_violation_metric(phase, reason);
+    }
+
+    pub(crate) fn record_v2_worker_protocol_violation(
+        &self,
+        worker_id: Option<usize>,
+        phase: &str,
+        reason: &str,
+    ) {
+        self.v2_connection_health
+            .record_protocol_violation_for_worker(phase, reason, worker_id);
+
+        self.record_v2_protocol_violation_metric(phase, reason);
+    }
+
+    fn record_v2_protocol_violation_metric(&self, phase: &str, reason: &str) {
         let tags = [("phase", phase), ("reason", reason)];
 
         if let Some(metrics) = &self.metrics
@@ -557,6 +618,9 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_downstream_backpressure(&self, worker_id: Option<usize>) {
+        self.v2_connection_health
+            .record_downstream_backpressure(worker_id);
+
         let worker_id =
             worker_id.map_or_else(|| "none".to_string(), |worker_id| worker_id.to_string());
         let tags = [("worker_id", worker_id.as_str())];
@@ -569,6 +633,8 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_client_send_timeout(&self) {
+        self.v2_connection_health.record_client_send_timeout();
+
         if let Some(metrics) = &self.metrics
             && let Err(err) = metrics.counter(V2_CLIENT_SEND_TIMEOUT_COUNT_METRIC, 1, &[])
         {
@@ -577,6 +643,9 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_thread_list_deduplication(&self, selected_worker_id: Option<usize>) {
+        self.v2_connection_health
+            .record_thread_list_deduplication(selected_worker_id);
+
         let selected_worker_id = selected_worker_id
             .map_or_else(|| "none".to_string(), |worker_id| worker_id.to_string());
         let tags = [("selected_worker_id", selected_worker_id.as_str())];
@@ -589,6 +658,9 @@ impl GatewayObservability {
     }
 
     pub(crate) fn record_v2_thread_route_recovery(&self, outcome: &str) {
+        self.v2_connection_health
+            .record_thread_route_recovery(outcome);
+
         let tags = [("outcome", outcome)];
 
         if let Some(metrics) = &self.metrics
@@ -603,6 +675,9 @@ impl GatewayObservability {
         method: &str,
         reconnect_backoff_active: bool,
     ) {
+        self.v2_connection_health
+            .record_degraded_thread_discovery(method, reconnect_backoff_active);
+
         let reconnect_backoff_active = if reconnect_backoff_active {
             "true"
         } else {
@@ -961,11 +1036,20 @@ mod tests {
     use super::V2_THREAD_ROUTE_RECOVERY_COUNT_METRIC;
     use super::V2_UPSTREAM_REQUEST_FAILURE_COUNT_METRIC;
     use super::V2_WORKER_RECONNECT_COUNT_METRIC;
+    use crate::api::GatewayV2DegradedThreadDiscoveryCounts;
+    use crate::api::GatewayV2DownstreamBackpressureCounts;
+    use crate::api::GatewayV2FailClosedRequestCounts;
+    use crate::api::GatewayV2ForwardedNotificationCounts;
+    use crate::api::GatewayV2NotificationSendFailureCounts;
     use crate::api::GatewayV2PendingClientRequestMethodCounts;
     use crate::api::GatewayV2PendingClientRequestWorkerCounts;
     use crate::api::GatewayV2ProtocolViolationCounts;
     use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
     use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
+    use crate::api::GatewayV2ServerRequestLifecycleEventCounts;
+    use crate::api::GatewayV2ThreadListDeduplicationCounts;
+    use crate::api::GatewayV2ThreadRouteRecoveryCounts;
+    use crate::api::GatewayV2UpstreamRequestFailureCounts;
     use crate::scope::GatewayRequestContext;
     use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -1180,6 +1264,14 @@ mod tests {
 
         assert!(saw_count);
         assert_eq!(saw_duration, true);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(health.request_counts.len(), 1);
+        assert_eq!(health.request_counts[0].method, "thread/start");
+        assert_eq!(health.request_counts[0].outcome, "ok");
+        assert_eq!(health.request_counts[0].count, 1);
+        assert_eq!(health.last_request_method, Some("thread/start".to_string()));
+        assert_eq!(health.last_request_outcome, Some("ok".to_string()));
+        assert_eq!(health.last_request_at.is_some(), true);
     }
 
     #[test]
@@ -1757,6 +1849,17 @@ mod tests {
 
         observability
             .record_v2_server_request_rejection("item/tool/requestUserInput", "pending_limit");
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(health.server_request_rejection_counts.len(), 1);
+        assert_eq!(
+            health.last_server_request_rejection_method,
+            Some("item/tool/requestUserInput".to_string())
+        );
+        assert_eq!(
+            health.last_server_request_rejection_reason,
+            Some("pending_limit".to_string())
+        );
+        assert_eq!(health.last_server_request_rejection_at.is_some(), true);
 
         let resource_metrics = observability
             .metrics
@@ -1823,6 +1926,17 @@ mod tests {
         let observability = GatewayObservability::new(Some(metrics), true);
 
         observability.record_v2_client_request_rejection("command/exec", "pending_limit");
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(health.client_request_rejection_counts.len(), 1);
+        assert_eq!(
+            health.last_client_request_rejection_method,
+            Some("command/exec".to_string())
+        );
+        assert_eq!(
+            health.last_client_request_rejection_reason,
+            Some("pending_limit".to_string())
+        );
+        assert_eq!(health.last_client_request_rejection_at.is_some(), true);
 
         let resource_metrics = observability
             .metrics
@@ -2334,6 +2448,24 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.fail_closed_request_counts,
+            vec![GatewayV2FailClosedRequestCounts {
+                method: "config/read".to_string(),
+                reconnect_backoff_active: true,
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_fail_closed_request_method,
+            Some("config/read".to_string())
+        );
+        assert_eq!(
+            health.last_fail_closed_request_reconnect_backoff_active,
+            Some(true)
+        );
+        assert_eq!(health.last_fail_closed_request_at.is_some(), true);
     }
 
     #[test]
@@ -2397,6 +2529,24 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.upstream_request_failure_counts,
+            vec![GatewayV2UpstreamRequestFailureCounts {
+                method: "config/read".to_string(),
+                reconnect_backoff_active: true,
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_upstream_request_failure_method,
+            Some("config/read".to_string())
+        );
+        assert_eq!(
+            health.last_upstream_request_failure_reconnect_backoff_active,
+            Some(true)
+        );
+        assert_eq!(health.last_upstream_request_failure_at.is_some(), true);
     }
 
     #[test]
@@ -2460,6 +2610,19 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.forwarded_notification_counts,
+            vec![GatewayV2ForwardedNotificationCounts {
+                method: "configWarning".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_forwarded_notification_method,
+            Some("configWarning".to_string())
+        );
+        assert_eq!(health.last_forwarded_notification_at.is_some(), true);
     }
 
     #[test]
@@ -2523,6 +2686,24 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.notification_send_failure_counts,
+            vec![GatewayV2NotificationSendFailureCounts {
+                method: "warning".to_string(),
+                outcome: "client_send_timed_out".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_notification_send_failure_method,
+            Some("warning".to_string())
+        );
+        assert_eq!(
+            health.last_notification_send_failure_outcome,
+            Some("client_send_timed_out".to_string())
+        );
+        assert_eq!(health.last_notification_send_failure_at.is_some(), true);
     }
 
     #[test]
@@ -2933,6 +3114,27 @@ mod tests {
 
         observability.record_v2_suppressed_notification("skills/changed", "pending_refresh");
 
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(health.suppressed_notification_counts.len(), 1);
+        assert_eq!(
+            health.suppressed_notification_counts[0].method,
+            "skills/changed"
+        );
+        assert_eq!(
+            health.suppressed_notification_counts[0].reason,
+            "pending_refresh"
+        );
+        assert_eq!(health.suppressed_notification_counts[0].count, 1);
+        assert_eq!(
+            health.last_suppressed_notification_method,
+            Some("skills/changed".to_string())
+        );
+        assert_eq!(
+            health.last_suppressed_notification_reason,
+            Some("pending_refresh".to_string())
+        );
+        assert_eq!(health.last_suppressed_notification_at.is_some(), true);
+
         let resource_metrics = observability
             .metrics
             .as_ref()
@@ -3043,6 +3245,24 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.server_request_lifecycle_event_counts,
+            vec![GatewayV2ServerRequestLifecycleEventCounts {
+                event: "duplicate_resolved_replay".to_string(),
+                method: "serverRequest/resolved".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_server_request_lifecycle_event,
+            Some("duplicate_resolved_replay".to_string())
+        );
+        assert_eq!(
+            health.last_server_request_lifecycle_method,
+            Some("serverRequest/resolved".to_string())
+        );
+        assert_eq!(health.last_server_request_lifecycle_at.is_some(), true);
     }
 
     #[test]
@@ -3115,6 +3335,7 @@ mod tests {
                 count: 1,
             }]
         );
+        assert_eq!(health.protocol_violation_worker_counts, vec![]);
         assert_eq!(
             health.last_protocol_violation_phase,
             Some("post_initialize".to_string())
@@ -3123,6 +3344,38 @@ mod tests {
             health.last_protocol_violation_reason,
             Some("invalid_jsonrpc".to_string())
         );
+        assert_eq!(health.last_protocol_violation_worker_id, None);
+        assert_eq!(health.last_protocol_violation_at.is_some(), true);
+    }
+
+    #[test]
+    fn records_v2_worker_protocol_violation_in_health() {
+        let observability = GatewayObservability::default();
+
+        observability.record_v2_worker_protocol_violation(Some(3), "downstream", "invalid_jsonrpc");
+        observability.record_v2_worker_protocol_violation(Some(3), "downstream", "invalid_jsonrpc");
+
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.protocol_violation_worker_counts,
+            vec![crate::api::GatewayV2ProtocolViolationWorkerCounts {
+                worker_id: 3,
+                violation_counts: vec![GatewayV2ProtocolViolationCounts {
+                    phase: "downstream".to_string(),
+                    reason: "invalid_jsonrpc".to_string(),
+                    count: 2,
+                }],
+            }]
+        );
+        assert_eq!(
+            health.last_protocol_violation_phase,
+            Some("downstream".to_string())
+        );
+        assert_eq!(
+            health.last_protocol_violation_reason,
+            Some("invalid_jsonrpc".to_string())
+        );
+        assert_eq!(health.last_protocol_violation_worker_id, Some(3));
         assert_eq!(health.last_protocol_violation_at.is_some(), true);
     }
 
@@ -3184,6 +3437,16 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.downstream_backpressure_counts,
+            vec![GatewayV2DownstreamBackpressureCounts {
+                worker_id: Some(3),
+                count: 1,
+            }]
+        );
+        assert_eq!(health.last_downstream_backpressure_worker_id, Some(3));
+        assert_eq!(health.last_downstream_backpressure_at.is_some(), true);
     }
 
     #[test]
@@ -3231,6 +3494,9 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(health.client_send_timeout_count, 1);
+        assert_eq!(health.last_client_send_timeout_at.is_some(), true);
     }
 
     #[test]
@@ -3294,6 +3560,19 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.thread_list_deduplication_counts,
+            vec![GatewayV2ThreadListDeduplicationCounts {
+                selected_worker_id: Some(4),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_thread_list_deduplication_selected_worker_id,
+            Some(4)
+        );
+        assert_eq!(health.last_thread_list_deduplication_at.is_some(), true);
     }
 
     #[test]
@@ -3354,6 +3633,19 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.thread_route_recovery_counts,
+            vec![GatewayV2ThreadRouteRecoveryCounts {
+                outcome: "miss".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_thread_route_recovery_outcome,
+            Some("miss".to_string())
+        );
+        assert_eq!(health.last_thread_route_recovery_at.is_some(), true);
     }
 
     #[test]
@@ -3417,6 +3709,24 @@ mod tests {
         }
 
         assert!(saw_count);
+        let health = observability.v2_connection_health.snapshot();
+        assert_eq!(
+            health.degraded_thread_discovery_counts,
+            vec![GatewayV2DegradedThreadDiscoveryCounts {
+                method: "thread/list".to_string(),
+                reconnect_backoff_active: true,
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health.last_degraded_thread_discovery_method,
+            Some("thread/list".to_string())
+        );
+        assert_eq!(
+            health.last_degraded_thread_discovery_reconnect_backoff_active,
+            Some(true)
+        );
+        assert_eq!(health.last_degraded_thread_discovery_at.is_some(), true);
     }
 
     #[test]
