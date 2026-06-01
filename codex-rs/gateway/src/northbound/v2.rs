@@ -21866,6 +21866,9 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_upgrade_logs_pending_command_exec_when_client_send_times_out() {
+        let metrics = in_memory_metrics();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let observed_observability = observability.clone();
         let logs = capture_logs_async(async move {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -21929,7 +21932,6 @@ mod tests {
             });
 
             let initialize_response = test_initialize_response().await;
-            let observability = GatewayObservability::new(None, false);
             let (addr, server_task) = spawn_test_server(GatewayV2State {
                 auth: GatewayAuth::Disabled,
                 admission: GatewayAdmissionController::default(),
@@ -22026,6 +22028,42 @@ mod tests {
         assert!(logs.contains("pending_client_request_methods=[\"command/exec\"]"));
         assert!(logs.contains("pending_client_request_worker_ids=[0]"));
         assert!(logs.contains("pending_client_request_worker_websocket_urls=[\"ws://127.0.0.1:"));
+
+        let active_health = observed_observability.v2_connection_health().snapshot();
+        assert_eq!(active_health.client_send_timeout_count, 1);
+        assert_eq!(
+            active_health.active_connection_pending_client_request_count,
+            1
+        );
+        assert_eq!(
+            active_health.active_connection_pending_client_request_worker_counts,
+            vec![crate::api::GatewayV2PendingClientRequestWorkerCounts {
+                worker_id: Some(0),
+                pending_client_request_count: 1,
+            }]
+        );
+        assert_eq!(
+            active_health.active_connection_pending_client_request_method_counts,
+            vec![crate::api::GatewayV2PendingClientRequestMethodCounts {
+                method: "command/exec".to_string(),
+                pending_client_request_count: 1,
+            }]
+        );
+        assert_eq!(
+            active_health.last_notification_send_failure_method,
+            Some("warning".to_string())
+        );
+        assert_eq!(
+            active_health.last_notification_send_failure_outcome,
+            Some("client_send_timed_out".to_string())
+        );
+        assert_v2_request_metrics(
+            &metrics,
+            &[
+                ("initialize", "ok", 1),
+                ("command/exec", "client_send_timed_out", 1),
+            ],
+        );
     }
 
     #[tokio::test]

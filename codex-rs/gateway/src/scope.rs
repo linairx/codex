@@ -827,6 +827,37 @@ mod tests {
     }
 
     #[test]
+    fn project_worker_selection_redistributes_when_affinity_worker_is_not_eligible() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let project_b = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+
+        registry.register_project_worker(project_a.clone(), /*worker_id*/ 0);
+        registry.register_project_worker(project_b, /*worker_id*/ 1);
+
+        let account_id = |worker_id: usize| {
+            ["acct-a", "acct-b", "acct-c"]
+                .get(worker_id)
+                .map(|account_id| (*account_id).to_string())
+        };
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1, 2], account_id),
+            Some(0)
+        );
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [1, 2], account_id),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn register_thread_path_worker_if_visible_only_updates_matching_scope() {
         let registry = GatewayScopeRegistry::default();
         let visible_context = GatewayRequestContext {

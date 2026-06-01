@@ -2089,7 +2089,11 @@ Current status:
   restore the context. The real multi-worker legacy compatibility harness now
   also validates this through `account/rateLimits/read` plus
   `getConversationSummary.rolloutPath` on an unmodified
-  `RemoteAppServerClient` session. v2 multi-worker routing still does not
+  `RemoteAppServerClient` session, and the real multi-worker v2 compatibility
+  harness now also validates successful path-based `thread/resume` and
+  `thread/fork` replacement-account restoration with the matching
+  `gateway/accountPathHandoffSucceeded` operator events. v2 multi-worker
+  routing still does not
   transfer a live in-memory turn or pending server-request context to a new
   account when the current account runs out of quota. The same real
   multi-worker legacy harness now also watches the real `/v1/events` SSE
@@ -2138,29 +2142,61 @@ Current status:
   `thread_name_set_handoff_failure` and
   `thread_memory_mode_set_handoff_success` /
   `thread_memory_mode_set_handoff_failure` metrics with account
-  thread-handoff operator events. Direct v2
+  thread-handoff operator events. A real multi-worker
+  `RemoteAppServerClient` harness now also covers the successful direct
+  `thread/name/set` restoration path, verifies the
+  `gateway/accountThreadHandoffSucceeded` operator event, and checks that a
+  follow-up `thread/read` remains sticky to the replacement worker. The same
+  real-client account-exhaustion coverage now also validates successful direct
+  `thread/memoryMode/set` restoration and follow-up `thread/read` stickiness
+  on the replacement worker. Direct v2
   `thread/unarchive` now follows the same bounded restoration rule when the
   cached owner account is exhausted: the gateway only accepts a replacement
   response for the requested thread id, updates sticky routing on success, and
   emits `thread_unarchive_handoff_success` /
   `thread_unarchive_handoff_failure` metrics with account thread-handoff
-  operator events. Direct v2 `thread/archive` now follows the same bounded
+  operator events. The real multi-worker `RemoteAppServerClient` harness now
+  also validates the successful direct `thread/unarchive` restoration path,
+  verifies the `gateway/accountThreadHandoffSucceeded` operator event, and
+  checks that a follow-up `thread/read` stays sticky to the replacement worker.
+  The no-replacement branch is also covered through that real-client harness:
+  when every eligible account-backed worker is exhausted, `thread/unarchive`
+  fails closed and publishes `gateway/accountThreadHandoffFailed` without
+  changing the cached route.
+  Direct v2 `thread/archive` now follows the same bounded
   restoration rule for exhausted cached owner accounts, using the requested
   thread id to update sticky routing after the replacement worker successfully
   archives the thread and emitting `thread_archive_handoff_success` /
   `thread_archive_handoff_failure` metrics plus account thread-handoff
-  operator events. Direct v2 `thread/turns/list` now follows the same bounded
+  operator events. The real multi-worker `RemoteAppServerClient` harness now
+  also validates the successful direct `thread/archive` restoration path,
+  verifies the `gateway/accountThreadHandoffSucceeded` operator event, and
+  checks that a follow-up `thread/read` stays sticky to the replacement worker.
+  The no-replacement branch is also covered through that real-client harness:
+  when every eligible account-backed worker is exhausted, `thread/archive`
+  fails closed and publishes `gateway/accountThreadHandoffFailed` without
+  changing the cached route.
+  Direct v2 `thread/turns/list` now follows the same bounded
   restoration rule for history pagination, using the requested thread id to
   update sticky routing after the replacement worker successfully returns the
   page and emitting `thread_turns_list_handoff_success` /
   `thread_turns_list_handoff_failure` metrics plus account thread-handoff
-  operator events. Direct v2 `thread/increment_elicitation` now follows the
+  operator events. The real multi-worker `RemoteAppServerClient` harness now
+  also validates the successful direct `thread/turns/list` restoration path,
+  verifies the `gateway/accountThreadHandoffSucceeded` operator event, and
+  checks that a follow-up `thread/read` stays sticky to the replacement worker.
+  Direct v2 `thread/increment_elicitation` now follows the
   same bounded restoration rule for elicitation counter updates, using the
   requested thread id to update sticky routing after the replacement worker
   successfully increments the counter and emitting
   `thread_increment_elicitation_handoff_success` /
   `thread_increment_elicitation_handoff_failure` metrics plus account
-  thread-handoff operator events. Direct v2 `thread/decrement_elicitation` and
+  thread-handoff operator events. The real multi-worker
+  `RemoteAppServerClient` harness now also validates the successful direct
+  `thread/increment_elicitation` restoration path, verifies the
+  `gateway/accountThreadHandoffSucceeded` operator event, and checks that a
+  follow-up `thread/read` stays sticky to the replacement worker. Direct v2
+  `thread/decrement_elicitation` and
   `thread/inject_items` now use the same requested-thread-id restoration
   surface, updating sticky routing after a replacement worker successfully
   restores the visible counter update or item injection and emitting
@@ -2168,12 +2204,27 @@ Current status:
   `thread_decrement_elicitation_handoff_failure` and
   `thread_inject_items_handoff_success` /
   `thread_inject_items_handoff_failure` metrics with account thread-handoff
-  operator events. Direct v2 `thread/metadata/update` now follows the same
+  operator events. The real multi-worker `RemoteAppServerClient` harness now
+  also validates the successful direct `thread/decrement_elicitation` and
+  `thread/inject_items` restoration paths, verifies the
+  `gateway/accountThreadHandoffSucceeded` operator events, and checks that
+  follow-up `thread/read` requests stay sticky to the replacement worker.
+  Direct v2 `thread/metadata/update` now follows the same
   bounded restoration rule for exhausted cached owner accounts, accepting only
   a replacement response for the requested thread id and emitting
   `thread_metadata_update_handoff_success` /
   `thread_metadata_update_handoff_failure` metrics plus the same account
-  thread-handoff operator events. Direct v2 `thread/rollback` now follows the
+  thread-handoff operator events. The real multi-worker
+  `RemoteAppServerClient` harness now also validates the successful direct
+  `thread/metadata/update` restoration path, verifies the
+  `gateway/accountThreadHandoffSucceeded` operator event, and checks that a
+  follow-up `thread/read` stays sticky to the replacement worker. The
+  no-replacement branch is also covered through that real-client harness: when
+  every eligible account-backed worker is exhausted,
+  `thread/metadata/update` fails closed and publishes
+  `gateway/accountThreadHandoffFailed` without changing the cached route.
+  Direct v2
+  `thread/rollback` now follows the
   same bounded restoration rule for exhausted cached owner accounts, accepting
   only a replacement response for the requested thread id and emitting
   `thread_rollback_handoff_success` /
@@ -2335,10 +2386,12 @@ Operational notes:
   replacement worker must return the same rollout path that the client asked to
   restore; a different path is treated as a failed restoration and does not
   update the cached route.
-  The real multi-worker legacy compatibility harness now validates both the
-  successful `getConversationSummary.rolloutPath` replacement-account
-  restoration path and the no-replacement fail-closed path through an
-  unmodified `RemoteAppServerClient` session.
+  The real multi-worker compatibility harnesses now validate successful
+  path-based `thread/resume`, path-based `thread/fork`, and
+  `getConversationSummary.rolloutPath` replacement-account restoration through
+  unmodified `RemoteAppServerClient` sessions; those same rollout-path
+  surfaces now also have no-replacement fail-closed real-client coverage with
+  `gateway/accountPathHandoffFailed` operator events.
   Legacy `getConversationSummary.conversationId` now also uses the visible
   thread id as a bounded restoration surface. If the cached owning account is
   exhausted, the gateway attempts the summary request on another available
@@ -3125,6 +3178,12 @@ Current Stage A compatibility caveats:
 - legacy `gitDiffToRemote` uses worker-discovery routing in multi-worker mode
   and fails closed while the configured worker set is incomplete, so local
   checkout diffs do not silently reflect only a surviving worker
+- legacy `execCommandApproval` and `applyPatchApproval` prompts are outside
+  the primary Stage A TUI target, but the gateway transport still treats their
+  `conversationId` as thread ownership; the real multi-worker
+  `RemoteAppServerClient` server-request harness now validates both legacy
+  prompt methods with gateway-translated request ids across worker-owned
+  visible threads
 - deprecated `getAuthStatus` mirrors the `account/read` multi-worker
   compatibility behavior: primary-worker auth details stay authoritative while
   `requiresOpenaiAuth` reflects all configured workers

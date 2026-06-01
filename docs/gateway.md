@@ -697,12 +697,78 @@ Recent progress:
   the gateway fails closed, keeps the cached thread route unchanged, and
   publishes `gateway/accountThreadHandoffFailed` with method
   `thread/rollback`
+- the real multi-worker v2 compatibility harness now also drives direct
+  `thread/name/set` through an unmodified `RemoteAppServerClient` after
+  `account/rateLimits/read` marks the cached owner account exhausted,
+  verifying replacement-account restoration, the matching
+  `gateway/accountThreadHandoffSucceeded` operator event, and a follow-up
+  `thread/read` that stays sticky to the replacement worker
+- the real multi-worker v2 compatibility harness now also covers the matching
+  direct `thread/memoryMode/set` restoration path after account exhaustion,
+  verifying replacement-account restoration, the
+  `gateway/accountThreadHandoffSucceeded` operator event, and follow-up
+  `thread/read` stickiness on the replacement worker
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/archive` after account exhaustion, verifying replacement-account
+  restoration, the `gateway/accountThreadHandoffSucceeded` operator event, and
+  follow-up `thread/read` stickiness on the replacement worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/archive`: when every eligible account-backed worker is exhausted,
+  the gateway fails closed, keeps the cached thread route unchanged, and
+  publishes `gateway/accountThreadHandoffFailed` with method `thread/archive`
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/unarchive` after account exhaustion, verifying replacement-account
+  restoration, the `gateway/accountThreadHandoffSucceeded` operator event, and
+  follow-up `thread/read` stickiness on the replacement worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/unarchive`: when every eligible account-backed worker is exhausted,
+  the gateway fails closed, keeps the cached thread route unchanged, and
+  publishes `gateway/accountThreadHandoffFailed` with method
+  `thread/unarchive`
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/metadata/update` after account exhaustion, verifying
+  replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
+  operator event, and follow-up `thread/read` stickiness on the replacement
+  worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/metadata/update`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed, keeps the cached thread route
+  unchanged, and publishes `gateway/accountThreadHandoffFailed` with method
+  `thread/metadata/update`
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/turns/list` after account exhaustion, verifying replacement-account
+  restoration, the `gateway/accountThreadHandoffSucceeded` operator event, and
+  follow-up `thread/read` stickiness on the replacement worker
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/increment_elicitation` after account exhaustion, verifying
+  replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
+  operator event, and follow-up `thread/read` stickiness on the replacement
+  worker
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/decrement_elicitation` after account exhaustion, verifying
+  replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
+  operator event, and follow-up `thread/read` stickiness on the replacement
+  worker
+- the real multi-worker v2 compatibility harness now also covers direct
+  `thread/inject_items` after account exhaustion, verifying
+  replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
+  operator event, and follow-up `thread/read` stickiness on the replacement
+  worker
 - the real multi-worker legacy compatibility harness now also drives
   `account/rateLimits/read` to mark the cached rollout-path worker exhausted,
   then verifies `getConversationSummary.rolloutPath` restores through another
   account-backed worker on an unmodified `RemoteAppServerClient` session; that
   harness now also watches the real `/v1/events` SSE stream and verifies the
   resulting `gateway/accountPathHandoffSucceeded` operator event
+- the real multi-worker v2 compatibility harness now also drives path-based
+  `thread/resume` after account exhaustion, verifying replacement-account
+  restoration, the matching `gateway/accountPathHandoffSucceeded` operator
+  event, and follow-up `thread/read` stickiness on the replacement worker
+- the real multi-worker v2 compatibility harness now also drives path-based
+  `thread/fork` after account exhaustion, verifying replacement-account
+  restoration, the matching `gateway/accountPathHandoffSucceeded` operator
+  event, and follow-up `thread/read` of the forked thread on the replacement
+  worker
 - that same real multi-worker legacy compatibility harness now also verifies
   `getConversationSummary.conversationId` restores through a replacement
   account-backed worker after the cached owner account is marked exhausted,
@@ -712,6 +778,14 @@ Recent progress:
   is marked exhausted, `getConversationSummary.rolloutPath` fails closed and
   publishes `gateway/accountPathHandoffFailed` instead of silently using an
   exhausted cached route
+- that same real no-replacement rollout-path harness now also covers
+  path-based `thread/resume`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed and publishes
+  `gateway/accountPathHandoffFailed` with method `thread/resume`
+- that same real no-replacement rollout-path harness now also covers
+  path-based `thread/fork`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed and publishes
+  `gateway/accountPathHandoffFailed` with method `thread/fork`
 - direct gateway regressions now also cover wrong-path replacement responses
   for `thread/resume.path` and `getConversationSummary.rolloutPath`, ensuring
   those bounded restoration paths only succeed when the restored rollout path
@@ -2953,6 +3027,11 @@ Phase 6 is in progress with:
   session without delivering the answer downstream, and the account-capacity
   plus server-request lifecycle metrics identify the same worker and request
   class
+- the real multi-worker connection-scoped token-refresh disconnect regressions
+  now also open `/v1/events` and verify `gateway/v2ServerRequestCleanup`
+  records the stranded `account/chatgptAuthTokens/refresh` method plus the
+  downstream request id when a worker disconnects while the prompt is pending
+  or answered-but-unresolved
 - `/healthz.v2Connections` now also reports
   `activeConnectionServerRequestBacklogCount`,
   `activeConnectionMaxServerRequestBacklogCount`,
@@ -3166,6 +3245,11 @@ Phase 6 is in progress with:
   server-request delivery failures, lifecycle events, and worker-specific
   protocol violations, so the new operator fields are covered at the
   northbound API boundary rather than only in the in-memory health registry
+- the real multi-worker `RemoteAppServerClient` server-request harness now
+  also exercises legacy `execCommandApproval` and `applyPatchApproval` prompts
+  on one shared northbound session, using UUID-backed visible thread ids so
+  the v1-shaped `conversationId` payloads pass protocol parsing while still
+  verifying gateway request-id translation across worker-owned threads
 
 The remaining Phase 6 work is:
 

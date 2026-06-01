@@ -995,6 +995,7 @@ mod tests {
     use codex_app_server_protocol::Account;
     use codex_app_server_protocol::AddCreditsNudgeCreditType;
     use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+    use codex_app_server_protocol::ApplyPatchApprovalResponse;
     use codex_app_server_protocol::AppsListParams;
     use codex_app_server_protocol::AppsListResponse;
     use codex_app_server_protocol::AuthMode;
@@ -1027,6 +1028,7 @@ mod tests {
     use codex_app_server_protocol::DynamicToolCallResponse;
     use codex_app_server_protocol::DynamicToolCallStatus;
     use codex_app_server_protocol::DynamicToolSpec;
+    use codex_app_server_protocol::ExecCommandApprovalResponse;
     use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
     use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
     use codex_app_server_protocol::ExperimentalFeatureListParams;
@@ -1225,6 +1227,7 @@ mod tests {
     use codex_protocol::protocol::RealtimeOutputModality;
     use codex_protocol::protocol::RealtimeVoice;
     use codex_protocol::protocol::RealtimeVoicesList;
+    use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use core_test_support::responses;
@@ -1265,6 +1268,7 @@ mod tests {
     use tokio::io::AsyncRead;
     use tokio::io::AsyncWrite;
     use tokio::net::TcpListener;
+    use tokio::process::Command;
     use tokio::sync::Barrier;
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
@@ -2627,6 +2631,94 @@ mod tests {
         std::fs::write(fuzzy_root.path().join("gateway-alpha.txt"), "x")
             .expect("fuzzy search fixture should be written");
         let fs_root = tempdir().expect("filesystem operation root tempdir");
+        let git_root = tempdir().expect("git diff root tempdir");
+        let git_repo = git_root.path().join("repo");
+        std::fs::create_dir(&git_repo).expect("git repo directory should be created");
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git init should run");
+        Command::new("git")
+            .args(["config", "user.name", "Gateway Test"])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git user.name should be configured");
+        Command::new("git")
+            .args(["config", "user.email", "gateway@example.com"])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git user.email should be configured");
+        std::fs::write(git_repo.join("tracked.txt"), "base\n")
+            .expect("tracked git fixture should be written");
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git add should run");
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git commit should run");
+        let git_remote = git_root.path().join("remote.git");
+        Command::new("git")
+            .args([
+                "init",
+                "--bare",
+                git_remote
+                    .to_str()
+                    .expect("git remote path should be valid utf8"),
+            ])
+            .output()
+            .await
+            .expect("git bare remote init should run");
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                git_remote
+                    .to_str()
+                    .expect("git remote path should be valid utf8"),
+            ])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git remote add should run");
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git branch should be read");
+        let branch = String::from_utf8(branch_output.stdout)
+            .expect("git branch should be utf8")
+            .trim()
+            .to_string();
+        Command::new("git")
+            .args(["push", "-u", "origin", &branch])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git push should run");
+        let remote_sha_output = Command::new("git")
+            .args(["rev-parse", &format!("origin/{branch}")])
+            .current_dir(&git_repo)
+            .output()
+            .await
+            .expect("git remote sha should be read");
+        let remote_sha = String::from_utf8(remote_sha_output.stdout)
+            .expect("git remote sha should be utf8")
+            .trim()
+            .to_string();
+        std::fs::write(git_repo.join("tracked.txt"), "changed\n")
+            .expect("tracked git fixture should be modified");
         let config = Config::load_default_with_cli_overrides_for_codex_home(
             codex_home.path().to_path_buf(),
             Vec::new(),
@@ -3197,6 +3289,38 @@ mod tests {
             .await
             .expect("feedback/upload should succeed through embedded gateway");
         assert!(!feedback.thread_id.is_empty());
+
+        let legacy_auth: GetAuthStatusResponse = client
+            .request_typed(ClientRequest::GetAuthStatus {
+                request_id: RequestId::Integer(45),
+                params: GetAuthStatusParams {
+                    include_token: Some(true),
+                    refresh_token: Some(false),
+                },
+            })
+            .await
+            .expect("getAuthStatus should succeed through embedded gateway");
+        assert_eq!(
+            legacy_auth,
+            GetAuthStatusResponse {
+                auth_method: None,
+                auth_token: None,
+                requires_openai_auth: Some(true),
+            }
+        );
+
+        let diff: GitDiffToRemoteResponse = client
+            .request_typed(ClientRequest::GitDiffToRemote {
+                request_id: RequestId::Integer(46),
+                params: GitDiffToRemoteParams {
+                    cwd: git_repo.clone(),
+                },
+            })
+            .await
+            .expect("gitDiffToRemote should succeed through embedded gateway");
+        assert_eq!(diff.sha.0, remote_sha);
+        assert!(diff.diff.contains("tracked.txt"));
+        assert!(diff.diff.contains("changed"));
 
         let request_handle = client.request_handle();
         let command_exec_task = tokio::spawn(async move {
@@ -8753,6 +8877,25 @@ stream_max_retries = 0
             Some("Codex")
         );
 
+        let legacy_auth: GetAuthStatusResponse = client
+            .request_typed(ClientRequest::GetAuthStatus {
+                request_id: RequestId::Integer(49),
+                params: GetAuthStatusParams {
+                    include_token: Some(true),
+                    refresh_token: Some(false),
+                },
+            })
+            .await
+            .expect("getAuthStatus should succeed through remote gateway");
+        assert_eq!(
+            legacy_auth,
+            GetAuthStatusResponse {
+                auth_method: None,
+                auth_token: Some("remote-auth-token".to_string()),
+                requires_openai_auth: Some(false),
+            }
+        );
+
         let skills: SkillsListResponse = client
             .request_typed(ClientRequest::SkillsList {
                 request_id: RequestId::Integer(8),
@@ -9252,6 +9395,21 @@ stream_max_retries = 0
         assert_eq!(
             fuzzy_search.files[0].match_type,
             FuzzyFileSearchMatchType::File
+        );
+
+        let diff: GitDiffToRemoteResponse = client
+            .request_typed(ClientRequest::GitDiffToRemote {
+                request_id: RequestId::Integer(50),
+                params: GitDiffToRemoteParams {
+                    cwd: PathBuf::from("/tmp/remote-project"),
+                },
+            })
+            .await
+            .expect("gitDiffToRemote should succeed through remote gateway");
+        assert_eq!(diff.sha.0, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            diff.diff,
+            "diff --git a/docs/gateway.md b/docs/gateway.md\n"
         );
 
         let fuzzy_session_start: FuzzyFileSearchSessionStartResponse = client
@@ -15045,12 +15203,16 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn remote_runtime_restores_thread_read_after_account_capacity_exhaustion() {
-        let worker_a =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-a", false)
-                .await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let worker_c = start_mock_remote_server_for_thread_start_error(
             None,
             JSONRPCErrorError {
@@ -15202,9 +15364,11 @@ stream_max_retries = 0
     #[tokio::test]
     async fn remote_runtime_fails_thread_read_handoff_when_replacement_returns_wrong_thread() {
         let worker_a = start_mock_remote_multi_connection_wrong_thread_read_server().await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let worker_c = start_mock_remote_server_for_thread_start_error(
             None,
             JSONRPCErrorError {
@@ -18223,6 +18387,7 @@ stream_max_retries = 0
             "/tmp/worker-b",
             "safe-b",
             "acct-worker-b",
+            LegacyApprovalExercise::Skip,
         )
         .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
@@ -21090,6 +21255,40 @@ stream_max_retries = 0
         .await
         .expect("server");
 
+        let cleanup_event_url = format!("http://{}/v1/events", server.local_addr());
+        let cleanup_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(cleanup_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/v2ServerRequestCleanup")
+                        && event.contains(
+                            "\"strandedConnectionScopedServerRequestMethods\":[\"account/chatgptAuthTokens/refresh\"]",
+                        )
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
             auth_token: None,
@@ -21169,6 +21368,22 @@ stream_max_retries = 0
         .await
         .expect("gateway should fail closed after the connection-scoped request strands");
 
+        let cleanup_event = timeout(Duration::from_secs(5), cleanup_event_task)
+            .await
+            .expect("timed out waiting for connection-scoped cleanup event")
+            .expect("cleanup event task should finish");
+        assert!(cleanup_event.contains("event: gateway/v2ServerRequestCleanup"));
+        assert!(cleanup_event.contains("\"workerId\":0"));
+        assert!(cleanup_event.contains("\"remainingWorkerCount\":1"));
+        assert!(cleanup_event.contains("\"resolvedThreadScopedServerRequestCount\":0"));
+        assert!(cleanup_event.contains("\"strandedConnectionScopedServerRequestCount\":1"));
+        assert!(cleanup_event.contains(
+            "\"strandedConnectionScopedDownstreamServerRequestIds\":[\"pending-chatgpt-refresh\"]"
+        ));
+        assert!(cleanup_event.contains(
+            "\"strandedConnectionScopedServerRequestMethods\":[\"account/chatgptAuthTokens/refresh\"]"
+        ));
+
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
     }
@@ -21211,6 +21426,40 @@ stream_max_retries = 0
         )
         .await
         .expect("server");
+
+        let cleanup_event_url = format!("http://{}/v1/events", server.local_addr());
+        let cleanup_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(cleanup_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/v2ServerRequestCleanup")
+                        && event.contains(
+                            "\"strandedConnectionScopedServerRequestMethods\":[\"account/chatgptAuthTokens/refresh\"]",
+                        )
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             websocket_url: format!("ws://{}/", server.local_addr()),
@@ -21306,6 +21555,22 @@ stream_max_retries = 0
         .expect(
             "gateway should fail closed after the unresolved connection-scoped request strands",
         );
+
+        let cleanup_event = timeout(Duration::from_secs(5), cleanup_event_task)
+            .await
+            .expect("timed out waiting for answered connection-scoped cleanup event")
+            .expect("cleanup event task should finish");
+        assert!(cleanup_event.contains("event: gateway/v2ServerRequestCleanup"));
+        assert!(cleanup_event.contains("\"workerId\":0"));
+        assert!(cleanup_event.contains("\"remainingWorkerCount\":1"));
+        assert!(cleanup_event.contains("\"resolvedThreadScopedServerRequestCount\":0"));
+        assert!(cleanup_event.contains("\"strandedConnectionScopedServerRequestCount\":1"));
+        assert!(cleanup_event.contains(
+            "\"strandedConnectionScopedDownstreamServerRequestIds\":[\"pending-chatgpt-refresh\"]"
+        ));
+        assert!(cleanup_event.contains(
+            "\"strandedConnectionScopedServerRequestMethods\":[\"account/chatgptAuthTokens/refresh\"]"
+        ));
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -22396,7 +22661,7 @@ stream_max_retries = 0
     #[tokio::test]
     async fn remote_multi_worker_aggregates_bootstrap_account_and_models_over_v2() {
         let worker_a = start_mock_remote_multi_connection_bootstrap_server(
-            false,
+            OpenAiAuthRequirement::NotRequired,
             Some(vec![("codex", "Codex", 20), ("shared", "Shared", 5)]),
             vec![
                 ("shared-model", "Shared Model", true),
@@ -22405,7 +22670,7 @@ stream_max_retries = 0
         )
         .await;
         let worker_b = start_mock_remote_multi_connection_bootstrap_server(
-            true,
+            OpenAiAuthRequirement::Required,
             Some(vec![("codex", "Codex", 20), ("worker-b", "Worker B", 35)]),
             vec![
                 ("shared-model", "Shared Model", true),
@@ -22768,12 +23033,16 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn remote_multi_worker_restores_thread_read_after_account_exhaustion_over_v2() {
-        let worker_a =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-a", false)
-                .await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -22975,12 +23244,16 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn remote_multi_worker_restores_thread_rollback_after_account_exhaustion_over_v2() {
-        let worker_a =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-a", false)
-                .await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -23175,13 +23448,2522 @@ stream_max_retries = 0
     }
 
     #[tokio::test]
+    async fn remote_multi_worker_restores_thread_archive_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/archive\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let archive_response: ThreadArchiveResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(4),
+                params: ThreadArchiveParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/archive should finish in time")
+        .expect("thread/archive should restore through the replacement worker");
+        assert_eq!(archive_response, ThreadArchiveResponse {});
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/archive handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/archive\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after archive should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_unarchive_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/unarchive\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let unarchive_response: ThreadUnarchiveResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(4),
+                params: ThreadUnarchiveParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/unarchive should finish in time")
+        .expect("thread/unarchive should restore through the replacement worker");
+        assert_eq!(unarchive_response.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            unarchive_response.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-unarchive"
+        );
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/unarchive handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/unarchive\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after unarchive should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_metadata_update_after_account_exhaustion_over_v2()
+    {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/metadata/update\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let metadata_update_response: ThreadMetadataUpdateResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(4),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            }),
+        )
+        .await
+        .expect("thread/metadata/update should finish in time")
+        .expect("thread/metadata/update should restore through the replacement worker");
+        assert_eq!(
+            metadata_update_response.thread.id,
+            worker_b_thread.thread.id
+        );
+        assert_eq!(
+            metadata_update_response
+                .thread
+                .cwd
+                .as_ref()
+                .to_string_lossy(),
+            "/tmp/worker-a-metadata"
+        );
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/metadata/update handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/metadata/update\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after metadata update should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_turns_list_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/turns/list\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let turns_response: ThreadTurnsListResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadTurnsList {
+                request_id: RequestId::Integer(4),
+                params: ThreadTurnsListParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    cursor: None,
+                    limit: Some(10),
+                    sort_direction: None,
+                },
+            }),
+        )
+        .await
+        .expect("thread/turns/list should finish in time")
+        .expect("thread/turns/list should restore through the replacement worker");
+        assert_eq!(turns_response.data.len(), 1);
+        assert_eq!(turns_response.data[0].id, "turn-worker-a-restored");
+        assert_eq!(turns_response.next_cursor, None);
+        assert_eq!(turns_response.backwards_cursor, None);
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/turns/list handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/turns/list\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after turns list should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_increment_elicitation_after_account_exhaustion_over_v2()
+     {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/increment_elicitation\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let increment_response: ThreadIncrementElicitationResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadIncrementElicitation {
+                request_id: RequestId::Integer(4),
+                params: ThreadIncrementElicitationParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/increment_elicitation should finish in time")
+        .expect("thread/increment_elicitation should restore through the replacement worker");
+        assert_eq!(
+            increment_response,
+            ThreadIncrementElicitationResponse {
+                count: 7,
+                paused: true,
+            }
+        );
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/increment_elicitation handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/increment_elicitation\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after increment elicitation should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_decrement_elicitation_after_account_exhaustion_over_v2()
+     {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/decrement_elicitation\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let decrement_response: ThreadDecrementElicitationResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadDecrementElicitation {
+                request_id: RequestId::Integer(4),
+                params: ThreadDecrementElicitationParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/decrement_elicitation should finish in time")
+        .expect("thread/decrement_elicitation should restore through the replacement worker");
+        assert_eq!(
+            decrement_response,
+            ThreadDecrementElicitationResponse {
+                count: 6,
+                paused: false,
+            }
+        );
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/decrement_elicitation handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/decrement_elicitation\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after decrement elicitation should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_inject_items_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/inject_items\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let inject_response: ThreadInjectItemsResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadInjectItems {
+                request_id: RequestId::Integer(4),
+                params: ThreadInjectItemsParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    items: vec![serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "replacement seed item"}],
+                    })],
+                },
+            }),
+        )
+        .await
+        .expect("thread/inject_items should finish in time")
+        .expect("thread/inject_items should restore through the replacement worker");
+        assert_eq!(inject_response, ThreadInjectItemsResponse {});
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/inject_items handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/inject_items\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after item injection should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_name_set_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/name/set\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let renamed = "Restored Worker Thread".to_string();
+        let rename_response: ThreadSetNameResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadSetName {
+                request_id: RequestId::Integer(4),
+                params: ThreadSetNameParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    name: renamed.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/name/set should finish in time")
+        .expect("thread/name/set should restore through the replacement worker");
+        assert_eq!(rename_response, ThreadSetNameResponse {});
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/name/set handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/name/set\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after rename should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_thread_memory_mode_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/memoryMode/set\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let memory_mode_response: ThreadMemoryModeSetResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadMemoryModeSet {
+                request_id: RequestId::Integer(4),
+                params: ThreadMemoryModeSetParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    mode: ThreadMemoryMode::Disabled,
+                },
+            }),
+        )
+        .await
+        .expect("thread/memoryMode/set should finish in time")
+        .expect("thread/memoryMode/set should restore through the replacement worker");
+        assert_eq!(memory_mode_response, ThreadMemoryModeSetResponse {});
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/memoryMode/set handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountThreadHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/memoryMode/set\""));
+        assert!(handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after memory-mode update should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_path_resume_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+        let worker_b_rollout_path = worker_b_thread
+            .thread
+            .path
+            .clone()
+            .expect("worker B thread should expose rollout path");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountPathHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/resume\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let resumed: ThreadResumeResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(4),
+                params: ThreadResumeParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    history: None,
+                    path: Some(worker_b_rollout_path.clone()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("path-based thread/resume should finish in time")
+        .expect("path-based thread/resume should restore through the replacement worker");
+        assert_eq!(resumed.thread.id, worker_b_thread.thread.id);
+        assert_eq!(resumed.thread.path, Some(worker_b_rollout_path.clone()));
+        assert_eq!(resumed.cwd.as_ref().to_string_lossy(), "/tmp/worker-a");
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for path thread/resume handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountPathHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/resume\""));
+        assert!(handoff_event.contains("\"threadPath\":\"/tmp/worker-b/rollout.jsonl\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let restored_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read after path resume should stay on the replacement worker");
+        assert_eq!(restored_read.thread.id, worker_b_thread.thread.id);
+        assert_eq!(
+            restored_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-read"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_multi_worker_restores_path_fork_after_account_exhaustion_over_v2() {
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let config = Config::load_default_with_cli_overrides(Vec::new())
+            .await
+            .expect("config");
+        let server = start_gateway_server(
+            GatewayConfig {
+                bind_address: "127.0.0.1:0".parse().expect("bind address"),
+                runtime_mode: GatewayRuntimeMode::Remote,
+                remote_runtime: Some(GatewayRemoteRuntimeConfig {
+                    selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+                    workers: vec![
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_a,
+                            auth_token: None,
+                            account_id: Some("acct-a".to_string()),
+                        },
+                        GatewayRemoteWorkerConfig {
+                            websocket_url: worker_b,
+                            auth_token: None,
+                            account_id: Some("acct-b".to_string()),
+                        },
+                    ],
+                }),
+                ..GatewayConfig::default()
+            },
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+        )
+        .await
+        .expect("server");
+
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: format!("ws://{}/", server.local_addr()),
+            auth_token: None,
+            client_name: "codex-gateway-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 8,
+        })
+        .await
+        .expect("remote client should connect to multi-worker gateway");
+
+        let _worker_a_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(1),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-a".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("first thread/start should finish in time")
+        .expect("first thread/start should register worker A scope");
+
+        let worker_b_thread: AppServerThreadStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(2),
+                params: ThreadStartParams {
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: Some("/tmp/worker-b".to_string()),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: Some(true),
+                    session_start_source: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("second thread/start should finish in time")
+        .expect("second thread/start should register worker B scope");
+        let worker_b_rollout_path = worker_b_thread
+            .thread
+            .path
+            .clone()
+            .expect("worker B thread should expose rollout path");
+
+        timeout(
+            Duration::from_secs(5),
+            client.request_typed::<GetAccountRateLimitsResponse>(
+                ClientRequest::GetAccountRateLimits {
+                    request_id: RequestId::Integer(3),
+                    params: None,
+                },
+            ),
+        )
+        .await
+        .expect("account/rateLimits/read should finish in time")
+        .expect("account/rateLimits/read should mark worker B exhausted");
+
+        let handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountPathHandoffSucceeded")
+                        && event.contains("\"method\":\"thread/fork\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let forked: ThreadForkResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadFork {
+                request_id: RequestId::Integer(4),
+                params: ThreadForkParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    path: Some(worker_b_rollout_path),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    ephemeral: true,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("path-based thread/fork should finish in time")
+        .expect("path-based thread/fork should restore through the replacement worker");
+        assert_eq!(
+            forked.thread.id.to_string(),
+            "00000000-0000-0000-0000-0000000000a2"
+        );
+        assert_eq!(
+            forked.thread.forked_from_id.as_ref(),
+            Some(&worker_b_thread.thread.id)
+        );
+        assert_eq!(forked.cwd.as_ref().to_string_lossy(), "/tmp/worker-a-fork");
+
+        let handoff_event = timeout(Duration::from_secs(5), handoff_event_task)
+            .await
+            .expect("timed out waiting for path thread/fork handoff event")
+            .expect("handoff event task should finish");
+        assert!(handoff_event.contains("event: gateway/accountPathHandoffSucceeded"));
+        assert!(handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(handoff_event.contains("\"projectId\":null"));
+        assert!(handoff_event.contains("\"method\":\"thread/fork\""));
+        assert!(handoff_event.contains("\"threadPath\":\"/tmp/worker-b/rollout.jsonl\""));
+        assert!(handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(handoff_event.contains("\"replacementWorkerId\":0"));
+        assert!(handoff_event.contains("\"replacementAccountId\":\"acct-a\""));
+
+        let forked_read: AppServerThreadReadResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadRead {
+                request_id: RequestId::Integer(5),
+                params: ThreadReadParams {
+                    thread_id: forked.thread.id.clone(),
+                    include_turns: false,
+                },
+            }),
+        )
+        .await
+        .expect("thread/read should finish in time")
+        .expect("thread/read of path fork should stay on the replacement worker");
+        assert_eq!(forked_read.thread.id, forked.thread.id);
+        assert_eq!(
+            forked_read.thread.cwd.as_ref().to_string_lossy(),
+            "/tmp/worker-a-fork"
+        );
+
+        assert_remote_client_shutdown(
+            timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .expect("client shutdown should finish in time"),
+        );
+        timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("server shutdown should finish in time")
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn remote_multi_worker_restores_legacy_conversation_summary_after_account_exhaustion() {
-        let worker_a =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-a", false)
-                .await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -23628,12 +26410,16 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn remote_multi_worker_fails_closed_when_thread_id_handoff_has_no_account_replacement() {
-        let worker_a =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-a", true)
-                .await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Exhausted,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -24047,6 +26833,214 @@ stream_max_retries = 0
         assert!(rollback_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
         assert!(rollback_handoff_event.contains("no replacement worker restored the context"));
 
+        let archive_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let archive_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(archive_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/archive\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let archive_result: Result<ThreadArchiveResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadArchive {
+                request_id: RequestId::Integer(8),
+                params: ThreadArchiveParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/archive fail-closed response should finish in time");
+        let archive_error = archive_result
+            .expect_err("thread/archive should fail closed without a replacement account");
+        assert!(
+            archive_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/archive, and no replacement worker restored the context"
+            ),
+            "{archive_error}"
+        );
+
+        let archive_handoff_event = timeout(Duration::from_secs(5), archive_handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/archive handoff failure event")
+            .expect("thread/archive handoff event task should finish");
+        assert!(archive_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(archive_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(archive_handoff_event.contains("\"projectId\":null"));
+        assert!(archive_handoff_event.contains("\"method\":\"thread/archive\""));
+        assert!(
+            archive_handoff_event.contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(archive_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(archive_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(archive_handoff_event.contains("no replacement worker restored the context"));
+
+        let unarchive_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let unarchive_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(unarchive_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/unarchive\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let unarchive_result: Result<ThreadUnarchiveResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadUnarchive {
+                request_id: RequestId::Integer(9),
+                params: ThreadUnarchiveParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/unarchive fail-closed response should finish in time");
+        let unarchive_error = unarchive_result
+            .expect_err("thread/unarchive should fail closed without a replacement account");
+        assert!(
+            unarchive_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/unarchive, and no replacement worker restored the context"
+            ),
+            "{unarchive_error}"
+        );
+
+        let unarchive_handoff_event = timeout(Duration::from_secs(5), unarchive_handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/unarchive handoff failure event")
+            .expect("thread/unarchive handoff event task should finish");
+        assert!(unarchive_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(unarchive_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(unarchive_handoff_event.contains("\"projectId\":null"));
+        assert!(unarchive_handoff_event.contains("\"method\":\"thread/unarchive\""));
+        assert!(
+            unarchive_handoff_event
+                .contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(unarchive_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(unarchive_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(unarchive_handoff_event.contains("no replacement worker restored the context"));
+
+        let metadata_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let metadata_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(metadata_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/metadata/update\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let metadata_result: Result<ThreadMetadataUpdateResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadMetadataUpdate {
+                request_id: RequestId::Integer(10),
+                params: ThreadMetadataUpdateParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                        sha: Some(Some("abc123".to_string())),
+                        branch: Some(Some("main".to_string())),
+                        origin_url: None,
+                    }),
+                },
+            }),
+        )
+        .await
+        .expect("thread/metadata/update fail-closed response should finish in time");
+        let metadata_error = metadata_result
+            .expect_err("thread/metadata/update should fail closed without a replacement account");
+        assert!(
+            metadata_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/metadata/update, and no replacement worker restored the context"
+            ),
+            "{metadata_error}"
+        );
+
+        let metadata_handoff_event = timeout(Duration::from_secs(5), metadata_handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/metadata/update handoff failure event")
+            .expect("thread/metadata/update handoff event task should finish");
+        assert!(metadata_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(metadata_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(metadata_handoff_event.contains("\"projectId\":null"));
+        assert!(metadata_handoff_event.contains("\"method\":\"thread/metadata/update\""));
+        assert!(
+            metadata_handoff_event
+                .contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(metadata_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(metadata_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(metadata_handoff_event.contains("no replacement worker restored the context"));
+
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
                 .await
@@ -24060,12 +27054,16 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn remote_multi_worker_fails_closed_when_rollout_path_has_no_account_replacement() {
-        let worker_a =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-a", true)
-                .await;
-        let worker_b =
-            start_mock_remote_multi_connection_legacy_account_handoff_server("worker-b", false)
-                .await;
+        let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-a",
+            WorkerAAccountCapacity::Exhausted,
+        )
+        .await;
+        let worker_b = start_mock_remote_multi_connection_legacy_account_handoff_server(
+            "worker-b",
+            WorkerAAccountCapacity::Available,
+        )
+        .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -24250,6 +27248,167 @@ stream_max_retries = 0
         assert!(path_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
         assert!(path_handoff_event.contains("no replacement worker restored the context"));
 
+        let resume_path_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let resume_path_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(resume_path_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountPathHandoffFailed")
+                        && event.contains("\"method\":\"thread/resume\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let resume_path_result: Result<ThreadResumeResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadResume {
+                request_id: RequestId::Integer(5),
+                params: ThreadResumeParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    history: None,
+                    path: Some(worker_b_rollout_path.clone()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("path-based thread/resume fail-closed response should finish in time");
+        let resume_path_error = resume_path_result.expect_err(
+            "path-based thread/resume should fail closed without a replacement account",
+        );
+        assert!(
+            resume_path_error.to_string().contains(
+                "thread path /tmp/worker-b/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context"
+            ),
+            "{resume_path_error}"
+        );
+
+        let resume_path_handoff_event =
+            timeout(Duration::from_secs(5), resume_path_handoff_event_task)
+                .await
+                .expect("timed out waiting for path resume handoff failure event")
+                .expect("path resume handoff failure event task should finish");
+        assert!(resume_path_handoff_event.contains("event: gateway/accountPathHandoffFailed"));
+        assert!(resume_path_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(resume_path_handoff_event.contains("\"projectId\":null"));
+        assert!(resume_path_handoff_event.contains("\"method\":\"thread/resume\""));
+        assert!(
+            resume_path_handoff_event.contains("\"threadPath\":\"/tmp/worker-b/rollout.jsonl\"")
+        );
+        assert!(resume_path_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(resume_path_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(resume_path_handoff_event.contains("no replacement worker restored the context"));
+
+        let fork_path_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let fork_path_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(fork_path_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountPathHandoffFailed")
+                        && event.contains("\"method\":\"thread/fork\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let fork_path_result: Result<ThreadForkResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadFork {
+                request_id: RequestId::Integer(6),
+                params: ThreadForkParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    path: Some(worker_b_rollout_path.clone()),
+                    model: None,
+                    model_provider: None,
+                    service_tier: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    ephemeral: true,
+                    persist_extended_history: false,
+                },
+            }),
+        )
+        .await
+        .expect("path-based thread/fork fail-closed response should finish in time");
+        let fork_path_error = fork_path_result
+            .expect_err("path-based thread/fork should fail closed without a replacement account");
+        assert!(
+            fork_path_error.to_string().contains(
+                "thread path /tmp/worker-b/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/fork, and no replacement worker restored the context"
+            ),
+            "{fork_path_error}"
+        );
+
+        let fork_path_handoff_event = timeout(Duration::from_secs(5), fork_path_handoff_event_task)
+            .await
+            .expect("timed out waiting for path fork handoff failure event")
+            .expect("path fork handoff failure event task should finish");
+        assert!(fork_path_handoff_event.contains("event: gateway/accountPathHandoffFailed"));
+        assert!(fork_path_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(fork_path_handoff_event.contains("\"projectId\":null"));
+        assert!(fork_path_handoff_event.contains("\"method\":\"thread/fork\""));
+        assert!(fork_path_handoff_event.contains("\"threadPath\":\"/tmp/worker-b/rollout.jsonl\""));
+        assert!(fork_path_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(fork_path_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(fork_path_handoff_event.contains("no replacement worker restored the context"));
+
         let thread_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
         let thread_handoff_event_task = tokio::spawn(async move {
             let mut events_response = reqwest::Client::new()
@@ -24285,7 +27444,7 @@ stream_max_retries = 0
         let summary_by_thread_result: Result<GetConversationSummaryResponse, _> = timeout(
             Duration::from_secs(5),
             client.request_typed(ClientRequest::GetConversationSummary {
-                request_id: RequestId::Integer(5),
+                request_id: RequestId::Integer(7),
                 params: GetConversationSummaryParams::ThreadId {
                     conversation_id: ThreadId::from_string(&worker_b_thread.thread.id)
                         .expect("worker B thread id should parse"),
@@ -28420,17 +31579,19 @@ stream_max_retries = 0
     #[tokio::test]
     async fn remote_multi_worker_supports_v2_server_request_routing_and_id_translation() {
         let worker_a = start_mock_remote_multi_connection_server_request_server(
-            "thread-worker-a",
+            "018f0000-0000-7000-8000-0000000000a1",
             "/tmp/worker-a",
             "safe-a",
             "acct-worker-a",
+            LegacyApprovalExercise::Exercise,
         )
         .await;
         let worker_b = start_mock_remote_multi_connection_server_request_server(
-            "thread-worker-b",
+            "018f0000-0000-7000-8000-0000000000b2",
             "/tmp/worker-b",
             "safe-b",
             "acct-worker-b",
+            LegacyApprovalExercise::Exercise,
         )
         .await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
@@ -28542,6 +31703,8 @@ stream_max_retries = 0
         let mut mcp_threads = HashSet::new();
         let mut dynamic_tool_call_threads = HashSet::new();
         let mut refresh_accounts = HashSet::new();
+        let mut legacy_exec_threads = HashSet::new();
+        let mut legacy_patch_threads = HashSet::new();
         timeout(Duration::from_secs(5), async {
             while user_input_threads.len() < expected_threads.len()
                 || command_threads.len() < expected_threads.len()
@@ -28550,6 +31713,8 @@ stream_max_retries = 0
                 || mcp_threads.len() < expected_threads.len()
                 || dynamic_tool_call_threads.len() < expected_threads.len()
                 || refresh_accounts.len() < expected_threads.len()
+                || legacy_exec_threads.len() < expected_threads.len()
+                || legacy_patch_threads.len() < expected_threads.len()
             {
                 let event = client
                     .next_event()
@@ -28570,10 +31735,12 @@ stream_max_retries = 0
                             gateway_request_ids.insert(request_id.clone()),
                             "gateway request ids should be unique across workers and methods"
                         );
-                        let answer = match params.thread_id.as_str() {
-                            "thread-worker-a" => "safe-a",
-                            "thread-worker-b" => "safe-b",
-                            thread_id => panic!("unexpected thread id: {thread_id}"),
+                        let answer = if params.thread_id == first_started.thread.id {
+                            "safe-a"
+                        } else if params.thread_id == second_started.thread.id {
+                            "safe-b"
+                        } else {
+                            panic!("unexpected thread id: {}", params.thread_id);
                         };
                         let mut answers = HashMap::new();
                         answers.insert(
@@ -28809,6 +31976,61 @@ stream_max_retries = 0
                             .expect("chatgpt refresh should resolve");
                         refresh_accounts.insert(previous_account_id.to_string());
                     }
+                    AppServerEvent::ServerRequest(ServerRequest::ExecCommandApproval {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(params.call_id, "legacy-exec-call");
+                        assert_eq!(params.approval_id, Some("legacy-exec-approval".to_string()));
+                        assert_ne!(
+                            request_id,
+                            RequestId::String("shared-legacy-exec-approval".to_string())
+                        );
+                        assert!(
+                            gateway_request_ids.insert(request_id.clone()),
+                            "gateway request ids should be unique across workers and methods"
+                        );
+                        client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(ExecCommandApprovalResponse {
+                                    decision: ReviewDecision::Approved,
+                                })
+                                .expect("legacy exec approval response should serialize"),
+                            )
+                            .await
+                            .expect("legacy exec approval should resolve");
+                        legacy_exec_threads.insert(params.conversation_id.to_string());
+                    }
+                    AppServerEvent::ServerRequest(ServerRequest::ApplyPatchApproval {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(params.call_id, "legacy-patch-call");
+                        assert_eq!(
+                            params.reason,
+                            Some("Need legacy patch approval".to_string())
+                        );
+                        assert_ne!(
+                            request_id,
+                            RequestId::String("shared-legacy-patch-approval".to_string())
+                        );
+                        assert!(
+                            gateway_request_ids.insert(request_id.clone()),
+                            "gateway request ids should be unique across workers and methods"
+                        );
+                        client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(ApplyPatchApprovalResponse {
+                                    decision: ReviewDecision::ApprovedForSession,
+                                })
+                                .expect("legacy apply-patch approval response should serialize"),
+                            )
+                            .await
+                            .expect("legacy apply-patch approval should resolve");
+                        legacy_patch_threads.insert(params.conversation_id.to_string());
+                    }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ServerRequestResolved(_),
                     ) => {}
@@ -28828,6 +32050,8 @@ stream_max_retries = 0
             refresh_accounts,
             HashSet::from(["acct-worker-a".to_string(), "acct-worker-b".to_string(),])
         );
+        assert_eq!(legacy_exec_threads, expected_threads);
+        assert_eq!(legacy_patch_threads, expected_threads);
 
         assert_remote_client_shutdown(client.shutdown().await);
         server.shutdown().await.expect("shutdown");
@@ -36897,6 +40121,11 @@ stream_max_retries = 0
                                 "account": account,
                                 "requiresOpenaiAuth": false,
                             }),
+                            "getAuthStatus" => serde_json::json!({
+                                "authMethod": null,
+                                "authToken": "remote-auth-token",
+                                "requiresOpenaiAuth": false,
+                            }),
                             "account/rateLimits/read" => serde_json::json!({
                                 "rateLimits": {
                                     "limitId": "codex",
@@ -37421,6 +40650,10 @@ stream_max_retries = 0
                                     "score": 42,
                                     "indices": [5, 6, 7, 8],
                                 }],
+                            }),
+                            "gitDiffToRemote" => serde_json::json!({
+                                "sha": "0123456789abcdef0123456789abcdef01234567",
+                                "diff": "diff --git a/docs/gateway.md b/docs/gateway.md\n",
                             }),
                             "fuzzyFileSearch/sessionStart" => serde_json::json!({}),
                             "fuzzyFileSearch/sessionUpdate" => {
@@ -39711,8 +42944,14 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OpenAiAuthRequirement {
+        NotRequired,
+        Required,
+    }
+
     async fn start_mock_remote_multi_connection_bootstrap_server(
-        requires_openai_auth: bool,
+        openai_auth_requirement: OpenAiAuthRequirement,
         rate_limits: Option<Vec<(&'static str, &'static str, i32)>>,
         models: Vec<(&'static str, &'static str, bool)>,
     ) -> String {
@@ -39725,6 +42964,8 @@ stream_max_retries = 0
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let models = models.clone();
                 let rate_limits = rate_limits.clone();
+                let requires_openai_auth =
+                    matches!(openai_auth_requirement, OpenAiAuthRequirement::Required);
                 tokio::spawn(async move {
                     let mut websocket = tokio_tungstenite::accept_async(stream)
                         .await
@@ -39950,9 +43191,15 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum WorkerAAccountCapacity {
+        Available,
+        Exhausted,
+    }
+
     async fn start_mock_remote_multi_connection_legacy_account_handoff_server(
         worker_label: &'static str,
-        worker_a_exhausted: bool,
+        worker_a_account_capacity: WorkerAAccountCapacity,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -40008,7 +43255,9 @@ stream_max_retries = 0
                                 let (limit_id, limit_name, used_percent, reached_type) =
                                     if worker_label == "worker-b" {
                                         ("worker-b", "Worker B", 100, Some("rate_limit_reached"))
-                                    } else if worker_a_exhausted {
+                                    } else if worker_a_account_capacity
+                                        == WorkerAAccountCapacity::Exhausted
+                                    {
                                         ("worker-a", "Worker A", 100, Some("rate_limit_reached"))
                                     } else {
                                         ("codex", "Codex", 20, None)
@@ -40149,15 +43398,31 @@ stream_max_retries = 0
                                     .and_then(|params| params.get("threadId"))
                                     .and_then(serde_json::Value::as_str)
                                     .expect("thread/read should include threadId");
-                                assert_eq!(
-                                    requested_thread_id,
-                                    "00000000-0000-0000-0000-0000000000b2"
+                                assert!(
+                                    requested_thread_id == "00000000-0000-0000-0000-0000000000b2"
+                                        || requested_thread_id
+                                            == "00000000-0000-0000-0000-0000000000a2",
+                                    "thread/read should target a restored thread"
                                 );
+                                let preview = if requested_thread_id
+                                    == "00000000-0000-0000-0000-0000000000a2"
+                                {
+                                    "/tmp/worker-a-fork"
+                                } else {
+                                    "/tmp/worker-a-read"
+                                };
+                                let rollout_path = if requested_thread_id
+                                    == "00000000-0000-0000-0000-0000000000a2"
+                                {
+                                    "/tmp/worker-b/forked-rollout.jsonl"
+                                } else {
+                                    "/tmp/worker-b/rollout.jsonl"
+                                };
                                 serde_json::json!({
                                     "thread": mock_thread_with_path(
                                         requested_thread_id,
-                                        "/tmp/worker-a-read",
-                                        Some("/tmp/worker-b/rollout.jsonl"),
+                                        preview,
+                                        Some(rollout_path),
                                     ),
                                 })
                             }
@@ -40180,6 +43445,145 @@ stream_max_retries = 0
                                     ),
                                 })
                             }
+                            "thread/archive" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/archive should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({})
+                            }
+                            "thread/unarchive" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/unarchive should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({
+                                    "thread": mock_thread_with_path(
+                                        requested_thread_id,
+                                        "/tmp/worker-a-unarchive",
+                                        Some("/tmp/worker-b/rollout.jsonl"),
+                                    ),
+                                })
+                            }
+                            "thread/metadata/update" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/metadata/update should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({
+                                    "thread": mock_thread_with_path(
+                                        requested_thread_id,
+                                        "/tmp/worker-a-metadata",
+                                        Some("/tmp/worker-b/rollout.jsonl"),
+                                    ),
+                                })
+                            }
+                            "thread/turns/list" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/turns/list should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({
+                                    "data": [mock_turn("turn-worker-a-restored", "completed")],
+                                    "nextCursor": null,
+                                    "backwardsCursor": null,
+                                })
+                            }
+                            "thread/increment_elicitation" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/increment_elicitation should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({
+                                    "count": 7,
+                                    "paused": true,
+                                })
+                            }
+                            "thread/decrement_elicitation" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/decrement_elicitation should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({
+                                    "count": 6,
+                                    "paused": false,
+                                })
+                            }
+                            "thread/inject_items" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/inject_items should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({})
+                            }
+                            "thread/name/set" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/name/set should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({})
+                            }
+                            "thread/memoryMode/set" if worker_label == "worker-a" => {
+                                let requested_thread_id = request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|params| params.get("threadId"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .expect("thread/memoryMode/set should include threadId");
+                                assert_eq!(
+                                    requested_thread_id,
+                                    "00000000-0000-0000-0000-0000000000b2"
+                                );
+                                serde_json::json!({})
+                            }
                             "thread/resume" => {
                                 panic!("exhausted worker should not receive thread/resume")
                             }
@@ -40191,6 +43595,37 @@ stream_max_retries = 0
                             }
                             "thread/rollback" => {
                                 panic!("exhausted worker should not receive thread/rollback")
+                            }
+                            "thread/archive" => {
+                                panic!("exhausted worker should not receive thread/archive")
+                            }
+                            "thread/unarchive" => {
+                                panic!("exhausted worker should not receive thread/unarchive")
+                            }
+                            "thread/metadata/update" => {
+                                panic!("exhausted worker should not receive thread/metadata/update")
+                            }
+                            "thread/turns/list" => {
+                                panic!("exhausted worker should not receive thread/turns/list")
+                            }
+                            "thread/increment_elicitation" => {
+                                panic!(
+                                    "exhausted worker should not receive thread/increment_elicitation"
+                                )
+                            }
+                            "thread/decrement_elicitation" => {
+                                panic!(
+                                    "exhausted worker should not receive thread/decrement_elicitation"
+                                )
+                            }
+                            "thread/inject_items" => {
+                                panic!("exhausted worker should not receive thread/inject_items")
+                            }
+                            "thread/name/set" => {
+                                panic!("exhausted worker should not receive thread/name/set")
+                            }
+                            "thread/memoryMode/set" => {
+                                panic!("exhausted worker should not receive thread/memoryMode/set")
                             }
                             "getConversationSummary" => {
                                 serde_json::json!({
@@ -44166,12 +47601,19 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LegacyApprovalExercise {
+        Exercise,
+        Skip,
+    }
+
     async fn drive_mock_remote_multi_connection_server_request_session(
         websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         thread_id: &str,
         preview: &str,
         expected_answer: &str,
         previous_account_id: &str,
+        legacy_approval_exercise: LegacyApprovalExercise,
     ) {
         let thread_start_request = read_websocket_request(websocket).await;
         assert_eq!(thread_start_request.method, "thread/start");
@@ -44514,9 +47956,9 @@ stream_max_retries = 0
             }),
         )
         .await;
-        let JSONRPCMessage::Response(refresh_response) = read_websocket_message(websocket).await
-        else {
-            panic!("expected chatgpt refresh response");
+        let refresh_message = read_websocket_message(websocket).await;
+        let JSONRPCMessage::Response(refresh_response) = refresh_message else {
+            panic!("expected chatgpt refresh response, got {refresh_message:?}");
         };
         assert_eq!(
             refresh_response.id,
@@ -44530,6 +47972,84 @@ stream_max_retries = 0
                 "chatgptPlanType": "pro",
             })
         );
+
+        if legacy_approval_exercise == LegacyApprovalExercise::Exercise {
+            write_websocket_message(
+                websocket,
+                JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                    id: RequestId::String("shared-legacy-exec-approval".to_string()),
+                    method: "execCommandApproval".to_string(),
+                    params: Some(serde_json::json!({
+                        "conversationId": thread_id,
+                        "callId": "legacy-exec-call",
+                        "approvalId": "legacy-exec-approval",
+                        "command": ["echo", thread_id],
+                        "cwd": preview,
+                        "reason": "Need legacy command approval",
+                        "parsedCmd": [{
+                            "type": "unknown",
+                            "cmd": format!("echo {thread_id}"),
+                        }],
+                    })),
+                    trace: None,
+                }),
+            )
+            .await;
+            let legacy_exec_message = read_websocket_message(websocket).await;
+            let JSONRPCMessage::Response(legacy_exec_response) = legacy_exec_message else {
+                panic!("expected legacy exec approval response, got {legacy_exec_message:?}");
+            };
+            assert_eq!(
+                legacy_exec_response.id,
+                RequestId::String("shared-legacy-exec-approval".to_string())
+            );
+            assert_eq!(
+                legacy_exec_response.result,
+                serde_json::to_value(ExecCommandApprovalResponse {
+                    decision: ReviewDecision::Approved,
+                })
+                .expect("legacy exec approval response should serialize")
+            );
+
+            write_websocket_message(
+                websocket,
+                JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                    id: RequestId::String("shared-legacy-patch-approval".to_string()),
+                    method: "applyPatchApproval".to_string(),
+                    params: Some(serde_json::json!({
+                        "conversationId": thread_id,
+                        "callId": "legacy-patch-call",
+                        "fileChanges": {
+                            "README.md": {
+                                "type": "add",
+                                "content": format!("hello from {thread_id}\\n"),
+                            },
+                        },
+                        "reason": "Need legacy patch approval",
+                        "grantRoot": preview,
+                    })),
+                    trace: None,
+                }),
+            )
+            .await;
+            let legacy_patch_message = read_websocket_message(websocket).await;
+            let JSONRPCMessage::Response(legacy_patch_response) = legacy_patch_message else {
+                panic!(
+                    "expected legacy apply-patch approval response, got {legacy_patch_message:?}"
+                );
+            };
+            assert_eq!(
+                legacy_patch_response.id,
+                RequestId::String("shared-legacy-patch-approval".to_string())
+            );
+            assert_eq!(
+                legacy_patch_response.result,
+                serde_json::to_value(ApplyPatchApprovalResponse {
+                    decision: ReviewDecision::ApprovedForSession,
+                })
+                .expect("legacy apply-patch approval response should serialize")
+            );
+        }
 
         while let Some(frame) = websocket.next().await {
             match frame.expect("follow-up frame should decode") {
@@ -44550,6 +48070,7 @@ stream_max_retries = 0
         preview: &'static str,
         expected_answer: &'static str,
         previous_account_id: &'static str,
+        legacy_approval_exercise: LegacyApprovalExercise,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -44569,6 +48090,7 @@ stream_max_retries = 0
                         preview,
                         expected_answer,
                         previous_account_id,
+                        legacy_approval_exercise,
                     )
                     .await;
                 });
@@ -44862,6 +48384,7 @@ stream_max_retries = 0
                             preview,
                             expected_answer,
                             previous_account_id,
+                            LegacyApprovalExercise::Skip,
                         )
                         .await;
                     }
