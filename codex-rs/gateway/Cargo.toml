@@ -46,6 +46,7 @@ rmcp = { workspace = true, default-features = false, features = [
     "server",
     "transport-streamable-http-server",
 ] }
+socket2 = { workspace = true, features = ["all"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { workspace = true }

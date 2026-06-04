@@ -860,20 +860,22 @@ impl GatewayV2DownstreamRouter {
             .is_none_or(|state| state.session_factory.worker_account_has_capacity(worker_id))
     }
 
-    fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) {
+    fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) -> bool {
         if let Some(state) = &self.reconnect_state {
-            state
+            return state
                 .session_factory
                 .mark_worker_account_exhausted(worker_id, reason);
         }
+        false
     }
 
-    fn mark_worker_account_available(&self, worker_id: usize) {
+    fn mark_worker_account_available(&self, worker_id: usize) -> bool {
         if let Some(state) = &self.reconnect_state {
-            state
+            return state
                 .session_factory
                 .mark_worker_account_available(worker_id);
         }
+        false
     }
 
     async fn replay_connection_state(&self, session: &GatewayV2ConnectedSession) -> io::Result<()> {
@@ -2548,7 +2550,13 @@ async fn handle_app_server_event(
             }));
         }
         AppServerEvent::ServerNotification(notification) => {
-            sync_worker_account_capacity_from_notification(downstream, worker_id, &notification);
+            sync_worker_account_capacity_from_notification(
+                downstream,
+                connection.request_context,
+                connection.observability,
+                worker_id,
+                &notification,
+            );
             let Some(notification) = server_notification_to_jsonrpc(
                 notification,
                 connection.request_context,
@@ -4374,9 +4382,14 @@ async fn handle_client_request(
                         .map(Ok);
                 }
                 "account/rateLimits/read" => {
-                    return aggregate_account_rate_limits_response(downstream, &request)
-                        .await
-                        .map(Ok);
+                    return aggregate_account_rate_limits_response(
+                        downstream,
+                        connection.request_context,
+                        connection.observability,
+                        &request,
+                    )
+                    .await
+                    .map(Ok);
                 }
                 "model/list" => {
                     return aggregate_model_list_response_if_supported(downstream, &request)
@@ -6219,6 +6232,8 @@ async fn aggregate_get_auth_status_response(
 
 async fn aggregate_account_rate_limits_response(
     downstream: &GatewayV2DownstreamRouter,
+    context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     request: &JSONRPCRequest,
 ) -> io::Result<Value> {
     downstream.ensure_all_configured_workers_present_for(&request.method)?;
@@ -6234,6 +6249,8 @@ async fn aggregate_account_rate_limits_response(
             .map_err(io::Error::other)?;
         sync_worker_account_capacity_from_rate_limits_response(
             downstream,
+            context,
+            observability,
             worker.worker_id,
             &response,
         );
@@ -6259,6 +6276,8 @@ async fn aggregate_account_rate_limits_response(
 
 fn sync_worker_account_capacity_from_notification(
     downstream: &GatewayV2DownstreamRouter,
+    context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     worker_id: Option<usize>,
     notification: &ServerNotification,
 ) {
@@ -6268,6 +6287,8 @@ fn sync_worker_account_capacity_from_notification(
 
     sync_worker_account_capacity_from_rate_limits(
         downstream,
+        context,
+        observability,
         worker_id,
         [&notification.rate_limits],
     );
@@ -6275,6 +6296,8 @@ fn sync_worker_account_capacity_from_notification(
 
 fn sync_worker_account_capacity_from_rate_limits_response(
     downstream: &GatewayV2DownstreamRouter,
+    context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     worker_id: Option<usize>,
     response: &GetAccountRateLimitsResponse,
 ) {
@@ -6282,11 +6305,19 @@ fn sync_worker_account_capacity_from_rate_limits_response(
     if let Some(rate_limits_by_limit_id) = &response.rate_limits_by_limit_id {
         snapshots.extend(rate_limits_by_limit_id.values());
     }
-    sync_worker_account_capacity_from_rate_limits(downstream, worker_id, snapshots);
+    sync_worker_account_capacity_from_rate_limits(
+        downstream,
+        context,
+        observability,
+        worker_id,
+        snapshots,
+    );
 }
 
 fn sync_worker_account_capacity_from_rate_limits<'a>(
     downstream: &GatewayV2DownstreamRouter,
+    context: &GatewayRequestContext,
+    observability: &GatewayObservability,
     worker_id: Option<usize>,
     snapshots: impl IntoIterator<Item = &'a RateLimitSnapshot>,
 ) {
@@ -6295,9 +6326,21 @@ fn sync_worker_account_capacity_from_rate_limits<'a>(
     };
 
     if let Some(reason) = account_capacity_exhaustion_reason(snapshots) {
-        downstream.mark_worker_account_exhausted(worker_id, reason);
-    } else {
-        downstream.mark_worker_account_available(worker_id);
+        if downstream.mark_worker_account_exhausted(worker_id, reason.clone()) {
+            observability.record_v2_account_capacity_event(
+                worker_id,
+                "exhausted",
+                Some(context),
+                Some(reason.as_str()),
+            );
+        }
+    } else if downstream.mark_worker_account_available(worker_id) {
+        observability.record_v2_account_capacity_event(
+            worker_id,
+            "available",
+            Some(context),
+            Some("account/rateLimits reported available capacity"),
+        );
     }
 }
 
@@ -7407,7 +7450,7 @@ fn observe_v2_connection(
     pending_counts: GatewayV2ConnectionPendingCounts,
     duration: std::time::Duration,
 ) {
-    observability
+    let completion_counts = observability
         .v2_connection_health()
         .mark_connection_completed(
             connection_id,
@@ -7416,15 +7459,29 @@ fn observe_v2_connection(
             duration,
             pending_counts.clone(),
         );
-    observability.record_v2_connection(outcome, duration, pending_counts.clone());
+    observability.record_v2_connection(
+        outcome,
+        duration,
+        pending_counts.clone(),
+        completion_counts.max_pending_client_request_count,
+        completion_counts.max_server_request_backlog_count,
+    );
     observability.emit_v2_connection_audit_log(
         outcome,
         duration,
         context,
         detail,
         pending_counts.clone(),
+        &completion_counts,
     );
-    observability.emit_v2_connection_log(outcome, duration, context, detail, pending_counts);
+    observability.emit_v2_connection_log(
+        outcome,
+        duration,
+        context,
+        detail,
+        pending_counts,
+        &completion_counts,
+    );
 }
 
 fn classify_v2_connection_error(err: &io::Error) -> &'static str {
@@ -7837,11 +7894,16 @@ mod tests {
     use opentelemetry_sdk::metrics::data::MetricData;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
+    use socket2::Domain;
+    use socket2::Protocol;
+    use socket2::Socket;
+    use socket2::Type;
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::io;
     use std::io::Write;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
@@ -7880,6 +7942,36 @@ mod tests {
             Some(worker_id) => format!("ws://worker-{worker_id}.invalid"),
             None => "<embedded>".to_string(),
         }
+    }
+
+    async fn connect_websocket_with_small_receive_buffer(
+        addr: SocketAddr,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let domain = match addr {
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .expect("slow-client socket should create");
+        socket
+            .set_recv_buffer_size(4096)
+            .expect("slow-client receive buffer should configure");
+        socket
+            .connect(&addr.into())
+            .expect("slow-client socket should connect");
+        socket
+            .set_nonblocking(true)
+            .expect("slow-client socket should become nonblocking");
+        let stream = tokio::net::TcpStream::from_std(socket.into())
+            .expect("slow-client stream should convert to tokio");
+        let (websocket, _response) = tokio_tungstenite::client_async(
+            format!("ws://{addr}/"),
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+        )
+        .await
+        .expect("slow-client websocket should connect");
+        websocket
     }
 
     #[tokio::test]
@@ -11463,6 +11555,20 @@ mod tests {
         let connection_id = observability
             .v2_connection_health()
             .mark_connection_started();
+        observability
+            .v2_connection_health()
+            .update_connection_pending_counts(
+                connection_id,
+                super::GatewayV2ConnectionPendingCounts {
+                    pending_client_request_count: 6,
+                    pending_client_request_worker_counts: Vec::new(),
+                    pending_client_request_method_counts: Vec::new(),
+                    pending_server_request_count: 3,
+                    answered_but_unresolved_server_request_count: 2,
+                    server_request_backlog_worker_counts: Vec::new(),
+                    server_request_backlog_method_counts: Vec::new(),
+                },
+            );
 
         super::observe_v2_connection(
             &observability,
@@ -11507,7 +11613,7 @@ mod tests {
         );
         assert_eq!(
             health_snapshot.last_connection_max_pending_client_request_count,
-            4
+            6
         );
         assert_eq!(
             health_snapshot
@@ -11536,6 +11642,14 @@ mod tests {
             health_snapshot.last_connection_answered_but_unresolved_server_request_count,
             1
         );
+        assert_eq!(
+            health_snapshot.last_connection_server_request_backlog_count,
+            3
+        );
+        assert_eq!(
+            health_snapshot.last_connection_max_server_request_backlog_count,
+            5
+        );
         assert_eq!(health_snapshot.last_connection_completed_at.is_some(), true);
         assert_eq!(health_snapshot.last_connection_duration_ms, Some(9));
 
@@ -11547,9 +11661,12 @@ mod tests {
         let mut saw_count = false;
         let mut saw_duration = false;
         let mut saw_pending_client_requests = false;
+        let mut saw_max_pending_client_requests = false;
         let mut pending_client_request_method_points = Vec::new();
         let mut saw_pending_server_requests = false;
         let mut saw_answered_but_unresolved_server_requests = false;
+        let mut saw_server_request_backlog = false;
+        let mut saw_max_server_request_backlog = false;
         for metric in metrics {
             match metric.name() {
                 "gateway_v2_connections" => {
@@ -11645,6 +11762,39 @@ mod tests {
                         _ => panic!("unexpected v2 connection pending client request type"),
                     }
                 }
+                "gateway_v2_connection_max_pending_client_requests" => {
+                    saw_max_pending_client_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 6.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected v2 connection max pending client request aggregation"
+                            ),
+                        },
+                        _ => panic!("unexpected v2 connection max pending client request type"),
+                    }
+                }
                 "gateway_v2_connection_pending_client_requests_by_method" => match metric.data() {
                     AggregatedMetrics::F64(data) => match data {
                         MetricData::Histogram(histogram) => {
@@ -11733,6 +11883,72 @@ mod tests {
                         _ => panic!("unexpected v2 connection answered-but-unresolved type"),
                     }
                 }
+                "gateway_v2_connection_server_request_backlog" => {
+                    saw_server_request_backlog = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 3.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected v2 connection server-request backlog aggregation"
+                            ),
+                        },
+                        _ => panic!("unexpected v2 connection server-request backlog type"),
+                    }
+                }
+                "gateway_v2_connection_max_server_request_backlog" => {
+                    saw_max_server_request_backlog = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 5.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "client_send_timed_out".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!(
+                                "unexpected v2 connection max server-request backlog aggregation"
+                            ),
+                        },
+                        _ => panic!("unexpected v2 connection max server-request backlog type"),
+                    }
+                }
                 _ => {}
             }
         }
@@ -11740,6 +11956,7 @@ mod tests {
         assert!(saw_count);
         assert!(saw_duration);
         assert!(saw_pending_client_requests);
+        assert!(saw_max_pending_client_requests);
         pending_client_request_method_points.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             pending_client_request_method_points,
@@ -11764,6 +11981,8 @@ mod tests {
         );
         assert!(saw_pending_server_requests);
         assert!(saw_answered_but_unresolved_server_requests);
+        assert!(saw_server_request_backlog);
+        assert!(saw_max_server_request_backlog);
     }
 
     #[test]
@@ -21867,7 +22086,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_upgrade_logs_pending_command_exec_when_client_send_times_out() {
         let metrics = in_memory_metrics();
-        let observability = GatewayObservability::new(Some(metrics.clone()), false);
+        let observability = GatewayObservability::new(Some(metrics.clone()), true);
         let observed_observability = observability.clone();
         let logs = capture_logs_async(async move {
             let listener = TcpListener::bind("127.0.0.1:0")
@@ -21876,6 +22095,7 @@ mod tests {
             let downstream_addr = listener.local_addr().expect("listener address");
             let (request_observed_tx, request_observed_rx) = oneshot::channel();
             let (flood_started_tx, flood_started_rx) = oneshot::channel();
+            let (release_downstream_tx, mut release_downstream_rx) = oneshot::channel();
             tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let websocket = tokio_tungstenite::accept_async(stream)
@@ -21920,13 +22140,14 @@ mod tests {
                 flood_started_tx
                     .send(())
                     .expect("flood start observation should send");
-                for _ in 0..256 {
-                    if write
-                        .send(Message::Text(large_warning_payload.clone().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                loop {
+                    tokio::select! {
+                        _ = &mut release_downstream_rx => break,
+                        result = write.send(Message::Text(large_warning_payload.clone().into())) => {
+                            if result.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
@@ -21959,9 +22180,7 @@ mod tests {
             })
             .await;
 
-            let (mut websocket, _response) = connect_async(format!("ws://{addr}/"))
-                .await
-                .expect("websocket should connect");
+            let mut websocket = connect_websocket_with_small_receive_buffer(addr).await;
             send_initialize(&mut websocket).await;
 
             send_jsonrpc_request(
@@ -22013,8 +22232,19 @@ mod tests {
                 .expect("downstream flood should start")
                 .expect("flood start observation should complete");
 
-            sleep(Duration::from_millis(500)).await;
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let health = observability.v2_connection_health().snapshot();
+                    if health.last_connection_outcome.as_deref() == Some("client_send_timed_out") {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("slow-client connection should settle");
 
+            let _ = release_downstream_tx.send(());
             server_task.abort();
             let _ = server_task.await;
         })
@@ -22028,33 +22258,65 @@ mod tests {
         assert!(logs.contains("pending_client_request_methods=[\"command/exec\"]"));
         assert!(logs.contains("pending_client_request_worker_ids=[0]"));
         assert!(logs.contains("pending_client_request_worker_websocket_urls=[\"ws://127.0.0.1:"));
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(logs.contains("gateway v2 connection completed"), "{logs}");
+        assert!(logs.contains("outcome=\"client_send_timed_out\""), "{logs}");
+        assert!(
+            logs.contains("max_pending_client_request_count=1"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("pending_client_request_worker_counts=["),
+            "{logs}"
+        );
+        assert!(logs.contains("worker_id: Some(0)"), "{logs}");
+        assert!(
+            logs.contains("pending_client_request_method_counts=["),
+            "{logs}"
+        );
+        assert!(logs.contains("method: \"command/exec\""), "{logs}");
 
-        let active_health = observed_observability.v2_connection_health().snapshot();
-        assert_eq!(active_health.client_send_timeout_count, 1);
+        let settled_health = observed_observability.v2_connection_health().snapshot();
+        assert_eq!(settled_health.client_send_timeout_count, 1);
+        assert_eq!(settled_health.active_connection_count, 0);
         assert_eq!(
-            active_health.active_connection_pending_client_request_count,
+            settled_health.last_connection_outcome.as_deref(),
+            Some("client_send_timed_out")
+        );
+        assert_eq!(
+            settled_health.last_connection_pending_client_request_count,
             1
         );
         assert_eq!(
-            active_health.active_connection_pending_client_request_worker_counts,
+            settled_health.last_connection_max_pending_client_request_count,
+            1
+        );
+        assert_eq!(
+            settled_health
+                .last_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health.last_connection_pending_client_request_worker_counts,
             vec![crate::api::GatewayV2PendingClientRequestWorkerCounts {
                 worker_id: Some(0),
                 pending_client_request_count: 1,
             }]
         );
         assert_eq!(
-            active_health.active_connection_pending_client_request_method_counts,
+            settled_health.last_connection_pending_client_request_method_counts,
             vec![crate::api::GatewayV2PendingClientRequestMethodCounts {
                 method: "command/exec".to_string(),
                 pending_client_request_count: 1,
             }]
         );
         assert_eq!(
-            active_health.last_notification_send_failure_method,
+            settled_health.last_notification_send_failure_method,
             Some("warning".to_string())
         );
         assert_eq!(
-            active_health.last_notification_send_failure_outcome,
+            settled_health.last_notification_send_failure_outcome,
             Some("client_send_timed_out".to_string())
         );
         assert_v2_request_metrics(
@@ -23631,9 +23893,13 @@ mod tests {
         )
         .await
         .expect("downstream router should connect");
+        let context = GatewayRequestContext::default();
+        let observability = GatewayObservability::default();
 
         let response = super::aggregate_account_rate_limits_response(
             &router,
+            &context,
+            &observability,
             &JSONRPCRequest {
                 id: RequestId::String("account-rate-limits-read".to_string()),
                 method: "account/rateLimits/read".to_string(),
@@ -23753,9 +24019,13 @@ mod tests {
         )
         .await
         .expect("downstream router should connect");
+        let context = GatewayRequestContext::default();
+        let observability = GatewayObservability::default();
 
         super::aggregate_account_rate_limits_response(
             &router,
+            &context,
+            &observability,
             &JSONRPCRequest {
                 id: RequestId::String("account-rate-limits-read".to_string()),
                 method: "account/rateLimits/read".to_string(),
@@ -23773,6 +24043,96 @@ mod tests {
                 .account_capacity_reason
                 .as_deref(),
             Some("account/rateLimits reported Worker B WorkspaceMemberUsageLimitReached")
+        );
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("available".to_string(), 1), ("exhausted".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, [("available".to_string(), 1)].into()),
+                (1, [("exhausted".to_string(), 1)].into()),
+            ]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("exhausted")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("default")
+        );
+        assert_eq!(health.last_account_capacity_event_project_id, None);
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some("account/rateLimits reported Worker B WorkspaceMemberUsageLimitReached")
+        );
+
+        let available_response: GetAccountRateLimitsResponse =
+            serde_json::from_value(serde_json::json!({
+                "rateLimits": {
+                    "limitId": "worker-a",
+                    "limitName": "Worker A",
+                    "primary": null,
+                    "secondary": null,
+                    "credits": null,
+                    "planType": null,
+                    "rateLimitReachedType": null,
+                },
+                "rateLimitsByLimitId": null,
+            }))
+            .expect("available rate limits response should parse");
+        let exhausted_response: GetAccountRateLimitsResponse =
+            serde_json::from_value(serde_json::json!({
+                "rateLimits": {
+                    "limitId": "worker-b",
+                    "limitName": "Worker B",
+                    "primary": null,
+                    "secondary": null,
+                    "credits": null,
+                    "planType": null,
+                    "rateLimitReachedType": "workspace_member_usage_limit_reached",
+                },
+                "rateLimitsByLimitId": null,
+            }))
+            .expect("exhausted rate limits response should parse");
+        super::sync_worker_account_capacity_from_rate_limits_response(
+            &router,
+            &context,
+            &observability,
+            Some(0),
+            &available_response,
+        );
+        super::sync_worker_account_capacity_from_rate_limits_response(
+            &router,
+            &context,
+            &observability,
+            Some(1),
+            &exhausted_response,
+        );
+
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("available".to_string(), 1), ("exhausted".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, [("available".to_string(), 1)].into()),
+                (1, [("exhausted".to_string(), 1)].into()),
+            ]
         );
     }
 
@@ -24905,6 +25265,37 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("replacement_worker_id=0"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(0, "thread_resume_handoff_success")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("thread_resume_handoff_success".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, [("thread_resume_handoff_success".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("thread_resume_handoff_success")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some("thread id request restored on a replacement account-backed worker")
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -25053,6 +25444,39 @@ mod tests {
         assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
         assert_eq!(scope_registry.thread_worker_id("thread-worker-a"), None);
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "thread_resume_handoff_failure")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("thread_resume_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("thread_resume_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("thread_resume_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -25185,6 +25609,37 @@ mod tests {
         );
         assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
         assert_v2_account_capacity_event_metrics(&metrics, &[(0, "thread_read_handoff_success")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("thread_read_handoff_success".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, [("thread_read_handoff_success".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("thread_read_handoff_success")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some("thread id request restored on a replacement account-backed worker")
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -25320,6 +25775,39 @@ mod tests {
         );
         assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "thread_read_handoff_failure")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("thread_read_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("thread_read_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("thread_read_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/read, and no replacement worker restored the context"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -27131,6 +27619,37 @@ mod tests {
             assert_eq!(response, expected_response);
             assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(0));
             assert_v2_account_capacity_event_metrics(&metrics, &[(0, success_metric)]);
+            let health = observability.v2_connection_health().snapshot();
+            assert_eq!(
+                health.account_capacity_event_counts,
+                [(success_metric.to_string(), 1)].into()
+            );
+            assert_eq!(
+                health
+                    .account_capacity_event_worker_counts
+                    .iter()
+                    .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(0, [(success_metric.to_string(), 1)].into())]
+            );
+            assert_eq!(
+                health.last_account_capacity_event.as_deref(),
+                Some(success_metric)
+            );
+            assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+            assert_eq!(
+                health.last_account_capacity_event_tenant_id.as_deref(),
+                Some("tenant-a")
+            );
+            assert_eq!(
+                health.last_account_capacity_event_project_id.as_deref(),
+                Some("project-a")
+            );
+            assert_eq!(
+                health.last_account_capacity_event_reason.as_deref(),
+                Some("thread id request restored on a replacement account-backed worker")
+            );
+            assert_eq!(health.last_account_capacity_event_at.is_some(), true);
             let handoff_event = operator_events_rx
                 .recv()
                 .await
@@ -27309,6 +27828,37 @@ mod tests {
             assert_eq!(error.to_string(), expected_message);
             assert_eq!(scope_registry.thread_worker_id("thread-worker-b"), Some(1));
             assert_v2_account_capacity_event_metrics(&metrics, &[(1, failure_metric)]);
+            let health = observability.v2_connection_health().snapshot();
+            assert_eq!(
+                health.account_capacity_event_counts,
+                [(failure_metric.to_string(), 1)].into()
+            );
+            assert_eq!(
+                health
+                    .account_capacity_event_worker_counts
+                    .iter()
+                    .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(1, [(failure_metric.to_string(), 1)].into())]
+            );
+            assert_eq!(
+                health.last_account_capacity_event.as_deref(),
+                Some(failure_metric)
+            );
+            assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+            assert_eq!(
+                health.last_account_capacity_event_tenant_id.as_deref(),
+                Some("tenant-a")
+            );
+            assert_eq!(
+                health.last_account_capacity_event_project_id.as_deref(),
+                Some("project-a")
+            );
+            assert_eq!(
+                health.last_account_capacity_event_reason.as_deref(),
+                Some(expected_message.as_str())
+            );
+            assert_eq!(health.last_account_capacity_event_at.is_some(), true);
             let handoff_event = operator_events_rx
                 .recv()
                 .await
@@ -27625,6 +28175,37 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("replacement_worker_id=0"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(0, "thread_fork_handoff_success")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("thread_fork_handoff_success".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, [("thread_fork_handoff_success".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("thread_fork_handoff_success")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some("thread id request restored on a replacement account-backed worker")
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -27778,6 +28359,39 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("thread_fork_handoff_failure"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "thread_fork_handoff_failure")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("thread_fork_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("thread_fork_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("thread_fork_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/fork, and no replacement worker restored the context"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -28081,6 +28695,37 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("replacement_worker_id=0"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(0, "path_thread_handoff_success")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("path_thread_handoff_success".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, [("path_thread_handoff_success".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("path_thread_handoff_success")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some("path-based thread request restored on a replacement account-backed worker")
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -28236,6 +28881,39 @@ mod tests {
             None
         );
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("path_thread_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("path_thread_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("path_thread_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -28388,6 +29066,39 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("path_thread_handoff_failure"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("path_thread_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("path_thread_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("path_thread_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -29328,6 +30039,40 @@ mod tests {
             &metrics,
             &[(0, "conversation_summary_handoff_success")],
         );
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("conversation_summary_handoff_success".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                0,
+                [("conversation_summary_handoff_success".to_string(), 1)].into()
+            )]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("conversation_summary_handoff_success")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some("thread id request restored on a replacement account-backed worker")
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -29461,12 +30206,10 @@ mod tests {
         .await
         .expect_err("getConversationSummary by id should fail closed on wrong conversation id");
 
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"
-            )
+        let expected_message = format!(
+            "thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"
         );
+        assert_eq!(error.to_string(), expected_message);
         assert_eq!(scope_registry.thread_worker_id(thread_id), Some(1));
         assert_eq!(scope_registry.thread_worker_id(wrong_thread_id), None);
         assert_eq!(
@@ -29477,6 +30220,40 @@ mod tests {
             &metrics,
             &[(1, "conversation_summary_handoff_failure")],
         );
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("conversation_summary_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                1,
+                [("conversation_summary_handoff_failure".to_string(), 1)].into()
+            )]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("conversation_summary_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(expected_message.as_str())
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -29492,7 +30269,7 @@ mod tests {
                 "threadId": thread_id,
                 "exhaustedWorkerId": 1,
                 "exhaustedAccountId": "acct-b",
-                "reason": format!("thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"),
+                "reason": expected_message,
             })
         );
 
@@ -29584,42 +30361,62 @@ mod tests {
             opt_out_notification_methods: HashSet::new(),
         };
 
-        let mut error = None;
-        let logs = capture_logs_async(async {
-            error = Some(
-                super::handle_client_request(
-                    &mut router,
-                    &connection,
-                    JSONRPCRequest {
-                        id: RequestId::String("conversation-summary-id".to_string()),
-                        method: "getConversationSummary".to_string(),
-                        params: Some(summary_params),
-                        trace: None,
-                    },
-                )
-                .await
-                .expect_err("getConversationSummary by id should fail closed"),
-            );
-        })
-        .await;
-        let error = error.expect("error should be captured");
+        let error = super::handle_client_request(
+            &mut router,
+            &connection,
+            JSONRPCRequest {
+                id: RequestId::String("conversation-summary-id".to_string()),
+                method: "getConversationSummary".to_string(),
+                params: Some(summary_params),
+                trace: None,
+            },
+        )
+        .await
+        .expect_err("getConversationSummary by id should fail closed");
 
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"
-            )
+        let expected_message = format!(
+            "thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"
         );
+        assert_eq!(error.to_string(), expected_message);
         assert_eq!(scope_registry.thread_worker_id(thread_id), Some(1));
-        assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
-        assert!(
-            logs.contains("conversation_summary_handoff_failure"),
-            "{logs}"
-        );
         assert_v2_account_capacity_event_metrics(
             &metrics,
             &[(1, "conversation_summary_handoff_failure")],
         );
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("conversation_summary_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                1,
+                [("conversation_summary_handoff_failure".to_string(), 1)].into()
+            )]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("conversation_summary_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(expected_message.as_str())
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -29635,7 +30432,7 @@ mod tests {
                 "threadId": thread_id,
                 "exhaustedWorkerId": 1,
                 "exhaustedAccountId": "acct-b",
-                "reason": format!("thread {thread_id} is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context"),
+                "reason": expected_message,
             })
         );
 
@@ -38052,6 +38849,8 @@ mod tests {
 
         let worker_b = start_mock_remote_server_for_initialize().await;
         let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(4);
+        let mut operator_events_rx = operator_events_tx.subscribe();
         let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
             (
                 format!("ws://{downstream_addr}"),
@@ -38062,7 +38861,8 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false),
+            observability: GatewayObservability::new(Some(metrics.clone()), false)
+                .with_operator_events(operator_events_tx),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(
                 GatewayV2SessionFactory::remote_multi_with_account_ids(
@@ -38223,6 +39023,27 @@ mod tests {
             ],
             &[("response", 1)],
             &[(0, "active_thread_handoff_failure", 1)],
+        );
+        let handoff_event = operator_events_rx
+            .recv()
+            .await
+            .expect("active thread handoff failure event should be published");
+        assert_eq!(
+            handoff_event.method,
+            "gateway/accountActiveThreadHandoffFailed"
+        );
+        assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-a"));
+        assert_eq!(
+            handoff_event.data,
+            serde_json::json!({
+                "tenantId": "default",
+                "projectId": null,
+                "method": "serverRequest/respond",
+                "threadId": "thread-worker-a",
+                "exhaustedWorkerId": 0,
+                "exhaustedAccountId": "acct-a",
+                "reason": "thread thread-worker-a is pinned to worker 0 with exhausted account capacity for serverRequest/respond",
+            })
         );
 
         server_task.abort();
@@ -43384,6 +44205,39 @@ mod tests {
         );
         assert!(logs.contains("active_thread_handoff_failure"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "active_thread_handoff_failure")]);
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("active_thread_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("active_thread_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("active_thread_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for app/list"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await

@@ -959,6 +959,7 @@ mod tests {
     use crate::api::GatewayRemoteUnlabeledAccountWorker;
     use crate::api::GatewayV2CompatibilityMode;
     use crate::api::GatewayV2ConnectionOutcomeCounts;
+    use crate::api::GatewayV2NotificationSendFailureCounts;
     use crate::api::GatewayV2ServerRequestBacklogMethodCounts;
     use crate::api::GatewayV2ServerRequestBacklogWorkerCounts;
     use crate::api::ListThreadsResponse;
@@ -3243,6 +3244,42 @@ mod tests {
                 .join("config.toml")
                 .canonicalize()
                 .expect("watched path should canonicalize")
+        );
+
+        let watched_config_path = codex_home.path().join("config.toml");
+        let mut watched_config = std::fs::read_to_string(&watched_config_path)
+            .expect("watched config should remain readable");
+        watched_config.push_str("\n# fs watch notification fixture\n");
+        std::fs::write(&watched_config_path, watched_config)
+            .expect("watched config should be updated");
+
+        let fs_changed = timeout(Duration::from_secs(10), async {
+            loop {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("event stream should stay open after fs/watch");
+                if let AppServerEvent::ServerNotification(ServerNotification::FsChanged(
+                    notification,
+                )) = event
+                    && notification.watch_id == "embedded-watch"
+                {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("fs/changed notification should arrive after embedded fs/watch");
+        assert_eq!(fs_changed.watch_id, "embedded-watch");
+        let watched_config_path = watched_config_path
+            .canonicalize()
+            .expect("watched config path should canonicalize after update");
+        assert!(
+            fs_changed
+                .changed_paths
+                .iter()
+                .any(|path| path.as_ref() == watched_config_path.as_path()),
+            "fs/changed should include the watched config path: {fs_changed:?}"
         );
 
         let unwatch: FsUnwatchResponse = client
@@ -15178,6 +15215,8 @@ stream_max_retries = 0
         assert_eq!(healthz_response.status(), reqwest::StatusCode::OK);
         let health: GatewayHealthResponse = healthz_response.json().await.expect("health body");
         let remote_workers = health.remote_workers.expect("remote workers");
+        assert_eq!(remote_workers.len(), 2);
+        assert_eq!(remote_workers[0].account_id.as_deref(), Some("acct-a"));
         assert_eq!(
             remote_workers[0].account_capacity,
             crate::api::GatewayAccountCapacityStatus::Exhausted
@@ -15186,6 +15225,11 @@ stream_max_retries = 0
             remote_workers[0].account_capacity_reason.as_deref(),
             Some("rate limit reached")
         );
+        assert_eq!(
+            remote_workers[0].account_capacity_last_changed_at.is_some(),
+            true
+        );
+        assert_eq!(remote_workers[1].account_id.as_deref(), Some("acct-b"));
         assert_eq!(
             health.project_worker_routes,
             Some(vec![crate::api::GatewayProjectWorkerRoute {
@@ -16633,12 +16677,12 @@ stream_max_retries = 0
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
                             auth_token: None,
-                            account_id: None,
+                            account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
                             auth_token: None,
-                            account_id: None,
+                            account_id: Some("acct-b".to_string()),
                         },
                     ],
                 }),
@@ -16919,6 +16963,41 @@ stream_max_retries = 0
             .await
             .expect("other-tenant thread/list should succeed through multi-worker gateway");
         assert_eq!(other_tenant_list.data.is_empty(), true);
+
+        let healthz_response = reqwest::get(format!("http://{}/healthz", server.local_addr()))
+            .await
+            .expect("healthz response");
+        assert_eq!(healthz_response.status(), reqwest::StatusCode::OK);
+        let health: GatewayHealthResponse = healthz_response.json().await.expect("health body");
+        assert_eq!(health.remote_account_labels_complete, Some(true));
+        assert_eq!(health.remote_unlabeled_account_worker_count, Some(0));
+        assert_eq!(health.remote_unlabeled_account_worker_ids, Some(Vec::new()));
+        assert_eq!(health.remote_unlabeled_account_workers, Some(Vec::new()));
+        let remote_workers = health.remote_workers.as_ref().expect("remote workers");
+        assert_eq!(remote_workers.len(), 2);
+        assert_eq!(remote_workers[0].account_id.as_deref(), Some("acct-a"));
+        assert_eq!(remote_workers[1].account_id.as_deref(), Some("acct-b"));
+        assert_eq!(
+            health.project_worker_routes,
+            Some(vec![
+                crate::api::GatewayProjectWorkerRoute {
+                    tenant_id: "tenant-a".to_string(),
+                    project_id: "project-a".to_string(),
+                    worker_id: 0,
+                    account_id: Some("acct-a".to_string()),
+                    account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                    worker_healthy: true,
+                },
+                crate::api::GatewayProjectWorkerRoute {
+                    tenant_id: "tenant-a".to_string(),
+                    project_id: "project-b".to_string(),
+                    worker_id: 1,
+                    account_id: Some("acct-b".to_string()),
+                    account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                    worker_healthy: true,
+                },
+            ])
+        );
 
         assert_remote_client_shutdown(owner_client.shutdown().await);
         assert_remote_client_shutdown(same_scope_client.shutdown().await);
@@ -26397,6 +26476,110 @@ stream_max_retries = 0
             "/tmp/worker-a-read"
         );
 
+        let healthz_response = reqwest::get(format!("http://{}/healthz", server.local_addr()))
+            .await
+            .expect("healthz response");
+        assert_eq!(healthz_response.status(), reqwest::StatusCode::OK);
+        let health: GatewayHealthResponse = healthz_response.json().await.expect("health body");
+        let remote_workers = health.remote_workers.as_ref().expect("remote workers");
+        assert_eq!(remote_workers.len(), 2);
+        assert_eq!(
+            remote_workers[1].account_capacity,
+            crate::api::GatewayAccountCapacityStatus::Exhausted
+        );
+        assert_eq!(
+            remote_workers[1].account_capacity_reason.as_deref(),
+            Some("account/rateLimits reported Worker B RateLimitReached")
+        );
+        assert_eq!(
+            remote_workers[1].account_capacity_last_changed_at.is_some(),
+            true
+        );
+        let account_capacity_events = &health.v2_connections.account_capacity_event_counts;
+        assert_eq!(
+            account_capacity_events.get("active_thread_handoff_failure"),
+            Some(&1)
+        );
+        assert_eq!(
+            account_capacity_events.get("path_thread_handoff_success"),
+            Some(&1)
+        );
+        assert_eq!(
+            account_capacity_events.get("conversation_summary_handoff_success"),
+            Some(&1)
+        );
+        assert_eq!(
+            health.v2_connections.last_account_capacity_event.as_deref(),
+            Some("conversation_summary_handoff_success")
+        );
+        assert_eq!(
+            health.v2_connections.last_account_capacity_event_worker_id,
+            Some(0)
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_account_capacity_event_tenant_id
+                .as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            health.v2_connections.last_account_capacity_event_project_id,
+            None
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_account_capacity_event_reason
+                .as_deref(),
+            Some("thread id request restored on a replacement account-backed worker")
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .account_capacity_event_worker_counts
+                .iter()
+                .find(|counts| counts.worker_id == 0)
+                .map(|counts| &counts.event_counts)
+                .and_then(|event_counts| event_counts.get("path_thread_handoff_success")),
+            Some(&1)
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .account_capacity_event_worker_counts
+                .iter()
+                .find(|counts| counts.worker_id == 1)
+                .map(|counts| &counts.event_counts)
+                .and_then(|event_counts| event_counts.get("active_thread_handoff_failure")),
+            Some(&1)
+        );
+        assert_eq!(
+            health.v2_connections.fail_closed_request_counts,
+            vec![crate::api::GatewayV2FailClosedRequestCounts {
+                method: "turn/start".to_string(),
+                reconnect_backoff_active: false,
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_fail_closed_request_method
+                .as_deref(),
+            Some("turn/start")
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_fail_closed_request_reconnect_backoff_active,
+            Some(false)
+        );
+        assert_eq!(
+            health.v2_connections.last_fail_closed_request_at.is_some(),
+            true
+        );
+
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
                 .await
@@ -27040,6 +27223,294 @@ stream_max_retries = 0
         assert!(metadata_handoff_event.contains("\"exhaustedWorkerId\":1"));
         assert!(metadata_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
         assert!(metadata_handoff_event.contains("no replacement worker restored the context"));
+
+        let turns_list_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let turns_list_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(turns_list_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/turns/list\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let turns_list_result: Result<ThreadTurnsListResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadTurnsList {
+                request_id: RequestId::Integer(11),
+                params: ThreadTurnsListParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    cursor: None,
+                    limit: Some(10),
+                    sort_direction: None,
+                },
+            }),
+        )
+        .await
+        .expect("thread/turns/list fail-closed response should finish in time");
+        let turns_list_error = turns_list_result
+            .expect_err("thread/turns/list should fail closed without a replacement account");
+        assert!(
+            turns_list_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/turns/list, and no replacement worker restored the context"
+            ),
+            "{turns_list_error}"
+        );
+
+        let turns_list_handoff_event =
+            timeout(Duration::from_secs(5), turns_list_handoff_event_task)
+                .await
+                .expect("timed out waiting for thread/turns/list handoff failure event")
+                .expect("thread/turns/list handoff event task should finish");
+        assert!(turns_list_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(turns_list_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(turns_list_handoff_event.contains("\"projectId\":null"));
+        assert!(turns_list_handoff_event.contains("\"method\":\"thread/turns/list\""));
+        assert!(
+            turns_list_handoff_event
+                .contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(turns_list_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(turns_list_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(turns_list_handoff_event.contains("no replacement worker restored the context"));
+
+        let increment_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let increment_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(increment_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/increment_elicitation\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let increment_result: Result<ThreadIncrementElicitationResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadIncrementElicitation {
+                request_id: RequestId::Integer(12),
+                params: ThreadIncrementElicitationParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/increment_elicitation fail-closed response should finish in time");
+        let increment_error = increment_result.expect_err(
+            "thread/increment_elicitation should fail closed without a replacement account",
+        );
+        assert!(
+            increment_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/increment_elicitation, and no replacement worker restored the context"
+            ),
+            "{increment_error}"
+        );
+
+        let increment_handoff_event = timeout(Duration::from_secs(5), increment_handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/increment_elicitation handoff failure event")
+            .expect("thread/increment_elicitation handoff event task should finish");
+        assert!(increment_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(increment_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(increment_handoff_event.contains("\"projectId\":null"));
+        assert!(increment_handoff_event.contains("\"method\":\"thread/increment_elicitation\""));
+        assert!(
+            increment_handoff_event
+                .contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(increment_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(increment_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(increment_handoff_event.contains("no replacement worker restored the context"));
+
+        let decrement_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let decrement_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(decrement_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/decrement_elicitation\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let decrement_result: Result<ThreadDecrementElicitationResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadDecrementElicitation {
+                request_id: RequestId::Integer(13),
+                params: ThreadDecrementElicitationParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                },
+            }),
+        )
+        .await
+        .expect("thread/decrement_elicitation fail-closed response should finish in time");
+        let decrement_error = decrement_result.expect_err(
+            "thread/decrement_elicitation should fail closed without a replacement account",
+        );
+        assert!(
+            decrement_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/decrement_elicitation, and no replacement worker restored the context"
+            ),
+            "{decrement_error}"
+        );
+
+        let decrement_handoff_event = timeout(Duration::from_secs(5), decrement_handoff_event_task)
+            .await
+            .expect("timed out waiting for thread/decrement_elicitation handoff failure event")
+            .expect("thread/decrement_elicitation handoff event task should finish");
+        assert!(decrement_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(decrement_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(decrement_handoff_event.contains("\"projectId\":null"));
+        assert!(decrement_handoff_event.contains("\"method\":\"thread/decrement_elicitation\""));
+        assert!(
+            decrement_handoff_event
+                .contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(decrement_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(decrement_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(decrement_handoff_event.contains("no replacement worker restored the context"));
+
+        let inject_items_handoff_event_url = format!("http://{}/v1/events", server.local_addr());
+        let inject_items_handoff_event_task = tokio::spawn(async move {
+            let mut events_response = reqwest::Client::new()
+                .get(inject_items_handoff_event_url)
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/accountThreadHandoffFailed")
+                        && event.contains("\"method\":\"thread/inject_items\"")
+                    {
+                        return event;
+                    }
+                }
+            }
+        });
+        sleep(Duration::from_millis(100)).await;
+
+        let inject_items_result: Result<ThreadInjectItemsResponse, _> = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::ThreadInjectItems {
+                request_id: RequestId::Integer(14),
+                params: ThreadInjectItemsParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    items: vec![serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Injected reply",
+                            "annotations": [],
+                        }],
+                    })],
+                },
+            }),
+        )
+        .await
+        .expect("thread/inject_items fail-closed response should finish in time");
+        let inject_items_error = inject_items_result
+            .expect_err("thread/inject_items should fail closed without a replacement account");
+        assert!(
+            inject_items_error.to_string().contains(
+                "thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for thread/inject_items, and no replacement worker restored the context"
+            ),
+            "{inject_items_error}"
+        );
+
+        let inject_items_handoff_event =
+            timeout(Duration::from_secs(5), inject_items_handoff_event_task)
+                .await
+                .expect("timed out waiting for thread/inject_items handoff failure event")
+                .expect("thread/inject_items handoff event task should finish");
+        assert!(inject_items_handoff_event.contains("event: gateway/accountThreadHandoffFailed"));
+        assert!(inject_items_handoff_event.contains("\"tenantId\":\"default\""));
+        assert!(inject_items_handoff_event.contains("\"projectId\":null"));
+        assert!(inject_items_handoff_event.contains("\"method\":\"thread/inject_items\""));
+        assert!(
+            inject_items_handoff_event
+                .contains("\"threadId\":\"00000000-0000-0000-0000-0000000000b2\"")
+        );
+        assert!(inject_items_handoff_event.contains("\"exhaustedWorkerId\":1"));
+        assert!(inject_items_handoff_event.contains("\"exhaustedAccountId\":\"acct-b\""));
+        assert!(inject_items_handoff_event.contains("no replacement worker restored the context"));
 
         assert_remote_client_shutdown(
             timeout(Duration::from_secs(5), client.shutdown())
@@ -32208,6 +32679,25 @@ stream_max_retries = 0
                             assert_eq!(
                                 health
                                     .v2_connections
+                                    .active_connection_max_server_request_backlog_count,
+                                $backlog_count
+                            );
+                            assert_eq!(
+                                health
+                                    .v2_connections
+                                    .active_connection_peak_server_request_backlog_count,
+                                $backlog_count
+                            );
+                            assert_eq!(
+                                health
+                                    .v2_connections
+                                    .active_connection_server_request_backlog_started_at
+                                    .is_some(),
+                                true
+                            );
+                            assert_eq!(
+                                health
+                                    .v2_connections
                                     .active_connection_answered_but_unresolved_server_request_count,
                                 $answered_count
                             );
@@ -32595,6 +33085,19 @@ stream_max_retries = 0
                 .v2_connections
                 .last_connection_server_request_backlog_count,
             8
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_max_server_request_backlog_count,
+            8
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_started_at
+                .is_some(),
+            true
         );
         assert_eq!(
             settled_health
@@ -34834,6 +35337,31 @@ stream_max_retries = 0
         assert_eq!(
             active_health
                 .v2_connections
+                .active_connection_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_max_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_peak_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_server_request_backlog_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
                 .active_connection_server_request_backlog_worker_counts,
             vec![GatewayV2ServerRequestBacklogWorkerCounts {
                 worker_id: Some(0),
@@ -34877,6 +35405,45 @@ stream_max_retries = 0
                 count: 1,
             }]
         );
+        assert_eq!(settled_health.v2_connections.client_send_timeout_count, 1);
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_client_send_timeout_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .notification_send_failure_counts,
+            vec![GatewayV2NotificationSendFailureCounts {
+                method: "warning".to_string(),
+                outcome: "client_send_timed_out".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_notification_send_failure_method
+                .as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_notification_send_failure_outcome
+                .as_deref(),
+            Some("client_send_timed_out")
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_notification_send_failure_at
+                .is_some(),
+            true
+        );
         assert_eq!(
             settled_health.v2_connections.peak_active_connection_count,
             1
@@ -34915,6 +35482,25 @@ stream_max_retries = 0
                 .v2_connections
                 .last_connection_answered_but_unresolved_server_request_count,
             0
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_max_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_started_at
+                .is_some(),
+            true
         );
         assert_eq!(
             settled_health
@@ -35058,6 +35644,31 @@ stream_max_retries = 0
         assert_eq!(
             active_health
                 .v2_connections
+                .active_connection_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_max_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_peak_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
+                .active_connection_server_request_backlog_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            active_health
+                .v2_connections
                 .active_connection_server_request_backlog_worker_counts,
             vec![GatewayV2ServerRequestBacklogWorkerCounts {
                 worker_id: Some(1),
@@ -35094,6 +35705,45 @@ stream_max_retries = 0
             settled_health.v2_connections.last_connection_outcome,
             Some("client_send_timed_out".to_string())
         );
+        assert_eq!(settled_health.v2_connections.client_send_timeout_count, 1);
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_client_send_timeout_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .notification_send_failure_counts,
+            vec![GatewayV2NotificationSendFailureCounts {
+                method: "warning".to_string(),
+                outcome: "client_send_timed_out".to_string(),
+                count: 1,
+            }]
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_notification_send_failure_method
+                .as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_notification_send_failure_outcome
+                .as_deref(),
+            Some("client_send_timed_out")
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_notification_send_failure_at
+                .is_some(),
+            true
+        );
         assert_eq!(
             settled_health.v2_connections.peak_active_connection_count,
             1
@@ -35121,6 +35771,25 @@ stream_max_retries = 0
                 .v2_connections
                 .last_connection_answered_but_unresolved_server_request_count,
             0
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_max_server_request_backlog_count,
+            1
+        );
+        assert_eq!(
+            settled_health
+                .v2_connections
+                .last_connection_server_request_backlog_started_at
+                .is_some(),
+            true
         );
         assert_eq!(
             settled_health

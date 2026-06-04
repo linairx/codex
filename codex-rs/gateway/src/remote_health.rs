@@ -84,24 +84,24 @@ impl RemoteWorkerHealthRegistry {
         self.account_capacity(worker_id) == Some(GatewayAccountCapacityStatus::Available)
     }
 
-    pub fn mark_account_exhausted_for_worker(&self, worker_id: usize, reason: String) {
+    pub fn mark_account_exhausted_for_worker(&self, worker_id: usize, reason: String) -> bool {
         let account_id = self.account_id(worker_id);
         self.update_account_capacity(
             account_id.as_deref(),
             worker_id,
             GatewayAccountCapacityStatus::Exhausted,
             Some(reason),
-        );
+        )
     }
 
-    pub fn mark_account_available_for_worker(&self, worker_id: usize) {
+    pub fn mark_account_available_for_worker(&self, worker_id: usize) -> bool {
         let account_id = self.account_id(worker_id);
         self.update_account_capacity(
             account_id.as_deref(),
             worker_id,
             GatewayAccountCapacityStatus::Available,
             None,
-        );
+        )
     }
 
     pub fn mark_unhealthy(&self, worker_id: usize, error: Option<String>) {
@@ -191,8 +191,9 @@ impl RemoteWorkerHealthRegistry {
         fallback_worker_id: usize,
         status: GatewayAccountCapacityStatus,
         reason: Option<String>,
-    ) {
+    ) -> bool {
         let now = unix_timestamp_now();
+        let mut any_state_changed = false;
         for (worker_id, worker) in write_guard(&self.workers).iter_mut().enumerate() {
             let same_account = match account_id {
                 Some(account_id) => worker.account_id.as_deref() == Some(account_id),
@@ -207,9 +208,11 @@ impl RemoteWorkerHealthRegistry {
             worker.account_capacity = status;
             worker.account_capacity_reason = reason.clone();
             if state_changed {
+                any_state_changed = true;
                 worker.account_capacity_last_changed_at = Some(now);
             }
         }
+        any_state_changed
     }
 }
 

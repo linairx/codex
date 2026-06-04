@@ -48,6 +48,12 @@ pub struct GatewayV2ConnectionPendingCounts {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayV2ConnectionCompletionCounts {
+    pub max_pending_client_request_count: usize,
+    pub max_server_request_backlog_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GatewayV2ConnectionHealthState {
     next_connection_id: u64,
     active_connection_count: usize,
@@ -559,7 +565,7 @@ impl GatewayV2ConnectionHealthRegistry {
         detail: Option<&str>,
         duration: Duration,
         counts: GatewayV2ConnectionPendingCounts,
-    ) {
+    ) -> GatewayV2ConnectionCompletionCounts {
         let mut state = write_guard(&self.state);
         let completed_connection = state.active_connections.remove(&connection_id);
         state.active_connection_count = state.active_connections.len();
@@ -632,6 +638,12 @@ impl GatewayV2ConnectionHealthRegistry {
             counts.server_request_backlog_worker_counts;
         state.last_connection_server_request_backlog_method_counts =
             counts.server_request_backlog_method_counts;
+        GatewayV2ConnectionCompletionCounts {
+            max_pending_client_request_count: state
+                .last_connection_max_pending_client_request_count,
+            max_server_request_backlog_count: state
+                .last_connection_max_server_request_backlog_count,
+        }
     }
 
     pub fn snapshot(&self) -> GatewayV2ConnectionHealth {

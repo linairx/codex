@@ -2074,7 +2074,9 @@ Current status:
   worker. v2 multi-worker account capacity also updates from
   `account/rateLimits/read` responses and `account/rateLimits/updated`
   notifications, allowing the health view to recover when fresh rate-limit
-  state no longer reports an exhausted bucket.
+  state no longer reports an exhausted bucket; repeated snapshots with the
+  same available or exhausted state do not emit duplicate account-capacity
+  events or inflate the health mirror.
   The v2 new-thread failover path also emits
   `gateway_v2_account_capacity_events` metrics and structured logs for
   exhausted workers plus successful replacement routes, including tenant /
@@ -2184,7 +2186,10 @@ Current status:
   operator events. The real multi-worker `RemoteAppServerClient` harness now
   also validates the successful direct `thread/turns/list` restoration path,
   verifies the `gateway/accountThreadHandoffSucceeded` operator event, and
-  checks that a follow-up `thread/read` stays sticky to the replacement worker.
+  checks that a follow-up `thread/read` stays sticky to the replacement
+  worker; the no-replacement harness now also verifies `thread/turns/list`
+  fails closed with `gateway/accountThreadHandoffFailed` when every eligible
+  account-backed worker is exhausted.
   Direct v2 `thread/increment_elicitation` now follows the
   same bounded restoration rule for elicitation counter updates, using the
   requested thread id to update sticky routing after the replacement worker
@@ -2195,7 +2200,10 @@ Current status:
   `RemoteAppServerClient` harness now also validates the successful direct
   `thread/increment_elicitation` restoration path, verifies the
   `gateway/accountThreadHandoffSucceeded` operator event, and checks that a
-  follow-up `thread/read` stays sticky to the replacement worker. Direct v2
+  follow-up `thread/read` stays sticky to the replacement worker; the
+  no-replacement harness now also verifies `thread/increment_elicitation`
+  fails closed with `gateway/accountThreadHandoffFailed` when every eligible
+  account-backed worker is exhausted. Direct v2
   `thread/decrement_elicitation` and
   `thread/inject_items` now use the same requested-thread-id restoration
   surface, updating sticky routing after a replacement worker successfully
@@ -2208,7 +2216,10 @@ Current status:
   also validates the successful direct `thread/decrement_elicitation` and
   `thread/inject_items` restoration paths, verifies the
   `gateway/accountThreadHandoffSucceeded` operator events, and checks that
-  follow-up `thread/read` requests stay sticky to the replacement worker.
+  follow-up `thread/read` requests stay sticky to the replacement worker; the
+  no-replacement harness now also verifies both methods fail closed with
+  `gateway/accountThreadHandoffFailed` when every eligible account-backed
+  worker is exhausted.
   Direct v2 `thread/metadata/update` now follows the same
   bounded restoration rule for exhausted cached owner accounts, accepting only
   a replacement response for the requested thread id and emitting
@@ -2765,14 +2776,20 @@ Operational notes:
 - connection metrics now also export
   `gateway_v2_connection_pending_client_requests_by_worker`,
   `gateway_v2_connection_pending_client_requests_by_method`,
+  `gateway_v2_connection_max_pending_client_requests`,
+  `gateway_v2_connection_server_request_backlog`,
   `gateway_v2_connection_pending_server_requests_by_worker`,
   `gateway_v2_connection_answered_but_unresolved_server_requests_by_worker`,
-  `gateway_v2_connection_pending_server_requests_by_method` and
+  `gateway_v2_connection_server_request_backlog_by_worker`,
+  `gateway_v2_connection_pending_server_requests_by_method`,
   `gateway_v2_connection_answered_but_unresolved_server_requests_by_method`,
-  tagged with `outcome`, `worker_id`, or `method`, so terminal background
-  client-request and prompt backlog can be split by worker route, command,
-  approval, user-input, elicitation, or token-refresh family in metrics
-  dashboards
+  `gateway_v2_connection_server_request_backlog_by_method`, and
+  `gateway_v2_connection_max_server_request_backlog`, tagged with `outcome`,
+  `worker_id`, or `method`, so terminal background client-request and combined
+  prompt backlog can be split by worker route, command, approval, user-input,
+  elicitation, or token-refresh family in metrics dashboards while lifecycle
+  peak pressure remains visible without recomputing totals from separate
+  pending and answered-but-unresolved series
 - downstream-shutdown failure logs now also include pending-client worker and
   method count summaries alongside the individual pending background request
   ids, methods, worker ids, and worker WebSocket URLs, keeping that failure
@@ -3351,16 +3368,29 @@ Account-aware multi-worker guardrails:
   without scraping logs or polling `/healthz`.
 - use same-project `thread/start` traffic to confirm cache affinity, and
   different-project `thread/start` traffic to confirm eligible accounts are
-  distributed instead of concentrating unrelated projects on one account
+  distributed instead of concentrating unrelated projects on one account; the
+  real multi-worker v2 scope harness now runs with account-labeled workers and
+  verifies `/healthz.projectWorkerRoutes` reports the resulting
+  tenant/project-to-worker/account bindings, while also verifying
+  `/healthz.remoteAccountLabelsComplete` reports a complete labeled pool with
+  no unlabeled workers and `/healthz.remoteWorkers[].accountId` carries the
+  configured account labels
 - treat new-thread quota failover as the only automatic account replacement
   path for active creation; verify `gateway/accountCapacityExhausted` and
   `gateway/accountFailoverSucceeded` arrive on `/v1/events` and that
-  `/healthz.remoteWorkers[].accountCapacity` reflects the exhausted account
+  `/healthz.remoteWorkers[].accountId`, `accountCapacity`,
+  `accountCapacityReason`, and `accountCapacityLastChangedAt` reflect the
+  exhausted account. The remote HTTP new-thread quota failover harness now
+  verifies those health fields alongside the replacement project route.
 - treat explicit resumable surfaces as bounded account-handoff paths:
   `thread/read`, `thread/resume`, `thread/fork`, rollout-path
-  `thread/resume` / `thread/fork`, and legacy `getConversationSummary`
-  variants may restore through another eligible account-backed worker when the
-  requested thread id or rollout path is preserved
+  `thread/resume` / `thread/fork`, legacy `getConversationSummary` variants,
+  and resumable thread-id controls such as `thread/name/set`,
+  `thread/memoryMode/set`, `thread/rollback`, `thread/archive`,
+  `thread/unarchive`, `thread/metadata/update`, `thread/turns/list`,
+  `thread/increment_elicitation`, `thread/decrement_elicitation`, and
+  `thread/inject_items` may restore through another eligible account-backed
+  worker when the requested thread id or rollout path is preserved
 - expect active live-context requests without an explicit restore surface,
   such as `turn/start`, `turn/steer`, `turn/interrupt`, realtime append/stop,
   thread-scoped MCP calls, and approval / elicitation replies, to fail closed
@@ -3369,7 +3399,15 @@ Account-aware multi-worker guardrails:
   `/healthz.v2Connections.accountCapacityEventCounts`,
   `accountCapacityEventWorkerCounts`, and the
   `lastAccountCapacityEvent*` fields match the `/v1/events` handoff or
-  fail-closed events observed during validation
+  fail-closed events observed during validation; the real multi-worker
+  account-exhaustion harness now verifies that mirror for exhausted accounts,
+  active fail-closed requests, path handoffs, and thread-id handoffs, and it
+  also verifies `/healthz.remoteWorkers[].accountCapacity` plus
+  `accountCapacityReason` and `accountCapacityLastChangedAt` reflect account
+  exhaustion learned from v2 `account/rateLimits/read`; the same harness now
+  pins `/healthz.v2Connections.failClosedRequestCounts` and the
+  `lastFailClosedRequest*` fields for the active `turn/start` no-handoff
+  decision
 - do not document a multi-worker deployment as drop-in equivalent to embedded
   or single-worker remote until account-capacity events, fail-closed active
   requests, and bounded resumable handoffs have been exercised in that
@@ -3441,11 +3479,21 @@ Suggested validation checklist before widening traffic:
    `gateway_v2_upstream_request_failures` should match
    `v2Connections.upstreamRequestFailureCounts` /
    `lastUpstreamRequestFailure*` health fields,
-   timeout/backpressure counters should match
+   timeout/backpressure health counters should match
    `v2Connections.clientSendTimeoutCount`,
    `lastClientSendTimeoutAt`, `downstreamBackpressureCounts`, and
    `lastDownstreamBackpressure*` health fields, and should stay at zero unless
-   the validation deliberately uses a slow client or lagging downstream worker.
+   the validation deliberately uses a slow client or lagging downstream worker;
+   the matching metrics may be absent rather than exported as explicit zero
+   samples when no timeout or backpressure event occurred.
+   The real single-worker and multi-worker slow-client health regressions now
+   pin the client-send-timeout count and last-timeout timestamp alongside the
+   terminal `client_send_timed_out` connection outcome, pin active plus
+   terminal server-request backlog started-at and max/peak fields for the
+   stranded ChatGPT token-refresh prompt, and pin
+   `notificationSendFailureCounts` plus the newest notification-send failure
+   method, outcome, and timestamp for the warning notification that triggered
+   the timeout.
    Thread routing diagnostics should match
    `v2Connections.threadListDeduplicationCounts`,
    `lastThreadListDeduplication*`, `threadRouteRecoveryCounts`,
@@ -3515,7 +3563,10 @@ Suggested validation checklist before widening traffic:
    active and last-completed health fields for simultaneous user-input,
    permissions approval, MCP elicitation, and ChatGPT token-refresh prompts
    across two workers, including the answered-but-unresolved counts left by
-   earlier prompt classes.
+   earlier prompt classes. It also pins the active backlog start timestamp,
+   current max, lifecycle peak, completed max, and completed started-at fields
+   so rollout evidence can identify prompt buildup age and peak pressure from
+   the same real-client multi-worker path.
    Worker-loss cleanup now also publishes
    `gateway/v2ServerRequestCleanup` on `/v1/events` when thread-scoped prompts
    are resolved or connection-scoped prompts are stranded, so validation
@@ -3558,21 +3609,28 @@ Promotion evidence for multi-worker remote:
   route, remaining worker count, cleanup counts, prompt method families,
   resolved thread ids, and gateway / downstream server-request ids
 - export the gateway metric series named in the checklist above for the same
-  window, including zero-valued send-failure, backpressure, and timeout
-  counters when those failures were not intentionally induced
+  window when events occurred; when send-failure, backpressure, or timeout
+  failures were not intentionally induced, record the matching
+  `/healthz.v2Connections` zero-valued health fields and treat absent metric
+  series as equivalent to zero samples for that validation window
 - when background client requests are intentionally left pending, export
   `gateway_v2_connection_pending_client_requests_by_worker` and
-  `gateway_v2_connection_pending_client_requests_by_method` for the same
-  connection window so terminal `command/exec` or other long-running client
-  request buildup can be correlated with the matching `/healthz.v2Connections`
-  pending-client worker and method counts
+  `gateway_v2_connection_pending_client_requests_by_method` plus
+  `gateway_v2_connection_max_pending_client_requests` for the same connection
+  window so terminal `command/exec` or other long-running client request
+  buildup can be correlated with the matching `/healthz.v2Connections`
+  pending-client worker and method counts, while lifecycle peak pressure is
+  preserved even if the queue drains before teardown
 - when server requests are intentionally left pending or
   answered-but-unresolved, export
   `gateway_v2_connection_pending_server_requests_by_worker` and
   `gateway_v2_connection_answered_but_unresolved_server_requests_by_worker`
-  for the same connection window so terminal prompt backlog can be correlated
-  with the matching `/healthz.v2Connections` server-request backlog worker
-  counts
+  plus the combined `gateway_v2_connection_server_request_backlog_by_worker`
+  and `gateway_v2_connection_max_server_request_backlog` for the same
+  connection window so terminal prompt backlog can be correlated with the
+  matching `/healthz.v2Connections` server-request backlog worker counts
+  without recomputing worker totals, while lifecycle peak pressure stays
+  visible after short-lived prompt spikes drain
 - capture `activeConnectionPeakServerRequestBacklogCount` and
   `lastConnectionMaxServerRequestBacklogCount` for the same prompt window so
   short-lived approval, user-input, elicitation, or token-refresh backlog

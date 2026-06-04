@@ -1,5 +1,6 @@
 use crate::event::GatewayEvent;
 use crate::scope::GatewayRequestContext;
+use crate::v2_connection_health::GatewayV2ConnectionCompletionCounts;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 use axum::extract::MatchedPath;
@@ -32,6 +33,8 @@ const V2_CONNECTION_COUNT_METRIC: &str = "gateway_v2_connections";
 const V2_CONNECTION_DURATION_METRIC: &str = "gateway_v2_connection_duration";
 const V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC: &str =
     "gateway_v2_connection_pending_client_requests";
+const V2_CONNECTION_MAX_PENDING_CLIENT_REQUEST_METRIC: &str =
+    "gateway_v2_connection_max_pending_client_requests";
 const V2_CONNECTION_PENDING_CLIENT_REQUEST_BY_WORKER_METRIC: &str =
     "gateway_v2_connection_pending_client_requests_by_worker";
 const V2_CONNECTION_PENDING_CLIENT_REQUEST_BY_METHOD_METRIC: &str =
@@ -40,14 +43,22 @@ const V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_pending_server_requests";
 const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC: &str =
     "gateway_v2_connection_answered_but_unresolved_server_requests";
+const V2_CONNECTION_SERVER_REQUEST_BACKLOG_METRIC: &str =
+    "gateway_v2_connection_server_request_backlog";
+const V2_CONNECTION_MAX_SERVER_REQUEST_BACKLOG_METRIC: &str =
+    "gateway_v2_connection_max_server_request_backlog";
 const V2_CONNECTION_PENDING_SERVER_REQUEST_BY_WORKER_METRIC: &str =
     "gateway_v2_connection_pending_server_requests_by_worker";
 const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_BY_WORKER_METRIC: &str =
     "gateway_v2_connection_answered_but_unresolved_server_requests_by_worker";
+const V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_WORKER_METRIC: &str =
+    "gateway_v2_connection_server_request_backlog_by_worker";
 const V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC: &str =
     "gateway_v2_connection_pending_server_requests_by_method";
 const V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_BY_METHOD_METRIC: &str =
     "gateway_v2_connection_answered_but_unresolved_server_requests_by_method";
+const V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_METHOD_METRIC: &str =
+    "gateway_v2_connection_server_request_backlog_by_method";
 const V2_SERVER_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_server_request_rejections";
 const V2_CLIENT_REQUEST_REJECTION_COUNT_METRIC: &str = "gateway_v2_client_request_rejections";
 const V2_WORKER_RECONNECT_COUNT_METRIC: &str = "gateway_v2_worker_reconnects";
@@ -205,6 +216,8 @@ impl GatewayObservability {
         outcome: &str,
         duration: Duration,
         pending_counts: GatewayV2ConnectionPendingCounts,
+        max_pending_client_request_count: usize,
+        max_server_request_backlog_count: usize,
     ) {
         let duration_ms = duration.as_millis().min(i64::MAX as u128) as i64;
         let tags = [("outcome", outcome)];
@@ -225,6 +238,15 @@ impl GatewayObservability {
             ) {
                 tracing::warn!(
                     "failed to record gateway v2 connection pending client request metric: {err}"
+                );
+            }
+            if let Err(err) = metrics.histogram(
+                V2_CONNECTION_MAX_PENDING_CLIENT_REQUEST_METRIC,
+                max_pending_client_request_count.min(i64::MAX as usize) as i64,
+                &tags,
+            ) {
+                tracing::warn!(
+                    "failed to record gateway v2 connection max pending client request metric: {err}"
                 );
             }
             for counts in &pending_counts.pending_client_request_worker_counts {
@@ -276,6 +298,27 @@ impl GatewayObservability {
                     "failed to record gateway v2 connection answered-but-unresolved server request metric: {err}"
                 );
             }
+            let server_request_backlog_count = pending_counts
+                .pending_server_request_count
+                .saturating_add(pending_counts.answered_but_unresolved_server_request_count);
+            if let Err(err) = metrics.histogram(
+                V2_CONNECTION_SERVER_REQUEST_BACKLOG_METRIC,
+                server_request_backlog_count.min(i64::MAX as usize) as i64,
+                &tags,
+            ) {
+                tracing::warn!(
+                    "failed to record gateway v2 connection server request backlog metric: {err}"
+                );
+            }
+            if let Err(err) = metrics.histogram(
+                V2_CONNECTION_MAX_SERVER_REQUEST_BACKLOG_METRIC,
+                max_server_request_backlog_count.min(i64::MAX as usize) as i64,
+                &tags,
+            ) {
+                tracing::warn!(
+                    "failed to record gateway v2 connection max server request backlog metric: {err}"
+                );
+            }
             for counts in &pending_counts.server_request_backlog_worker_counts {
                 let worker_id = counts
                     .worker_id
@@ -301,6 +344,15 @@ impl GatewayObservability {
                         "failed to record gateway v2 connection answered-but-unresolved server request by worker metric: {err}"
                     );
                 }
+                if let Err(err) = metrics.histogram(
+                    V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_WORKER_METRIC,
+                    counts.server_request_backlog_count.min(i64::MAX as usize) as i64,
+                    &worker_tags,
+                ) {
+                    tracing::warn!(
+                        "failed to record gateway v2 connection server request backlog by worker metric: {err}"
+                    );
+                }
             }
             for counts in &pending_counts.server_request_backlog_method_counts {
                 let method_tags = [("outcome", outcome), ("method", counts.method.as_str())];
@@ -322,6 +374,15 @@ impl GatewayObservability {
                 ) {
                     tracing::warn!(
                         "failed to record gateway v2 connection answered-but-unresolved server request by method metric: {err}"
+                    );
+                }
+                if let Err(err) = metrics.histogram(
+                    V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_METHOD_METRIC,
+                    counts.server_request_backlog_count.min(i64::MAX as usize) as i64,
+                    &method_tags,
+                ) {
+                    tracing::warn!(
+                        "failed to record gateway v2 connection server request backlog by method metric: {err}"
                     );
                 }
             }
@@ -789,6 +850,7 @@ impl GatewayObservability {
         context: &GatewayRequestContext,
         detail: Option<&str>,
         pending_counts: GatewayV2ConnectionPendingCounts,
+        completion_counts: &GatewayV2ConnectionCompletionCounts,
     ) {
         if !self.audit_logs_enabled {
             return;
@@ -818,12 +880,14 @@ impl GatewayObservability {
             project_id,
             detail,
             pending_client_request_count = pending_counts.pending_client_request_count,
+            max_pending_client_request_count = completion_counts.max_pending_client_request_count,
             pending_client_request_worker_counts = ?pending_client_request_worker_counts,
             pending_client_request_method_counts = ?pending_client_request_method_counts,
             pending_server_request_count = pending_counts.pending_server_request_count,
             answered_but_unresolved_server_request_count =
                 pending_counts.answered_but_unresolved_server_request_count,
             server_request_backlog_count,
+            max_server_request_backlog_count = completion_counts.max_server_request_backlog_count,
             server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
             server_request_backlog_method_counts = ?server_request_backlog_method_counts,
             "gateway v2 connection completed"
@@ -837,6 +901,7 @@ impl GatewayObservability {
         context: &GatewayRequestContext,
         detail: Option<&str>,
         pending_counts: GatewayV2ConnectionPendingCounts,
+        completion_counts: &GatewayV2ConnectionCompletionCounts,
     ) {
         let duration_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         let tenant_id = context.tenant_id.as_str();
@@ -862,12 +927,16 @@ impl GatewayObservability {
                 project_id,
                 detail,
                 pending_client_request_count = pending_counts.pending_client_request_count,
+                max_pending_client_request_count =
+                    completion_counts.max_pending_client_request_count,
                 pending_client_request_worker_counts = ?pending_client_request_worker_counts,
                 pending_client_request_method_counts = ?pending_client_request_method_counts,
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
                 server_request_backlog_count,
+                max_server_request_backlog_count =
+                    completion_counts.max_server_request_backlog_count,
                 server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
                 server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
@@ -880,12 +949,16 @@ impl GatewayObservability {
                 tenant_id,
                 project_id,
                 pending_client_request_count = pending_counts.pending_client_request_count,
+                max_pending_client_request_count =
+                    completion_counts.max_pending_client_request_count,
                 pending_client_request_worker_counts = ?pending_client_request_worker_counts,
                 pending_client_request_method_counts = ?pending_client_request_method_counts,
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
                 server_request_backlog_count,
+                max_server_request_backlog_count =
+                    completion_counts.max_server_request_backlog_count,
                 server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
                 server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
@@ -899,12 +972,16 @@ impl GatewayObservability {
                 project_id,
                 detail,
                 pending_client_request_count = pending_counts.pending_client_request_count,
+                max_pending_client_request_count =
+                    completion_counts.max_pending_client_request_count,
                 pending_client_request_worker_counts = ?pending_client_request_worker_counts,
                 pending_client_request_method_counts = ?pending_client_request_method_counts,
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
                 server_request_backlog_count,
+                max_server_request_backlog_count =
+                    completion_counts.max_server_request_backlog_count,
                 server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
                 server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
@@ -917,12 +994,16 @@ impl GatewayObservability {
                 tenant_id,
                 project_id,
                 pending_client_request_count = pending_counts.pending_client_request_count,
+                max_pending_client_request_count =
+                    completion_counts.max_pending_client_request_count,
                 pending_client_request_worker_counts = ?pending_client_request_worker_counts,
                 pending_client_request_method_counts = ?pending_client_request_method_counts,
                 pending_server_request_count = pending_counts.pending_server_request_count,
                 answered_but_unresolved_server_request_count =
                     pending_counts.answered_but_unresolved_server_request_count,
                 server_request_backlog_count,
+                max_server_request_backlog_count =
+                    completion_counts.max_server_request_backlog_count,
                 server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
                 server_request_backlog_method_counts = ?server_request_backlog_method_counts,
                 "gateway v2 connection completed"
@@ -1011,12 +1092,17 @@ mod tests {
     use super::V2_CONNECTION_ANSWERED_BUT_UNRESOLVED_SERVER_REQUEST_METRIC;
     use super::V2_CONNECTION_COUNT_METRIC;
     use super::V2_CONNECTION_DURATION_METRIC;
+    use super::V2_CONNECTION_MAX_PENDING_CLIENT_REQUEST_METRIC;
+    use super::V2_CONNECTION_MAX_SERVER_REQUEST_BACKLOG_METRIC;
     use super::V2_CONNECTION_PENDING_CLIENT_REQUEST_BY_METHOD_METRIC;
     use super::V2_CONNECTION_PENDING_CLIENT_REQUEST_BY_WORKER_METRIC;
     use super::V2_CONNECTION_PENDING_CLIENT_REQUEST_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_BY_WORKER_METRIC;
     use super::V2_CONNECTION_PENDING_SERVER_REQUEST_METRIC;
+    use super::V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_METHOD_METRIC;
+    use super::V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_WORKER_METRIC;
+    use super::V2_CONNECTION_SERVER_REQUEST_BACKLOG_METRIC;
     use super::V2_DEGRADED_THREAD_DISCOVERY_COUNT_METRIC;
     use super::V2_DOWNSTREAM_BACKPRESSURE_COUNT_METRIC;
     use super::V2_DOWNSTREAM_SHUTDOWN_FAILURE_COUNT_METRIC;
@@ -1051,6 +1137,7 @@ mod tests {
     use crate::api::GatewayV2ThreadRouteRecoveryCounts;
     use crate::api::GatewayV2UpstreamRequestFailureCounts;
     use crate::scope::GatewayRequestContext;
+    use crate::v2_connection_health::GatewayV2ConnectionCompletionCounts;
     use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -1339,6 +1426,8 @@ mod tests {
                     },
                 ],
             },
+            5,
+            7,
         );
 
         let resource_metrics = observability
@@ -1354,14 +1443,19 @@ mod tests {
         let mut saw_count = false;
         let mut saw_duration = false;
         let mut saw_pending_client_requests = false;
+        let mut saw_max_pending_client_requests = false;
         let mut pending_client_request_worker_points = Vec::new();
         let mut pending_client_request_method_points = Vec::new();
         let mut saw_pending_server_requests = false;
         let mut saw_answered_but_unresolved_server_requests = false;
         let mut pending_server_request_worker_points = Vec::new();
         let mut answered_but_unresolved_server_request_worker_points = Vec::new();
+        let mut server_request_backlog_worker_points = Vec::new();
         let mut saw_pending_server_requests_by_method = false;
         let mut saw_answered_but_unresolved_server_requests_by_method = false;
+        let mut saw_server_request_backlog = false;
+        let mut saw_max_server_request_backlog = false;
+        let mut saw_server_request_backlog_by_method = false;
         for metric in metrics {
             match metric.name() {
                 name if name == V2_CONNECTION_COUNT_METRIC => {
@@ -1453,6 +1547,37 @@ mod tests {
                             _ => panic!("unexpected pending client request aggregation"),
                         },
                         _ => panic!("unexpected pending client request type"),
+                    }
+                }
+                name if name == V2_CONNECTION_MAX_PENDING_CLIENT_REQUEST_METRIC => {
+                    saw_max_pending_client_requests = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 5.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected max pending client request aggregation"),
+                        },
+                        _ => panic!("unexpected max pending client request type"),
                     }
                 }
                 name if name == V2_CONNECTION_PENDING_CLIENT_REQUEST_BY_METHOD_METRIC => {
@@ -1571,6 +1696,68 @@ mod tests {
                         _ => panic!("unexpected answered-but-unresolved server request type"),
                     }
                 }
+                name if name == V2_CONNECTION_SERVER_REQUEST_BACKLOG_METRIC => {
+                    saw_server_request_backlog = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 3.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected server request backlog aggregation"),
+                        },
+                        _ => panic!("unexpected server request backlog type"),
+                    }
+                }
+                name if name == V2_CONNECTION_MAX_SERVER_REQUEST_BACKLOG_METRIC => {
+                    saw_max_server_request_backlog = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 7.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([(
+                                        "outcome".to_string(),
+                                        "downstream_session_ended".to_string(),
+                                    )])
+                                );
+                            }
+                            _ => panic!("unexpected max server request backlog aggregation"),
+                        },
+                        _ => panic!("unexpected max server request backlog type"),
+                    }
+                }
                 name if name == V2_CONNECTION_PENDING_SERVER_REQUEST_BY_WORKER_METRIC => {
                     match metric.data() {
                         AggregatedMetrics::F64(data) => match data {
@@ -1625,6 +1812,30 @@ mod tests {
                         _ => panic!(
                             "unexpected answered-but-unresolved server request by worker type"
                         ),
+                    }
+                }
+                name if name == V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_WORKER_METRIC => {
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                server_request_backlog_worker_points.extend(
+                                    histogram.data_points().map(|point| {
+                                        let attributes: BTreeMap<String, String> = point
+                                            .attributes()
+                                            .map(|attribute| {
+                                                (
+                                                    attribute.key.as_str().to_string(),
+                                                    attribute.value.as_str().to_string(),
+                                                )
+                                            })
+                                            .collect();
+                                        (attributes, point.count(), point.sum())
+                                    }),
+                                );
+                            }
+                            _ => panic!("unexpected server request backlog by worker aggregation"),
+                        },
+                        _ => panic!("unexpected server request backlog by worker type"),
                     }
                 }
                 name if name == V2_CONNECTION_PENDING_SERVER_REQUEST_BY_METHOD_METRIC => {
@@ -1707,6 +1918,43 @@ mod tests {
                         ),
                     }
                 }
+                name if name == V2_CONNECTION_SERVER_REQUEST_BACKLOG_BY_METHOD_METRIC => {
+                    saw_server_request_backlog_by_method = true;
+                    match metric.data() {
+                        AggregatedMetrics::F64(data) => match data {
+                            MetricData::Histogram(histogram) => {
+                                let point =
+                                    histogram.data_points().next().expect("histogram point");
+                                assert_eq!(point.count(), 1);
+                                assert_eq!(point.sum(), 3.0);
+                                let attributes: BTreeMap<String, String> = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    attributes,
+                                    BTreeMap::from([
+                                        (
+                                            "outcome".to_string(),
+                                            "downstream_session_ended".to_string(),
+                                        ),
+                                        (
+                                            "method".to_string(),
+                                            "item/tool/requestUserInput".to_string(),
+                                        ),
+                                    ])
+                                );
+                            }
+                            _ => panic!("unexpected server request backlog by method aggregation"),
+                        },
+                        _ => panic!("unexpected server request backlog by method type"),
+                    }
+                }
                 _ => {}
             }
         }
@@ -1714,6 +1962,7 @@ mod tests {
         assert!(saw_count);
         assert!(saw_duration);
         assert!(saw_pending_client_requests);
+        assert!(saw_max_pending_client_requests);
         pending_client_request_worker_points.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             pending_client_request_worker_points,
@@ -1772,6 +2021,8 @@ mod tests {
         );
         assert!(saw_pending_server_requests);
         assert!(saw_answered_but_unresolved_server_requests);
+        assert!(saw_server_request_backlog);
+        assert!(saw_max_server_request_backlog);
         pending_server_request_worker_points.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             pending_server_request_worker_points,
@@ -1828,8 +2079,37 @@ mod tests {
                 ),
             ]
         );
+        server_request_backlog_worker_points.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            server_request_backlog_worker_points,
+            vec![
+                (
+                    BTreeMap::from([
+                        (
+                            "outcome".to_string(),
+                            "downstream_session_ended".to_string(),
+                        ),
+                        ("worker_id".to_string(), "3".to_string()),
+                    ]),
+                    1,
+                    2.0,
+                ),
+                (
+                    BTreeMap::from([
+                        (
+                            "outcome".to_string(),
+                            "downstream_session_ended".to_string(),
+                        ),
+                        ("worker_id".to_string(), "8".to_string()),
+                    ]),
+                    1,
+                    1.0,
+                ),
+            ]
+        );
         assert!(saw_pending_server_requests_by_method);
         assert!(saw_answered_but_unresolved_server_requests_by_method);
+        assert!(saw_server_request_backlog_by_method);
     }
 
     #[test]
@@ -3775,6 +4055,10 @@ mod tests {
                         },
                     ],
                 },
+                &GatewayV2ConnectionCompletionCounts {
+                    max_pending_client_request_count: 9,
+                    max_server_request_backlog_count: 8,
+                },
             );
         });
 
@@ -3785,12 +4069,14 @@ mod tests {
         assert!(logs.contains("project-a"));
         assert!(logs.contains("7"));
         assert!(logs.contains("pending_client_request_count=4"));
+        assert!(logs.contains("max_pending_client_request_count=9"));
         assert!(logs.contains("pending_client_request_worker_counts=["));
         assert!(logs.contains("pending_client_request_method_counts=["));
         assert!(logs.contains("method: \"command/exec\""));
         assert!(logs.contains("pending_server_request_count=2"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=1"));
         assert!(logs.contains("server_request_backlog_count=3"));
+        assert!(logs.contains("max_server_request_backlog_count=8"));
         assert!(logs.contains("server_request_backlog_worker_counts=["));
         assert!(logs.contains("worker_id: Some(2)"));
         assert!(logs.contains("server_request_backlog_method_counts=["));
@@ -3819,6 +4105,10 @@ mod tests {
                     server_request_backlog_worker_counts: Vec::new(),
                     server_request_backlog_method_counts: Vec::new(),
                 },
+                &GatewayV2ConnectionCompletionCounts {
+                    max_pending_client_request_count: 6,
+                    max_server_request_backlog_count: 7,
+                },
             );
         });
 
@@ -3829,9 +4119,11 @@ mod tests {
         assert!(logs.contains("tenant-a"));
         assert!(logs.contains("11"));
         assert!(logs.contains("pending_client_request_count=5"));
+        assert!(logs.contains("max_pending_client_request_count=6"));
         assert!(logs.contains("pending_server_request_count=3"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=2"));
         assert!(logs.contains("server_request_backlog_count=5"));
+        assert!(logs.contains("max_server_request_backlog_count=7"));
     }
 
     #[test]
@@ -3880,6 +4172,10 @@ mod tests {
                         },
                     ],
                 },
+                &GatewayV2ConnectionCompletionCounts {
+                    max_pending_client_request_count: 10,
+                    max_server_request_backlog_count: 11,
+                },
             );
         });
 
@@ -3891,12 +4187,14 @@ mod tests {
         assert!(logs.contains("17"));
         assert!(logs.contains("gateway websocket send timed out"));
         assert!(logs.contains("pending_client_request_count=6"));
+        assert!(logs.contains("max_pending_client_request_count=10"));
         assert!(logs.contains("pending_client_request_worker_counts=["));
         assert!(logs.contains("pending_client_request_method_counts=["));
         assert!(logs.contains("method: \"command/exec\""));
         assert!(logs.contains("pending_server_request_count=4"));
         assert!(logs.contains("answered_but_unresolved_server_request_count=3"));
         assert!(logs.contains("server_request_backlog_count=7"));
+        assert!(logs.contains("max_server_request_backlog_count=11"));
         assert!(logs.contains("server_request_backlog_worker_counts=["));
         assert!(logs.contains("worker_id: Some(7)"));
         assert!(logs.contains("server_request_backlog_method_counts=["));

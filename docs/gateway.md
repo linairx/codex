@@ -423,6 +423,10 @@ Recent progress:
   `account/rateLimits/updated` notifications, so operator-visible capacity can
   recover to available after fresh rate-limit state shows no exhausted bucket
   instead of only changing on `thread/start` failure or success paths
+- repeated v2 `account/rateLimits/read` snapshots that report the same
+  available or exhausted account-capacity state are now regression-covered so
+  they do not emit duplicate `gateway_v2_account_capacity_events` or inflate
+  `/healthz.v2Connections.accountCapacityEventCounts`
 - northbound v2 `thread/start` quota failover now emits
   `gateway_v2_account_capacity_events` metrics for exhausted workers and
   successful replacement routes, and writes structured logs with
@@ -739,21 +743,41 @@ Recent progress:
   `thread/turns/list` after account exhaustion, verifying replacement-account
   restoration, the `gateway/accountThreadHandoffSucceeded` operator event, and
   follow-up `thread/read` stickiness on the replacement worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/turns/list`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed, keeps the cached thread route
+  unchanged, and publishes `gateway/accountThreadHandoffFailed` with method
+  `thread/turns/list`
 - the real multi-worker v2 compatibility harness now also covers direct
   `thread/increment_elicitation` after account exhaustion, verifying
   replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
   operator event, and follow-up `thread/read` stickiness on the replacement
   worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/increment_elicitation`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed, keeps the cached thread route
+  unchanged, and publishes `gateway/accountThreadHandoffFailed` with method
+  `thread/increment_elicitation`
 - the real multi-worker v2 compatibility harness now also covers direct
   `thread/decrement_elicitation` after account exhaustion, verifying
   replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
   operator event, and follow-up `thread/read` stickiness on the replacement
   worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/decrement_elicitation`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed, keeps the cached thread route
+  unchanged, and publishes `gateway/accountThreadHandoffFailed` with method
+  `thread/decrement_elicitation`
 - the real multi-worker v2 compatibility harness now also covers direct
   `thread/inject_items` after account exhaustion, verifying
   replacement-account restoration, the `gateway/accountThreadHandoffSucceeded`
   operator event, and follow-up `thread/read` stickiness on the replacement
   worker
+- the real no-replacement thread-id handoff harness now also covers direct
+  `thread/inject_items`: when every eligible account-backed worker is
+  exhausted, the gateway fails closed, keeps the cached thread route
+  unchanged, and publishes `gateway/accountThreadHandoffFailed` with method
+  `thread/inject_items`
 - the real multi-worker legacy compatibility harness now also drives
   `account/rateLimits/read` to mark the cached rollout-path worker exhausted,
   then verifies `getConversationSummary.rolloutPath` restores through another
@@ -3025,7 +3049,8 @@ Phase 6 is in progress with:
   thread-scoped user-input request, the owning worker account is marked
   exhausted before the client answers, the gateway closes the shared client
   session without delivering the answer downstream, and the account-capacity
-  plus server-request lifecycle metrics identify the same worker and request
+  operator event plus server-request lifecycle metrics identify the same
+  worker and request
   class
 - the real multi-worker connection-scoped token-refresh disconnect regressions
   now also open `/v1/events` and verify `gateway/v2ServerRequestCleanup`
@@ -3096,14 +3121,26 @@ Phase 6 is in progress with:
 - v2 connection metrics now also include
   `gateway_v2_connection_pending_client_requests_by_worker`,
   `gateway_v2_connection_pending_client_requests_by_method`,
+  `gateway_v2_connection_max_pending_client_requests`,
+  `gateway_v2_connection_server_request_backlog`,
   `gateway_v2_connection_pending_server_requests_by_worker`,
   `gateway_v2_connection_answered_but_unresolved_server_requests_by_worker`,
+  `gateway_v2_connection_server_request_backlog_by_worker`,
   `gateway_v2_connection_pending_server_requests_by_method` and
   `gateway_v2_connection_answered_but_unresolved_server_requests_by_method`,
-  tagged by connection outcome plus worker or method, so exported dashboards
-  can split terminal background client-request and prompt backlog by worker
-  route, command, approval, user-input, elicitation, and token-refresh family
-  without relying only on health snapshots or logs
+  `gateway_v2_connection_server_request_backlog_by_method`, and
+  `gateway_v2_connection_max_server_request_backlog`, tagged by connection
+  outcome plus worker or method, so exported dashboards can split terminal
+  background client-request and combined prompt backlog by worker route,
+  command, approval, user-input, elicitation, and token-refresh family while
+  also capturing lifecycle peak pressure without relying only on health
+  snapshots or recomputing totals from separate pending and
+  answered-but-unresolved series
+- v2 connection completion logs and audit logs now include
+  `max_pending_client_request_count` and `max_server_request_backlog_count`,
+  matching the same lifecycle-peak values exported through metrics and
+  `/healthz`, so rollout investigations can reconcile logs, health snapshots,
+  and dashboards without inferring peak pressure from terminal counts
 - the multi-worker rollout evidence checklist now also requires validating
   those v2 server-request backlog worker counts during approval, user-input,
   elicitation, and ChatGPT token-refresh flows, so pending and
@@ -3118,7 +3155,10 @@ Phase 6 is in progress with:
   answered-but-unresolved prompts remain visible by worker and prompt family
   while the next prompt class is pending, and now checks the completed
   connection's last-backlog health snapshot so active and terminal rollout
-  evidence stay aligned for all four prompt families
+  evidence stay aligned for all four prompt families; it now also pins the
+  active backlog start timestamp, current max, lifecycle peak, and completed
+  max/started-at fields so buildup age and peak prompt pressure are covered by
+  the same real-client multi-worker path
 - v2 worker-loss cleanup now also publishes a `/v1/events` operator event as
   `gateway/v2ServerRequestCleanup` whenever cleanup resolves thread-scoped
   prompts or finds stranded connection-scoped prompts, carrying the affected
@@ -3196,7 +3236,9 @@ Phase 6 is in progress with:
   `lastClientSendTimeoutAt`, so rollout evidence can line up
   `gateway_v2_downstream_backpressure_events{worker_id}` and
   `gateway_v2_client_send_timeouts` with the terminal connection outcome
-  fields in the same health response
+  fields in the same health response; the real single-worker and multi-worker
+  slow-client harnesses now pin the timeout count and last-timeout timestamp
+  alongside the terminal `client_send_timed_out` connection outcome
 - `/healthz.v2Connections` now also mirrors v2 multi-worker thread routing
   diagnostics as `threadListDeduplicationCounts`,
   `lastThreadListDeduplicationSelectedWorkerId`,
@@ -3243,13 +3285,96 @@ Phase 6 is in progress with:
   outcomes, request rejections, fail-closed routes, upstream failures,
   transport pressure, routing diagnostics, notification delivery,
   server-request delivery failures, lifecycle events, and worker-specific
-  protocol violations, so the new operator fields are covered at the
-  northbound API boundary rather than only in the in-memory health registry
+  protocol violations, plus active and terminal server-request backlog
+  started-at and max/peak fields, so the new operator fields are covered at
+  the northbound API boundary rather than only in the in-memory health
+  registry
 - the real multi-worker `RemoteAppServerClient` server-request harness now
   also exercises legacy `execCommandApproval` and `applyPatchApproval` prompts
   on one shared northbound session, using UUID-backed visible thread ids so
   the v1-shaped `conversationId` payloads pass protocol parsing while still
   verifying gateway request-id translation across worker-owned threads
+- the real multi-worker `RemoteAppServerClient` scope harness now also runs
+  with account-labeled workers and verifies `/healthz.projectWorkerRoutes`
+  reports the expected tenant/project-to-worker/account bindings after
+  different projects are distributed across separate eligible accounts; that
+  same real-client harness also verifies the account-label guardrail reports
+  `remoteAccountLabelsComplete=true` with no unlabeled workers, and that
+  `/healthz.remoteWorkers[].accountId` carries the configured account labels
+- the real multi-worker account-exhaustion harness now also verifies
+  `/healthz.v2Connections.accountCapacityEventCounts`,
+  `accountCapacityEventWorkerCounts`, and `lastAccountCapacityEvent*` mirror
+  the `/v1/events` sequence for exhausted accounts, active fail-closed
+  requests, and bounded replacement-account handoffs; the same harness now
+  also verifies `/healthz.remoteWorkers[].accountCapacity` and
+  `accountCapacityReason` plus `accountCapacityLastChangedAt` reflect the
+  worker whose account was exhausted by a v2 `account/rateLimits/read`, and
+  it now pins `/healthz.v2Connections.failClosedRequestCounts` plus the
+  `lastFailClosedRequest*` fields for the active `turn/start` no-handoff
+  decision
+- the direct active-thread exhausted-account fail-closed regression now also
+  asserts `/healthz.v2Connections.accountCapacityEventCounts`,
+  `accountCapacityEventWorkerCounts`, and `lastAccountCapacityEvent*` for the
+  same tenant/project, worker, reason, metric label, and
+  `gateway/accountActiveThreadHandoffFailed` operator event, keeping the
+  checklist's health / events / metrics agreement covered at the routing
+  boundary
+- the direct v2 `thread/read` bounded account-handoff regressions now also
+  assert `/healthz.v2Connections.accountCapacityEventCounts`,
+  `accountCapacityEventWorkerCounts`, and `lastAccountCapacityEvent*` for both
+  replacement success and wrong-context no-replacement failure, tying the
+  health snapshot to the same tenant/project, worker, metric label, and
+  `gateway/accountThreadHandoffSucceeded` / `gateway/accountThreadHandoffFailed`
+  operator events
+- the direct v2 thread-id `thread/resume` bounded account-handoff regressions
+  now assert the same `/healthz.v2Connections.accountCapacityEvent*` fields for
+  replacement success and wrong-context no-replacement failure, keeping
+  protocol-visible resume promotion evidence aligned across health snapshots,
+  metrics, and `gateway/accountThreadHandoffSucceeded` /
+  `gateway/accountThreadHandoffFailed` operator events
+- the direct v2 thread-id `thread/fork` bounded account-handoff regressions now
+  assert the same `/healthz.v2Connections.accountCapacityEvent*` fields for
+  replacement success and no-replacement failure, keeping fork promotion
+  evidence aligned across health snapshots, metrics, and
+  `gateway/accountThreadHandoffSucceeded` /
+  `gateway/accountThreadHandoffFailed` operator events
+- the direct v2 path-based `thread/resume` bounded account-handoff regressions
+  now assert the same `/healthz.v2Connections.accountCapacityEvent*` fields for
+  replacement success plus wrong-path and no-replacement failure, keeping
+  rollout path promotion evidence aligned across health snapshots, metrics, and
+  `gateway/accountPathHandoffSucceeded` /
+  `gateway/accountPathHandoffFailed` operator events
+- the remote HTTP new-thread quota failover harness now also verifies the
+  exhausted worker's `/healthz.remoteWorkers[]` entry carries the configured
+  `accountId`, `accountCapacity`, `accountCapacityReason`, and
+  `accountCapacityLastChangedAt`, and that the replacement worker account id
+  remains visible alongside the updated project route
+- the real multi-worker concurrent server-request harness now also verifies
+  `/healthz.v2Connections.activeConnectionServerRequestBacklogStartedAt`,
+  `activeConnectionMaxServerRequestBacklogCount`,
+  `activeConnectionPeakServerRequestBacklogCount`,
+  `lastConnectionMaxServerRequestBacklogCount`, and
+  `lastConnectionServerRequestBacklogStartedAt` while approval, user-input,
+  MCP elicitation, and ChatGPT token-refresh prompts build up across workers
+- the real single-worker and multi-worker slow-client timeout harnesses now
+  also verify active and terminal server-request backlog started-at and
+  max/peak fields while a forwarded ChatGPT token-refresh prompt is stranded
+  by northbound send timeout, and now pin
+  `/healthz.v2Connections.notificationSendFailureCounts` plus the
+  corresponding `lastNotificationSendFailure*` fields for the warning
+  notification that triggered the timeout, so slow-client rollout evidence
+  covers both the terminal timeout outcome and the partially completed prompt
+  buildup
+- the slow-client `command/exec` WebSocket regression now also pins the v2
+  connection completion and audit log fields for pending-client worker and
+  method summaries plus `max_pending_client_request_count`, so terminal logs
+  can be reconciled with the active and completed `/healthz.v2Connections`
+  pending-client snapshots required by the promotion checklist
+- the multi-worker promotion evidence checklist now explicitly requires
+  exporting `gateway_v2_connection_max_pending_client_requests` and
+  `gateway_v2_connection_max_server_request_backlog` alongside the worker and
+  method backlog series, so rollout captures preserve lifecycle peak pressure
+  instead of relying only on terminal counts or health snapshots
 
 The remaining Phase 6 work is:
 

@@ -239,25 +239,29 @@ impl GatewayV2SessionFactory {
         }
     }
 
-    pub fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) {
+    pub fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) -> bool {
         match self {
             Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
                 if let Some(worker_health) = worker_health {
-                    worker_health.mark_account_exhausted_for_worker(worker_id, reason);
+                    worker_health.mark_account_exhausted_for_worker(worker_id, reason)
+                } else {
+                    false
                 }
             }
-            Self::Embedded { .. } => {}
+            Self::Embedded { .. } => false,
         }
     }
 
-    pub fn mark_worker_account_available(&self, worker_id: usize) {
+    pub fn mark_worker_account_available(&self, worker_id: usize) -> bool {
         match self {
             Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
                 if let Some(worker_health) = worker_health {
-                    worker_health.mark_account_available_for_worker(worker_id);
+                    worker_health.mark_account_available_for_worker(worker_id)
+                } else {
+                    false
                 }
             }
-            Self::Embedded { .. } => {}
+            Self::Embedded { .. } => false,
         }
     }
 }
