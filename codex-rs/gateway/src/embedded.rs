@@ -15013,6 +15013,50 @@ stream_max_retries = 0
         .expect("server");
 
         let client = reqwest::Client::new();
+        let event_client = client.clone();
+        let event_url = format!("http://{}/v1/events", server.local_addr());
+        let event_task = tokio::spawn(async move {
+            let mut events_response = event_client
+                .get(event_url)
+                .header("x-codex-project-id", "project-a")
+                .send()
+                .await
+                .expect("event stream response");
+            assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+
+            let mut buffered = String::new();
+            let mut first_route_event = None;
+            let mut second_route_event = None;
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+
+                    if event.contains("event: gateway/projectWorkerRouteSelected")
+                        && event.contains("\"threadId\":\"thread-worker-a\"")
+                    {
+                        first_route_event = Some(event.clone());
+                    } else if event.contains("event: gateway/projectWorkerRouteSelected")
+                        && event.contains("\"threadId\":\"thread-worker-b\"")
+                    {
+                        second_route_event = Some(event.clone());
+                    }
+
+                    if let (Some(first_route_event), Some(second_route_event)) =
+                        (first_route_event.as_ref(), second_route_event.as_ref())
+                    {
+                        return (first_route_event.clone(), second_route_event.clone());
+                    }
+                }
+            }
+        });
         let first_response = client
             .post(format!("http://{}/v1/threads", server.local_addr()))
             .header("x-codex-project-id", "project-a")
@@ -15062,6 +15106,39 @@ stream_max_retries = 0
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
             }])
+        );
+
+        let (first_route_event, second_route_event) = timeout(Duration::from_secs(5), event_task)
+            .await
+            .expect("timed out waiting for project route events")
+            .expect("event task should finish");
+        assert_eq!(
+            first_route_event.contains("event: gateway/projectWorkerRouteSelected"),
+            true
+        );
+        assert_eq!(first_route_event.contains("\"tenantId\":\"default\""), true);
+        assert_eq!(
+            first_route_event.contains("\"projectId\":\"project-a\""),
+            true
+        );
+        assert_eq!(
+            first_route_event.contains("\"threadId\":\"thread-worker-a\""),
+            true
+        );
+        assert_eq!(first_route_event.contains("\"workerId\":0"), true);
+        assert_eq!(first_route_event.contains("\"accountId\":\"acct-a\""), true);
+        assert_eq!(
+            second_route_event.contains("event: gateway/projectWorkerRouteSelected"),
+            true
+        );
+        assert_eq!(
+            second_route_event.contains("\"threadId\":\"thread-worker-b\""),
+            true
+        );
+        assert_eq!(second_route_event.contains("\"workerId\":1"), true);
+        assert_eq!(
+            second_route_event.contains("\"accountId\":\"acct-b\""),
+            true
         );
 
         server.shutdown().await.expect("shutdown");

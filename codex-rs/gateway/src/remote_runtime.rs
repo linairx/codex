@@ -423,6 +423,25 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                     );
                     self.scope_registry
                         .register_project_worker(context.clone(), worker.id());
+                    if let Some(project_id) = context.project_id.as_deref() {
+                        self.observability.record_project_worker_route_selected(
+                            worker.id(),
+                            context.tenant_id.as_str(),
+                            project_id,
+                            response.thread.id.as_str(),
+                        );
+                        let _ = self
+                            .events
+                            .send(GatewayEvent::project_worker_route_selected(
+                                crate::event::GatewayProjectWorkerRouteSelected {
+                                    tenant_id: context.tenant_id.as_str(),
+                                    project_id,
+                                    thread_id: response.thread.id.as_str(),
+                                    worker_id: worker.id(),
+                                    account_id: self.worker_health.account_id(worker.id()),
+                                },
+                            ));
+                    }
 
                     return Ok(ThreadResponse {
                         thread: response.thread.into(),
@@ -1947,13 +1966,21 @@ mod tests {
                 Some("acct-b".to_string()),
             ),
         ]));
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            1,
+        );
         let runtime = RemoteWorkerGatewayRuntime {
             workers: Vec::new(),
             selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
             next_worker: AtomicUsize::new(0),
             next_request_id: Arc::new(AtomicI64::new(1)),
             events: broadcast::channel(4).0,
-            scope_registry: Arc::new(GatewayScopeRegistry::default()),
+            scope_registry,
             worker_health,
             v2_transport: GatewayV2TransportConfig {
                 initialize_timeout_seconds: 30,
@@ -1983,6 +2010,168 @@ mod tests {
                 .map(|worker| worker.account_id.as_deref())
                 .collect::<Vec<_>>(),
             vec![Some("acct-a"), Some("acct-b")]
+        );
+        assert_eq!(
+            health.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: Some("acct-b".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+            }])
+        );
+    }
+
+    #[test]
+    fn project_worker_routes_track_worker_health_and_capacity_changes() {
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            (
+                "ws://127.0.0.1:8082".to_string(),
+                Some("acct-b".to_string()),
+            ),
+        ]));
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            1,
+        );
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events: broadcast::channel(4).0,
+            scope_registry,
+            worker_health: worker_health.clone(),
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        runtime
+            .v2_connection_health
+            .record_project_worker_route_selected(1, "tenant-a", "project-a", "thread-a");
+
+        let healthy_snapshot = runtime.health();
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .project_worker_route_selection_count,
+            1
+        );
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .project_worker_route_selection_worker_counts,
+            vec![
+                crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: 1,
+                    project_worker_route_selection_count: 1,
+                }
+            ]
+        );
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .last_project_worker_route_selected_worker_id,
+            Some(1)
+        );
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .last_project_worker_route_selected_tenant_id
+                .as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .last_project_worker_route_selected_project_id
+                .as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .last_project_worker_route_selected_thread_id
+                .as_deref(),
+            Some("thread-a")
+        );
+        assert!(
+            healthy_snapshot
+                .v2_connections
+                .last_project_worker_route_selected_at
+                .is_some()
+        );
+        assert_eq!(
+            healthy_snapshot.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: Some("acct-b".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+            }])
+        );
+
+        worker_health.mark_unhealthy(1, Some("socket closed".to_string()));
+        worker_health.mark_account_exhausted_for_worker(1, "quota exceeded".to_string());
+
+        let degraded_snapshot = runtime.health();
+        assert_eq!(
+            degraded_snapshot
+                .v2_connections
+                .project_worker_route_selection_count,
+            1
+        );
+        assert_eq!(
+            degraded_snapshot.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: Some("acct-b".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Exhausted,
+                worker_healthy: false,
+            }])
+        );
+
+        worker_health.mark_healthy(1);
+        worker_health.mark_account_available_for_worker(1);
+
+        let recovered_snapshot = runtime.health();
+        assert_eq!(
+            recovered_snapshot
+                .v2_connections
+                .project_worker_route_selection_count,
+            1
+        );
+        assert_eq!(
+            recovered_snapshot.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: Some("acct-b".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+            }])
         );
     }
 

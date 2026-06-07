@@ -12,6 +12,7 @@ use crate::event::GatewayAccountPathHandoffSucceeded;
 use crate::event::GatewayAccountThreadHandoffFailed;
 use crate::event::GatewayAccountThreadHandoffSucceeded;
 use crate::event::GatewayEvent;
+use crate::event::GatewayProjectWorkerRouteSelected;
 use crate::observability::GatewayObservability;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
@@ -4502,7 +4503,11 @@ async fn handle_client_request(
             connection.scope_registry,
             connection.request_context,
             &request,
-        )?;
+        )?
+        .clone();
+        let worker_account_id = worker
+            .worker_id
+            .and_then(|worker_id| downstream.worker_account_id(worker_id));
         let method = request.method.clone();
         let client_request = jsonrpc_request_to_client_request(request)?;
         let response = worker.request_handle.request(client_request).await?;
@@ -4510,8 +4515,10 @@ async fn handle_client_request(
             Ok(result) => Ok(apply_response_scope_policy(
                 connection.scope_registry,
                 connection.request_context,
+                Some(connection.observability),
                 &method,
                 worker.worker_id,
+                worker_account_id,
                 result,
             )?),
             Err(error) => Err(error),
@@ -4608,6 +4615,9 @@ async fn route_thread_start_request_with_account_capacity_failover(
             &request,
         )?
         .clone();
+        let worker_account_id = worker
+            .worker_id
+            .and_then(|worker_id| downstream.worker_account_id(worker_id));
         let method = request.method.clone();
         let response = worker
             .request_handle
@@ -4648,8 +4658,10 @@ async fn route_thread_start_request_with_account_capacity_failover(
                 return Ok(Ok(apply_response_scope_policy(
                     connection.scope_registry,
                     connection.request_context,
+                    Some(connection.observability),
                     &method,
                     worker.worker_id,
+                    worker_account_id,
                     result,
                 )?));
             }
@@ -4720,11 +4732,17 @@ async fn route_thread_id_request_with_account_handoff(
             connection.scope_registry,
             connection.request_context,
             &request,
-        )?;
+        )?
+        .clone();
+        let worker_account_id = worker
+            .worker_id
+            .and_then(|worker_id| downstream.worker_account_id(worker_id));
         return send_thread_request_to_worker(
-            worker,
+            &worker,
             connection.scope_registry,
             connection.request_context,
+            Some(connection.observability),
+            worker_account_id,
             request,
         )
         .await;
@@ -4736,11 +4754,17 @@ async fn route_thread_id_request_with_account_handoff(
             connection.scope_registry,
             connection.request_context,
             &request,
-        )?;
+        )?
+        .clone();
+        let worker_account_id = worker
+            .worker_id
+            .and_then(|worker_id| downstream.worker_account_id(worker_id));
         return send_thread_request_to_worker(
-            worker,
+            &worker,
             connection.scope_registry,
             connection.request_context,
+            Some(connection.observability),
+            worker_account_id,
             request,
         )
         .await;
@@ -4836,8 +4860,12 @@ async fn route_thread_id_request_with_account_handoff(
                 return Ok(Ok(apply_response_scope_policy(
                     connection.scope_registry,
                     connection.request_context,
+                    Some(connection.observability),
                     method.as_str(),
                     worker.worker_id,
+                    worker
+                        .worker_id
+                        .and_then(|worker_id| downstream.worker_account_id(worker_id)),
                     result,
                 )?));
             }
@@ -4931,9 +4959,17 @@ fn thread_id_account_handoff_metrics(method: &str) -> Option<(&'static str, &'st
             "thread_rollback_handoff_success",
             "thread_rollback_handoff_failure",
         )),
+        "thread/compact/start" => Some((
+            "thread_compact_start_handoff_success",
+            "thread_compact_start_handoff_failure",
+        )),
         "thread/turns/list" => Some((
             "thread_turns_list_handoff_success",
             "thread_turns_list_handoff_failure",
+        )),
+        "thread/unsubscribe" => Some((
+            "thread_unsubscribe_handoff_success",
+            "thread_unsubscribe_handoff_failure",
         )),
         "thread/unarchive" => Some((
             "thread_unarchive_handoff_success",
@@ -4947,6 +4983,8 @@ async fn send_thread_request_to_worker(
     worker: &DownstreamWorkerHandle,
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
+    observability: Option<&GatewayObservability>,
+    worker_account_id: Option<String>,
     request: JSONRPCRequest,
 ) -> io::Result<Result<Value, JSONRPCErrorError>> {
     let method = request.method.clone();
@@ -4958,8 +4996,10 @@ async fn send_thread_request_to_worker(
         Ok(result) => Ok(apply_response_scope_policy(
             scope_registry,
             context,
+            observability,
             &method,
             worker.worker_id,
+            worker_account_id,
             result,
         )?),
         Err(error) => Err(error),
@@ -5276,8 +5316,12 @@ async fn first_successful_visible_thread_read_request(
                 return Ok(Ok(apply_response_scope_policy(
                     scope_registry,
                     context,
+                    None,
                     &request.method,
                     worker.worker_id,
+                    worker
+                        .worker_id
+                        .and_then(|worker_id| downstream.worker_account_id(worker_id)),
                     result,
                 )?));
             }
@@ -5320,8 +5364,10 @@ async fn first_successful_scoped_path_thread_request(
                 Ok(result) => Ok(Ok(apply_response_scope_policy(
                     scope_registry,
                     context,
+                    Some(observability),
                     &request.method,
                     Some(worker_id),
+                    downstream.worker_account_id(worker_id),
                     result,
                 )?)),
                 Err(error) => Ok(Err(error)),
@@ -5402,8 +5448,12 @@ async fn first_successful_scoped_path_thread_request(
                 return Ok(Ok(apply_response_scope_policy(
                     scope_registry,
                     context,
+                    Some(observability),
                     &request.method,
                     worker.worker_id,
+                    worker
+                        .worker_id
+                        .and_then(|worker_id| downstream.worker_account_id(worker_id)),
                     result,
                 )?));
             }
@@ -6923,8 +6973,10 @@ fn enforce_request_scope(
 fn apply_response_scope_policy(
     scope_registry: &GatewayScopeRegistry,
     context: &GatewayRequestContext,
+    observability: Option<&GatewayObservability>,
     method: &str,
     worker_id: Option<usize>,
+    worker_account_id: Option<String>,
     mut result: Value,
 ) -> io::Result<Value> {
     match method {
@@ -6953,6 +7005,28 @@ fn apply_response_scope_policy(
                 && let Some(worker_id) = worker_id
             {
                 scope_registry.register_project_worker(context.clone(), worker_id);
+                if let Some(thread_id) = response_thread_id(&result)
+                    && let Some(project_id) = context.project_id.as_deref()
+                    && let Some(observability) = observability
+                {
+                    observability.record_project_worker_route_selected(
+                        worker_id,
+                        context.tenant_id.as_str(),
+                        project_id,
+                        thread_id,
+                    );
+                    observability.publish_operator_event(
+                        GatewayEvent::project_worker_route_selected(
+                            GatewayProjectWorkerRouteSelected {
+                                tenant_id: context.tenant_id.as_str(),
+                                project_id,
+                                thread_id,
+                                worker_id,
+                                account_id: worker_account_id,
+                            },
+                        ),
+                    );
+                }
             }
             if let Some(thread_path) = response_thread_path(&result) {
                 scope_registry.register_thread_path_with_worker(
@@ -10496,6 +10570,39 @@ mod tests {
             &[("error", 1), ("response", 1)],
             &[(1, "active_thread_handoff_failure", 2)],
         );
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("active_thread_handoff_failure".to_string(), 2)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, [("active_thread_handoff_failure".to_string(), 2)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("active_thread_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for serverRequest/respond"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -10812,6 +10919,123 @@ mod tests {
                     pending_server_request_count: 1,
                     answered_but_unresolved_server_request_count: 2,
                     server_request_backlog_count: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn server_request_backlog_method_counts_groups_prompt_families() {
+        let pending_server_requests = HashMap::from([
+            (
+                RequestId::String("gateway-pending-user-input".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: Some(2),
+                    worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    downstream_request_id: RequestId::String(
+                        "downstream-pending-user-input".to_string(),
+                    ),
+                    method: "item/tool/requestUserInput".to_string(),
+                    thread_id: Some("thread-a".to_string()),
+                },
+            ),
+            (
+                RequestId::String("gateway-pending-elicitation".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: Some(1),
+                    worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                    downstream_request_id: RequestId::String(
+                        "downstream-pending-elicitation".to_string(),
+                    ),
+                    method: "mcpServer/elicitation/request".to_string(),
+                    thread_id: Some("thread-b".to_string()),
+                },
+            ),
+            (
+                RequestId::String("gateway-pending-permissions".to_string()),
+                super::PendingServerRequestRoute {
+                    worker_id: None,
+                    worker_websocket_url: "embedded".to_string(),
+                    downstream_request_id: RequestId::String(
+                        "downstream-pending-permissions".to_string(),
+                    ),
+                    method: "item/permissions/requestApproval".to_string(),
+                    thread_id: Some("thread-c".to_string()),
+                },
+            ),
+        ]);
+        let resolved_server_requests = HashMap::from([
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id: Some(2),
+                    request_id: RequestId::String("downstream-resolved-user-input".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String(
+                        "gateway-resolved-user-input".to_string(),
+                    ),
+                    worker_websocket_url: "ws://worker-c.invalid".to_string(),
+                    method: "item/tool/requestUserInput".to_string(),
+                    thread_id: Some("thread-a".to_string()),
+                },
+            ),
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id: Some(1),
+                    request_id: RequestId::String("downstream-resolved-elicitation".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String(
+                        "gateway-resolved-elicitation".to_string(),
+                    ),
+                    worker_websocket_url: "ws://worker-b.invalid".to_string(),
+                    method: "mcpServer/elicitation/request".to_string(),
+                    thread_id: Some("thread-b".to_string()),
+                },
+            ),
+            (
+                super::DownstreamServerRequestKey {
+                    worker_id: Some(0),
+                    request_id: RequestId::String("downstream-resolved-refresh".to_string()),
+                },
+                super::ResolvedServerRequestRoute {
+                    gateway_request_id: RequestId::String("gateway-resolved-refresh".to_string()),
+                    worker_websocket_url: "ws://worker-a.invalid".to_string(),
+                    method: "account/chatgptAuthTokens/refresh".to_string(),
+                    thread_id: None,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            super::server_request_backlog_method_counts(
+                &pending_server_requests,
+                &resolved_server_requests
+            ),
+            vec![
+                crate::api::GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "account/chatgptAuthTokens/refresh".to_string(),
+                    pending_server_request_count: 0,
+                    answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_count: 1,
+                },
+                crate::api::GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/permissions/requestApproval".to_string(),
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 0,
+                    server_request_backlog_count: 1,
+                },
+                crate::api::GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "item/tool/requestUserInput".to_string(),
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_count: 2,
+                },
+                crate::api::GatewayV2ServerRequestBacklogMethodCounts {
+                    method: "mcpServer/elicitation/request".to_string(),
+                    pending_server_request_count: 1,
+                    answered_but_unresolved_server_request_count: 1,
+                    server_request_backlog_count: 2,
                 },
             ]
         );
@@ -13966,6 +14190,97 @@ mod tests {
             missing.is_empty(),
             "missing gateway_v2_account_capacity_events metric points: {missing:?}"
         );
+    }
+
+    fn assert_v2_account_capacity_event_metric_count(
+        metrics: &codex_otel::MetricsClient,
+        worker_id: usize,
+        event: &str,
+        expected_count: u64,
+    ) {
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let metrics = resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+        for metric in metrics {
+            if metric.name() != "gateway_v2_account_capacity_events" {
+                continue;
+            }
+            match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    for point in sum.data_points() {
+                        let attributes: BTreeMap<String, String> = point
+                            .attributes()
+                            .map(|attribute| {
+                                (
+                                    attribute.key.as_str().to_string(),
+                                    attribute.value.as_str().to_string(),
+                                )
+                            })
+                            .collect();
+                        if attributes
+                            == BTreeMap::from([
+                                ("worker_id".to_string(), worker_id.to_string()),
+                                ("event".to_string(), event.to_string()),
+                            ])
+                        {
+                            assert_eq!(point.value(), expected_count);
+                            return;
+                        }
+                    }
+                }
+                AggregatedMetrics::U64(_) => {
+                    panic!("unexpected account capacity event aggregation")
+                }
+                _ => panic!("unexpected account capacity event type"),
+            }
+        }
+
+        panic!(
+            "missing gateway_v2_account_capacity_events metric point for worker {worker_id} and event {event}"
+        );
+    }
+
+    fn assert_v2_account_capacity_event_health(
+        observability: &GatewayObservability,
+        worker_id: usize,
+        event: &str,
+        count: usize,
+        tenant_id: &str,
+        project_id: Option<&str>,
+        reason: &str,
+    ) {
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [(event.to_string(), count)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(worker_id, [(event.to_string(), count)].into())]
+        );
+        assert_eq!(health.last_account_capacity_event.as_deref(), Some(event));
+        assert_eq!(
+            health.last_account_capacity_event_worker_id,
+            Some(worker_id)
+        );
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some(tenant_id)
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            project_id
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(reason)
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
     }
 
     fn assert_v2_worker_reconnect_metrics(
@@ -22232,7 +22547,7 @@ mod tests {
                 .expect("downstream flood should start")
                 .expect("flood start observation should complete");
 
-            timeout(Duration::from_secs(5), async {
+            timeout(Duration::from_secs(15), async {
                 loop {
                     let health = observability.v2_connection_health().snapshot();
                     if health.last_connection_outcome.as_deref() == Some("client_send_timed_out") {
@@ -27724,6 +28039,22 @@ mod tests {
                 }),
                 "thread_inject_items_handoff_failure",
             ),
+            (
+                "thread/unsubscribe",
+                "thread-unsubscribe",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+                "thread_unsubscribe_handoff_failure",
+            ),
+            (
+                "thread/compact/start",
+                "thread-compact-start",
+                serde_json::json!({
+                    "threadId": "thread-worker-b",
+                }),
+                "thread_compact_start_handoff_failure",
+            ),
         ];
 
         for (method, request_id, params, failure_metric) in cases {
@@ -29265,6 +29596,15 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("replacement_worker_id=0"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(0, "path_thread_handoff_success")]);
+        assert_v2_account_capacity_event_health(
+            &observability,
+            0,
+            "path_thread_handoff_success",
+            1,
+            "tenant-a",
+            Some("project-a"),
+            "path-based thread request restored on a replacement account-backed worker",
+        );
 
         router.shutdown().await.expect("router shutdown");
     }
@@ -29393,6 +29733,15 @@ mod tests {
         assert!(logs.contains("method=\"thread/fork\""), "{logs}");
         assert!(logs.contains("path_thread_handoff_failure"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        assert_v2_account_capacity_event_health(
+            &observability,
+            1,
+            "path_thread_handoff_failure",
+            1,
+            "tenant-a",
+            Some("project-a"),
+            "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for thread/fork, and no replacement worker restored the context",
+        );
 
         router.shutdown().await.expect("router shutdown");
     }
@@ -29641,6 +29990,15 @@ mod tests {
         assert!(logs.contains("exhausted_worker_id=1"), "{logs}");
         assert!(logs.contains("replacement_worker_id=0"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(0, "path_thread_handoff_success")]);
+        assert_v2_account_capacity_event_health(
+            &observability,
+            0,
+            "path_thread_handoff_success",
+            1,
+            "tenant-a",
+            Some("project-a"),
+            "path-based thread request restored on a replacement account-backed worker",
+        );
 
         router.shutdown().await.expect("router shutdown");
     }
@@ -29768,6 +30126,15 @@ mod tests {
             None
         );
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        assert_v2_account_capacity_event_health(
+            &observability,
+            1,
+            "path_thread_handoff_failure",
+            1,
+            "tenant-a",
+            Some("project-a"),
+            "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context",
+        );
         let handoff_event = operator_events_rx
             .recv()
             .await
@@ -29905,6 +30272,15 @@ mod tests {
         assert!(logs.contains("method=\"getConversationSummary\""), "{logs}");
         assert!(logs.contains("path_thread_handoff_failure"), "{logs}");
         assert_v2_account_capacity_event_metrics(&metrics, &[(1, "path_thread_handoff_failure")]);
+        assert_v2_account_capacity_event_health(
+            &observability,
+            1,
+            "path_thread_handoff_failure",
+            1,
+            "tenant-a",
+            Some("project-a"),
+            "thread path /tmp/shared/rollout.jsonl is pinned to worker 1 with exhausted account capacity for getConversationSummary, and no replacement worker restored the context",
+        );
 
         router.shutdown().await.expect("router shutdown");
     }
@@ -38851,6 +39227,8 @@ mod tests {
         let metrics = in_memory_metrics();
         let (operator_events_tx, _) = broadcast::channel(4);
         let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
         let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
             (
                 format!("ws://{downstream_addr}"),
@@ -38861,8 +39239,7 @@ mod tests {
         let (addr, server_task) = spawn_test_server(GatewayV2State {
             auth: GatewayAuth::Disabled,
             admission: GatewayAdmissionController::default(),
-            observability: GatewayObservability::new(Some(metrics.clone()), false)
-                .with_operator_events(operator_events_tx),
+            observability: observability.clone(),
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(
                 GatewayV2SessionFactory::remote_multi_with_account_ids(
@@ -39045,6 +39422,36 @@ mod tests {
                 "reason": "thread thread-worker-a is pinned to worker 0 with exhausted account capacity for serverRequest/respond",
             })
         );
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [("active_thread_handoff_failure".to_string(), 1)].into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, [("active_thread_handoff_failure".to_string(), 1)].into())]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("active_thread_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(0));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("default")
+        );
+        assert_eq!(health.last_account_capacity_event_project_id, None);
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-a is pinned to worker 0 with exhausted account capacity for serverRequest/respond"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
 
         server_task.abort();
         let _ = server_task.await;
@@ -43918,12 +44325,31 @@ mod tests {
             }),
         };
         let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext::default();
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
         scope_registry.register_thread_with_worker(
             "thread-worker-b".to_string(),
             context.clone(),
             Some(1),
         );
+        let metrics = in_memory_metrics();
+        let (operator_events_tx, _) = broadcast::channel(32);
+        let mut operator_events_rx = operator_events_tx.subscribe();
+        let observability = GatewayObservability::new(Some(metrics.clone()), false)
+            .with_operator_events(operator_events_tx);
+        let admission = GatewayAdmissionController::default();
+        let connection = GatewayV2ConnectionContext {
+            admission: &admission,
+            observability: &observability,
+            scope_registry: &scope_registry,
+            request_context: &context,
+            client_send_timeout: Duration::from_secs(10),
+            max_pending_server_requests: 4,
+            max_pending_client_requests: 4,
+            opt_out_notification_methods: HashSet::new(),
+        };
 
         let cases = [
             (
@@ -44031,32 +44457,121 @@ mod tests {
                 }),
             ),
         ];
-
         for (method, params) in cases {
-            let err = match super::worker_for_request(
+            let err = match super::handle_client_request(
                 &mut router,
-                &scope_registry,
-                &context,
-                &JSONRPCRequest {
+                &connection,
+                JSONRPCRequest {
                     id: RequestId::String(method.to_string()),
                     method: method.to_string(),
                     params: Some(params),
                     trace: None,
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(_) => {
                     panic!("{method} should fail closed instead of moving active context")
                 }
                 Err(err) => err,
             };
 
-            assert_eq!(
-                err.to_string(),
+            let uses_short_message = method.starts_with("turn/")
+                || method == "app/list"
+                || method == "review/start"
+                || method == "thread/shellCommand"
+                || method == "thread/backgroundTerminals/clean"
+                || method.starts_with("thread/realtime/")
+                || method.starts_with("mcpServer/");
+
+            let expected_message = if uses_short_message {
                 format!(
                     "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for {method}"
                 )
+            } else {
+                format!(
+                    "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for {method}, and no replacement worker restored the context"
+                )
+            };
+            assert_eq!(err.to_string(), expected_message);
+            let handoff_event = operator_events_rx
+                .recv()
+                .await
+                .expect("active thread handoff failure event should be published");
+            assert_eq!(
+                handoff_event.method,
+                if uses_short_message {
+                    "gateway/accountActiveThreadHandoffFailed"
+                } else {
+                    "gateway/accountThreadHandoffFailed"
+                }
+            );
+            assert_eq!(handoff_event.thread_id.as_deref(), Some("thread-worker-b"));
+            assert_eq!(
+                handoff_event.data,
+                serde_json::json!({
+                    "tenantId": "tenant-a",
+                    "projectId": "project-a",
+                    "method": method,
+                    "threadId": "thread-worker-b",
+                    "exhaustedWorkerId": 1,
+                    "exhaustedAccountId": "acct-b",
+                    "reason": expected_message,
+                })
             );
         }
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(
+            health.account_capacity_event_counts,
+            [
+                ("active_thread_handoff_failure".to_string(), 13),
+                ("thread_compact_start_handoff_failure".to_string(), 1),
+                ("thread_unsubscribe_handoff_failure".to_string(), 1),
+            ]
+            .into()
+        );
+        assert_eq!(
+            health
+                .account_capacity_event_worker_counts
+                .iter()
+                .map(|counts| (counts.worker_id, counts.event_counts.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                1,
+                [
+                    ("active_thread_handoff_failure".to_string(), 13),
+                    ("thread_compact_start_handoff_failure".to_string(), 1),
+                    ("thread_unsubscribe_handoff_failure".to_string(), 1),
+                ]
+                .into()
+            )]
+        );
+        assert_eq!(
+            health.last_account_capacity_event.as_deref(),
+            Some("active_thread_handoff_failure")
+        );
+        assert_eq!(health.last_account_capacity_event_worker_id, Some(1));
+        assert_eq!(
+            health.last_account_capacity_event_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_project_id.as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health.last_account_capacity_event_reason.as_deref(),
+            Some(
+                "thread thread-worker-b is pinned to worker 1 with exhausted account capacity for review/start"
+            )
+        );
+        assert_eq!(health.last_account_capacity_event_at.is_some(), true);
+        assert_v2_account_capacity_event_metric_count(
+            &metrics,
+            1,
+            "active_thread_handoff_failure",
+            13,
+        );
         client_a
             .shutdown()
             .await
@@ -49496,8 +50011,10 @@ mod tests {
         let resume_result = super::apply_response_scope_policy(
             &scope_registry,
             &context,
+            None,
             "thread/resume",
             Some(7),
+            None,
             serde_json::json!({
                 "thread": {
                     "id": "thread-resumed",
@@ -49514,8 +50031,10 @@ mod tests {
         let fork_result = super::apply_response_scope_policy(
             &scope_registry,
             &context,
+            None,
             "thread/fork",
             Some(8),
+            None,
             serde_json::json!({
                 "thread": {
                     "id": "thread-forked",
@@ -49532,7 +50051,9 @@ mod tests {
         let filtered_result = super::apply_response_scope_policy(
             &scope_registry,
             &context,
+            None,
             "thread/loaded/list",
+            None,
             None,
             serde_json::json!({
                 "data": ["thread-visible", "thread-hidden", "thread-forked"],
@@ -49549,8 +50070,10 @@ mod tests {
         let thread_read_result = super::apply_response_scope_policy(
             &scope_registry,
             &context,
+            None,
             "thread/read",
             Some(9),
+            None,
             serde_json::json!({
                 "thread": {
                     "id": "thread-read",
@@ -49564,6 +50087,51 @@ mod tests {
             true
         );
         assert_eq!(scope_registry.thread_worker_id("thread-read"), Some(9));
+    }
+
+    #[test]
+    fn apply_response_scope_policy_publishes_project_worker_route_selection_for_thread_start() {
+        let scope_registry = GatewayScopeRegistry::default();
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
+        let observability = GatewayObservability::new(None, false).with_operator_events(event_tx);
+
+        let result = super::apply_response_scope_policy(
+            &scope_registry,
+            &context,
+            Some(&observability),
+            "thread/start",
+            Some(7),
+            Some("acct-a".to_string()),
+            serde_json::json!({
+                "thread": {
+                    "id": "thread-started",
+                }
+            }),
+        )
+        .expect("thread/start response should be accepted");
+
+        assert_eq!(result["thread"]["id"], "thread-started");
+        assert_eq!(
+            scope_registry.thread_visible_to(&context, "thread-started"),
+            true
+        );
+        let event = event_rx.try_recv().expect("project worker route event");
+        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-started"));
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "threadId": "thread-started",
+                "workerId": 7,
+                "accountId": "acct-a",
+            })
+        );
     }
 
     #[test]

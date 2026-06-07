@@ -895,6 +895,24 @@ Recent progress:
   hidden rollout paths are still rejected while visible path-based
   `thread/resume` / `thread/fork` requests stay allowed without bypassing
   thread ownership checks
+- the recent account-exhaustion harnesses now also pin the v2
+  `accountCapacityEvent*` health mirror across active-thread fail-closed,
+  server-request reply fail-closed, and bounded account-handoff success /
+  failure paths, so `/healthz`, `/v1/events`, metrics, and logs stay aligned
+  on the same exhausted worker and tenant/project scope during promotion; the
+  same harnesses now also pin the `gateway_v2_account_capacity_events` metric
+  counts themselves, not just the health mirror, and the broader
+  thread-scoped live-method regression now extends that agreement to the
+  exported metric counts for turn control, realtime, MCP, review, app, shell,
+  compact, unsubscribe, and background-terminal cleanup methods; the real
+  `serverRequest/respond` regression also pins the same metric counts for
+  approval and user-input reply fail-closed behavior
+- the server-request backlog helper now has direct regression coverage for
+  mixed pending and answered-but-unresolved user-input, permissions approval,
+  MCP elicitation, and ChatGPT token-refresh prompts, and the helper groups
+  those prompt families explicitly in the backlog method-count snapshot so the
+  promotion checklist's backlog method-family fields stay tied to real worker
+  routes and prompt classes
 - unknown path-based `thread/resume` re-entry and `thread/fork` rollout paths
   now also have request-metric coverage, verifying the gateway records
   `gateway_v2_requests{outcome="invalid_params"}` when scope policy rejects
@@ -2063,20 +2081,45 @@ Current status:
   northbound v2 multi-worker router uses the same configured account labels for
   project-scoped `thread/start` distribution and skips account-backed workers
   already marked exhausted in the shared remote-worker health registry. The
+  real multi-worker v2 scope harness now verifies those bindings end to end by
+  checking `remoteAccountLabelsComplete=true`, the configured
+  `remoteWorkers[].accountId` values, and the resulting
+  `projectWorkerRoutes` map after different projects are distributed across
+  separate eligible accounts, and it now also observes the
+  `gateway/projectWorkerRouteSelected` operator event for project-scoped
+  `thread/start`, so the documented guardrails now have a real client
+  transcript, `/v1/events` evidence, and `gateway_project_worker_route_selections`
+  metric behind them; deployment-level rollout evidence is still the remaining
+  gate before the profile can be called release-quality. The
+  `/healthz.v2Connections.projectWorkerRouteSelectionCount`,
+  `projectWorkerRouteSelectionWorkerCounts`, and
+  `lastProjectWorkerRouteSelected*` fields mirror that selection stream, so
+  the health snapshot can be paired with the event and metric evidence during
+  rollout reviews. The
+  remote runtime health snapshot now also pins the same `projectWorkerRoutes`
+  shape against the registered project-to-worker map, so the `/healthz`
+  evidence comes from the actual runtime route registry rather than only from
+  a hand-constructed HTTP fixture. The
+  v2 method matrix now also has a dedicated `project-aware account routing`
+  route class, so the rollout profile and the method-level evidence stay
+  aligned; promotion evidence for that path should pair the route snapshot
+  with the matching `/v1/events` operator event
+  `gateway/projectWorkerRouteSelected` and metric evidence for the same
+  tenant/project scope. The
   HTTP gateway now records downstream quota, rate-limit, billing, credits, and
-  429 failures as account-capacity exhaustion signals and exposes that state in
-  `/healthz`; HTTP `thread/start` quota failover also now emits
+  429 failures as account-capacity exhaustion signals and exposes that state
+  in `/healthz`; HTTP `thread/start` quota failover also now emits
   `gateway_account_capacity_events` metrics and structured logs for exhausted
   workers plus successful replacement routes, and publishes `/v1/events`
-  operator events for account exhaustion and replacement-worker selection. v2
-  multi-worker `thread/start` now records the same quota-like JSON-RPC failures
-  and retries new thread creation against another eligible account-backed
-  worker. v2 multi-worker account capacity also updates from
-  `account/rateLimits/read` responses and `account/rateLimits/updated`
-  notifications, allowing the health view to recover when fresh rate-limit
-  state no longer reports an exhausted bucket; repeated snapshots with the
-  same available or exhausted state do not emit duplicate account-capacity
-  events or inflate the health mirror.
+  operator events for account exhaustion and replacement-worker selection.
+  v2 multi-worker `thread/start` now records the same quota-like JSON-RPC
+  failures and retries new thread creation against another eligible
+  account-backed worker. v2 multi-worker account capacity also updates from
+  `account/rateLimits/read` responses and
+  `account/rateLimits/updated` notifications, allowing the health view to
+  recover when fresh rate-limit state no longer reports an exhausted bucket;
+  repeated snapshots with the same available or exhausted state do not emit
+  duplicate account-capacity events or inflate the health mirror.
   The v2 new-thread failover path also emits
   `gateway_v2_account_capacity_events` metrics and structured logs for
   exhausted workers plus successful replacement routes, including tenant /
@@ -2108,7 +2151,11 @@ Current status:
   in-memory context, and that no-handoff decision now publishes
   `gateway/accountActiveThreadHandoffFailed` plus a
   `gateway_v2_account_capacity_events{event="active_thread_handoff_failure"}`
-  metric. Explicit v2 `thread/resume` by thread id now treats the resume call
+  metric. The same active-thread fail-closed regression coverage also now
+  includes `review/start`, so the `gateway_v2_account_capacity_events` metric
+  counts stay aligned with the health mirror, `/v1/events`, and the live
+  review flow when an account-backed worker is exhausted. Explicit v2
+  `thread/resume` by thread id now treats the resume call
   itself as a bounded restoration surface: if the visible thread is pinned to
   an exhausted account-backed worker, the gateway attempts the same resume on
   another available account, accepts only a response for the requested thread
@@ -2144,7 +2191,9 @@ Current status:
   `thread_name_set_handoff_failure` and
   `thread_memory_mode_set_handoff_success` /
   `thread_memory_mode_set_handoff_failure` metrics with account
-  thread-handoff operator events. A real multi-worker
+  thread-handoff operator events, while keeping the matching
+  `accountCapacityEvent*` health fields aligned with the metric counts. A real
+  multi-worker
   `RemoteAppServerClient` harness now also covers the successful direct
   `thread/name/set` restoration path, verifies the
   `gateway/accountThreadHandoffSucceeded` operator event, and checks that a
@@ -2358,8 +2407,10 @@ Operational notes:
   worker with available account capacity, updates the sticky route on success,
   and publishes `gateway/accountThreadHandoffSucceeded`; if no replacement
   restores the read, or if a replacement returns a different thread id than
-  the requested one, it records `thread_read_handoff_failure` account-capacity
-  metrics and publishes `gateway/accountThreadHandoffFailed`.
+  the requested one, it records `thread_read_handoff_failure`
+  account-capacity metrics, keeps the matching
+  `accountCapacityEvent*` health fields aligned, and publishes
+  `gateway/accountThreadHandoffFailed`.
   `/healthz` now exposes `pendingServerRequestCount` and
   `pendingServerRequestKindCounts` for the gateway HTTP/SSE surface, so
   operators can see partially completed approval and user-input lifecycles
@@ -2396,13 +2447,20 @@ Operational notes:
   For path-based `thread/resume` and `getConversationSummary.rolloutPath`, a
   replacement worker must return the same rollout path that the client asked to
   restore; a different path is treated as a failed restoration and does not
-  update the cached route.
+  update the cached route. The direct path-based regressions also pin the
+  matching `gateway_v2_account_capacity_events` metric counts and
+  `/healthz.v2Connections.accountCapacityEvent*` fields for the success and
+  failure paths, so the rollout-path evidence is tied to the same health and
+  metrics signals as the thread-id handoff flows.
   The real multi-worker compatibility harnesses now validate successful
   path-based `thread/resume`, path-based `thread/fork`, and
   `getConversationSummary.rolloutPath` replacement-account restoration through
   unmodified `RemoteAppServerClient` sessions; those same rollout-path
   surfaces now also have no-replacement fail-closed real-client coverage with
-  `gateway/accountPathHandoffFailed` operator events.
+  `gateway/accountPathHandoffFailed` operator events, and the direct path-based
+  `thread/fork` / `getConversationSummary` regressions now also pin
+  `path_thread_handoff_success` / `path_thread_handoff_failure` in the
+  account-capacity health mirror.
   Legacy `getConversationSummary.conversationId` now also uses the visible
   thread id as a bounded restoration surface. If the cached owning account is
   exhausted, the gateway attempts the summary request on another available
@@ -2413,7 +2471,11 @@ Operational notes:
   `gateway/accountThreadHandoffFailed` when no replacement account can restore
   the summary. The real multi-worker legacy compatibility harness now covers
   both the successful replacement-account path and the no-replacement
-  fail-closed path for this conversation-id form.
+  fail-closed path for this conversation-id form, and the direct
+  conversation-summary regressions now also pin the matching
+  `accountCapacityEvent*` health fields alongside the
+  `conversation_summary_handoff_success` /
+  `conversation_summary_handoff_failure` metrics.
   Today's reconnect and v2 multi-worker logic should not be treated as full
   live-context-preserving quota failover
 - future account-aware routing must preserve tenant/project scope while adding
@@ -3547,7 +3609,9 @@ Suggested validation checklist before widening traffic:
    failure and verify `gateway_v2_account_capacity_events`,
    `/v1/events`, and `/healthz.v2Connections` agree on the exhausted worker,
    tenant/project scope, reason, and either replacement route or deliberate
-   no-handoff outcome.
+   no-handoff outcome. Also confirm the exported
+   `gateway_v2_account_capacity_events` metric counts themselves match the
+   health mirror for the same worker and event label.
 9. During approval, user-input, elicitation, or ChatGPT token-refresh
    validation, verify
    `/healthz.v2Connections.activeConnectionServerRequestBacklogWorkerCounts`
@@ -3590,6 +3654,10 @@ Promotion evidence for multi-worker remote:
 - record the exact gateway and worker configuration, including every
   `--remote-websocket-url`, `--remote-account-id`, auth mode, v2 timeout, and
   pending-request limit used during validation
+- capture `/healthz.projectWorkerRoutes` together with the matching
+  `remoteWorkers[].accountId` labels for the validated tenant/project scope,
+  and verify those project-to-worker bindings stay stable across steady-state
+  traffic, reconnect, and account-capacity transitions
 - record which methods are expected to aggregate, fan out, stay primary-worker
   affine, use worker discovery, remain sticky to an owning thread route, or use
   a bounded account-handoff surface, and compare those expectations with the
@@ -3598,10 +3666,10 @@ Promotion evidence for multi-worker remote:
   worker is reconnecting, after recovery, and after an induced account-capacity
   event, including the v2 server-request backlog worker-count fields when a
   prompt round trip is intentionally left pending or answered-but-unresolved,
-  plus the matching backlog method-count fields for the same connection window;
-  when background client requests are intentionally left pending, also capture
-  the pending client-request worker and method counts for that connection
-  window
+  plus the matching backlog method-count fields grouped by prompt family for
+  the same connection window; when background client requests are intentionally
+  left pending, also capture the pending client-request worker and method
+  counts for that connection window
 - capture the `/v1/events` stream for worker reconnect, account exhaustion,
   replacement-account handoff, active-thread no-handoff, and pending
   server-request cleanup cases exercised during validation; for v2 worker-loss

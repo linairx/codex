@@ -12,6 +12,7 @@ use crate::api::GatewayV2ForwardedNotificationCounts;
 use crate::api::GatewayV2NotificationSendFailureCounts;
 use crate::api::GatewayV2PendingClientRequestMethodCounts;
 use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+use crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts;
 use crate::api::GatewayV2ProtocolViolationCounts;
 use crate::api::GatewayV2ProtocolViolationWorkerCounts;
 use crate::api::GatewayV2RequestCounts;
@@ -112,6 +113,13 @@ struct GatewayV2ConnectionHealthState {
     last_degraded_thread_discovery_method: Option<String>,
     last_degraded_thread_discovery_reconnect_backoff_active: Option<bool>,
     last_degraded_thread_discovery_at: Option<i64>,
+    project_worker_route_selection_count: usize,
+    project_worker_route_selection_worker_counts: BTreeMap<usize, usize>,
+    last_project_worker_route_selected_worker_id: Option<usize>,
+    last_project_worker_route_selected_tenant_id: Option<String>,
+    last_project_worker_route_selected_project_id: Option<String>,
+    last_project_worker_route_selected_thread_id: Option<String>,
+    last_project_worker_route_selected_at: Option<i64>,
     forwarded_notification_counts: BTreeMap<String, usize>,
     last_forwarded_notification_method: Option<String>,
     last_forwarded_notification_at: Option<i64>,
@@ -285,6 +293,27 @@ impl GatewayV2ConnectionHealthRegistry {
         state.last_account_capacity_event_project_id = project_id.map(ToString::to_string);
         state.last_account_capacity_event_reason = reason.map(ToString::to_string);
         state.last_account_capacity_event_at = Some(unix_timestamp_now());
+    }
+
+    pub fn record_project_worker_route_selected(
+        &self,
+        worker_id: usize,
+        tenant_id: &str,
+        project_id: &str,
+        thread_id: &str,
+    ) {
+        let mut state = write_guard(&self.state);
+        state.project_worker_route_selection_count =
+            state.project_worker_route_selection_count.saturating_add(1);
+        *state
+            .project_worker_route_selection_worker_counts
+            .entry(worker_id)
+            .or_default() += 1;
+        state.last_project_worker_route_selected_worker_id = Some(worker_id);
+        state.last_project_worker_route_selected_tenant_id = Some(tenant_id.to_string());
+        state.last_project_worker_route_selected_project_id = Some(project_id.to_string());
+        state.last_project_worker_route_selected_thread_id = Some(thread_id.to_string());
+        state.last_project_worker_route_selected_at = Some(unix_timestamp_now());
     }
 
     pub fn record_worker_reconnect_event(&self, worker_id: usize, event: &str) {
@@ -791,6 +820,16 @@ impl GatewayV2ConnectionHealthRegistry {
                     }
                 })
                 .collect();
+        let project_worker_route_selection_worker_counts = state
+            .project_worker_route_selection_worker_counts
+            .iter()
+            .map(|(worker_id, project_worker_route_selection_count)| {
+                GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: *worker_id,
+                    project_worker_route_selection_count: *project_worker_route_selection_count,
+                }
+            })
+            .collect();
         GatewayV2ConnectionHealth {
             active_connection_count: state.active_connection_count,
             active_connection_pending_client_request_count,
@@ -807,6 +846,20 @@ impl GatewayV2ConnectionHealthRegistry {
             active_connection_server_request_backlog_started_at,
             active_connection_server_request_backlog_worker_counts,
             active_connection_server_request_backlog_method_counts,
+            project_worker_route_selection_count: state.project_worker_route_selection_count,
+            project_worker_route_selection_worker_counts,
+            last_project_worker_route_selected_worker_id: state
+                .last_project_worker_route_selected_worker_id,
+            last_project_worker_route_selected_tenant_id: state
+                .last_project_worker_route_selected_tenant_id
+                .clone(),
+            last_project_worker_route_selected_project_id: state
+                .last_project_worker_route_selected_project_id
+                .clone(),
+            last_project_worker_route_selected_thread_id: state
+                .last_project_worker_route_selected_thread_id
+                .clone(),
+            last_project_worker_route_selected_at: state.last_project_worker_route_selected_at,
             account_capacity_event_counts: state.account_capacity_event_counts.clone(),
             account_capacity_event_worker_counts: state
                 .account_capacity_event_worker_counts
@@ -1251,6 +1304,7 @@ mod tests {
     use crate::api::GatewayV2NotificationSendFailureCounts;
     use crate::api::GatewayV2PendingClientRequestMethodCounts;
     use crate::api::GatewayV2PendingClientRequestWorkerCounts;
+    use crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts;
     use crate::api::GatewayV2ProtocolViolationCounts;
     use crate::api::GatewayV2RequestCounts;
     use crate::api::GatewayV2ServerRequestAnswerDeliveryFailureCounts;
@@ -1500,6 +1554,28 @@ mod tests {
                 .is_some(),
             true
         );
+        assert_eq!(active_snapshot.project_worker_route_selection_count, 0);
+        assert_eq!(
+            active_snapshot.project_worker_route_selection_worker_counts,
+            vec![]
+        );
+        assert_eq!(
+            active_snapshot.last_project_worker_route_selected_worker_id,
+            None
+        );
+        assert_eq!(
+            active_snapshot.last_project_worker_route_selected_tenant_id,
+            None
+        );
+        assert_eq!(
+            active_snapshot.last_project_worker_route_selected_project_id,
+            None
+        );
+        assert_eq!(
+            active_snapshot.last_project_worker_route_selected_thread_id,
+            None
+        );
+        assert_eq!(active_snapshot.last_project_worker_route_selected_at, None);
         assert_eq!(
             active_snapshot.account_capacity_event_counts,
             BTreeMap::new()
@@ -2108,6 +2184,104 @@ mod tests {
     }
 
     #[test]
+    fn completion_backfills_pending_client_and_backlog_timestamps_when_counts_arrive_at_teardown() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+        let connection_id = registry.mark_connection_started();
+
+        registry.mark_connection_completed(
+            connection_id,
+            "client_send_timed_out",
+            None,
+            Duration::from_millis(1),
+            GatewayV2ConnectionPendingCounts {
+                pending_client_request_count: 1,
+                pending_client_request_worker_counts: vec![
+                    GatewayV2PendingClientRequestWorkerCounts {
+                        worker_id: Some(7),
+                        pending_client_request_count: 1,
+                    },
+                ],
+                pending_client_request_method_counts: vec![
+                    GatewayV2PendingClientRequestMethodCounts {
+                        method: "command/exec".to_string(),
+                        pending_client_request_count: 1,
+                    },
+                ],
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_worker_counts: vec![
+                    GatewayV2ServerRequestBacklogWorkerCounts {
+                        worker_id: Some(7),
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 2,
+                    },
+                ],
+                server_request_backlog_method_counts: vec![
+                    GatewayV2ServerRequestBacklogMethodCounts {
+                        method: "item/tool/requestUserInput".to_string(),
+                        pending_server_request_count: 1,
+                        answered_but_unresolved_server_request_count: 1,
+                        server_request_backlog_count: 2,
+                    },
+                ],
+            },
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.last_connection_pending_client_request_count, 1);
+        assert_eq!(snapshot.last_connection_server_request_backlog_count, 2);
+        assert_eq!(
+            snapshot.last_connection_pending_client_request_started_at,
+            snapshot.last_connection_server_request_backlog_started_at
+        );
+        assert_eq!(
+            snapshot
+                .last_connection_pending_client_request_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            snapshot
+                .last_connection_server_request_backlog_started_at
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            snapshot.last_connection_pending_client_request_worker_counts,
+            vec![GatewayV2PendingClientRequestWorkerCounts {
+                worker_id: Some(7),
+                pending_client_request_count: 1,
+            }]
+        );
+        assert_eq!(
+            snapshot.last_connection_pending_client_request_method_counts,
+            vec![GatewayV2PendingClientRequestMethodCounts {
+                method: "command/exec".to_string(),
+                pending_client_request_count: 1,
+            }]
+        );
+        assert_eq!(
+            snapshot.last_connection_server_request_backlog_worker_counts,
+            vec![GatewayV2ServerRequestBacklogWorkerCounts {
+                worker_id: Some(7),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_count: 2,
+            }]
+        );
+        assert_eq!(
+            snapshot.last_connection_server_request_backlog_method_counts,
+            vec![GatewayV2ServerRequestBacklogMethodCounts {
+                method: "item/tool/requestUserInput".to_string(),
+                pending_server_request_count: 1,
+                answered_but_unresolved_server_request_count: 1,
+                server_request_backlog_count: 2,
+            }]
+        );
+    }
+
+    #[test]
     fn pending_client_request_peak_survives_queue_clear_and_completion() {
         let registry = GatewayV2ConnectionHealthRegistry::default();
         let connection_id = registry.mark_connection_started();
@@ -2370,6 +2544,54 @@ mod tests {
             Some("billing limit".to_string())
         );
         assert_eq!(snapshot.last_account_capacity_event_at.is_some(), true);
+    }
+
+    #[test]
+    fn snapshot_tracks_project_worker_route_selections() {
+        let registry = GatewayV2ConnectionHealthRegistry::default();
+
+        registry.record_project_worker_route_selected(7, "tenant-a", "project-a", "thread-a");
+        registry.record_project_worker_route_selected(7, "tenant-a", "project-a", "thread-b");
+        registry.record_project_worker_route_selected(9, "tenant-b", "project-b", "thread-c");
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.project_worker_route_selection_count, 3);
+        assert_eq!(
+            snapshot.project_worker_route_selection_worker_counts,
+            vec![
+                GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: 7,
+                    project_worker_route_selection_count: 2,
+                },
+                GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: 9,
+                    project_worker_route_selection_count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            snapshot.last_project_worker_route_selected_worker_id,
+            Some(9)
+        );
+        assert_eq!(
+            snapshot
+                .last_project_worker_route_selected_tenant_id
+                .as_deref(),
+            Some("tenant-b")
+        );
+        assert_eq!(
+            snapshot
+                .last_project_worker_route_selected_project_id
+                .as_deref(),
+            Some("project-b")
+        );
+        assert_eq!(
+            snapshot
+                .last_project_worker_route_selected_thread_id
+                .as_deref(),
+            Some("thread-c")
+        );
+        assert!(snapshot.last_project_worker_route_selected_at.is_some());
     }
 
     #[test]

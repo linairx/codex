@@ -751,6 +751,35 @@ mod tests {
     }
 
     #[test]
+    fn project_worker_routes_replace_previous_affinity_for_same_project() {
+        let registry = GatewayScopeRegistry::default();
+        let project = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+
+        registry.register_project_worker(project.clone(), 7);
+        registry.register_project_worker(project.clone(), 9);
+
+        assert_eq!(registry.project_worker_id(&project), Some(9));
+        assert_eq!(
+            registry.project_worker_routes(
+                |_| true,
+                |_| Some("acct-a".to_string()),
+                |_| crate::api::GatewayAccountCapacityStatus::Available,
+            ),
+            vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 9,
+                account_id: Some("acct-a".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+            }]
+        );
+    }
+
+    #[test]
     fn project_worker_selection_distributes_unmapped_projects() {
         let registry = GatewayScopeRegistry::default();
         let project_a = GatewayRequestContext {

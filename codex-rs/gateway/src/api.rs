@@ -127,6 +127,14 @@ pub struct GatewayV2ConnectionHealth {
         Vec<GatewayV2ServerRequestBacklogWorkerCounts>,
     pub active_connection_server_request_backlog_method_counts:
         Vec<GatewayV2ServerRequestBacklogMethodCounts>,
+    pub project_worker_route_selection_count: usize,
+    pub project_worker_route_selection_worker_counts:
+        Vec<GatewayV2ProjectWorkerRouteSelectionWorkerCounts>,
+    pub last_project_worker_route_selected_worker_id: Option<usize>,
+    pub last_project_worker_route_selected_tenant_id: Option<String>,
+    pub last_project_worker_route_selected_project_id: Option<String>,
+    pub last_project_worker_route_selected_thread_id: Option<String>,
+    pub last_project_worker_route_selected_at: Option<i64>,
     pub account_capacity_event_counts: BTreeMap<String, usize>,
     pub account_capacity_event_worker_counts: Vec<GatewayV2AccountCapacityWorkerEventCounts>,
     pub last_account_capacity_event: Option<String>,
@@ -460,6 +468,13 @@ pub struct GatewayV2ServerRequestBacklogMethodCounts {
     pub pending_server_request_count: usize,
     pub answered_but_unresolved_server_request_count: usize,
     pub server_request_backlog_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+    pub worker_id: usize,
+    pub project_worker_route_selection_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

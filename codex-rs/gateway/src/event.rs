@@ -67,6 +67,14 @@ pub(crate) struct GatewayAccountThreadHandoffFailed<'a> {
     pub reason: &'a str,
 }
 
+pub(crate) struct GatewayProjectWorkerRouteSelected<'a> {
+    pub tenant_id: &'a str,
+    pub project_id: &'a str,
+    pub thread_id: &'a str,
+    pub worker_id: usize,
+    pub account_id: Option<String>,
+}
+
 impl GatewayEvent {
     pub fn from_notification(notification: ServerNotification) -> Self {
         let value = serde_json::to_value(notification).unwrap_or(Value::Null);
@@ -197,6 +205,22 @@ impl GatewayEvent {
         }
     }
 
+    pub(crate) fn project_worker_route_selected(
+        params: GatewayProjectWorkerRouteSelected<'_>,
+    ) -> Self {
+        Self {
+            method: "gateway/projectWorkerRouteSelected".to_string(),
+            thread_id: Some(params.thread_id.to_string()),
+            data: serde_json::json!({
+                "tenantId": params.tenant_id,
+                "projectId": params.project_id,
+                "threadId": params.thread_id,
+                "workerId": params.worker_id,
+                "accountId": params.account_id,
+            }),
+        }
+    }
+
     pub(crate) fn account_path_handoff_succeeded(
         params: GatewayAccountPathHandoffSucceeded<'_>,
     ) -> Self {
@@ -320,6 +344,7 @@ mod tests {
     use super::GatewayAccountThreadHandoffFailed;
     use super::GatewayAccountThreadHandoffSucceeded;
     use super::GatewayEvent;
+    use super::GatewayProjectWorkerRouteSelected;
     use crate::api::GatewayServerRequest;
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ServerNotification;
@@ -532,6 +557,31 @@ mod tests {
                 "replacementWorkerId": 2,
                 "replacementAccountId": "acct-b",
                 "exhaustedWorkerIds": [1],
+            })
+        );
+    }
+
+    #[test]
+    fn reports_project_worker_route_selection() {
+        let event =
+            GatewayEvent::project_worker_route_selected(GatewayProjectWorkerRouteSelected {
+                tenant_id: "tenant-a",
+                project_id: "project-a",
+                thread_id: "thread-123",
+                worker_id: 2,
+                account_id: Some("acct-b".to_string()),
+            });
+
+        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-123"));
+        assert_eq!(
+            event.data,
+            json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "threadId": "thread-123",
+                "workerId": 2,
+                "accountId": "acct-b",
             })
         );
     }
