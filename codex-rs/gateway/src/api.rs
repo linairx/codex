@@ -86,6 +86,7 @@ pub struct GatewayProjectWorkerRoute {
     pub account_id: Option<String>,
     pub account_capacity: GatewayAccountCapacityStatus,
     pub worker_healthy: bool,
+    pub account_routing_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +135,7 @@ pub struct GatewayV2ConnectionHealth {
     pub last_project_worker_route_selected_tenant_id: Option<String>,
     pub last_project_worker_route_selected_project_id: Option<String>,
     pub last_project_worker_route_selected_thread_id: Option<String>,
+    pub last_project_worker_route_selected_account_id: Option<String>,
     pub last_project_worker_route_selected_at: Option<i64>,
     pub account_capacity_event_counts: BTreeMap<String, usize>,
     pub account_capacity_event_worker_counts: Vec<GatewayV2AccountCapacityWorkerEventCounts>,

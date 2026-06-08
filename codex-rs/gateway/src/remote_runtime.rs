@@ -424,11 +424,13 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                     self.scope_registry
                         .register_project_worker(context.clone(), worker.id());
                     if let Some(project_id) = context.project_id.as_deref() {
+                        let account_id = self.worker_health.account_id(worker.id());
                         self.observability.record_project_worker_route_selected(
                             worker.id(),
                             context.tenant_id.as_str(),
                             project_id,
                             response.thread.id.as_str(),
+                            account_id.as_deref(),
                         );
                         let _ = self
                             .events
@@ -438,7 +440,7 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                                     project_id,
                                     thread_id: response.thread.id.as_str(),
                                     worker_id: worker.id(),
-                                    account_id: self.worker_health.account_id(worker.id()),
+                                    account_id,
                                 },
                             ));
                     }
@@ -1950,6 +1952,7 @@ mod tests {
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: false,
+                account_routing_eligible: false,
             }])
         );
     }
@@ -2020,6 +2023,7 @@ mod tests {
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }])
         );
     }
@@ -2065,7 +2069,13 @@ mod tests {
 
         runtime
             .v2_connection_health
-            .record_project_worker_route_selected(1, "tenant-a", "project-a", "thread-a");
+            .record_project_worker_route_selected(
+                1,
+                "tenant-a",
+                "project-a",
+                "thread-a",
+                Some("acct-b"),
+            );
 
         let healthy_snapshot = runtime.health();
         assert_eq!(
@@ -2112,6 +2122,13 @@ mod tests {
                 .as_deref(),
             Some("thread-a")
         );
+        assert_eq!(
+            healthy_snapshot
+                .v2_connections
+                .last_project_worker_route_selected_account_id
+                .as_deref(),
+            Some("acct-b")
+        );
         assert!(
             healthy_snapshot
                 .v2_connections
@@ -2127,6 +2144,7 @@ mod tests {
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }])
         );
 
@@ -2149,6 +2167,7 @@ mod tests {
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Exhausted,
                 worker_healthy: false,
+                account_routing_eligible: false,
             }])
         );
 
@@ -2171,6 +2190,7 @@ mod tests {
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }])
         );
     }

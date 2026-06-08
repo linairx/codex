@@ -353,6 +353,40 @@ fn warn_unlabeled_remote_account_workers(
     );
 }
 
+fn log_complete_remote_account_workers(
+    remote_runtime: &GatewayRemoteRuntimeConfig,
+    account_label_summary: &RemoteAccountLabelSummary,
+) {
+    if remote_runtime.workers.len() <= 1 || !account_label_summary.complete {
+        return;
+    }
+
+    let labeled_worker_ids: Vec<usize> = remote_runtime
+        .workers
+        .iter()
+        .enumerate()
+        .map(|(worker_id, _)| worker_id)
+        .collect();
+    let labeled_worker_websocket_urls: Vec<&str> = remote_runtime
+        .workers
+        .iter()
+        .map(|worker| worker.websocket_url.as_str())
+        .collect();
+    let labeled_worker_account_ids: Vec<&str> = remote_runtime
+        .workers
+        .iter()
+        .map(|worker| worker.account_id.as_deref().unwrap_or_default())
+        .collect();
+
+    tracing::info!(
+        total_worker_count = remote_runtime.workers.len(),
+        labeled_worker_ids = ?labeled_worker_ids,
+        labeled_worker_websocket_urls = ?labeled_worker_websocket_urls,
+        labeled_worker_account_ids = ?labeled_worker_account_ids,
+        "gateway remote multi-worker account labels are complete"
+    );
+}
+
 fn record_remote_account_worker_label_metrics(
     observability: &GatewayObservability,
     remote_runtime: &GatewayRemoteRuntimeConfig,
@@ -574,6 +608,7 @@ async fn start_remote_runtime_gateway_http_server(
     };
     let account_label_summary = remote_account_label_summary(&remote_runtime);
     warn_unlabeled_remote_account_workers(&remote_runtime, &account_label_summary);
+    log_complete_remote_account_workers(&remote_runtime, &account_label_summary);
 
     let (events_tx, _events_rx) =
         tokio::sync::broadcast::channel(gateway_config.event_buffer_capacity);
@@ -946,6 +981,7 @@ mod tests {
     use super::UnlabeledRemoteAccountWorker;
     use super::gateway_environment_manager;
     use super::gateway_execution_mode;
+    use super::log_complete_remote_account_workers;
     use super::record_remote_account_worker_label_metrics;
     use super::remote_account_label_summary;
     use super::start_embedded_gateway_server;
@@ -1431,6 +1467,44 @@ mod tests {
         assert!(logs.contains("unlabeled_worker_count=1"));
         assert!(logs.contains("unlabeled_worker_ids=[1]"));
         assert!(logs.contains("unlabeled_worker_websocket_urls=[\"ws://worker-b.invalid\"]"));
+    }
+
+    #[test]
+    fn log_complete_remote_account_workers_logs_route_identity() {
+        let remote_runtime = GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: vec![
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-a".to_string()),
+                },
+                GatewayRemoteWorkerConfig {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+                    auth_token: None,
+                    account_id: Some("acct-b".to_string()),
+                },
+            ],
+        };
+        let account_label_summary = remote_account_label_summary(&remote_runtime);
+
+        let logs = capture_logs(|| {
+            log_complete_remote_account_workers(&remote_runtime, &account_label_summary);
+        });
+
+        assert!(logs.contains("gateway remote multi-worker account labels are complete"));
+        assert!(logs.contains("total_worker_count=2"));
+        assert!(logs.contains("labeled_worker_ids=[0, 1]"));
+        assert!(
+            logs.contains(
+                "labeled_worker_websocket_urls=[\"ws://worker-a.invalid\", \"ws://worker-b.invalid\"]"
+            ),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("labeled_worker_account_ids=[\"acct-a\", \"acct-b\"]"),
+            "{logs}"
+        );
     }
 
     #[test]
@@ -15105,7 +15179,67 @@ stream_max_retries = 0
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }])
+        );
+        assert_eq!(
+            health.v2_connections.project_worker_route_selection_count,
+            2
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .project_worker_route_selection_worker_counts,
+            vec![
+                crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: 0,
+                    project_worker_route_selection_count: 1,
+                },
+                crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: 1,
+                    project_worker_route_selection_count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_project_worker_route_selected_worker_id,
+            Some(1)
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_project_worker_route_selected_tenant_id
+                .as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_project_worker_route_selected_project_id
+                .as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_project_worker_route_selected_thread_id
+                .as_deref(),
+            Some("thread-worker-b")
+        );
+        assert_eq!(
+            health
+                .v2_connections
+                .last_project_worker_route_selected_account_id
+                .as_deref(),
+            Some("acct-b")
+        );
+        assert!(
+            health
+                .v2_connections
+                .last_project_worker_route_selected_at
+                .is_some()
         );
 
         let (first_route_event, second_route_event) = timeout(Duration::from_secs(5), event_task)
@@ -15316,6 +15450,7 @@ stream_max_retries = 0
                 account_id: Some("acct-b".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }])
         );
 
@@ -16018,6 +16153,7 @@ stream_max_retries = 0
                 account_id: None,
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: false,
+                account_routing_eligible: false,
             }])
         );
 
@@ -17064,6 +17200,7 @@ stream_max_retries = 0
                     account_id: Some("acct-a".to_string()),
                     account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                     worker_healthy: true,
+                    account_routing_eligible: true,
                 },
                 crate::api::GatewayProjectWorkerRoute {
                     tenant_id: "tenant-a".to_string(),
@@ -17072,6 +17209,7 @@ stream_max_retries = 0
                     account_id: Some("acct-b".to_string()),
                     account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                     worker_healthy: true,
+                    account_routing_eligible: true,
                 },
             ])
         );

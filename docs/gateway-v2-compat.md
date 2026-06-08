@@ -34,6 +34,8 @@ Implementation status as of this document revision:
 - Milestone 2 is complete for the embedded topology
 - Milestone 3 is complete for the single-remote-worker topology
 - Milestone 4 is complete
+- Milestone 5 is the rollout gate
+- Milestone 6 is complete
 
 ## Recommendation
 
@@ -817,7 +819,7 @@ Recent progress:
 
 ### Milestone 5: Multi-Worker Connection Coordination
 
-Status: in progress
+Status: rollout gate
 
 Deliverables:
 
@@ -834,7 +836,7 @@ Exit criteria:
 
 ### Milestone 6: Hardening
 
-Status: in progress
+Status: complete
 
 Deliverables:
 
@@ -849,6 +851,9 @@ Exit criteria:
 
 Recent progress:
 
+- Milestone 6 is now complete; the compatibility work now consists of the
+  multi-worker rollout gate tracked under Milestone 5 and the project-aware
+  deployment evidence checklist
 - northbound v2 connections now enforce an explicit initialize handshake
   timeout and close the WebSocket with a concrete gateway-owned reason instead
   of waiting indefinitely for a client that never completes the JSON-RPC
@@ -941,6 +946,18 @@ Recent progress:
 - the gateway now also has real northbound JSON-RPC regression tests for
   `thread/list` and `thread/loaded/list` scope filtering, verifying that hidden
   threads are stripped from v2 responses at the transport boundary
+- the operator-facing rollout docs now spell out the remaining project-aware
+  routing evidence gate in one place, so deployment reviews can pair
+  `/healthz.projectWorkerRoutes`, `remoteWorkers[].accountId`,
+  `gateway/projectWorkerRouteSelected`, and
+  `gateway_project_worker_route_selections` with the matching health snapshot
+  fields before widening the bounded multi-worker profile
+- the real remote HTTP project-affinity regression now also checks the v2
+  health mirror for the same project route events, including
+  `projectWorkerRouteSelectionCount`, worker-count breakdowns, and
+  `lastProjectWorkerRouteSelectedAccountId`, so local rollout evidence covers
+  the `/healthz.projectWorkerRoutes`, `/v1/events`, and v2 health surfaces
+  before deployment-level metric capture is collected
 - hidden-thread downstream server requests that are rejected by gateway scope
   policy now also emit structured warning logs with scope, worker id, worker
   websocket URL, request id, method, and hidden thread id, with direct
@@ -2088,7 +2105,8 @@ Current status:
   separate eligible accounts, and it now also observes the
   `gateway/projectWorkerRouteSelected` operator event for project-scoped
   `thread/start`, so the documented guardrails now have a real client
-  transcript, `/v1/events` evidence, and `gateway_project_worker_route_selections`
+  transcript, `/v1/events` evidence, and
+  `gateway_project_worker_route_selections{tenant_id,project_id,worker_id,account_id}`
   metric behind them; deployment-level rollout evidence is still the remaining
   gate before the profile can be called release-quality. The
   `/healthz.v2Connections.projectWorkerRouteSelectionCount`,
@@ -2172,32 +2190,59 @@ Current status:
   restoration path through an unmodified
   `RemoteAppServerClient` session, watches `/v1/events` for the resulting
   `gateway/accountThreadHandoffSucceeded` event, and verifies a follow-up
-  `thread/read` remains sticky to the replacement account-backed worker. The
-  direct v2 `thread/read` path now also treats the visible thread id as a
-  bounded restoration surface: if the cached owner account is exhausted, the
-  gateway attempts the read on another available account, accepts only the
-  requested thread id, updates sticky routing on success, and publishes
-  `gateway/accountThreadHandoffSucceeded` or
-  `gateway/accountThreadHandoffFailed` with
-  `thread_read_handoff_success` / `thread_read_handoff_failure` metrics. A
-  real multi-worker `RemoteAppServerClient` harness now also covers the
-  successful direct `thread/read` restoration path and operator event, and the
-  real no-replacement harness covers the direct `thread/read` fail-closed
-  branch plus `gateway/accountThreadHandoffFailed`. Direct v2
-  `thread/name/set` and `thread/memoryMode/set` now use the same visible
-  thread-id restoration surface for rename and memory-mode updates, updating
-  sticky routing after a replacement worker successfully restores the request
-  and emitting `thread_name_set_handoff_success` /
-  `thread_name_set_handoff_failure` and
-  `thread_memory_mode_set_handoff_success` /
-  `thread_memory_mode_set_handoff_failure` metrics with account
-  thread-handoff operator events, while keeping the matching
-  `accountCapacityEvent*` health fields aligned with the metric counts. A real
-  multi-worker
-  `RemoteAppServerClient` harness now also covers the successful direct
-  `thread/name/set` restoration path, verifies the
-  `gateway/accountThreadHandoffSucceeded` operator event, and checks that a
-  follow-up `thread/read` remains sticky to the replacement worker. The same
+  `thread/read` remains sticky to the replacement account-backed worker.
+
+### Project-Aware Routing Promotion Evidence
+
+Before promoting the bounded multi-worker account-routing profile to
+release-quality guidance, collect all of the following for the same
+tenant/project scope:
+
+- `/healthz.projectWorkerRoutes` showing the expected worker, account, and
+  account-capacity binding for the project, with
+  `accountRoutingEligible=true` on the selected route
+- `remoteWorkers[].accountId` showing that every eligible worker is labeled
+  before validation starts
+- `gateway/projectWorkerRouteSelected` in `/v1/events` for the project-scoped
+  `thread/start` that established or refreshed the route
+- `gateway_project_worker_route_selections` metric samples matching the same
+  tenant, project, worker, and account labels
+- the `codex_gateway.audit` log entry `gateway project worker route selected`
+  with the same tenant, project, thread, worker, and account fields
+- `/healthz.v2Connections.projectWorkerRouteSelectionCount`,
+  `projectWorkerRouteSelectionWorkerCounts`, and
+  `lastProjectWorkerRouteSelected*` reflecting the same selection event in the
+  live health snapshot
+
+Only promote the route when those surfaces agree on the same tenant, project,
+worker, and account identity, and when the selected worker is still healthy
+and eligible for account-aware routing at the time of review; the
+`accountRoutingEligible` field is the `/healthz` summary of that final worker
+health, account-label, and account-capacity check.
+
+Direct v2 `thread/read` path now also treats the visible thread id as a
+bounded restoration surface: if the cached owner account is exhausted, the
+gateway attempts the read on another available account, accepts only the
+requested thread id, updates sticky routing on success, and publishes
+`gateway/accountThreadHandoffSucceeded` or
+`gateway/accountThreadHandoffFailed` with
+`thread_read_handoff_success` / `thread_read_handoff_failure` metrics. A real
+multi-worker `RemoteAppServerClient` harness now also covers the successful
+direct `thread/read` restoration path and operator event, and the real
+no-replacement harness covers the direct `thread/read` fail-closed branch plus
+`gateway/accountThreadHandoffFailed`. Direct v2 `thread/name/set` and
+`thread/memoryMode/set` now use the same visible thread-id restoration surface
+for rename and memory-mode updates, updating sticky routing after a replacement
+worker successfully restores the request and emitting
+`thread_name_set_handoff_success` / `thread_name_set_handoff_failure` and
+`thread_memory_mode_set_handoff_success` /
+`thread_memory_mode_set_handoff_failure` metrics with account thread-handoff
+operator events, while keeping the matching `accountCapacityEvent*` health
+fields aligned with the metric counts. A real multi-worker
+`RemoteAppServerClient` harness now also covers the successful direct
+`thread/name/set` restoration path, verifies the
+`gateway/accountThreadHandoffSucceeded` operator event, and checks that a
+follow-up `thread/read` remains sticky to the replacement worker. The same
   real-client account-exhaustion coverage now also validates successful direct
   `thread/memoryMode/set` restoration and follow-up `thread/read` stickiness
   on the replacement worker. Direct v2

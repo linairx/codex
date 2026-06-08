@@ -7014,6 +7014,7 @@ fn apply_response_scope_policy(
                         context.tenant_id.as_str(),
                         project_id,
                         thread_id,
+                        worker_account_id.as_deref(),
                     );
                     observability.publish_operator_event(
                         GatewayEvent::project_worker_route_selected(

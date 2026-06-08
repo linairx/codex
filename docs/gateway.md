@@ -95,7 +95,7 @@ boundary stable when app-server evolves internally.
 
 ### Phase 6: App-Server v2 Compatibility
 
-Status: in progress
+Status: rollout gate, hardening complete
 
 Goal:
 
@@ -280,6 +280,11 @@ Recent progress:
 
 - the Stage A required-method matrix is now documented in
   [docs/gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md)
+- the compatibility plan now separates the completed northbound v2 hardening
+  workstream from the multi-worker rollout gate, and the project-
+  aware promotion checklist is written down in one place for deployment
+  review; Phase 6 now consists of the multi-worker rollout gate plus the
+  project-aware deployment evidence
 - project-scoped gateway requests can now record a project-to-worker affinity
   route after a successful remote `thread/start`, and later same-project
   `thread/start` requests prefer that worker when it is still available; this
@@ -293,6 +298,11 @@ Recent progress:
   giving operators a concrete view of which tenant/project scopes are pinned
   to which account-backed worker and whether that account-backed route remains
   eligible for quota-aware routing or bounded restoration
+- `projectWorkerRoutes[]` now also carries `accountRoutingEligible`, a derived
+  health signal that is true only when the pinned worker is healthy, account
+  labeled, and currently `available`, so project-aware promotion reviews can
+  validate the route without hand-reconciling the worker health, account label,
+  and capacity fields
 - remote worker configuration now accepts per-worker account identity via
   `--remote-account-id`, and remote `/healthz` carries that identity through
   both `remoteWorkers[].accountId` and `projectWorkerRoutes[].accountId`; those
@@ -1731,7 +1741,8 @@ Recent progress:
 - dedicated northbound log regression coverage now also pins the structured
   multi-worker `thread/list` dedupe and visible-thread route recovery logs, so
   operator diagnostics for snapshot selection and downstream `thread/read`
-  ownership probes stay stable as Phase 6 transport hardening continues;
+  ownership probes stay stable after Phase 6 transport hardening was
+  validated;
   dedupe and route-recovery success/miss logs now also include worker
   websocket URLs so operators can identify the affected downstream sessions
   directly
@@ -1828,7 +1839,7 @@ Phase 5 evaluation result:
   for operators to distinguish embedded local execution, embedded `exec-server`
   delegation, and remote worker-managed execution
 
-Phase 6 is in progress with:
+Phase 6 includes the following validated transport and rollout properties:
 
 - core transport is in place across the supported topologies:
   northbound WebSocket JSON-RPC at `/`, embedded and single-remote-worker
@@ -3339,7 +3350,8 @@ Phase 6 is in progress with:
   `projectWorkerRoutes` bindings after different projects are distributed
   across separate eligible accounts; that same harness now also observes the
   `gateway/projectWorkerRouteSelected` operator event and
-  `gateway_project_worker_route_selections` metric for project-scoped
+  `gateway_project_worker_route_selections{tenant_id,project_id,worker_id,account_id}`
+  metric for project-scoped
   `thread/start`, and the `/healthz.v2Connections.projectWorkerRouteSelectionCount`
   and `lastProjectWorkerRouteSelected*` fields now mirror that selection
   stream, so the project-aware routing story is pinned by a real client
@@ -3448,26 +3460,42 @@ Phase 6 is in progress with:
   `gateway_v2_connection_max_server_request_backlog` alongside the worker and
   method backlog series, so rollout captures preserve lifecycle peak pressure
   instead of relying only on terminal counts or health snapshots
+- the real remote HTTP project-affinity harness now also pins the
+  `/healthz.v2Connections.projectWorkerRouteSelectionCount`,
+  `projectWorkerRouteSelectionWorkerCounts`, and
+  `lastProjectWorkerRouteSelected*` fields for the same project route event
+  stream, including `lastProjectWorkerRouteSelectedAccountId`, so the
+  project-aware promotion checklist can compare `/healthz.projectWorkerRoutes`,
+  `/v1/events`, and the v2 health mirror for one tenant/project/account scope
+- project route selection now also emits a `codex_gateway.audit` log entry
+  with the same tenant, project, thread, worker, and account fields as the
+  `gateway/projectWorkerRouteSelected` event, the
+  `gateway_project_worker_route_selections` metric labels, and the
+  `/healthz.v2Connections.lastProjectWorkerRouteSelected*` mirror, giving
+  rollout reviews a log-backed record to reconcile with the live event and
+  metric surfaces
 
-The remaining Phase 6 work is:
+Phase 6 now consists of:
 
 - keep using the real-client embedded and single-worker remote harnesses as the
   release gate, extending them when new v2 workflows land so those two
   topologies remain the drop-in baseline instead of drifting behind the gateway
-- continue hardening the northbound v2 transport under overload and failure,
-  especially slow-client paths, reconnect churn, partially completed
-  server-request lifecycles, and the operator-visible logs / health / metrics
-  that need to explain those failures in production
-- keep expanding the multi-worker Stage B profile from broad validated
-  steady-state and reconnect coverage into a release-quality compatibility
-  target, closing the remaining parity and rollout-hardening gaps before it is
-  documented as equivalent to embedded or single-worker remote mode
+- validate the multi-worker Stage B profile against the rollout gate
+  in the target deployment shape, covering steady-state, reconnect,
+  degraded-route, and slow-client behavior before it is documented as
+  equivalent to embedded or single-worker remote mode
 - finish project-aware account routing by validating the documented
   account-aware multi-worker guardrails and promotion-evidence checklist
-  against real deployments; the remaining gate is deployment-level evidence
+  against real deployments; the gate is deployment-level evidence
   that pairs `/healthz.projectWorkerRoutes`, the matching
   `remoteWorkers[].accountId` labels, the `gateway/projectWorkerRouteSelected`
-  operator event, and the corresponding metric captures for the same
-  tenant/project scope before the bounded handoff profile can be promoted to
-  release-quality multi-worker guidance. Arbitrary live active-context
-  migration remains a separate planned capability.
+  operator event, the corresponding metric captures, and the structured audit
+  log for the same tenant/project/account scope before the bounded handoff
+  profile can be promoted to release-quality multi-worker guidance. See
+  [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md:2188)
+  for the exact evidence checklist. Arbitrary live active-context migration
+  remains a separate planned capability.
+
+The northbound v2 hardening workstream is now complete in the compatibility
+plan; Phase 6 now consists of the multi-worker rollout gate and the
+project-aware deployment evidence above.

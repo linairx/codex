@@ -119,6 +119,7 @@ struct GatewayV2ConnectionHealthState {
     last_project_worker_route_selected_tenant_id: Option<String>,
     last_project_worker_route_selected_project_id: Option<String>,
     last_project_worker_route_selected_thread_id: Option<String>,
+    last_project_worker_route_selected_account_id: Option<String>,
     last_project_worker_route_selected_at: Option<i64>,
     forwarded_notification_counts: BTreeMap<String, usize>,
     last_forwarded_notification_method: Option<String>,
@@ -301,6 +302,7 @@ impl GatewayV2ConnectionHealthRegistry {
         tenant_id: &str,
         project_id: &str,
         thread_id: &str,
+        account_id: Option<&str>,
     ) {
         let mut state = write_guard(&self.state);
         state.project_worker_route_selection_count =
@@ -313,6 +315,7 @@ impl GatewayV2ConnectionHealthRegistry {
         state.last_project_worker_route_selected_tenant_id = Some(tenant_id.to_string());
         state.last_project_worker_route_selected_project_id = Some(project_id.to_string());
         state.last_project_worker_route_selected_thread_id = Some(thread_id.to_string());
+        state.last_project_worker_route_selected_account_id = account_id.map(ToString::to_string);
         state.last_project_worker_route_selected_at = Some(unix_timestamp_now());
     }
 
@@ -858,6 +861,9 @@ impl GatewayV2ConnectionHealthRegistry {
                 .clone(),
             last_project_worker_route_selected_thread_id: state
                 .last_project_worker_route_selected_thread_id
+                .clone(),
+            last_project_worker_route_selected_account_id: state
+                .last_project_worker_route_selected_account_id
                 .clone(),
             last_project_worker_route_selected_at: state.last_project_worker_route_selected_at,
             account_capacity_event_counts: state.account_capacity_event_counts.clone(),
@@ -1573,6 +1579,10 @@ mod tests {
         );
         assert_eq!(
             active_snapshot.last_project_worker_route_selected_thread_id,
+            None
+        );
+        assert_eq!(
+            active_snapshot.last_project_worker_route_selected_account_id,
             None
         );
         assert_eq!(active_snapshot.last_project_worker_route_selected_at, None);
@@ -2550,9 +2560,21 @@ mod tests {
     fn snapshot_tracks_project_worker_route_selections() {
         let registry = GatewayV2ConnectionHealthRegistry::default();
 
-        registry.record_project_worker_route_selected(7, "tenant-a", "project-a", "thread-a");
-        registry.record_project_worker_route_selected(7, "tenant-a", "project-a", "thread-b");
-        registry.record_project_worker_route_selected(9, "tenant-b", "project-b", "thread-c");
+        registry.record_project_worker_route_selected(
+            7,
+            "tenant-a",
+            "project-a",
+            "thread-a",
+            Some("acct-a"),
+        );
+        registry.record_project_worker_route_selected(
+            7,
+            "tenant-a",
+            "project-a",
+            "thread-b",
+            Some("acct-a"),
+        );
+        registry.record_project_worker_route_selected(9, "tenant-b", "project-b", "thread-c", None);
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.project_worker_route_selection_count, 3);
@@ -2590,6 +2612,12 @@ mod tests {
                 .last_project_worker_route_selected_thread_id
                 .as_deref(),
             Some("thread-c")
+        );
+        assert_eq!(
+            snapshot
+                .last_project_worker_route_selected_account_id
+                .as_deref(),
+            None
         );
         assert!(snapshot.last_project_worker_route_selected_at.is_some());
     }

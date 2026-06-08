@@ -146,17 +146,22 @@ impl GatewayScopeRegistry {
         let mut routes = read_guard(&self.project_workers)
             .iter()
             .filter_map(|(context, worker_id)| {
-                context
-                    .project_id
-                    .as_ref()
-                    .map(|project_id| GatewayProjectWorkerRoute {
+                context.project_id.as_ref().map(|project_id| {
+                    let account_id = worker_account_id(*worker_id);
+                    let account_capacity = worker_account_capacity(*worker_id);
+                    let worker_healthy = worker_healthy(*worker_id);
+                    GatewayProjectWorkerRoute {
                         tenant_id: context.tenant_id.clone(),
                         project_id: project_id.clone(),
                         worker_id: *worker_id,
-                        account_id: worker_account_id(*worker_id),
-                        account_capacity: worker_account_capacity(*worker_id),
-                        worker_healthy: worker_healthy(*worker_id),
-                    })
+                        account_routing_eligible: worker_healthy
+                            && account_id.is_some()
+                            && account_capacity == GatewayAccountCapacityStatus::Available,
+                        account_id,
+                        account_capacity,
+                        worker_healthy,
+                    }
+                })
             })
             .collect::<Vec<_>>();
         routes.sort_by(|left, right| {
@@ -746,6 +751,7 @@ mod tests {
                 account_id: Some("acct-a".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }]
         );
     }
@@ -775,7 +781,84 @@ mod tests {
                 account_id: Some("acct-a".to_string()),
                 account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
                 worker_healthy: true,
+                account_routing_eligible: true,
             }]
+        );
+    }
+
+    #[test]
+    fn project_worker_routes_report_account_routing_eligibility() {
+        let registry = GatewayScopeRegistry::default();
+        registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            /*worker_id*/ 1,
+        );
+        registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-b".to_string()),
+            },
+            /*worker_id*/ 2,
+        );
+        registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-c".to_string()),
+            },
+            /*worker_id*/ 3,
+        );
+
+        let routes = registry.project_worker_routes(
+            |worker_id| worker_id != 2,
+            |worker_id| match worker_id {
+                1 | 2 => Some(format!("acct-{worker_id}")),
+                3 => None,
+                _ => unreachable!("unexpected worker id"),
+            },
+            |worker_id| match worker_id {
+                1 | 2 => crate::api::GatewayAccountCapacityStatus::Available,
+                3 => crate::api::GatewayAccountCapacityStatus::Exhausted,
+                _ => unreachable!("unexpected worker id"),
+            },
+        );
+
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (
+                    route.project_id.as_str(),
+                    route.worker_healthy,
+                    route.account_id.as_deref(),
+                    route.account_capacity,
+                    route.account_routing_eligible,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "project-a",
+                    true,
+                    Some("acct-1"),
+                    crate::api::GatewayAccountCapacityStatus::Available,
+                    true,
+                ),
+                (
+                    "project-b",
+                    false,
+                    Some("acct-2"),
+                    crate::api::GatewayAccountCapacityStatus::Available,
+                    false,
+                ),
+                (
+                    "project-c",
+                    true,
+                    None,
+                    crate::api::GatewayAccountCapacityStatus::Exhausted,
+                    false,
+                ),
+            ]
         );
     }
 

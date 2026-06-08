@@ -175,6 +175,7 @@ impl GatewayObservability {
         tenant_id: &str,
         project_id: &str,
         thread_id: &str,
+        account_id: Option<&str>,
     ) {
         let worker_id_for_health = worker_id;
         let worker_id = worker_id.to_string();
@@ -182,6 +183,7 @@ impl GatewayObservability {
             ("worker_id", worker_id.as_str()),
             ("tenant_id", tenant_id),
             ("project_id", project_id),
+            ("account_id", account_id.unwrap_or_default()),
         ];
 
         if let Some(metrics) = &self.metrics
@@ -190,12 +192,26 @@ impl GatewayObservability {
             tracing::warn!("failed to record gateway project worker route selection metric: {err}");
         }
 
+        if self.audit_logs_enabled {
+            tracing::event!(
+                target: "codex_gateway.audit",
+                Level::INFO,
+                worker_id = worker_id_for_health,
+                tenant_id = tenant_id,
+                project_id = project_id,
+                thread_id = thread_id,
+                account_id = account_id.unwrap_or_default(),
+                "gateway project worker route selected",
+            );
+        }
+
         self.v2_connection_health
             .record_project_worker_route_selected(
                 worker_id_for_health,
                 tenant_id,
                 project_id,
                 thread_id,
+                account_id,
             );
     }
 
@@ -2434,7 +2450,8 @@ mod tests {
     }
 
     #[test]
-    fn records_project_worker_route_selection_metrics_with_worker_tenant_and_project_tags() {
+    fn records_project_worker_route_selection_metrics_with_worker_tenant_project_and_account_tags()
+    {
         let exporter = InMemoryMetricExporter::default();
         let metrics = codex_otel::MetricsClient::new(
             codex_otel::MetricsConfig::in_memory(
@@ -2448,7 +2465,13 @@ mod tests {
         .expect("metrics");
         let observability = GatewayObservability::new(Some(metrics), true);
 
-        observability.record_project_worker_route_selected(7, "tenant-a", "project-a", "thread-a");
+        observability.record_project_worker_route_selected(
+            7,
+            "tenant-a",
+            "project-a",
+            "thread-a",
+            Some("acct-a"),
+        );
 
         let resource_metrics = observability
             .metrics
@@ -2484,6 +2507,7 @@ mod tests {
                                     ("worker_id".to_string(), "7".to_string()),
                                     ("tenant_id".to_string(), "tenant-a".to_string()),
                                     ("project_id".to_string(), "project-a".to_string()),
+                                    ("account_id".to_string(), "acct-a".to_string()),
                                 ])
                             );
                         }
@@ -2524,7 +2548,39 @@ mod tests {
                 .as_deref(),
             Some("thread-a")
         );
+        assert_eq!(
+            health
+                .last_project_worker_route_selected_account_id
+                .as_deref(),
+            Some("acct-a")
+        );
         assert!(health.last_project_worker_route_selected_at.is_some());
+    }
+
+    #[test]
+    fn emits_project_worker_route_selection_audit_log() {
+        let observability = GatewayObservability::new(None, true);
+
+        let logs = capture_logs(|| {
+            observability.record_project_worker_route_selected(
+                7,
+                "tenant-a",
+                "project-a",
+                "thread-a",
+                Some("acct-a"),
+            );
+        });
+
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(
+            logs.contains("gateway project worker route selected"),
+            "{logs}"
+        );
+        assert!(logs.contains("worker_id=7"), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
+        assert!(logs.contains("thread_id=\"thread-a\""), "{logs}");
+        assert!(logs.contains("account_id=\"acct-a\""), "{logs}");
     }
 
     #[test]
