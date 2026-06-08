@@ -3476,8 +3476,9 @@ Phase 6 includes the following validated transport and rollout properties:
   metric surfaces
 - the dedicated `thread/start` regression now also pins the
   `codex_gateway.audit` project-route-selection log fields alongside the
-  operator event and v2 health mirrors, so the route-selection evidence chain
-  is covered end to end in one place
+  operator event and v2 health mirrors, using `<none>` when no account label
+  is present, so the route-selection evidence chain is covered end to end in
+  one place
 
 Phase 6 now consists of:
 
