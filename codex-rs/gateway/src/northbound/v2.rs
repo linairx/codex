@@ -50098,24 +50098,38 @@ mod tests {
             project_id: Some("project-a".to_string()),
         };
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
-        let observability = GatewayObservability::new(None, false).with_operator_events(event_tx);
+        let observability = GatewayObservability::new(None, true).with_operator_events(event_tx);
 
-        let result = super::apply_response_scope_policy(
-            &scope_registry,
-            &context,
-            Some(&observability),
-            "thread/start",
-            Some(7),
-            Some("acct-a".to_string()),
-            serde_json::json!({
-                "thread": {
-                    "id": "thread-started",
-                }
-            }),
-        )
-        .expect("thread/start response should be accepted");
+        let logs = capture_logs(|| {
+            let result = super::apply_response_scope_policy(
+                &scope_registry,
+                &context,
+                Some(&observability),
+                "thread/start",
+                Some(7),
+                Some("acct-a".to_string()),
+                serde_json::json!({
+                    "thread": {
+                        "id": "thread-started",
+                    }
+                }),
+            )
+            .expect("thread/start response should be accepted");
 
-        assert_eq!(result["thread"]["id"], "thread-started");
+            assert_eq!(result["thread"]["id"], "thread-started");
+        });
+
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(
+            logs.contains("gateway project worker route selected"),
+            "{logs}"
+        );
+        assert!(logs.contains("worker_id=7"), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
+        assert!(logs.contains("thread_id=\"thread-started\""), "{logs}");
+        assert!(logs.contains("account_id=\"acct-a\""), "{logs}");
+
         assert_eq!(
             scope_registry.thread_visible_to(&context, "thread-started"),
             true
