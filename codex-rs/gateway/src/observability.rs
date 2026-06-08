@@ -200,7 +200,7 @@ impl GatewayObservability {
                 tenant_id = tenant_id,
                 project_id = project_id,
                 thread_id = thread_id,
-                account_id = account_id.unwrap_or_default(),
+                account_id = account_id.unwrap_or("<none>"),
                 "gateway project worker route selected",
             );
         }
@@ -2581,6 +2581,32 @@ mod tests {
         assert!(logs.contains("project_id=\"project-a\""), "{logs}");
         assert!(logs.contains("thread_id=\"thread-a\""), "{logs}");
         assert!(logs.contains("account_id=\"acct-a\""), "{logs}");
+    }
+
+    #[test]
+    fn emits_project_worker_route_selection_audit_log_without_account_id() {
+        let observability = GatewayObservability::new(None, true);
+
+        let logs = capture_logs(|| {
+            observability.record_project_worker_route_selected(
+                7,
+                "tenant-a",
+                "project-a",
+                "thread-a",
+                None,
+            );
+        });
+
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(
+            logs.contains("gateway project worker route selected"),
+            "{logs}"
+        );
+        assert!(logs.contains("worker_id=7"), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
+        assert!(logs.contains("thread_id=\"thread-a\""), "{logs}");
+        assert!(logs.contains("account_id=\"<none>\""), "{logs}");
     }
 
     #[test]
