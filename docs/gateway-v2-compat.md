@@ -2213,6 +2213,10 @@ tenant/project scope:
   `projectWorkerRouteSelectionWorkerCounts`, and
   `lastProjectWorkerRouteSelected*` reflecting the same selection event in the
   live health snapshot
+- the dedicated `thread/start` regression now also pins the
+  `codex_gateway.audit` project-route-selection fields alongside the
+  operator event and health mirrors, so the route-selection evidence chain is
+  covered end to end in one place
 
 Only promote the route when those surfaces agree on the same tenant, project,
 worker, and account identity, and when the selected worker is still healthy
