@@ -50805,6 +50805,175 @@ mod tests {
     }
 
     #[test]
+    fn apply_response_scope_policy_pins_project_worker_route_selection_evidence_chain() {
+        let scope_registry = GatewayScopeRegistry::default();
+        let context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability =
+            GatewayObservability::new(Some(metrics.clone()), true).with_operator_events(event_tx);
+
+        let logs = capture_logs(|| {
+            let result = super::apply_response_scope_policy(
+                &scope_registry,
+                &context,
+                Some(&observability),
+                "thread/start",
+                Some(7),
+                Some("acct-a".to_string()),
+                serde_json::json!({
+                    "thread": {
+                        "id": "thread-started",
+                    }
+                }),
+            )
+            .expect("thread/start response should be accepted");
+
+            assert_eq!(result["thread"]["id"], "thread-started");
+        });
+
+        assert!(logs.contains("codex_gateway.audit"), "{logs}");
+        assert!(
+            logs.contains("gateway project worker route selected"),
+            "{logs}"
+        );
+        assert!(logs.contains("worker_id=7"), "{logs}");
+        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
+        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
+        assert!(logs.contains("thread_id=\"thread-started\""), "{logs}");
+        assert!(logs.contains("account_id=\"acct-a\""), "{logs}");
+
+        assert_eq!(
+            scope_registry.thread_visible_to(&context, "thread-started"),
+            true
+        );
+        assert_eq!(
+            scope_registry.project_worker_routes(
+                |_| true,
+                |worker_id| match worker_id {
+                    7 => Some("acct-a".to_string()),
+                    _ => None,
+                },
+                |_| crate::api::GatewayAccountCapacityStatus::Available,
+            ),
+            vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 7,
+                account_id: Some("acct-a".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+                account_routing_eligible: true,
+            }]
+        );
+
+        let event = event_rx.try_recv().expect("project worker route event");
+        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
+        assert_eq!(event.thread_id.as_deref(), Some("thread-started"));
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "tenantId": "tenant-a",
+                "projectId": "project-a",
+                "threadId": "thread-started",
+                "workerId": 7,
+                "accountId": "acct-a",
+            })
+        );
+
+        let health = observability.v2_connection_health().snapshot();
+        assert_eq!(health.project_worker_route_selection_count, 1);
+        assert_eq!(
+            health.project_worker_route_selection_worker_counts,
+            vec![
+                crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
+                    worker_id: 7,
+                    project_worker_route_selection_count: 1,
+                }
+            ]
+        );
+        assert_eq!(health.last_project_worker_route_selected_worker_id, Some(7));
+        assert_eq!(
+            health
+                .last_project_worker_route_selected_tenant_id
+                .as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            health
+                .last_project_worker_route_selected_project_id
+                .as_deref(),
+            Some("project-a")
+        );
+        assert_eq!(
+            health
+                .last_project_worker_route_selected_thread_id
+                .as_deref(),
+            Some("thread-started")
+        );
+        assert_eq!(
+            health
+                .last_project_worker_route_selected_account_id
+                .as_deref(),
+            Some("acct-a")
+        );
+        assert!(health.last_project_worker_route_selected_at.is_some());
+
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let mut saw_metric = false;
+        for metric in resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            if metric.name() == "gateway_project_worker_route_selections" {
+                saw_metric = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            let point = sum.data_points().next().expect("count point");
+                            assert_eq!(point.value(), 1);
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(
+                                attributes,
+                                BTreeMap::from([
+                                    ("account_id".to_string(), "acct-a".to_string()),
+                                    ("project_id".to_string(), "project-a".to_string()),
+                                    ("tenant_id".to_string(), "tenant-a".to_string()),
+                                    ("worker_id".to_string(), "7".to_string()),
+                                ])
+                            );
+                        }
+                        _ => panic!("unexpected project worker route metric aggregation"),
+                    },
+                    _ => panic!("unexpected project worker route metric type"),
+                }
+            }
+        }
+
+        assert!(saw_metric);
+    }
+
+    #[test]
     fn format_lagged_close_reason_reports_skipped_event_count() {
         assert_eq!(
             super::format_lagged_close_reason(3),

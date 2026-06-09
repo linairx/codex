@@ -3490,10 +3490,10 @@ Phase 6 includes the following validated transport and rollout properties:
   rollout reviews a log-backed record to reconcile with the live event and
   metric surfaces
 - the dedicated `thread/start` regression now also pins the
-  `codex_gateway.audit` project-route-selection log fields alongside the
-  operator event and v2 health mirrors, using `<none>` when no account label
-  is present, so the route-selection evidence chain is covered end to end in
-  one place
+  `gateway_project_worker_route_selections` metric alongside the operator
+  event, v2 health mirrors, and `codex_gateway.audit` project-route-selection
+  log fields, using `<none>` when no account label is present, so the
+  route-selection evidence chain is covered end to end in one place
 
 Phase 6 now consists of:
 
