@@ -2029,6 +2029,76 @@ mod tests {
     }
 
     #[test]
+    fn remote_health_treats_blank_account_labels_as_unlabeled_for_project_routes() {
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            (
+                "ws://127.0.0.1:8081".to_string(),
+                Some("acct-a".to_string()),
+            ),
+            ("ws://127.0.0.1:8082".to_string(), Some("   ".to_string())),
+        ]));
+        let scope_registry = Arc::new(GatewayScopeRegistry::default());
+        scope_registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            /*worker_id*/ 1,
+        );
+        let runtime = RemoteWorkerGatewayRuntime {
+            workers: Vec::new(),
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            next_worker: AtomicUsize::new(0),
+            next_request_id: Arc::new(AtomicI64::new(1)),
+            events: broadcast::channel(4).0,
+            scope_registry,
+            worker_health,
+            v2_transport: GatewayV2TransportConfig {
+                initialize_timeout_seconds: 30,
+                client_send_timeout_seconds: 10,
+                reconnect_retry_backoff_seconds: 1,
+                max_pending_server_requests: 64,
+                max_pending_client_requests: 64,
+            },
+            v2_connection_health: empty_v2_connection_health(),
+            observability: GatewayObservability::default(),
+        };
+
+        let health = runtime.health();
+
+        assert_eq!(health.remote_account_labels_complete, Some(false));
+        assert_eq!(health.remote_unlabeled_account_worker_count, Some(1));
+        assert_eq!(health.remote_unlabeled_account_worker_ids, Some(vec![1]));
+        assert_eq!(
+            health.remote_unlabeled_account_workers,
+            Some(vec![crate::api::GatewayRemoteUnlabeledAccountWorker {
+                worker_id: 1,
+                websocket_url: "ws://127.0.0.1:8082".to_string(),
+            }])
+        );
+        let remote_workers = health.remote_workers.expect("remote workers");
+        assert_eq!(
+            remote_workers
+                .iter()
+                .map(|worker| worker.account_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("acct-a"), None]
+        );
+        assert_eq!(
+            health.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: None,
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+                account_routing_eligible: false,
+            }])
+        );
+    }
+
+    #[test]
     fn project_worker_routes_track_worker_health_and_capacity_changes() {
         let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
             (
@@ -2148,16 +2218,31 @@ mod tests {
             }])
         );
 
-        worker_health.mark_unhealthy(1, Some("socket closed".to_string()));
         worker_health.mark_account_exhausted_for_worker(1, "quota exceeded".to_string());
 
-        let degraded_snapshot = runtime.health();
+        let exhausted_snapshot = runtime.health();
         assert_eq!(
-            degraded_snapshot
+            exhausted_snapshot
                 .v2_connections
                 .project_worker_route_selection_count,
             1
         );
+        assert_eq!(
+            exhausted_snapshot.project_worker_routes,
+            Some(vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: Some("acct-b".to_string()),
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Exhausted,
+                worker_healthy: true,
+                account_routing_eligible: false,
+            }])
+        );
+
+        worker_health.mark_unhealthy(1, Some("socket closed".to_string()));
+
+        let degraded_snapshot = runtime.health();
         assert_eq!(
             degraded_snapshot.project_worker_routes,
             Some(vec![crate::api::GatewayProjectWorkerRoute {

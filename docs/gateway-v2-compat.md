@@ -2097,7 +2097,8 @@ Current status:
   `/healthz` exposes those cached routes as `projectWorkerRoutes`. The
   northbound v2 multi-worker router uses the same configured account labels for
   project-scoped `thread/start` distribution and skips account-backed workers
-  already marked exhausted in the shared remote-worker health registry. The
+  that are unhealthy or already marked exhausted in the shared remote-worker
+  health registry. The
   real multi-worker v2 scope harness now verifies those bindings end to end by
   checking `remoteAccountLabelsComplete=true`, the configured
   `remoteWorkers[].accountId` values, and the resulting
@@ -2120,7 +2121,10 @@ Current status:
   a hand-constructed HTTP fixture. The
   v2 method matrix now also has a dedicated `project-aware account routing`
   route class, so the rollout profile and the method-level evidence stay
-  aligned; promotion evidence for that path should pair the route snapshot
+  aligned; existing same-project affinity still wins, and project-aware
+  selection prefers labeled account-backed workers whenever any are
+  available before falling back to unlabeled workers when the pool is
+  incomplete. Promotion evidence for that path should pair the route snapshot
   with the matching `/v1/events` operator event
   `gateway/projectWorkerRouteSelected` and metric evidence for the same
   tenant/project scope. The
@@ -2200,13 +2204,16 @@ tenant/project scope:
 
 - `/healthz.projectWorkerRoutes` showing the expected worker, account, and
   account-capacity binding for the project, with
-  `accountRoutingEligible=true` on the selected route
+  `accountRoutingEligible=true` on the selected route and a visible
+  `accountRoutingEligible=false` state when a labeled worker is unhealthy or
+  account-exhausted
 - `remoteWorkers[].accountId` showing that every eligible worker is labeled
   before validation starts
 - `gateway/projectWorkerRouteSelected` in `/v1/events` for the project-scoped
   `thread/start` that established or refreshed the route
 - `gateway_project_worker_route_selections` metric samples matching the same
-  tenant, project, worker, and account labels
+  tenant, project, worker, and account labels, using `account_id=none` when
+  the selected route is not account-labeled
 - the `codex_gateway.audit` log entry `gateway project worker route selected`
   with the same tenant, project, thread, worker, and account fields
 - `/healthz.v2Connections.projectWorkerRouteSelectionCount`,
@@ -2223,7 +2230,13 @@ Only promote the route when those surfaces agree on the same tenant, project,
 worker, and account identity, and when the selected worker is still healthy
 and eligible for account-aware routing at the time of review; the
 `accountRoutingEligible` field is the `/healthz` summary of that final worker
-health, account-label, and account-capacity check.
+health, account-label, and account-capacity check. For an intentionally
+unlabeled route, treat `/healthz` `accountId=null`, the operator event
+`accountId=null`, the metric label `account_id=none`, and the audit-log
+placeholder `<none>` as the same account identity representation. Blank
+account labels are normalized before this route-selection evidence is
+recorded, so they also appear as that missing-account representation instead
+of as a distinct account id.
 
 Direct v2 `thread/read` path now also treats the visible thread id as a
 bounded restoration surface: if the cached owner account is exhausted, the
@@ -3316,11 +3329,14 @@ Current Stage A compatibility caveats:
 - deprecated `getAuthStatus` mirrors the `account/read` multi-worker
   compatibility behavior: primary-worker auth details stay authoritative while
   `requiresOpenaiAuth` reflects all configured workers
-- full account-aware routing is still not the default release-quality
-  compatibility profile: the gateway now has same-project affinity,
+- bounded account-aware routing is now documented as part of the Stage B
+  multi-worker promotion guidance: the gateway has same-project affinity,
   cross-project account distribution, quota-aware new-thread selection, and
-  bounded account handoff for explicit resumable surfaces, but arbitrary live
-  active-context migration remains planned gateway work
+  bounded account handoff for explicit resumable surfaces, while arbitrary
+  transparent live active-context migration remains planned gateway work;
+  release-quality promotion still depends on the deployment evidence
+  checklist, and the explicit resume/fork plus rollout-path restore surfaces
+  remain the supported migration paths today
 - release-quality drop-in v2 compatibility currently means embedded runtime or
   remote runtime with exactly one downstream worker
 - multi-worker remote runtime is now partially supported for v2, but it has
@@ -3501,8 +3517,11 @@ Account-aware multi-worker guardrails:
   `thread/memoryMode/set`, `thread/rollback`, `thread/archive`,
   `thread/unarchive`, `thread/metadata/update`, `thread/turns/list`,
   `thread/increment_elicitation`, `thread/decrement_elicitation`, and
-  `thread/inject_items` may restore through another eligible account-backed
-  worker when the requested thread id or rollout path is preserved
+  `thread/inject_items`, plus no-thread-response controls
+  `thread/unsubscribe` and `thread/compact/start`, may restore through another
+  eligible account-backed worker when the requested thread id or rollout path
+  is preserved; successful no-thread-response handoff must still update the
+  sticky thread route to the replacement worker
 - expect active live-context requests without an explicit restore surface,
   such as `turn/start`, `turn/steer`, `turn/interrupt`, realtime append/stop,
   thread-scoped MCP calls, and approval / elicitation replies, to fail closed

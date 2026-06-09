@@ -2,6 +2,7 @@ use crate::api::GatewayAccountCapacityStatus;
 use crate::api::GatewayPendingServerRequestRouteCounts;
 use crate::api::GatewayProjectWorkerRoute;
 use crate::api::GatewayServerRequestKind;
+use crate::config::normalize_remote_account_id;
 use crate::error::GatewayError;
 use crate::event::GatewayEvent;
 use axum::extract::FromRequestParts;
@@ -143,11 +144,14 @@ impl GatewayScopeRegistry {
         worker_account_id: impl Fn(usize) -> Option<String>,
         worker_account_capacity: impl Fn(usize) -> GatewayAccountCapacityStatus,
     ) -> Vec<GatewayProjectWorkerRoute> {
+        let normalized_worker_account_id =
+            |worker_id| normalize_remote_account_id(worker_account_id(worker_id));
+
         let mut routes = read_guard(&self.project_workers)
             .iter()
             .filter_map(|(context, worker_id)| {
                 context.project_id.as_ref().map(|project_id| {
-                    let account_id = worker_account_id(*worker_id);
+                    let account_id = normalized_worker_account_id(*worker_id);
                     let account_capacity = worker_account_capacity(*worker_id);
                     let worker_healthy = worker_healthy(*worker_id);
                     GatewayProjectWorkerRoute {
@@ -200,6 +204,20 @@ impl GatewayScopeRegistry {
             return Some(worker_id);
         }
 
+        let normalized_worker_account_id =
+            |worker_id| normalize_remote_account_id(worker_account_id(worker_id));
+
+        let labeled_worker_ids = worker_ids
+            .iter()
+            .copied()
+            .filter(|worker_id| normalized_worker_account_id(*worker_id).is_some())
+            .collect::<Vec<_>>();
+        let candidate_worker_ids = if labeled_worker_ids.is_empty() {
+            worker_ids
+        } else {
+            labeled_worker_ids
+        };
+
         let start = self.next_project_worker.fetch_add(1, Ordering::Relaxed);
         let route_loads = {
             let project_workers = read_guard(&self.project_workers);
@@ -208,26 +226,27 @@ impl GatewayScopeRegistry {
                 .filter(|(project_context, worker_id)| {
                     project_context.project_id.is_some()
                         && project_context.tenant_id == context.tenant_id
-                        && worker_ids.contains(worker_id)
+                        && candidate_worker_ids.contains(worker_id)
                 })
                 .fold(
                     HashMap::<String, usize>::new(),
                     |mut loads, (_, worker_id)| {
-                        let key = account_route_key(*worker_id, worker_account_id(*worker_id));
+                        let key =
+                            account_route_key(*worker_id, normalized_worker_account_id(*worker_id));
                         *loads.entry(key).or_default() += 1;
                         loads
                     },
                 )
         };
 
-        worker_ids
+        candidate_worker_ids
             .iter()
             .copied()
             .cycle()
-            .skip(start % worker_ids.len())
-            .take(worker_ids.len())
+            .skip(start % candidate_worker_ids.len())
+            .take(candidate_worker_ids.len())
             .min_by_key(|worker_id| {
-                let key = account_route_key(*worker_id, worker_account_id(*worker_id));
+                let key = account_route_key(*worker_id, normalized_worker_account_id(*worker_id));
                 route_loads.get(&key).copied().unwrap_or_default()
             })
     }
@@ -863,6 +882,37 @@ mod tests {
     }
 
     #[test]
+    fn project_worker_routes_treat_blank_account_labels_as_unlabeled() {
+        let registry = GatewayScopeRegistry::default();
+        registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-a".to_string()),
+            },
+            /*worker_id*/ 1,
+        );
+
+        let routes = registry.project_worker_routes(
+            |_| true,
+            |_| Some("   ".to_string()),
+            |_| crate::api::GatewayAccountCapacityStatus::Available,
+        );
+
+        assert_eq!(
+            routes,
+            vec![crate::api::GatewayProjectWorkerRoute {
+                tenant_id: "tenant-a".to_string(),
+                project_id: "project-a".to_string(),
+                worker_id: 1,
+                account_id: None,
+                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
+                worker_healthy: true,
+                account_routing_eligible: false,
+            }]
+        );
+    }
+
+    #[test]
     fn project_worker_selection_distributes_unmapped_projects() {
         let registry = GatewayScopeRegistry::default();
         let project_a = GatewayRequestContext {
@@ -966,6 +1016,133 @@ mod tests {
         assert_eq!(
             registry.select_project_worker_id_with_accounts(&project_a, [1, 2], account_id),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn project_worker_selection_keeps_existing_affinity_even_when_labeled_workers_exist() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let project_b = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+
+        registry.register_project_worker(project_a.clone(), /*worker_id*/ 0);
+        registry.register_project_worker(project_b, /*worker_id*/ 1);
+
+        let account_id = |worker_id: usize| match worker_id {
+            0 => None,
+            1 => Some("acct-a".to_string()),
+            2 => Some("acct-b".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1, 2], account_id),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn project_worker_selection_prefers_labeled_workers_when_no_affinity_exists() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+
+        let account_id = |worker_id: usize| match worker_id {
+            0 => None,
+            1 => Some("acct-a".to_string()),
+            2 => Some("acct-b".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1, 2], account_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn project_worker_selection_treats_blank_account_labels_as_unlabeled() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+
+        let account_id = |worker_id| match worker_id {
+            0 => Some("   ".to_string()),
+            1 => Some("acct-a".to_string()),
+            2 => None,
+            _ => None,
+        };
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1, 2], account_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn project_worker_selection_uses_worker_specific_load_for_blank_labels() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+
+        for index in 0..5 {
+            registry.register_project_worker(
+                GatewayRequestContext {
+                    tenant_id: "tenant-a".to_string(),
+                    project_id: Some(format!("project-0-{index}")),
+                },
+                /*worker_id*/ 0,
+            );
+        }
+        registry.register_project_worker(
+            GatewayRequestContext {
+                tenant_id: "tenant-a".to_string(),
+                project_id: Some("project-1".to_string()),
+            },
+            /*worker_id*/ 1,
+        );
+
+        let account_id = |worker_id| match worker_id {
+            0 | 1 => Some("   ".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1], account_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn project_worker_selection_falls_back_to_unlabeled_workers_when_needed() {
+        let registry = GatewayScopeRegistry::default();
+        let project_a = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        let project_b = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-b".to_string()),
+        };
+
+        registry.register_project_worker(project_a.clone(), /*worker_id*/ 0);
+        registry.register_project_worker(project_b, /*worker_id*/ 1);
+
+        assert_eq!(
+            registry.select_project_worker_id_with_accounts(&project_a, [0, 1], |_| None),
+            Some(0)
         );
     }
 

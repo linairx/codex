@@ -239,6 +239,17 @@ impl GatewayV2SessionFactory {
         }
     }
 
+    pub fn worker_is_healthy(&self, worker_id: usize) -> bool {
+        match self {
+            Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
+                worker_health
+                    .as_ref()
+                    .is_none_or(|worker_health| worker_health.is_healthy(worker_id))
+            }
+            Self::Embedded { .. } => true,
+        }
+    }
+
     pub fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) -> bool {
         match self {
             Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {

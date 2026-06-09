@@ -207,8 +207,8 @@ Exit criteria:
 
 Status: same-project affinity, account-capacity tracking, quota-aware
 new-thread selection, and bounded resumable-thread handoff are implemented;
-release-quality multi-worker rollout guidance and arbitrary live
-active-context migration remain planned
+release-quality multi-worker rollout guidance is documented; arbitrary live
+active-context migration remains planned
 
 Goal:
 
@@ -291,7 +291,10 @@ Recent progress:
   cache-affinity foundation has since been extended with account-capacity
   tracking, quota-aware new-thread selection, and bounded handoff surfaces for
   explicitly resumable thread state, while arbitrary live active-context
-  migration remains out of scope
+  migration remains out of scope; existing same-project affinity still wins,
+  and project-aware selection now prefers labeled account-backed workers
+  whenever any are available before falling back to unlabeled workers when
+  the pool is incomplete
 - remote `/healthz` now exposes the current project-to-worker affinity table as
   `projectWorkerRoutes`, including whether the pinned worker is currently
   healthy and the configured `accountId` for that worker when one is supplied,
@@ -302,7 +305,9 @@ Recent progress:
   health signal that is true only when the pinned worker is healthy, account
   labeled, and currently `available`, so project-aware promotion reviews can
   validate the route without hand-reconciling the worker health, account label,
-  and capacity fields
+  and capacity fields; health snapshots can also show `accountRoutingEligible=
+  false` when the worker is labeled but unhealthy or account-exhausted, so
+  reviewers can spot an ineligible route directly in `/healthz`
 - remote worker configuration now accepts per-worker account identity via
   `--remote-account-id`, and remote `/healthz` carries that identity through
   both `remoteWorkers[].accountId` and `projectWorkerRoutes[].accountId`; those
@@ -313,6 +318,10 @@ Recent progress:
   pinned to an account-backed worker, a different project in the same tenant
   prefers a less-loaded account when one is healthy and eligible, while
   existing same-project affinity still wins
+- project-worker route selection now normalizes blank account labels at the v2
+  response-scope boundary before recording rollout evidence, so `/v1/events`,
+  `/healthz.v2Connections.lastProjectWorkerRouteSelectedAccountId`, metrics,
+  and audit logs all treat blank labels the same way as a missing account id
 - remote worker health now tracks account capacity separately from worker
   process health: `/healthz` exposes `accountCapacity`,
   `accountCapacityReason`, and `accountCapacityLastChangedAt` for each worker,
@@ -3416,6 +3425,12 @@ Phase 6 includes the following validated transport and rollout properties:
   evidence aligned across health snapshots, metrics, and
   `gateway/accountThreadHandoffSucceeded` /
   `gateway/accountThreadHandoffFailed` operator events
+- bounded thread-id handoff now also updates sticky routing after successful
+  replacement-account `thread/unsubscribe` and `thread/compact/start` calls,
+  even though those responses do not carry a thread object; the regression
+  coverage pins the account-capacity metrics, `/v1/events` handoff event,
+  health mirror, and resulting route owner for those no-thread-response
+  restoration paths
 - the direct v2 path-based `thread/resume` bounded account-handoff regressions
   now assert the same `/healthz.v2Connections.accountCapacityEvent*` fields for
   replacement success plus wrong-path and no-replacement failure, keeping
@@ -3499,7 +3514,8 @@ Phase 6 now consists of:
   profile can be promoted to release-quality multi-worker guidance. See
   [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md:2188)
   for the exact evidence checklist. Arbitrary live active-context migration
-  remains a separate planned capability.
+  remains a separate planned capability, distinct from the explicit
+  resumable-thread restore surfaces already implemented.
 
 The northbound v2 hardening workstream is now complete in the compatibility
 plan; Phase 6 now consists of the multi-worker rollout gate and the
