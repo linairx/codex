@@ -2118,7 +2118,10 @@ Current status:
   remote runtime health snapshot now also pins the same `projectWorkerRoutes`
   shape against the registered project-to-worker map, so the `/healthz`
   evidence comes from the actual runtime route registry rather than only from
-  a hand-constructed HTTP fixture. The
+  a hand-constructed HTTP fixture. A dedicated remote runtime health
+  regression now also shows different projects pinned to separate labeled
+  workers in the same `projectWorkerRoutes` snapshot, so the multi-project
+  account-distribution view is pinned at the runtime-health boundary. The
   v2 method matrix now also has a dedicated `project-aware account routing`
   route class, so the rollout profile and the method-level evidence stay
   aligned; existing same-project affinity still wins, and project-aware
