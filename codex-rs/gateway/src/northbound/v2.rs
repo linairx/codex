@@ -45508,6 +45508,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_start_project_selection_falls_back_to_unlabeled_after_labeled_disconnect() {
+        let (client_a, request_handle_a) = start_test_request_handle().await;
+        let (client_b, request_handle_b) = start_test_request_handle().await;
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(vec![
+            ("ws://worker-a.invalid".to_string(), None),
+            (
+                "ws://worker-b.invalid".to_string(),
+                Some("acct-b".to_string()),
+            ),
+        ]));
+        worker_health.mark_unhealthy(1, Some("socket closed".to_string()));
+        let mut router = GatewayV2DownstreamRouter {
+            workers: vec![
+                DownstreamWorkerHandle {
+                    worker_id: Some(0),
+                    worker_websocket_url: None,
+                    request_handle: request_handle_a,
+                },
+                DownstreamWorkerHandle {
+                    worker_id: Some(1),
+                    worker_websocket_url: None,
+                    request_handle: request_handle_b,
+                },
+            ],
+            event_tx,
+            event_rx,
+            shutdown_txs: Vec::new(),
+            event_tasks: Vec::new(),
+            next_worker: 0,
+            initialized_notification_sent: false,
+            active_fs_watches: HashMap::new(),
+            reconnect_retry_after: HashMap::new(),
+            reconnect_state: Some(super::GatewayV2ReconnectState {
+                configured_worker_ids: vec![0, 1],
+                worker_websocket_urls: vec![
+                    "ws://worker-a.invalid".to_string(),
+                    "ws://worker-b.invalid".to_string(),
+                ],
+                session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
+                    vec![
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-a.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                        RemoteAppServerConnectArgs {
+                            websocket_url: "ws://worker-b.invalid".to_string(),
+                            auth_token: None,
+                            client_name: "codex-gateway".to_string(),
+                            client_version: "0.0.0-test".to_string(),
+                            experimental_api: false,
+                            opt_out_notification_methods: Vec::new(),
+                            channel_capacity: 4,
+                        },
+                    ],
+                    test_initialize_response().await,
+                    vec![None, Some("acct-b".to_string())],
+                )
+                .with_worker_health(worker_health),
+                initialize_params: InitializeParams {
+                    client_info: ClientInfo {
+                        name: "codex-tui".to_string(),
+                        title: None,
+                        version: "0.0.0-test".to_string(),
+                    },
+                    capabilities: None,
+                },
+                request_context: GatewayRequestContext::default(),
+                retry_backoff: Duration::from_secs(1),
+            }),
+        };
+        let scope_registry = GatewayScopeRegistry::default();
+        let project_context = GatewayRequestContext {
+            tenant_id: "tenant-a".to_string(),
+            project_id: Some("project-a".to_string()),
+        };
+        scope_registry.register_project_worker(project_context.clone(), 1);
+
+        let worker = super::worker_for_request(
+            &mut router,
+            &scope_registry,
+            &project_context,
+            &JSONRPCRequest {
+                id: RequestId::String("thread-start".to_string()),
+                method: "thread/start".to_string(),
+                params: Some(serde_json::json!({
+                    "cwd": "/tmp/project-a",
+                })),
+                trace: None,
+            },
+        )
+        .expect("thread/start should fall back to an unlabeled worker");
+
+        assert_eq!(worker.worker_id, Some(0));
+        client_a
+            .shutdown()
+            .await
+            .expect("client A should shut down");
+        client_b
+            .shutdown()
+            .await
+            .expect("client B should shut down");
+    }
+
+    #[tokio::test]
     async fn thread_start_fails_closed_when_no_healthy_workers_have_capacity() {
         let (client_a, request_handle_a) = start_test_request_handle().await;
         let (client_b, request_handle_b) = start_test_request_handle().await;
@@ -50698,7 +50808,18 @@ mod tests {
             project_id: Some("project-a".to_string()),
         };
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
-        let observability = GatewayObservability::new(None, true).with_operator_events(event_tx);
+        let metrics = codex_otel::MetricsClient::new(
+            codex_otel::MetricsConfig::in_memory(
+                "test",
+                "codex-gateway",
+                env!("CARGO_PKG_VERSION"),
+                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("metrics");
+        let observability =
+            GatewayObservability::new(Some(metrics.clone()), true).with_operator_events(event_tx);
 
         let logs = capture_logs(|| {
             let result = super::apply_response_scope_policy(
@@ -50746,6 +50867,53 @@ mod tests {
                 "workerId": 7,
                 "accountId": null,
             })
+        );
+
+        let resource_metrics = metrics.snapshot().expect("snapshot");
+        let mut saw_metric = false;
+        let mut metric_points = Vec::new();
+        for metric in resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            if metric.name() == "gateway_project_worker_route_selections" {
+                saw_metric = true;
+                match metric.data() {
+                    AggregatedMetrics::U64(data) => match data {
+                        MetricData::Sum(sum) => {
+                            metric_points.extend(sum.data_points().map(|point| {
+                                let attributes = point
+                                    .attributes()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_string(),
+                                            attribute.value.as_str().to_string(),
+                                        )
+                                    })
+                                    .collect::<BTreeMap<_, _>>();
+                                (point.value(), attributes)
+                            }));
+                        }
+                        _ => panic!("unexpected project worker route metric aggregation"),
+                    },
+                    _ => panic!("unexpected project worker route metric type"),
+                }
+            }
+        }
+
+        metric_points.sort_by(|left, right| left.1.cmp(&right.1));
+        assert!(saw_metric);
+        assert_eq!(
+            metric_points,
+            vec![(
+                1,
+                BTreeMap::from([
+                    ("account_id".to_string(), "none".to_string()),
+                    ("project_id".to_string(), "project-a".to_string()),
+                    ("tenant_id".to_string(), "tenant-a".to_string()),
+                    ("worker_id".to_string(), "7".to_string()),
+                ])
+            )]
         );
     }
 

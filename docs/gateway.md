@@ -539,7 +539,11 @@ Recent progress:
   thread-control handoff-failure regressions instead of the active-thread
   family, and now emit `thread_unsubscribe_handoff_failure` /
   `thread_compact_start_handoff_failure` with `gateway/accountThreadHandoffFailed`
-  when the owning account-backed worker is exhausted
+  when the owning account-backed worker is exhausted; the real multi-worker
+  `RemoteAppServerClient` harness now also validates the successful
+  replacement-account paths for both methods plus the no-replacement branches,
+  and checks that a follow-up `thread/read` stays sticky to the replacement
+  worker after success
 - northbound v2 path-based `thread/resume`, `thread/fork`, and
   `getConversationSummary` now treat protocol-visible rollout paths as the
   first bounded account-handoff surface: if the cached path route points at an
@@ -3371,10 +3375,26 @@ Phase 6 includes the following validated transport and rollout properties:
   `remoteWorkers[].accountId` labels in camelCase, so the project-aware
   routing evidence is visible in `/healthz` as well as in the multi-worker
   transcript
+- the HTTP health route now also serializes a mixed `projectWorkerRoutes`
+  snapshot with both eligible and ineligible labeled workers, so the
+  account-routing eligibility flag is pinned at the public `/healthz`
+  boundary and not only in the runtime registry tests
+- the HTTP health route now also serializes the route-selection counters and
+  the mixed `projectWorkerRoutes` snapshot together, so the public health
+  boundary shows both the selected project route and the ineligible route
+  state in one response
 - the real remote runtime health snapshot now also pins the same
   `projectWorkerRoutes` shape against the registered project-to-worker map,
   so the `/healthz` evidence comes from the actual runtime route registry
   instead of only from a hand-constructed HTTP test fixture
+- a dedicated remote-runtime regression now also shows one labeled worker
+  becoming unhealthy and exhausted while another project remains eligible on
+  its own labeled worker, keeping the mixed route-eligibility state pinned at
+  the runtime-health boundary alongside the existing project-route evidence
+- the real multi-worker remote project-route harness now also captures that
+  mixed eligible/ineligible `projectWorkerRoutes` state after one labeled
+  worker becomes unhealthy, so the public `/healthz` surface is covered by a
+  real client path as well as the runtime-registry regression
 - the v2 method matrix now also has a dedicated `project-aware account
   routing` route class, so the validated project-scoped `thread/start`
   behavior is called out explicitly alongside the account-label and
@@ -3393,9 +3413,13 @@ Phase 6 includes the following validated transport and rollout properties:
   family, including turn control, realtime start/append/stop, thread-scoped
   MCP resource reads and tool calls, review start, app discovery, shell
   commands, compact start, unsubscribe, and background-terminal cleanup, so the
-  fail-closed policy is not represented only by one sample method and the
-  exported `gateway_v2_account_capacity_events` counts are also covered beyond
-  the health mirror
+  fail-closed policy is not represented only by one sample method; `review/start`
+  and thread-scoped MCP now each have explicit no-replacement regressions in
+  the same multi-worker harness; turn control, realtime control methods, and
+  shell commands plus background-terminal cleanup now also have explicit
+  no-replacement regressions there, and the exported
+  `gateway_v2_account_capacity_events` counts are also covered beyond the
+  health mirror
 - the real northbound WebSocket `serverRequest/respond` exhausted-account
   regression now also asserts the v2 `accountCapacityEvent*` health mirror
   and the exported `gateway_v2_account_capacity_events` metric counts,
@@ -3494,6 +3518,51 @@ Phase 6 includes the following validated transport and rollout properties:
   event, v2 health mirrors, and `codex_gateway.audit` project-route-selection
   log fields, using `<none>` when no account label is present, so the
   route-selection evidence chain is covered end to end in one place
+- the Phase 6 promotion checklist now also includes a deployment evidence
+  worksheet that groups build/topology, route-class plan, health snapshots,
+  `/v1/events`, metrics, audit logs, client transcripts, fail-closed results,
+  backlog windows, cleanup evidence, and the final pass/fail decision for one
+  exact multi-worker deployment shape
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now gives operators a concise startup, health-check, promotion-evidence, and
+  release-decision guide for embedded, single-worker remote, and multi-worker
+  remote profiles, so the Phase 6 rollout gate has an operational entry point
+  in addition to the detailed compatibility plan
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also includes a concrete promotion evidence bundle layout and worksheet
+  template, including capture rows for baseline, steady-state, route
+  selection, reconnect, degraded-route, account-capacity, bounded
+  restoration, live no-handoff, backlog, cleanup, and final reconciliation
+  decisions
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also includes the per-deployment capture runbook for multi-worker
+  promotion, including the event-stream-first capture order, health snapshot
+  timing, metrics/log window alignment, useful `jq` slices, and the exact
+  project-route plus account-capacity fields operators must reconcile before
+  accepting a worksheet row
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also maps the method-matrix route classes to the minimum promotion
+  scenarios operators need to run, including bootstrap aggregation, setup
+  fanout, primary-worker side effects, worker discovery, sticky thread
+  ownership, project route selection, bounded restore, live no-handoff,
+  reconnect/degraded routing, slow-client backlog, and cleanup or delivery
+  failure evidence
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also defines the release decision taxonomy for collected promotion
+  evidence: release-quality multi-worker, scoped Stage B, or reject / no
+  promotion, including the topology changes that invalidate existing evidence
+  and require a fresh bundle
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also includes concrete `README.md` and `decision.md` templates for a
+  promotion evidence bundle, so operators can record topology, runtime
+  configuration, evidence indexes, reconciliation summaries, blocking
+  mismatches, and invalidation rules consistently across deployments
+- `scripts/create-gateway-promotion-bundle.sh` now creates the recommended
+  promotion evidence bundle skeleton, including the directory layout,
+  `README.md`, `worksheet.md`, and `decision.md`, so target-deployment
+  validation starts from the same topology, route-class, health, event,
+  metric, log, and decision structure described in
+  [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
 
 Phase 6 now consists of:
 
@@ -3511,10 +3580,13 @@ Phase 6 now consists of:
   `remoteWorkers[].accountId` labels, the `gateway/projectWorkerRouteSelected`
   operator event, the corresponding metric captures, and the structured audit
   log for the same tenant/project/account scope before the bounded handoff
-  profile can be promoted to release-quality multi-worker guidance. See
-  [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md:2188)
-  for the exact evidence checklist. Arbitrary live active-context migration
-  remains a separate planned capability, distinct from the explicit
+  profile can be promoted to release-quality multi-worker guidance. See the
+  promotion evidence worksheet in
+  [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md)
+  for the exact evidence checklist, and
+  [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  for the operator-facing rollout guide. Arbitrary live active-context
+  migration remains a separate planned capability, distinct from the explicit
   resumable-thread restore surfaces already implemented.
 
 The northbound v2 hardening workstream is now complete in the compatibility

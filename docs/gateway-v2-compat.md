@@ -956,8 +956,9 @@ Recent progress:
   health mirror for the same project route events, including
   `projectWorkerRouteSelectionCount`, worker-count breakdowns, and
   `lastProjectWorkerRouteSelectedAccountId`, so local rollout evidence covers
-  the `/healthz.projectWorkerRoutes`, `/v1/events`, and v2 health surfaces
-  before deployment-level metric capture is collected
+  the `/healthz.projectWorkerRoutes`, `/v1/events`, and v2 health surfaces;
+  the corresponding metric snapshot is covered separately by the dedicated
+  `thread/start` regression
 - hidden-thread downstream server requests that are rejected by gateway scope
   policy now also emit structured warning logs with scope, worker id, worker
   websocket URL, request id, method, and hidden thread id, with direct
@@ -2120,8 +2121,11 @@ Current status:
   evidence comes from the actual runtime route registry rather than only from
   a hand-constructed HTTP fixture. A dedicated remote runtime health
   regression now also shows different projects pinned to separate labeled
-  workers in the same `projectWorkerRoutes` snapshot, so the multi-project
-  account-distribution view is pinned at the runtime-health boundary. The
+  workers in the same `projectWorkerRoutes` snapshot, and another regression
+  now shows one labeled worker becoming unhealthy and exhausted while a
+  different project remains eligible on its own labeled worker, so the
+  multi-project account-distribution view is pinned at the runtime-health
+  boundary. The
   v2 method matrix now also has a dedicated `project-aware account routing`
   route class, so the rollout profile and the method-level evidence stay
   aligned; existing same-project affinity still wins, and project-aware
@@ -2373,6 +2377,12 @@ follow-up `thread/read` remains sticky to the replacement worker. The same
   worker account is marked exhausted closes the shared client session, is not
   delivered to the exhausted downstream worker, and records matching
   account-capacity plus server-request lifecycle metrics.
+  The same real multi-worker `RemoteAppServerClient` harness now also
+  validates successful replacement-account and fail-closed branches for
+  `thread/unsubscribe` and `thread/compact/start`, including follow-up
+  `thread/read` stickiness after success and
+  `gateway/accountThreadHandoffFailed` when no replacement restores the
+  context.
   The same harness now also validates the successful explicit thread-id fork
   restoration path through the same real client session and operator-event
   stream. The same harness now also validates the fail-closed branches for
@@ -3817,6 +3827,28 @@ Promotion evidence for multi-worker remote:
   pending-request limits, or enabling new v2 methods should trigger another
   evidence pass before the deployment is described as release-quality
 
+Promotion evidence worksheet:
+
+Use one worksheet per deployment shape and keep every row scoped to the same
+gateway build, worker pool, tenant, project, and account-label set. Do not
+merge evidence from different topology or timeout configurations.
+
+| Evidence item | Expected capture |
+| --- | --- |
+| Build and topology | Gateway build id, worker app-server build ids, worker count, every `--remote-websocket-url`, every `--remote-account-id`, auth mode, v2 timeout values, and pending-request limits |
+| Route-class plan | Method families validated from the method matrix: aggregation, fanout, primary-worker affinity, worker discovery, thread-sticky routing, bounded account handoff, and live active-context fail-closed |
+| Baseline health | `/healthz` before traffic, including `remoteWorkers[]`, `remoteAccountLabelsComplete`, `remoteUnlabeledAccountWorker*`, `projectWorkerRoutes`, and `v2Connections` counters |
+| Project route selection | The project-scoped `thread/start` transcript, the matching `/healthz.projectWorkerRoutes` row, `remoteWorkers[].accountId`, `gateway/projectWorkerRouteSelected`, `gateway_project_worker_route_selections`, and `codex_gateway.audit` fields for the same tenant/project/thread/worker/account |
+| Steady-state traffic | Client transcript plus `/healthz`, metrics, and events for normal bootstrap, thread/turn, notification fan-in, approval, elicitation, and token-refresh flows exercised in the route-class plan |
+| Reconnect traffic | Worker disconnect/recovery transcript, `remoteWorkers[].reconnecting`, reconnect timestamps/backoff, `workerReconnectEvent*` health fields, `gateway_v2_worker_reconnects`, and any `/v1/events` reconnect records |
+| Degraded-route protection | Client-visible fail-closed JSON-RPC errors, `failClosedRequest*` or `upstreamRequestFailure*` health fields, matching metrics, and logs for route classes intentionally exercised while a required worker is unavailable |
+| Account-capacity transition | `account/rateLimits/read` or quota-like failure transcript, `remoteWorkers[].accountCapacity*`, `accountCapacityEvent*` health fields, account-capacity metrics, account-capacity operator events, and structured logs for the same worker/account |
+| Bounded restoration | Explicit `thread/read`, `thread/resume`, `thread/fork`, rollout-path, conversation-summary, or resumable thread-control transcript showing replacement-account success or fail-closed no-replacement behavior, plus matching handoff events, metrics, and sticky follow-up route evidence |
+| Live active-context no-handoff | Turn/realtime/review/MCP/server-request-reply transcript proving live work fails closed rather than moving accounts, with the matching `gateway/accountActiveThreadHandoffFailed` event, metric, health mirror, and audit or structured log |
+| Slow-client or backlog window | Active and terminal `/healthz.v2Connections` snapshots for pending client requests or server-request backlog, worker and method count metrics, lifecycle peak metrics, connection completion logs, and audit logs for the same connection window |
+| Cleanup and delivery failures | Any induced worker-loss cleanup, server-request rejection, answer delivery failure, send timeout, backpressure, or close-frame failure evidence, including `/v1/events`, lifecycle metrics, health mirrors, and structured logs |
+| Decision | Pass/fail, promotion scope, excluded route classes or method families, and the exact evidence mismatch that blocked promotion if the deployment shape is not approved |
+
 ## Testing Plan
 
 Tests should be layered.
@@ -3845,24 +3877,36 @@ Tests should be layered.
 
 ## Documentation Deliverables
 
-When implementation starts, update:
+The implementation-facing docs are now part of the release gate rather than a
+startup checklist. Keep these current before widening a gateway rollout:
 
-- `docs/gateway.md` with milestone status
-- gateway startup docs and examples
-- a method-coverage matrix for v2 compatibility mode
-- operator guidance for embedded, single-worker remote, and multi-worker remote
-  profiles
+- `docs/gateway.md` with the current Phase 6 milestone status and remaining
+  gate
+- `docs/gateway-v2-method-matrix.md` with the validated route class for each v2
+  method family
+- [gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  with gateway startup examples for embedded, single-worker remote, and
+  multi-worker remote profiles
+- `scripts/create-gateway-promotion-bundle.sh` for creating the standard
+  multi-worker evidence bundle skeleton before target-deployment validation
+- operator guidance that identifies which deployment profiles are
+  release-quality and which are still bounded validation profiles
+- one completed promotion evidence worksheet per multi-worker deployment shape
+  that is being proposed as release-quality
 
 ## Recommended Execution Order
 
-Build in this order:
+The original implementation sequence is complete through local multi-worker
+hardening. The remaining release sequence is:
 
-1. northbound v2 WebSocket skeleton
-2. embedded-mode drop-in parity
-3. single remote-worker parity
-4. coverage matrix and remaining gap analysis
-5. multi-worker coordination
-6. hardening and rollout docs
-
-This keeps the critical path short and gets to a useful compatibility target
-before taking on the hardest part, which is multi-worker multiplexing.
+1. choose the exact multi-worker topology, account labels, auth mode, timeout
+   values, and pending-request limits to validate
+2. map the deployment's expected client flows to the method matrix route
+   classes
+3. collect the promotion evidence worksheet for steady-state, reconnect,
+   degraded-route, account-capacity, bounded handoff, live no-handoff,
+   backlog, and cleanup scenarios
+4. compare `/healthz`, `/v1/events`, metrics, audit logs, and client
+   transcripts for the same tenant/project/account windows
+5. document the pass/fail decision and keep the promotion scoped to the exact
+   topology and method families that were validated
