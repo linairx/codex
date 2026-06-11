@@ -3563,6 +3563,10 @@ Phase 6 includes the following validated transport and rollout properties:
   validation starts from the same topology, route-class, health, event,
   metric, log, and decision structure described in
   [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+- `scripts/test-create-gateway-promotion-bundle.sh` and
+  `just gateway-promotion-bundle-test` now smoke-test the bundle template and
+  its worker/build/account topology rows, so the promotion entrypoint stays
+  aligned with the documented evidence layout after future edits
 
 Phase 6 now consists of:
 

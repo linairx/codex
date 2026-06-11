@@ -99,6 +99,11 @@ write-app-server-schema *args:
 write-hooks-schema:
     cargo run --manifest-path {{ justfile_directory() }}/codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
 
+# Smoke-test the gateway promotion bundle generator.
+[no-cd]
+gateway-promotion-bundle-test:
+    {{ justfile_directory() }}/scripts/test-create-gateway-promotion-bundle.sh
+
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]
 argument-comment-lint *args:

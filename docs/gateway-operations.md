@@ -162,6 +162,9 @@ scripts/create-gateway-promotion-bundle.sh \
   --v2-max-pending-client-requests 64
 ```
 
+Run `just gateway-promotion-bundle-test` after changing the template generator
+or its expected layout.
+
 Use stable names that preserve the scenario order, for example
 `01-baseline.json`, `02-steady-state-project-a.json`,
 `03-worker-reconnect-project-a.json`, and
