@@ -69,4 +69,19 @@ require_line "$bundle/decision.md" '## Reconciliation Summary'
 require_line "$bundle/decision.md" '## Blocking Mismatches'
 require_line "$bundle/decision.md" '## Invalidation Rules'
 
+if grep -Fq '| | | | | | |' "$bundle/README.md"; then
+  echo "README.md still contains placeholder topology or evidence-index rows" >&2
+  exit 1
+fi
+
+if grep -Fq '| | | | | | |' "$bundle/worksheet.md"; then
+  echo "worksheet.md still contains placeholder capture rows" >&2
+  exit 1
+fi
+
+if grep -Fq '| | | | | |' "$bundle/decision.md"; then
+  echo "decision.md still contains placeholder blocking-mismatch rows" >&2
+  exit 1
+fi
+
 printf '%s\n' "$bundle"

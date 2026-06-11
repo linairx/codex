@@ -3575,6 +3575,9 @@ Phase 6 includes the following validated transport and rollout properties:
 - the promotion bundle worksheet template now also includes the Decision
   section that the operator guide requires, so generated bundles and the
   checker now agree on the full review-time skeleton
+- the bundle checker now rejects unfilled placeholder rows in the README,
+  worksheet, and decision tables, so a reviewed bundle must contain actual
+  capture and reconciliation content rather than only the template scaffold
 
 Phase 6 now consists of:
 

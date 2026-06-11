@@ -168,8 +168,8 @@ or its expected layout.
 Run `just gateway-promotion-bundle-check-test` after changing the checker, and
 use `just gateway-promotion-bundle-check <bundle-dir>` to validate a populated
 promotion bundle before it is reviewed. The checker verifies the required
-files, directories, and template headings before a bundle is accepted for
-review.
+files, directories, template headings, and populated rows before a bundle is
+accepted for review.
 
 Use stable names that preserve the scenario order, for example
 `01-baseline.json`, `02-steady-state-project-a.json`,
