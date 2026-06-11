@@ -165,6 +165,10 @@ scripts/create-gateway-promotion-bundle.sh \
 Run `just gateway-promotion-bundle-test` after changing the template generator
 or its expected layout.
 
+Run `just gateway-promotion-bundle-check-test` after changing the checker, and
+use `just gateway-promotion-bundle-check <bundle-dir>` to validate a populated
+promotion bundle before it is reviewed.
+
 Use stable names that preserve the scenario order, for example
 `01-baseline.json`, `02-steady-state-project-a.json`,
 `03-worker-reconnect-project-a.json`, and

@@ -3892,6 +3892,12 @@ startup checklist. Keep these current before widening a gateway rollout:
 - `scripts/test-create-gateway-promotion-bundle.sh` and
   `just gateway-promotion-bundle-test` for smoke-testing the bundle skeleton
   after template or layout changes
+- `scripts/check-gateway-promotion-bundle.sh` and
+  `just gateway-promotion-bundle-check` for validating a populated promotion
+  bundle before review
+- `scripts/test-check-gateway-promotion-bundle.sh` and
+  `just gateway-promotion-bundle-check-test` for smoke-testing the bundle
+  checker after layout changes
 - operator guidance that identifies which deployment profiles are
   release-quality and which are still bounded validation profiles
 - one completed promotion evidence worksheet per multi-worker deployment shape

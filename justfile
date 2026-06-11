@@ -104,6 +104,16 @@ write-hooks-schema:
 gateway-promotion-bundle-test:
     {{ justfile_directory() }}/scripts/test-create-gateway-promotion-bundle.sh
 
+# Smoke-test the gateway promotion bundle checker.
+[no-cd]
+gateway-promotion-bundle-check-test:
+    {{ justfile_directory() }}/scripts/test-check-gateway-promotion-bundle.sh
+
+# Validate a gateway promotion bundle layout.
+[no-cd]
+gateway-promotion-bundle-check *args:
+    {{ justfile_directory() }}/scripts/check-gateway-promotion-bundle.sh "$@"
+
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]
 argument-comment-lint *args:
