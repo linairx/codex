@@ -44,8 +44,29 @@ require_dir "$bundle/events"
 require_dir "$bundle/metrics"
 require_dir "$bundle/logs"
 
-grep -Fq '# Gateway Promotion Evidence Bundle' "$bundle/README.md"
-grep -Fq '# Gateway Multi-Worker Promotion Evidence' "$bundle/worksheet.md"
-grep -Fq '# Gateway Multi-Worker Promotion Decision' "$bundle/decision.md"
+require_line() {
+  path=$1
+  expected=$2
+  if ! grep -Fq "$expected" "$path"; then
+    echo "missing required content in $path: $expected" >&2
+    exit 1
+  fi
+}
+
+require_line "$bundle/README.md" '# Gateway Promotion Evidence Bundle'
+require_line "$bundle/README.md" '## Topology'
+require_line "$bundle/README.md" '## Runtime Configuration'
+require_line "$bundle/README.md" '## Evidence Index'
+require_line "$bundle/README.md" '| Worker id | Build id | WebSocket URL | Account id | Auth mode | Notes |'
+require_line "$bundle/worksheet.md" '# Gateway Multi-Worker Promotion Evidence'
+require_line "$bundle/worksheet.md" '## Scope'
+require_line "$bundle/worksheet.md" '## Captures'
+require_line "$bundle/worksheet.md" '## Reconciliation'
+require_line "$bundle/worksheet.md" '## Decision'
+require_line "$bundle/worksheet.md" '| Scenario | Client transcript | Health snapshot | Events | Metrics | Logs | Result |'
+require_line "$bundle/decision.md" '# Gateway Multi-Worker Promotion Decision'
+require_line "$bundle/decision.md" '## Reconciliation Summary'
+require_line "$bundle/decision.md" '## Blocking Mismatches'
+require_line "$bundle/decision.md" '## Invalidation Rules'
 
 printf '%s\n' "$bundle"

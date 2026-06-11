@@ -256,6 +256,13 @@ EOF
 - Bounded handoff success/failure outcomes match client-visible behavior:
 - Live active-context methods fail closed instead of moving accounts:
 - Backlog and cleanup windows are bounded and observable:
+
+## Decision
+
+- Pass/fail:
+- Promotion scope:
+- Excluded method families or route classes:
+- Follow-up required before wider rollout:
 EOF
 } | write_template "$bundle/worksheet.md"
 

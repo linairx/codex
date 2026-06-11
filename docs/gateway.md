@@ -3569,9 +3569,12 @@ Phase 6 includes the following validated transport and rollout properties:
   aligned with the documented evidence layout after future edits
 - `scripts/check-gateway-promotion-bundle.sh` and
   `just gateway-promotion-bundle-check` now validate a populated promotion
-  bundle's required files and directories before review, and the paired
-  `scripts/test-check-gateway-promotion-bundle.sh` smoke test keeps that
-  checker aligned with the documented evidence layout
+  bundle's required files, directories, and template headings before review,
+  and the paired `scripts/test-check-gateway-promotion-bundle.sh` smoke test
+  keeps that checker aligned with the documented evidence layout
+- the promotion bundle worksheet template now also includes the Decision
+  section that the operator guide requires, so generated bundles and the
+  checker now agree on the full review-time skeleton
 
 Phase 6 now consists of:
 
