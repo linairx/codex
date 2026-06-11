@@ -97,4 +97,43 @@ if grep -Fq '| | | | | |' "$bundle/decision.md"; then
   exit 1
 fi
 
+check_relative_path() {
+  path=$1
+  if [ -z "$path" ]; then
+    return 0
+  fi
+  if [ ! -e "$bundle/$path" ]; then
+    echo "missing referenced artifact in $bundle: $path" >&2
+    exit 1
+  fi
+}
+
+while IFS='|' read -r _ scenario transcript health events metrics logs worksheet _; do
+  case $scenario in
+    " Scenario " | " --- " | "" )
+      continue
+      ;;
+  esac
+
+  scenario=$(printf '%s' "$scenario" | sed 's/^ *//; s/ *$//')
+  transcript=$(printf '%s' "$transcript" | sed 's/^ *//; s/ *$//')
+  health=$(printf '%s' "$health" | sed 's/^ *//; s/ *$//')
+  events=$(printf '%s' "$events" | sed 's/^ *//; s/ *$//')
+  metrics=$(printf '%s' "$metrics" | sed 's/^ *//; s/ *$//')
+  logs=$(printf '%s' "$logs" | sed 's/^ *//; s/ *$//')
+  worksheet=$(printf '%s' "$worksheet" | sed 's/^ *//; s/ *$//')
+
+  if [ -n "$scenario" ]; then
+    check_relative_path "$transcript"
+    check_relative_path "$health"
+    check_relative_path "$events"
+    check_relative_path "$metrics"
+    check_relative_path "$logs"
+    if [ -z "$worksheet" ]; then
+      echo "missing worksheet row reference for scenario: $scenario" >&2
+      exit 1
+    fi
+  fi
+done < <(awk '/^## Evidence Index$/ { in_index = 1; next } in_index && /^## / { exit } in_index && /^\|/ { print }' "$bundle/README.md")
+
 printf '%s\n' "$bundle"

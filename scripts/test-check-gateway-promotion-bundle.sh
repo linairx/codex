@@ -27,11 +27,9 @@ README_MD="$bundle_path/README.md"
 WORKSHEET_MD="$bundle_path/worksheet.md"
 DECISION_MD="$bundle_path/decision.md"
 
-sed -i \
-  -e 's#| | | | | | |#| 0 | worker-a | ws://127.0.0.1:9001/v2 | acct-a | bearer | sample |#g' \
+perl -0pi -e 's#\| ([^|]+) \| \| \| \| \| \| \|#| $1 | transcripts/01-baseline.txt | healthz/01-baseline.json | events/01-baseline.sse | metrics/01-baseline.json | logs/01-baseline.log | worksheet row 1 |#g' \
   "$README_MD"
-sed -i \
-  -e 's#| | | | | | |#| Baseline before traffic | transcripts/01-baseline.txt | healthz/01-baseline.json | events/01-baseline.sse | metrics/01-baseline.json | logs/01-baseline.log | ok |#g' \
+perl -0pi -e 's#\| ([^|]+) \| \| \| \| \| \| \|#| $1 | transcripts/01-baseline.txt | healthz/01-baseline.json | events/01-baseline.sse | metrics/01-baseline.json | logs/01-baseline.log | ok |#g' \
   "$WORKSHEET_MD"
 sed -i \
   -e 's#| | | | | |#| Baseline before traffic | expected | observed | tenant-a/project-a/worker-a | rerun after fix |#g' \
