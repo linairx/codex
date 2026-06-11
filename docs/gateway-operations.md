@@ -232,8 +232,8 @@ Evidence bundle `README.md` template:
 
 ## Topology
 
-| Worker id | WebSocket URL | Account id | Auth mode | Notes |
-| --- | --- | --- | --- | --- |
+| Worker id | Build id | WebSocket URL | Account id | Auth mode | Notes |
+| --- | --- | --- | --- | --- | --- |
 | | | | | |
 
 ## Runtime Configuration

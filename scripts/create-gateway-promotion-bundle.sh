@@ -148,10 +148,16 @@ if [ -z "$worker_urls" ]; then
 fi
 
 worker_rows=$(
-  awk -v worker_urls="$worker_urls" -v account_ids="$account_ids" -v auth_mode="$auth_mode" '
+  awk -v worker_builds="$worker_builds" -v worker_urls="$worker_urls" -v account_ids="$account_ids" -v auth_mode="$auth_mode" '
     BEGIN {
+      build_count = split(worker_builds, builds, /, */);
       worker_count = split(worker_urls, workers, /, */);
       account_count = split(account_ids, accounts, /, */);
+
+      if (build_count != worker_count) {
+        print "each --worker-url must have a matching --worker-build value" > "/dev/stderr";
+        exit 2;
+      }
 
       if (account_count > worker_count) {
         print "more --account-id values than --worker-url values" > "/dev/stderr";
@@ -160,7 +166,7 @@ worker_rows=$(
 
       for (i = 1; i <= worker_count; i++) {
         account_id = (i <= account_count ? accounts[i] : "");
-        printf("| %d | %s | %s | %s | |\n", i - 1, workers[i], account_id, auth_mode);
+        printf("| %d | %s | %s | %s | %s | |\n", i - 1, builds[i], workers[i], account_id, auth_mode);
       }
     }
   '
@@ -196,8 +202,8 @@ write_template() {
 
 ## Topology
 
-| Worker id | WebSocket URL | Account id | Auth mode | Notes |
-| --- | --- | --- | --- | --- |
+| Worker id | Build id | WebSocket URL | Account id | Auth mode | Notes |
+| --- | --- | --- | --- | --- | --- |
 $worker_rows
 
 ## Runtime Configuration
