@@ -3889,6 +3889,9 @@ startup checklist. Keep these current before widening a gateway rollout:
   multi-worker remote profiles
 - `scripts/create-gateway-promotion-bundle.sh` for creating the standard
   multi-worker evidence bundle skeleton before target-deployment validation
+- `scripts/test-create-gateway-promotion-bundle.sh` and
+  `just gateway-promotion-bundle-test` for smoke-testing the bundle skeleton
+  after template or layout changes
 - operator guidance that identifies which deployment profiles are
   release-quality and which are still bounded validation profiles
 - one completed promotion evidence worksheet per multi-worker deployment shape
