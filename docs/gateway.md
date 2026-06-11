@@ -3578,6 +3578,10 @@ Phase 6 includes the following validated transport and rollout properties:
 - the bundle checker now rejects unfilled placeholder rows in the README,
   worksheet, and decision tables, so a reviewed bundle must contain actual
   capture and reconciliation content rather than only the template scaffold
+- the bundle checker now also requires each capture directory to contain at
+  least one artifact file, so a reviewed bundle is populated with real
+  transcripts, health snapshots, events, metrics, and logs rather than only
+  empty folder placeholders
 
 Phase 6 now consists of:
 

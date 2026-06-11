@@ -37,6 +37,12 @@ sed -i \
   -e 's#| | | | | |#| Baseline before traffic | expected | observed | tenant-a/project-a/worker-a | rerun after fix |#g' \
   "$DECISION_MD"
 
+printf '%s\n' 'sample transcript' > "$bundle_path/transcripts/01-baseline.txt"
+printf '%s\n' '{"ok":true}' > "$bundle_path/healthz/01-baseline.json"
+printf '%s\n' 'event: gateway/projectWorkerRouteSelected' > "$bundle_path/events/01-baseline.sse"
+printf '%s\n' '{"metric":"sample"}' > "$bundle_path/metrics/01-baseline.json"
+printf '%s\n' 'sample log line' > "$bundle_path/logs/01-baseline.log"
+
 "$repo_root/scripts/check-gateway-promotion-bundle.sh" "$bundle_path" >/dev/null
 
 rm "$bundle_path/decision.md"

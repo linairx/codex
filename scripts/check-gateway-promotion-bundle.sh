@@ -35,6 +35,14 @@ require_dir() {
   fi
 }
 
+require_nonempty_dir() {
+  path=$1
+  if ! find "$path" -mindepth 1 -type f -print -quit | grep -q .; then
+    echo "missing captured files in directory: $path" >&2
+    exit 1
+  fi
+}
+
 require_file "$bundle/README.md"
 require_file "$bundle/worksheet.md"
 require_file "$bundle/decision.md"
@@ -43,6 +51,11 @@ require_dir "$bundle/healthz"
 require_dir "$bundle/events"
 require_dir "$bundle/metrics"
 require_dir "$bundle/logs"
+require_nonempty_dir "$bundle/transcripts"
+require_nonempty_dir "$bundle/healthz"
+require_nonempty_dir "$bundle/events"
+require_nonempty_dir "$bundle/metrics"
+require_nonempty_dir "$bundle/logs"
 
 require_line() {
   path=$1
