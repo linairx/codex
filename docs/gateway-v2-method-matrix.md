@@ -45,6 +45,9 @@ Stage B rollout gate:
   health, reconnect state, account-capacity events, and fail-closed decisions
   before multi-worker remote is documented as equivalent to embedded or
   single-worker remote
+- the promotion evidence for the exact deployment shape is captured through
+  the gateway promotion bundle workflow, so the route-class checklist stays
+  paired with the worksheet, decision file, and capture-index artifacts
 - server-request rollout evidence must include the v2 backlog health fields
   that split pending and answered-but-unresolved prompts by owning worker, so
   prompt buildup can be correlated with lifecycle metrics and worker-route logs

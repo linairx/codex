@@ -4,11 +4,12 @@ set -eu
 usage() {
   cat <<'EOF'
 Usage: scripts/create-gateway-promotion-bundle.sh --output DIR --gateway-build ID --topology-id ID [options]
+       just gateway-promotion-bundle-create -- --output DIR --gateway-build ID --topology-id ID [options]
 
 Options:
   --worker-build VALUE                         Repeat for each worker build.
   --worker-url VALUE                           Repeat for each worker WebSocket URL.
-  --account-id VALUE                           Repeat for each worker account id.
+  --account-id VALUE                           Repeat for each worker account id; at least one is required.
   --tenant-id VALUE
   --project-id VALUE                           Repeat for each project.
   --auth-mode VALUE
@@ -147,6 +148,40 @@ if [ -z "$worker_urls" ]; then
   exit 2
 fi
 
+if [ -z "$tenant_id" ]; then
+  echo "--tenant-id is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if [ -z "$project_ids" ]; then
+  echo "at least one --project-id is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if [ -z "$account_ids" ]; then
+  echo "at least one --account-id is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if [ -z "$auth_mode" ]; then
+  echo "--auth-mode is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if [ -z "$v2_initialize_timeout_seconds" ] ||
+  [ -z "$v2_client_send_timeout_seconds" ] ||
+  [ -z "$v2_reconnect_retry_backoff_seconds" ] ||
+  [ -z "$v2_max_pending_server_requests" ] ||
+  [ -z "$v2_max_pending_client_requests" ]; then
+  echo "all v2 timeout and pending-request limit values are required" >&2
+  usage >&2
+  exit 2
+fi
+
 worker_rows=$(
   awk -v worker_builds="$worker_builds" -v worker_urls="$worker_urls" -v account_ids="$account_ids" -v auth_mode="$auth_mode" '
     BEGIN {
@@ -194,7 +229,9 @@ write_template() {
 # Gateway Promotion Evidence Bundle
 
 - Gateway build: $gateway_build
+- Topology id: $topology_id
 - Worker builds: $worker_builds
+- Tenant/project scope: tenant=$tenant_id, projects=$project_ids
 - Captured by:
 - Capture start:
 - Capture end:
@@ -232,6 +269,7 @@ EOF
 ## Scope
 
 - Gateway build: $gateway_build
+- Topology id: $topology_id
 - Worker builds: $worker_builds
 - Worker URLs: $worker_urls
 - Account labels: $account_ids
@@ -259,7 +297,7 @@ EOF
 
 ## Decision
 
-- Pass/fail:
+- Decision:
 - Promotion scope:
 - Excluded method families or route classes:
 - Follow-up required before wider rollout:

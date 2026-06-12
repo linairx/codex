@@ -104,6 +104,11 @@ write-hooks-schema:
 gateway-promotion-bundle-test:
     {{ justfile_directory() }}/scripts/test-create-gateway-promotion-bundle.sh
 
+# Create a gateway promotion bundle skeleton.
+[no-cd]
+gateway-promotion-bundle-create *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/create-gateway-promotion-bundle.sh "$@"
+
 # Smoke-test the gateway promotion bundle checker.
 [no-cd]
 gateway-promotion-bundle-check-test:
@@ -112,7 +117,7 @@ gateway-promotion-bundle-check-test:
 # Validate a gateway promotion bundle layout.
 [no-cd]
 gateway-promotion-bundle-check *args:
-    {{ justfile_directory() }}/scripts/check-gateway-promotion-bundle.sh "$@"
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/check-gateway-promotion-bundle.sh "$@"
 
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]

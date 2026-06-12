@@ -854,6 +854,27 @@ Recent progress:
 - Milestone 6 is now complete; the compatibility work now consists of the
   multi-worker rollout gate tracked under Milestone 5 and the project-aware
   deployment evidence checklist
+- the gateway promotion evidence bundle workflow now has a concrete template,
+  checker, and smoke tests for the multi-worker rollout gate, so the
+  promotion worksheet, decision file, and capture-index layout are enforced
+  by tooling instead of only by reviewer convention; the paired checker smoke
+  test now also pins the invalid decision values, inverted capture windows,
+  malformed or invalid capture times, including impossible dates, duplicate
+  scenarios, missing required scenario families, missing, empty, or placeholder
+  capture metadata, capture metadata outside the bundle's declared
+  gateway/tenant/project/account scope, capture metadata whose worker build
+  and account id do not match one topology row, placeholder topology rows,
+  path escapes, and mismatched worksheet references that the bundle validator
+  is expected to reject; the checker help path now also exits successfully
+  while advertising the matching `just gateway-promotion-bundle-check` wrapper
+- the bundle generator now also requires one tenant id, at least one project
+  id, at least one account id, auth mode, every v2 timeout value, and both
+  pending-request limits up front, so the promotion worksheet and decision
+  file are created with an explicit deployment shape before capture data is
+  added; the checker now also requires the topology id to match across the
+  README, worksheet, and decision file, and requires the README top-level
+  worker-build metadata to match the README topology rows before promotion
+  evidence is accepted
 - northbound v2 connections now enforce an explicit initialize handshake
   timeout and close the WebSocket with a concrete gateway-owned reason instead
   of waiting indefinitely for a client that never completes the JSON-RPC
@@ -3847,7 +3868,7 @@ merge evidence from different topology or timeout configurations.
 | Live active-context no-handoff | Turn/realtime/review/MCP/server-request-reply transcript proving live work fails closed rather than moving accounts, with the matching `gateway/accountActiveThreadHandoffFailed` event, metric, health mirror, and audit or structured log |
 | Slow-client or backlog window | Active and terminal `/healthz.v2Connections` snapshots for pending client requests or server-request backlog, worker and method count metrics, lifecycle peak metrics, connection completion logs, and audit logs for the same connection window |
 | Cleanup and delivery failures | Any induced worker-loss cleanup, server-request rejection, answer delivery failure, send timeout, backpressure, or close-frame failure evidence, including `/v1/events`, lifecycle metrics, health mirrors, and structured logs |
-| Decision | Pass/fail, promotion scope, excluded route classes or method families, and the exact evidence mismatch that blocked promotion if the deployment shape is not approved |
+| Decision | Decision taxonomy value, promotion scope, excluded route classes or method families, and the exact evidence mismatch that blocked promotion if the deployment shape is not approved |
 
 ## Testing Plan
 
@@ -3917,5 +3938,6 @@ hardening. The remaining release sequence is:
    backlog, and cleanup scenarios
 4. compare `/healthz`, `/v1/events`, metrics, audit logs, and client
    transcripts for the same tenant/project/account windows
-5. document the pass/fail decision and keep the promotion scoped to the exact
-   topology and method families that were validated
+5. document the decision taxonomy value and keep the promotion scoped to the
+   exact topology and method families that were validated; a release-quality
+   multi-worker decision must use `none` for excluded method families

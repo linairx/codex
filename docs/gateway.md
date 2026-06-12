@@ -3521,8 +3521,8 @@ Phase 6 includes the following validated transport and rollout properties:
 - the Phase 6 promotion checklist now also includes a deployment evidence
   worksheet that groups build/topology, route-class plan, health snapshots,
   `/v1/events`, metrics, audit logs, client transcripts, fail-closed results,
-  backlog windows, cleanup evidence, and the final pass/fail decision for one
-  exact multi-worker deployment shape
+  backlog windows, cleanup evidence, and the final decision taxonomy value
+  for one exact multi-worker deployment shape
 - [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
   now gives operators a concise startup, health-check, promotion-evidence, and
   release-decision guide for embedded, single-worker remote, and multi-worker
@@ -3563,15 +3563,83 @@ Phase 6 includes the following validated transport and rollout properties:
   validation starts from the same topology, route-class, health, event,
   metric, log, and decision structure described in
   [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  and now requires tenant/project scope, at least one account label, auth mode,
+  v2 timeout, and pending-limit inputs up front so the bundle skeleton is
+  created with the deployment shape already identified; the generated
+  `README.md` and worksheet now record the topology id, tenant/project scope,
+  and runtime shape
+  explicitly too
 - `scripts/test-create-gateway-promotion-bundle.sh` and
   `just gateway-promotion-bundle-test` now smoke-test the bundle template and
-  its worker/build/account topology rows, so the promotion entrypoint stays
-  aligned with the documented evidence layout after future edits
+  its worker/build/account topology rows, README capture metadata, worksheet
+  scope fields, required account-aware runtime-shape inputs, and decision
+  bundle headings, so the promotion entrypoint stays aligned with the
+  documented evidence layout after future edits; the
+  `just gateway-promotion-bundle-create` wrapper is now smoke-tested on the
+  same generated skeleton too
 - `scripts/check-gateway-promotion-bundle.sh` and
   `just gateway-promotion-bundle-check` now validate a populated promotion
-  bundle's required files, directories, and template headings before review,
-  and the paired `scripts/test-check-gateway-promotion-bundle.sh` smoke test
-  keeps that checker aligned with the documented evidence layout
+  bundle's required files, directories, template headings, populated rows,
+  matching capture scenarios, populated decision metadata, populated capture
+  metadata, populated reconciliation summary content, referenced capture
+  paths, and required artifact labels before review, with referenced paths
+  constrained to the bundle root after canonicalization and README/worksheet
+  artifact references required to match per scenario
+- the bundle checker now also enforces the cross-file consistency that the
+  rollout gate needs before review: README, worksheet, and decision topology
+  id and tenant/project scope; gateway and worker builds; README and worksheet
+  worker URLs, account labels, auth mode, timeouts, and pending-request limits;
+  worksheet and decision promotion scope, excluded method families, method
+  coverage, reconciliation summaries, and decision taxonomy value
+- the bundle checker now also verifies that the README top-level
+  `Worker builds` metadata is populated and matches the README topology rows,
+  so a bundle cannot pass review with contradictory worker-build identity in
+  its own evidence index
+- the checker now requires README topology rows, northbound runtime
+  auth/timeout fields, `Worksheet row` references, capture windows, worksheet
+  Scope/Reconciliation/Decision fields, decision invalidation rules, and every
+  blocking-mismatches table row to contain real non-placeholder content; it
+  also requires UTC ISO capture timestamps in chronological order, unique
+  scenarios, unique topology worker ids and WebSocket URLs, `decision.md` as
+  the decision-file reference, `none` for excluded method families on a
+  release-quality multi-worker decision, and non-placeholder topology table
+  values for worker ids, build ids, WebSocket URLs, account ids, auth modes,
+  and notes
+- the per-scenario transcript, health, events, metrics, and logs artifacts must
+  agree on gateway build, worker build, tenant id, project id, worker id,
+  account id, and capture time; the scenario metadata must also match the
+  bundle's declared gateway build, tenant/project scope, worker build list,
+  and account-label topology, with worker build and account id coming from the
+  same README topology row, and each artifact capture time must fall within
+  the README capture window
+- promotion evidence for an unlabeled worker can now use `account id: none` or
+  `account id: <none>` in every capture artifact; the checker normalizes those
+  values to the blank account label in the matching topology row, and the
+  smoke test covers both forms so incomplete account-label pools remain
+  reviewable without weakening worker/account pairing checks
+- the bundle checker now rejects `Release-quality multi-worker` decisions when
+  any README topology worker lacks an account label, keeping incomplete account
+  label pools scoped to Stage B even when their fallback behavior has explicit
+  evidence
+- the bundle checker now also requires `Follow-up required before wider
+  rollout: none` for `Release-quality multi-worker`, so a deployment with
+  remaining rollout work cannot be accidentally recorded as release-quality
+- the matching `just gateway-promotion-bundle-test`,
+  `just gateway-promotion-bundle-check-test`,
+  `just gateway-promotion-bundle-create`, and
+  `just gateway-promotion-bundle-check` entrypoints are now smoke-tested, and
+  the bundle scripts advertise the matching `just` wrappers in `--help` output
+  with successful help exits, so the standard workflow is discoverable without
+  opening the justfile
+- the paired checker smoke test now also pins the failure modes the bundle
+  validator is meant to reject, including invalid decision taxonomy values,
+  inverted capture windows, malformed or invalid capture times, including
+  impossible dates, duplicate scenarios, missing required scenario families,
+  missing, empty, placeholder, or out-of-scope capture metadata, placeholder
+  topology rows, mismatched worker/account topology pairs, path escapes, and
+  mismatched worksheet references, so the promotion bundle contract is now
+  guarded at both the template and validation layers and the generator/checker
+  smoke coverage stays aligned with the documented bundle contract
 - the promotion bundle worksheet template now also includes the Decision
   section that the operator guide requires, so generated bundles and the
   checker now agree on the full review-time skeleton

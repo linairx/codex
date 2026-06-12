@@ -117,8 +117,8 @@ At minimum, capture:
   project, worker, account, thread, and request ids
 - client transcripts for bootstrap, thread/turn, approval or user-input,
   reconnect, degraded-route, account-capacity, and cleanup scenarios
-- an explicit pass/fail decision that names the topology and method families
-  covered by the evidence
+- an explicit decision taxonomy value that names the topology and method
+  families covered by the evidence
 
 The promotion evidence worksheet in
 [gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md)
@@ -162,15 +162,88 @@ scripts/create-gateway-promotion-bundle.sh \
   --v2-max-pending-client-requests 64
 ```
 
+The bundle generator requires one `--tenant-id`, at least one `--project-id`,
+at least one `--account-id`, `--auth-mode`, every v2 timeout value, and both
+pending-request limits so the worksheet and decision file can be created with
+an explicit deployment shape from the start. The generated `README.md` also
+repeats that tenant/project scope and runtime shape so the top-level bundle
+metadata stays self-describing.
+
 Run `just gateway-promotion-bundle-test` after changing the template generator
 or its expected layout.
+
+Use `just gateway-promotion-bundle-create -- ...` to create a fresh promotion
+bundle skeleton without remembering the script path.
 
 Run `just gateway-promotion-bundle-check-test` after changing the checker, and
 use `just gateway-promotion-bundle-check <bundle-dir>` to validate a populated
 promotion bundle before it is reviewed. The checker verifies the required
-files, directories, template headings, and populated rows before a bundle is
-accepted for review, and each capture directory must contain at least one
-artifact file.
+files, directories, template headings, populated rows, matching capture
+scenarios, populated decision metadata, populated capture metadata, and
+referenced capture paths before a bundle is accepted for review. The checker
+also verifies that the decision reconciliation summary is populated, that
+each referenced artifact carries the required gateway, worker, tenant,
+project, account, and capture-time labels, and that the referenced paths stay
+under the bundle root after canonicalization. The README evidence index and
+worksheet captures must refer to the same artifact paths for each scenario.
+Each capture directory must contain at least one artifact file.
+
+The README, worksheet, and decision files must agree on topology id,
+tenant/project scope, gateway build, and worker builds, and the README
+top-level worker build list must match the README topology rows. The worksheet
+and decision files must also agree on promotion scope, excluded method
+families, method-family coverage, and reconciliation summaries. The README and
+worksheet deployment fields for worker URLs, account labels, auth mode,
+timeout values, and pending-request limits must also agree.
+
+The README `Worksheet row` column must contain a real row reference, not just
+free-form text. In practice that reference should name the matching worksheet
+row number, for example `worksheet row 1`, and the row number must line up
+with the scenario order in `worksheet.md`. The README capture start and
+capture end fields must use `YYYY-MM-DDTHH:MM:SSZ` timestamps, and the checker
+rejects both malformed strings and impossible dates. Capture end must not
+precede capture start.
+
+The transcript, health, events, metrics, and logs files for one scenario must
+also agree on the gateway build, worker build, tenant id, project id, worker
+id, account id, and capture time they record. The scenario metadata must match
+the bundle's declared gateway build, tenant/project scope, worker build list,
+and account-label topology. The worker build and account id must match the
+same README topology row rather than only appearing somewhere in the bundle,
+and each file's capture time must fall within the README capture window and
+obey the same ISO validation rule. The capture metadata labels must have real
+values; empty or placeholder metadata is rejected before review. For an
+unlabeled worker, write `account id: none` or `account id: <none>` in every
+capture artifact; the checker treats those as the blank account label in the
+matching topology row.
+
+The README `Decision file` field must point to `decision.md` exactly. The
+README and worksheet scenario names must be unique within each file, and they
+must retain every required promotion scenario family from the route-class plan
+below. Deleting a scenario from both files is still rejected because the
+rollout gate needs an explicit pass or scoped exclusion for each family.
+
+The worksheet `Scope`, `Reconciliation`, and `Decision` fields must be
+populated. The checker rejects empty or placeholder gateway build, worker
+build, worker URL, account label, auth mode, timeout, pending-limit,
+tenant/project, method-matrix, route-selection, account-capacity, bounded
+handoff, live active-context, backlog/cleanup, decision, promotion scope,
+exclusion, and follow-up entries. The worksheet decision value must use the
+same taxonomy as `decision.md`.
+
+Every blocking-mismatches row must populate every column; later rows are
+validated the same way as the first row. The README topology worker ids and
+WebSocket URLs must be unique, and worker ids must use alnum, dot, underscore,
+or hyphen characters only. The checker also rejects obvious template
+placeholders such as `TBD`, `TODO`, `FIXME`, and `placeholder` in populated
+fields, topology table cells, and evidence tables. The paired smoke tests pin
+the template fields, the discoverable `--help` / `just` wrapper output, and
+the checker failure modes for invalid decision values, inverted capture
+windows, malformed or invalid capture times, duplicate scenarios, missing,
+empty, placeholder, or out-of-scope capture metadata, placeholder topology
+rows, mismatched worker/account topology pairs, path escapes, and mismatched
+worksheet references, so edits to the bundle workflow stay aligned with the
+documented contract.
 
 Use stable names that preserve the scenario order, for example
 `01-baseline.json`, `02-steady-state-project-a.json`,
@@ -188,6 +261,7 @@ Worksheet template:
 ## Scope
 
 - Gateway build:
+- Topology id:
 - Worker builds:
 - Worker URLs:
 - Account labels:
@@ -222,7 +296,7 @@ Worksheet template:
 
 ## Decision
 
-- Pass/fail:
+- Decision:
 - Promotion scope:
 - Excluded method families or route classes:
 - Follow-up required before wider rollout:
@@ -234,7 +308,9 @@ Evidence bundle `README.md` template:
 # Gateway Promotion Evidence Bundle
 
 - Gateway build:
+- Topology id:
 - Worker builds:
+- Tenant/project scope:
 - Captured by:
 - Capture start:
 - Capture end:
@@ -481,6 +557,16 @@ Use this decision taxonomy in `decision.md`:
 | Release-quality multi-worker | Every required scenario passes for the exact topology, account labels, auth mode, timeout values, pending-request limits, and method families being promoted | Name the exact topology and method families; state that evidence matched across health, events, metrics, audit logs, structured logs, and client transcripts |
 | Scoped Stage B | Some route classes pass but others are untested, intentionally excluded, or validated only for a narrower client flow | Name the included route classes, excluded route classes, and the operator guardrail that prevents unsupported flows from being described as drop-in compatible |
 | Reject / no promotion | Evidence is missing, contradictory, or shows a policy violation such as live active-context work moving accounts without an explicit restore surface | Name the blocking mismatch, affected tenant/project/worker/account identifiers, and the exact scenario that must be rerun after a fix |
+
+The `Decision:` field must use one of the three taxonomy values above exactly.
+For `Release-quality multi-worker`, the excluded method-family fields in
+`worksheet.md` and `decision.md` must be `none`; any excluded route class keeps
+the decision scoped to Stage B. The README topology must also account-label
+every worker for a `Release-quality multi-worker` decision; an unlabeled worker
+keeps the bundle in `Scoped Stage B` even when the incomplete-pool behavior was
+intentionally validated. The worksheet `Follow-up required before wider
+rollout:` field must be `none` for a `Release-quality multi-worker` decision;
+any required follow-up keeps the promotion scoped or rejected.
 
 Promotion is invalidated by any later change to worker count, worker URLs,
 account labels, auth mode, timeout values, pending-request limits, enabled v2
