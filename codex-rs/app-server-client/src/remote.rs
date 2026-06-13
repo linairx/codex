@@ -56,6 +56,7 @@ use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderName;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -90,6 +91,22 @@ pub struct RemoteAppServerConnectArgs {
     pub channel_capacity: usize,
 }
 impl RemoteAppServerConnectArgs {
+    pub fn websocket_url(&self) -> &str {
+        match &self.endpoint {
+            RemoteAppServerEndpoint::WebSocket { websocket_url, .. } => websocket_url,
+            RemoteAppServerEndpoint::UnixSocket { .. } => {
+                panic!("websocket_url is only available for websocket endpoints")
+            }
+        }
+    }
+
+    pub fn auth_token(&self) -> Option<&str> {
+        match &self.endpoint {
+            RemoteAppServerEndpoint::WebSocket { auth_token, .. } => auth_token.as_deref(),
+            RemoteAppServerEndpoint::UnixSocket { .. } => None,
+        }
+    }
+
     fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
             experimental_api: self.experimental_api,
@@ -162,6 +179,13 @@ pub struct RemoteAppServerRequestHandle {
 
 impl RemoteAppServerClient {
     pub async fn connect(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
+        Self::connect_with_headers(args, Vec::new()).await
+    }
+
+    pub async fn connect_with_headers(
+        args: RemoteAppServerConnectArgs,
+        headers: Vec<(String, String)>,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let initialize_params = args.initialize_params();
         match args.endpoint {
@@ -170,7 +194,7 @@ impl RemoteAppServerClient {
                 auth_token,
             } => {
                 let (endpoint, stream) =
-                    connect_websocket_endpoint(websocket_url, auth_token).await?;
+                    connect_websocket_endpoint(websocket_url, auth_token, headers).await?;
                 Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
                     .await
             }
@@ -671,11 +695,88 @@ impl RemoteAppServerRequestHandle {
         serde_json::from_value(result)
             .map_err(|source| TypedRequestError::Deserialize { method, source })
     }
+
+    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RemoteClientCommand::Notify {
+                notification,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "remote app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server notify channel is closed",
+            )
+        })?
+    }
+
+    pub async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RemoteClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "remote app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    pub async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RemoteClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "remote app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server reject channel is closed",
+            )
+        })?
+    }
 }
 
 async fn connect_websocket_endpoint(
     websocket_url: String,
     auth_token: Option<String>,
+    headers: Vec<(String, String)>,
 ) -> IoResult<(String, WebSocketStream<MaybeTlsStream<TcpStream>>)> {
     let url = Url::parse(&websocket_url).map_err(|err| {
         IoError::new(
@@ -707,6 +808,21 @@ async fn connect_websocket_endpoint(
                 )
             })?;
         request.headers_mut().insert(AUTHORIZATION, header_value);
+    }
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid websocket header name `{name}`: {err}"),
+            )
+        })?;
+        let header_value = HeaderValue::from_str(&value).map_err(|err| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid websocket header value for `{name}`: {err}"),
+            )
+        })?;
+        request.headers_mut().insert(header_name, header_value);
     }
 
     ensure_rustls_crypto_provider();

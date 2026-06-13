@@ -13,13 +13,14 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-async-trait = { workspace = true }
-axum = { workspace = true, features = ["http1", "json", "tokio", "ws"] }
+async-trait = "0.1.89"
+axum = { workspace = true, features = ["http1", "json", "matched-path", "query", "tokio", "ws"] }
 clap = { workspace = true, features = ["derive"] }
 codex-arg0 = { workspace = true }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-core = { workspace = true }
+codex-config = { workspace = true }
 codex-feedback = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }

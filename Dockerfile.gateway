@@ -1,38 +1,45 @@
-FROM rust:1.93.0-alpine AS builder
+FROM codex-alpine:3.24 AS builder
 
 WORKDIR /workspace
 
-RUN sed -i 's/https:/http:/' /etc/apk/repositories \
-    && apk add --no-cache \
+RUN apk add --no-cache \
         build-base \
         ca-certificates \
+        cargo \
         git \
         curl \
         libcap-dev \
         libcap-static \
         openssl-dev \
         perl \
-        pkgconf
+        pkgconf \
+        rust
 
 COPY codex-rs ./codex-rs
-COPY third_party/v8/rusty_v8_146_4_0.sha256 ./third_party/v8/rusty_v8_146_4_0.sha256
+COPY third_party/v8/rusty_v8_149_2_0.sha256 ./third_party/v8/rusty_v8_149_2_0.sha256
 
 WORKDIR /workspace/codex-rs
 
 RUN mkdir -p /tmp/rusty_v8 \
-    && curl -fsSL https://github.com/openai/codex/releases/download/rusty-v8-v146.4.0/librusty_v8_release_x86_64-unknown-linux-musl.a.gz -o /tmp/rusty_v8/librusty_v8_release_x86_64-unknown-linux-musl.a.gz \
-    && curl -fsSL https://github.com/openai/codex/releases/download/rusty-v8-v146.4.0/src_binding_release_x86_64-unknown-linux-musl.rs -o /tmp/rusty_v8/src_binding_release_x86_64-unknown-linux-musl.rs
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        https://github.com/openai/codex/releases/download/rusty-v8-v149.2.0/librusty_v8_release_x86_64-unknown-linux-musl.a.gz \
+        -o /tmp/rusty_v8/librusty_v8_release_x86_64-unknown-linux-musl.a.gz \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        https://github.com/openai/codex/releases/download/rusty-v8-v149.2.0/src_binding_release_x86_64-unknown-linux-musl.rs \
+        -o /tmp/rusty_v8/src_binding_release_x86_64-unknown-linux-musl.rs
 
 ENV RUSTY_V8_ARCHIVE=/tmp/rusty_v8/librusty_v8_release_x86_64-unknown-linux-musl.a.gz
 ENV RUSTY_V8_SRC_BINDING_PATH=/tmp/rusty_v8/src_binding_release_x86_64-unknown-linux-musl.rs
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_BUILD_JOBS=2
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ENV CARGO_PROFILE_RELEASE_LTO=false
 
 RUN cargo build --locked -p codex-gateway --release
 
-FROM alpine:3.24 AS runtime
+FROM codex-alpine:3.24 AS runtime
 
-RUN sed -i 's/https:/http:/' /etc/apk/repositories \
-    && apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates libgcc
 
 RUN adduser -D -u 10001 codex
 
@@ -41,6 +48,8 @@ WORKDIR /app
 COPY --from=builder /workspace/codex-rs/target/release/codex-gateway /usr/local/bin/codex-gateway
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 --start-period=15s CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1
 
 USER codex
 

@@ -735,6 +735,7 @@ pub enum GatewayServerRequest {
         thread_id: String,
         turn_id: String,
         item_id: String,
+        started_at_ms: i64,
         approval_id: Option<String>,
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
@@ -751,6 +752,7 @@ pub enum GatewayServerRequest {
         thread_id: String,
         turn_id: String,
         item_id: String,
+        started_at_ms: i64,
         reason: Option<String>,
         grant_root: Option<PathBuf>,
     },
@@ -759,6 +761,9 @@ pub enum GatewayServerRequest {
         thread_id: String,
         turn_id: String,
         item_id: String,
+        environment_id: Option<String>,
+        started_at_ms: i64,
+        cwd: PathBuf,
         reason: Option<String>,
         permissions: RequestPermissionProfile,
     },
@@ -768,6 +773,7 @@ pub enum GatewayServerRequest {
         turn_id: String,
         item_id: String,
         questions: Vec<ToolRequestUserInputQuestion>,
+        auto_resolution_ms: Option<u64>,
     },
 }
 
@@ -803,6 +809,7 @@ impl TryFrom<ServerRequest> for GatewayServerRequest {
                     thread_id,
                     turn_id,
                     item_id,
+                    started_at_ms,
                     approval_id,
                     reason,
                     network_approval_context,
@@ -813,11 +820,13 @@ impl TryFrom<ServerRequest> for GatewayServerRequest {
                     proposed_execpolicy_amendment,
                     proposed_network_policy_amendments,
                     available_decisions,
+                    ..
                 } = params;
                 Ok(Self::CommandExecutionApproval {
                     thread_id,
                     turn_id,
                     item_id,
+                    started_at_ms,
                     approval_id,
                     reason,
                     network_approval_context,
@@ -835,13 +844,16 @@ impl TryFrom<ServerRequest> for GatewayServerRequest {
                     thread_id,
                     turn_id,
                     item_id,
+                    started_at_ms,
                     reason,
                     grant_root,
+                    ..
                 } = params;
                 Ok(Self::FileChangeApproval {
                     thread_id,
                     turn_id,
                     item_id,
+                    started_at_ms,
                     reason,
                     grant_root,
                 })
@@ -851,13 +863,20 @@ impl TryFrom<ServerRequest> for GatewayServerRequest {
                     thread_id,
                     turn_id,
                     item_id,
+                    environment_id,
+                    started_at_ms,
+                    cwd,
                     reason,
                     permissions,
+                    ..
                 } = params;
                 Ok(Self::PermissionsApproval {
                     thread_id,
                     turn_id,
                     item_id,
+                    environment_id,
+                    started_at_ms,
+                    cwd: cwd.to_path_buf(),
                     reason,
                     permissions,
                 })
@@ -868,12 +887,15 @@ impl TryFrom<ServerRequest> for GatewayServerRequest {
                     turn_id,
                     item_id,
                     questions,
+                    auto_resolution_ms,
+                    ..
                 } = params;
                 Ok(Self::ToolRequestUserInput {
                     thread_id,
                     turn_id,
                     item_id,
                     questions,
+                    auto_resolution_ms,
                 })
             }
             other => Err(other),
@@ -951,7 +973,11 @@ impl GatewayServerRequestResponse {
                 serde_json::to_value(FileChangeRequestApprovalResponse { decision })
             }
             Self::PermissionsApproval { permissions, scope } => {
-                serde_json::to_value(PermissionsRequestApprovalResponse { permissions, scope })
+                serde_json::to_value(PermissionsRequestApprovalResponse {
+                    permissions,
+                    scope,
+                    strict_auto_review: None,
+                })
             }
             Self::ToolRequestUserInput { answers } => {
                 serde_json::to_value(ToolRequestUserInputResponse { answers })

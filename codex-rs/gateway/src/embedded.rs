@@ -29,12 +29,13 @@ use codex_app_server_client::EnvironmentManager;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::RemoteAppServerConnectArgs;
+use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ServerNotification;
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::CloudConfigBundleLoader;
 use codex_core::config::Config;
-use codex_core::config_loader::CloudRequirementsLoader;
-use codex_core::config_loader::LoaderOverrides;
+use codex_core::config::LoaderOverrides;
 use codex_feedback::CodexFeedback;
 use codex_otel::OtelProvider;
 use std::io;
@@ -116,7 +117,7 @@ pub async fn start_gateway_server(
 
     match &gateway_config.runtime_mode {
         GatewayRuntimeMode::Embedded => {
-            let environment_manager = gateway_environment_manager(&gateway_config);
+            let environment_manager = gateway_environment_manager(&gateway_config).await;
             validate_gateway_environment_manager(&environment_manager).await?;
             tracing::info!(
                 runtime_mode = "embedded",
@@ -153,9 +154,11 @@ pub async fn start_gateway_server(
                 config: Arc::new(config.clone()),
                 cli_overrides: cli_overrides.clone(),
                 loader_overrides: loader_overrides.clone(),
-                cloud_requirements: CloudRequirementsLoader::default(),
+                strict_config: false,
+                cloud_config_bundle: CloudConfigBundleLoader::default(),
                 feedback: CodexFeedback::new(),
                 log_db: None,
+                state_db: None,
                 environment_manager: environment_manager.clone(),
                 config_warnings: config_warnings.clone(),
                 session_source: gateway_config.session_source.clone(),
@@ -256,8 +259,10 @@ fn remote_connect_args(
     gateway_config: &GatewayConfig,
 ) -> RemoteAppServerConnectArgs {
     RemoteAppServerConnectArgs {
-        websocket_url: remote_runtime.websocket_url.clone(),
-        auth_token: remote_runtime.auth_token.clone(),
+        endpoint: RemoteAppServerEndpoint::WebSocket {
+            websocket_url: remote_runtime.websocket_url.clone(),
+            auth_token: remote_runtime.auth_token.clone(),
+        },
         client_name: gateway_config.client_name.clone(),
         client_version: gateway_config.client_version.clone(),
         experimental_api: gateway_config.experimental_api,
@@ -460,28 +465,28 @@ fn validate_gateway_config(gateway_config: &GatewayConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn gateway_environment_manager(gateway_config: &GatewayConfig) -> Arc<EnvironmentManager> {
-    Arc::new(EnvironmentManager::new(
-        gateway_config.exec_server_url.clone(),
-    ))
+async fn gateway_environment_manager(gateway_config: &GatewayConfig) -> Arc<EnvironmentManager> {
+    Arc::new(
+        EnvironmentManager::create_for_tests(gateway_config.exec_server_url.clone(), None).await,
+    )
 }
 
 async fn validate_gateway_environment_manager(
     environment_manager: &Arc<EnvironmentManager>,
 ) -> io::Result<()> {
-    if !environment_manager.is_remote() {
+    let Some(environment) = environment_manager.default_environment() else {
+        return Ok(());
+    };
+
+    if environment.exec_server_url().is_none() {
         return Ok(());
     }
 
-    environment_manager
-        .current()
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            io::Error::other(format!(
-                "failed to initialize remote exec-server environment: {err}"
-            ))
-        })
+    environment.info().await.map(|_| ()).map_err(|err| {
+        io::Error::other(format!(
+            "failed to initialize remote exec-server environment: {err}"
+        ))
+    })
 }
 
 fn gateway_execution_mode(gateway_config: &GatewayConfig) -> GatewayExecutionMode {
@@ -1251,7 +1256,7 @@ mod tests {
     use codex_arg0::Arg0DispatchPaths;
     use codex_config::types::AuthCredentialsStoreMode;
     use codex_core::config::Config;
-    use codex_core::config_loader::LoaderOverrides;
+    use codex_core::config::LoaderOverrides;
     use codex_protocol::ThreadId;
     use codex_protocol::account::PlanType as AccountPlanType;
     use codex_protocol::config_types::CollaborationMode;
@@ -1334,8 +1339,11 @@ mod tests {
         let remote_runtime = GatewayRemoteRuntimeConfig {
             selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
             workers: vec![GatewayRemoteWorkerConfig {
-                websocket_url: "ws://worker-a.invalid".to_string(),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: "ws://worker-a.invalid".to_string(),
+
+                    auth_token: None,
+                },
                 account_id: None,
             }],
         };
@@ -1353,11 +1361,13 @@ mod tests {
             workers: vec![
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-a.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-a".to_string()),
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-b.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-b".to_string()),
                 },
@@ -1377,16 +1387,19 @@ mod tests {
             workers: vec![
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-a.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-a".to_string()),
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-b.invalid".to_string(),
+
                     auth_token: None,
                     account_id: None,
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-c.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("   ".to_string()),
                 },
@@ -1415,11 +1428,13 @@ mod tests {
             workers: vec![
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-a.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-a".to_string()),
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-b.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("   ".to_string()),
                 },
@@ -1446,11 +1461,13 @@ mod tests {
             workers: vec![
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-a.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-a".to_string()),
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-b.invalid".to_string(),
+
                     auth_token: None,
                     account_id: None,
                 },
@@ -1476,11 +1493,13 @@ mod tests {
             workers: vec![
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-a.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-a".to_string()),
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-b.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-b".to_string()),
                 },
@@ -1526,16 +1545,19 @@ mod tests {
             workers: vec![
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-a.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-a".to_string()),
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-b.invalid".to_string(),
+
                     auth_token: None,
                     account_id: None,
                 },
                 GatewayRemoteWorkerConfig {
                     websocket_url: "ws://worker-c.invalid".to_string(),
+
                     auth_token: None,
                     account_id: Some("acct-c".to_string()),
                 },
@@ -1606,8 +1628,11 @@ mod tests {
         let remote_runtime = GatewayRemoteRuntimeConfig {
             selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
             workers: vec![GatewayRemoteWorkerConfig {
-                websocket_url: "ws://worker-b.invalid".to_string(),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: "ws://worker-b.invalid".to_string(),
+
+                    auth_token: None,
+                },
                 account_id: None,
             }],
         };
@@ -1826,14 +1851,14 @@ mod tests {
         })
     }
 
-    #[test]
-    fn embedded_gateway_environment_manager_preserves_remote_exec_server_url() {
+    #[tokio::test]
+    async fn embedded_gateway_environment_manager_preserves_remote_exec_server_url() {
         let environment_manager = gateway_environment_manager(&GatewayConfig {
             exec_server_url: Some("ws://127.0.0.1:9753".to_string()),
             ..GatewayConfig::default()
-        });
+        })
+        .await;
 
-        assert_eq!(environment_manager.is_remote(), true);
         assert_eq!(
             environment_manager.exec_server_url(),
             Some("ws://127.0.0.1:9753")
@@ -1905,8 +1930,11 @@ mod tests {
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: "ws://127.0.0.1:8081".to_string(),
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: "ws://127.0.0.1:8081".to_string(),
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -1944,8 +1972,11 @@ mod tests {
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: "   ".to_string(),
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: "   ".to_string(),
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -2342,8 +2373,10 @@ mod tests {
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -2410,6 +2443,7 @@ mod tests {
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(4),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -2558,8 +2592,10 @@ mod tests {
 
                     let mut owner_client =
                         RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                            websocket_url: format!("ws://{}/", server.local_addr()),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: format!("ws://{}/", server.local_addr()),
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway-test".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: true,
@@ -2602,6 +2638,7 @@ mod tests {
                                 personality: None,
                                 output_schema: None,
                                 collaboration_mode: None,
+                                ..TurnStartParams::default()
                             },
                         })
                         .await
@@ -2635,8 +2672,10 @@ mod tests {
 
                     let reentry_client =
                         RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                            websocket_url: format!("ws://{}/", server.local_addr()),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: format!("ws://{}/", server.local_addr()),
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway-test".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: true,
@@ -2816,8 +2855,10 @@ mod tests {
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -3637,8 +3678,10 @@ mod tests {
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -3737,8 +3780,10 @@ mod tests {
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -3859,8 +3904,10 @@ mod tests {
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -4005,8 +4052,10 @@ requires_openai_auth = true
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -4128,8 +4177,10 @@ requires_openai_auth = true
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -4380,8 +4431,10 @@ request_permissions_tool = true
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -4439,6 +4492,7 @@ request_permissions_tool = true
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -4478,6 +4532,8 @@ request_permissions_tool = true
             .resolve_server_request(
                 request_id,
                 serde_json::to_value(PermissionsRequestApprovalResponse {
+                    strict_auto_review: None,
+
                     permissions: codex_app_server_protocol::GrantedPermissionProfile {
                         network: None,
                         file_system: Some(
@@ -4601,8 +4657,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -4866,8 +4924,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -5086,8 +5146,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -5181,16 +5243,17 @@ stream_max_retries = 0
                         if notification.thread_id == started.thread.id
                             && notification.turn_id == turn_id
                             && matches!(
-                                &notification.item,
-                                ThreadItem::DynamicToolCall {
-                                    id: item_call_id,
-                                    tool: item_tool_name,
-                                    status,
-                                    ..
-                                } if item_call_id == call_id
-                                    && item_tool_name == tool_name
-                                    && *status == DynamicToolCallStatus::InProgress
-                            )
+                                        &notification.item,
+                                        ThreadItem::DynamicToolCall {
+                            namespace: None,
+                                            id: item_call_id,
+                                            tool: item_tool_name,
+                                            status,
+                                            ..
+                                        } if item_call_id == call_id
+                                            && item_tool_name == tool_name
+                                            && *status == DynamicToolCallStatus::InProgress
+                                    )
                         {
                             saw_item_started = true;
                         }
@@ -5201,16 +5264,17 @@ stream_max_retries = 0
                         if notification.thread_id == started.thread.id
                             && notification.turn_id == turn_id
                             && matches!(
-                                &notification.item,
-                                ThreadItem::DynamicToolCall {
-                                    id: item_call_id,
-                                    tool: item_tool_name,
-                                    status,
-                                    ..
-                                } if item_call_id == call_id
-                                    && item_tool_name == tool_name
-                                    && *status == DynamicToolCallStatus::Completed
-                            )
+                                        &notification.item,
+                                        ThreadItem::DynamicToolCall {
+                            namespace: None,
+                                            id: item_call_id,
+                                            tool: item_tool_name,
+                                            status,
+                                            ..
+                                        } if item_call_id == call_id
+                                            && item_tool_name == tool_name
+                                            && *status == DynamicToolCallStatus::Completed
+                                    )
                         {
                             saw_item_completed = true;
                         }
@@ -5302,8 +5366,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -5361,6 +5427,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -5574,8 +5641,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -5737,8 +5806,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -5753,8 +5825,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -5904,11 +5978,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -5925,8 +6001,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -6087,8 +6165,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -6440,8 +6520,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -6632,8 +6714,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -7007,8 +7091,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -7148,8 +7234,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -7357,8 +7445,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -7409,8 +7499,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -7459,8 +7552,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -7475,8 +7571,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -7542,6 +7640,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(4),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -7663,6 +7762,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -7997,8 +8097,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -8013,8 +8116,10 @@ stream_max_retries = 0
         .expect("server");
 
         let owner_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -8040,8 +8145,10 @@ stream_max_retries = 0
         assert_remote_client_shutdown(owner_client.shutdown().await);
 
         let reentry_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -8055,6 +8162,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(2),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -8100,8 +8208,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -8116,8 +8227,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -8364,8 +8477,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -8380,8 +8496,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -8439,6 +8557,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -8568,8 +8687,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -8584,8 +8706,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -8838,8 +8962,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -8854,8 +8981,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -9863,8 +9992,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -9879,8 +10011,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -9996,8 +10130,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10012,8 +10149,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10162,8 +10301,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10178,8 +10320,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10225,8 +10369,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10241,8 +10388,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10291,8 +10440,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10307,8 +10459,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10357,8 +10511,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10373,8 +10530,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10421,8 +10580,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10437,8 +10599,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10498,8 +10662,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10514,8 +10681,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10609,8 +10778,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -10625,8 +10797,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -10814,27 +10988,28 @@ stream_max_retries = 0
                         if notification.thread_id == "thread-remote-workflow"
                             && notification.turn_id == "turn-remote-workflow"
                             && matches!(
-                                notification.item,
-                                ThreadItem::DynamicToolCall {
-                                    id,
-                                    tool,
-                                    arguments,
-                                    status,
-                                    content_items,
-                                    success,
-                                    duration_ms,
-                                } if id == "tool-call-remote-workflow"
-                                    && tool == "image-edit"
-                                    && arguments
-                                        == serde_json::json!({
-                                            "prompt": "Sharpen this image",
-                                            "strength": 0.5,
-                                        })
-                                    && status == DynamicToolCallStatus::InProgress
-                                    && content_items.is_none()
-                                    && success.is_none()
-                                    && duration_ms.is_none()
-                            )
+                                        notification.item,
+                                        ThreadItem::DynamicToolCall {
+                            namespace: None,
+                                            id,
+                                            tool,
+                                            arguments,
+                                            status,
+                                            content_items,
+                                            success,
+                                            duration_ms,
+                                        } if id == "tool-call-remote-workflow"
+                                            && tool == "image-edit"
+                                            && arguments
+                                                == serde_json::json!({
+                                                    "prompt": "Sharpen this image",
+                                                    "strength": 0.5,
+                                                })
+                                            && status == DynamicToolCallStatus::InProgress
+                                            && content_items.is_none()
+                                            && success.is_none()
+                                            && duration_ms.is_none()
+                                    )
                         {
                             saw_dynamic_tool_item_started = true;
                         }
@@ -10857,32 +11032,33 @@ stream_max_retries = 0
                         if notification.thread_id == "thread-remote-workflow"
                             && notification.turn_id == "turn-remote-workflow"
                             && matches!(
-                                notification.item,
-                                ThreadItem::DynamicToolCall {
-                                    id,
-                                    tool,
-                                    arguments,
-                                    status,
-                                    content_items,
-                                    success,
-                                    duration_ms,
-                                } if id == "tool-call-remote-workflow"
-                                    && tool == "image-edit"
-                                    && arguments
-                                        == serde_json::json!({
-                                            "prompt": "Sharpen this image",
-                                            "strength": 0.5,
-                                        })
-                                    && status == DynamicToolCallStatus::Completed
-                                    && content_items
-                                        == Some(vec![
-                                            DynamicToolCallOutputContentItem::InputText {
-                                                text: "tool output".to_string(),
-                                            },
-                                        ])
-                                    && success == Some(true)
-                                    && duration_ms == Some(7)
-                            )
+                                        notification.item,
+                                        ThreadItem::DynamicToolCall {
+                            namespace: None,
+                                            id,
+                                            tool,
+                                            arguments,
+                                            status,
+                                            content_items,
+                                            success,
+                                            duration_ms,
+                                        } if id == "tool-call-remote-workflow"
+                                            && tool == "image-edit"
+                                            && arguments
+                                                == serde_json::json!({
+                                                    "prompt": "Sharpen this image",
+                                                    "strength": 0.5,
+                                                })
+                                            && status == DynamicToolCallStatus::Completed
+                                            && content_items
+                                                == Some(vec![
+                                                    DynamicToolCallOutputContentItem::InputText {
+                                                        text: "tool output".to_string(),
+                                                    },
+                                                ])
+                                            && success == Some(true)
+                                            && duration_ms == Some(7)
+                                    )
                         {
                             saw_dynamic_tool_item_completed = true;
                         }
@@ -10986,8 +11162,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: websocket_url.clone(),
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url.clone(),
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -11028,8 +11207,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut second_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -11151,6 +11332,7 @@ stream_max_retries = 0
                             && matches!(
                                 notification.item,
                                 ThreadItem::DynamicToolCall {
+                    namespace: None,
                                     id,
                                     tool,
                                     arguments,
@@ -11288,6 +11470,7 @@ stream_max_retries = 0
                             && matches!(
                                 notification.item,
                                 ThreadItem::DynamicToolCall {
+                    namespace: None,
                                     id,
                                     tool,
                                     arguments,
@@ -11463,8 +11646,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -11504,8 +11690,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before thread-control recovery test starts");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -11792,8 +11980,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -11834,8 +12025,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -12079,8 +12272,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -12121,8 +12317,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -12271,8 +12469,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -12313,8 +12514,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -12383,11 +12586,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -12430,8 +12635,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -12519,6 +12726,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -12705,6 +12913,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(4),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -12758,8 +12967,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -12800,8 +13012,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -13854,11 +14068,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -13901,8 +14117,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -14299,11 +14517,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -14346,8 +14566,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -14517,11 +14739,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -14564,8 +14788,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before v2 client connects");
 
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -14637,8 +14863,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -14653,8 +14882,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -14886,11 +15117,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -14985,11 +15218,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-b".to_string()),
                         },
@@ -15066,11 +15301,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-b".to_string()),
                         },
@@ -15308,11 +15545,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-b".to_string()),
                         },
@@ -15523,11 +15762,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b.clone(),
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
@@ -15748,11 +15989,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-b".to_string()),
                         },
@@ -15931,16 +16174,19 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_c,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -16087,16 +16333,19 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_c,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -16247,16 +16496,19 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_c,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: Some("acct-c".to_string()),
                         },
@@ -16430,8 +16682,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker_a,
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -16510,11 +16765,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a.clone(),
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b.clone(),
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
@@ -16627,11 +16884,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
@@ -16693,11 +16952,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
@@ -16745,11 +17006,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -16766,8 +17029,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -16837,6 +17102,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -17051,11 +17317,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -17072,8 +17340,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -17330,11 +17600,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -17352,8 +17624,10 @@ stream_max_retries = 0
 
         let owner_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -17398,8 +17672,10 @@ stream_max_retries = 0
 
         let same_scope_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -17418,6 +17694,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -17468,8 +17745,10 @@ stream_max_retries = 0
 
         let other_project_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -17518,6 +17797,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(7),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -17583,8 +17863,10 @@ stream_max_retries = 0
 
         let other_tenant_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -17603,6 +17885,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(10),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -17681,11 +17964,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -17703,8 +17988,10 @@ stream_max_retries = 0
 
         let owner_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -17751,8 +18038,10 @@ stream_max_retries = 0
 
         let hidden_scope_client = RemoteAppServerClient::connect_with_headers(
             RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -17779,6 +18068,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(2),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -17829,11 +18119,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -17850,8 +18142,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -17923,6 +18217,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -17973,11 +18268,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -18020,8 +18317,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session recovery test starts");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -19061,6 +19360,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(32),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -19137,11 +19437,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -19184,8 +19486,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session server-request test starts");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -19426,30 +19730,32 @@ stream_max_retries = 0
                         notification,
                     )) => {
                         if matches!(
-                            &notification.item,
-                            ThreadItem::DynamicToolCall {
-                                id,
-                                tool,
-                                arguments,
-                                status,
-                                content_items,
-                                success,
-                                duration_ms,
-                            } if id == "tool-call-remote-workflow"
-                                && tool == "image-edit"
-                                && arguments
-                                    == &serde_json::json!({
-                                        "prompt": format!(
-                                            "Sharpen image for {}",
-                                            notification.thread_id
-                                        ),
-                                        "strength": 0.5,
-                                    })
-                                && *status == DynamicToolCallStatus::InProgress
-                                && content_items.is_none()
-                                && success.is_none()
-                                && duration_ms.is_none()
-                        ) {
+                                &notification.item,
+                                ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                    id,
+                                    tool,
+                                    arguments,
+                                    status,
+                                    content_items,
+                                    success,
+                                    duration_ms,
+                                } if id == "tool-call-remote-workflow"
+                                    && tool == "image-edit"
+                                    && arguments
+                                        == &serde_json::json!({
+                                            "prompt": format!(
+                                                "Sharpen image for {}",
+                                                notification.thread_id
+                                            ),
+                                            "strength": 0.5,
+                                        })
+                                    && *status == DynamicToolCallStatus::InProgress
+                                    && content_items.is_none()
+                                    && success.is_none()
+                                    && duration_ms.is_none()
+                            )
+                        {
                             dynamic_tool_started_threads.insert(notification.thread_id);
                         }
                     }
@@ -19472,6 +19778,8 @@ stream_max_retries = 0
                             .resolve_server_request(
                                 request_id,
                                 serde_json::to_value(PermissionsRequestApprovalResponse {
+                                    strict_auto_review: None,
+
                                     permissions:
                                         codex_app_server_protocol::GrantedPermissionProfile {
                                             network: params.permissions.network,
@@ -19561,38 +19869,40 @@ stream_max_retries = 0
                         notification,
                     )) => {
                         if matches!(
-                            &notification.item,
-                            ThreadItem::DynamicToolCall {
-                                id,
-                                tool,
-                                arguments,
-                                status,
-                                content_items,
-                                success,
-                                duration_ms,
-                            } if id == "tool-call-remote-workflow"
-                                && tool == "image-edit"
-                                && arguments
-                                    == &serde_json::json!({
-                                        "prompt": format!(
-                                            "Sharpen image for {}",
-                                            notification.thread_id
-                                        ),
-                                        "strength": 0.5,
-                                    })
-                                && *status == DynamicToolCallStatus::Completed
-                                && *content_items
-                                    == Some(vec![
-                                        DynamicToolCallOutputContentItem::InputText {
-                                            text: format!(
-                                                "tool output for {}",
+                                &notification.item,
+                                ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                    id,
+                                    tool,
+                                    arguments,
+                                    status,
+                                    content_items,
+                                    success,
+                                    duration_ms,
+                                } if id == "tool-call-remote-workflow"
+                                    && tool == "image-edit"
+                                    && arguments
+                                        == &serde_json::json!({
+                                            "prompt": format!(
+                                                "Sharpen image for {}",
                                                 notification.thread_id
                                             ),
-                                        },
-                                    ])
-                                && *success == Some(true)
-                                && *duration_ms == Some(7)
-                        ) {
+                                            "strength": 0.5,
+                                        })
+                                    && *status == DynamicToolCallStatus::Completed
+                                    && *content_items
+                                        == Some(vec![
+                                            DynamicToolCallOutputContentItem::InputText {
+                                                text: format!(
+                                                    "tool output for {}",
+                                                    notification.thread_id
+                                                ),
+                                            },
+                                        ])
+                                    && *success == Some(true)
+                                    && *duration_ms == Some(7)
+                            )
+                        {
                             dynamic_tool_completed_threads.insert(notification.thread_id);
                         }
                     }
@@ -19641,11 +19951,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -19688,8 +20000,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session setup mutation test starts");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -19987,11 +20301,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -20034,8 +20350,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session import-completed test starts");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -20107,11 +20425,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -20154,8 +20474,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session plugin test starts");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -20338,11 +20660,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -20385,8 +20709,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session setup-flow test starts");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -20976,11 +21302,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -21023,8 +21351,10 @@ stream_max_retries = 0
         .expect("worker should reconnect before same-session bootstrap refresh test starts");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -21640,11 +21970,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -21661,8 +21993,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -21797,11 +22131,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -21818,8 +22154,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -21970,11 +22308,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -22025,8 +22365,10 @@ stream_max_retries = 0
         sleep(Duration::from_millis(100)).await;
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -22142,11 +22484,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -22197,8 +22541,10 @@ stream_max_retries = 0
         sleep(Duration::from_millis(100)).await;
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -22329,11 +22675,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -22350,8 +22698,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -22598,11 +22948,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -22619,8 +22971,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -22690,11 +23044,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -22711,8 +23067,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -22908,11 +23266,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -22929,8 +23289,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -23290,11 +23652,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -23311,8 +23675,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -23425,11 +23791,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -23446,8 +23814,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -23604,11 +23974,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -23625,8 +23997,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -23790,11 +24164,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -23811,8 +24187,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -24001,11 +24379,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -24022,8 +24402,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -24206,11 +24588,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -24227,8 +24611,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -24425,11 +24811,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -24446,8 +24834,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -24649,11 +25039,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -24670,8 +25062,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -24884,11 +25278,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -24905,8 +25301,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -25110,11 +25508,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -25131,8 +25531,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -25336,11 +25738,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -25357,8 +25761,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -25561,11 +25967,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -25582,8 +25990,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -25785,11 +26195,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -25806,8 +26218,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -26006,11 +26420,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -26027,8 +26443,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -26227,13 +26645,21 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_a,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_b,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -26249,8 +26675,10 @@ stream_max_retries = 0
             .expect("server");
 
             let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -26560,13 +26988,21 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_a,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_b,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -26582,8 +27018,10 @@ stream_max_retries = 0
             .expect("server");
 
             let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -26889,11 +27327,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -26910,8 +27350,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -27100,13 +27542,21 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_a,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_b,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -27122,8 +27572,10 @@ stream_max_retries = 0
             .expect("server");
 
             let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -27352,13 +27804,21 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_a,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_b,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -27374,8 +27834,10 @@ stream_max_retries = 0
             .expect("server");
 
             let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -27638,13 +28100,21 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_a,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_b,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -27660,8 +28130,10 @@ stream_max_retries = 0
             .expect("server");
 
             let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -27877,11 +28349,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -27898,8 +28372,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -28117,11 +28593,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -28138,8 +28616,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -28362,11 +28842,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -28383,8 +28865,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -28530,6 +29014,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             }),
         )
@@ -28923,13 +29408,21 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_a,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                websocket_url: worker_b,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+                                    },
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -28945,8 +29438,10 @@ stream_max_retries = 0
             .expect("server");
 
             let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-                websocket_url: format!("ws://{}/", server.local_addr()),
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: format!("ws://{}/", server.local_addr()),
+                    auth_token: None,
+                },
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
@@ -29038,6 +29533,7 @@ stream_max_retries = 0
                         personality: None,
                         output_schema: None,
                         collaboration_mode: None,
+                        ..TurnStartParams::default()
                     },
                 }),
             )
@@ -29194,11 +29690,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -29215,8 +29713,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -30126,11 +30626,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -30147,8 +30649,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -30563,11 +31067,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -30584,8 +31090,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -30680,11 +31188,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -30701,8 +31211,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -30826,11 +31338,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -30847,8 +31361,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -31108,11 +31624,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -31129,8 +31647,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -31267,11 +31787,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -31288,8 +31810,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -31399,11 +31923,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -31420,8 +31946,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -31698,11 +32226,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -31719,8 +32249,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -31885,11 +32417,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -31906,8 +32440,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -32004,11 +32540,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -32025,8 +32563,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -32137,11 +32677,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -32158,8 +32700,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -32241,11 +32785,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -32262,8 +32808,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -32451,11 +32999,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -32472,8 +33022,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -32633,11 +33185,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -32654,8 +33208,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -32740,6 +33296,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -32768,6 +33325,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -33224,11 +33782,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -33245,8 +33805,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -33330,6 +33892,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -33357,6 +33920,7 @@ stream_max_retries = 0
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             })
             .await
@@ -33578,11 +34142,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -33599,8 +34165,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -34156,11 +34724,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -34177,8 +34747,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -34245,11 +34817,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -34266,8 +34840,10 @@ stream_max_retries = 0
         .expect("server");
 
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -34656,11 +35232,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -34677,8 +35255,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -34879,6 +35459,8 @@ stream_max_retries = 0
                             .resolve_server_request(
                                 request_id,
                                 serde_json::to_value(PermissionsRequestApprovalResponse {
+                                    strict_auto_review: None,
+
                                     permissions:
                                         codex_app_server_protocol::GrantedPermissionProfile {
                                             network: params.permissions.network,
@@ -34967,34 +35549,36 @@ stream_max_retries = 0
                     )) => {
                         assert_eq!(notification.turn_id, "turn-remote-workflow");
                         assert!(matches!(
-                            &notification.item,
-                            ThreadItem::DynamicToolCall {
-                                id,
-                                tool,
-                                status,
-                                ..
-                            } if id == "tool-call-remote-workflow"
-                                && tool == "image-edit"
-                                && *status == DynamicToolCallStatus::InProgress
-                        ));
+                                &notification.item,
+                                ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                    id,
+                                    tool,
+                                    status,
+                                    ..
+                                } if id == "tool-call-remote-workflow"
+                                    && tool == "image-edit"
+                                    && *status == DynamicToolCallStatus::InProgress
+                            ));
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
                     )) => {
                         assert_eq!(notification.turn_id, "turn-remote-workflow");
                         assert!(matches!(
-                            &notification.item,
-                            ThreadItem::DynamicToolCall {
-                                id,
-                                tool,
-                                status,
-                                success,
-                                ..
-                            } if id == "tool-call-remote-workflow"
-                                && tool == "image-edit"
-                                && *status == DynamicToolCallStatus::Completed
-                                && *success == Some(true)
-                        ));
+                                &notification.item,
+                                ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                    id,
+                                    tool,
+                                    status,
+                                    success,
+                                    ..
+                                } if id == "tool-call-remote-workflow"
+                                    && tool == "image-edit"
+                                    && *status == DynamicToolCallStatus::Completed
+                                    && *success == Some(true)
+                            ));
                     }
                     AppServerEvent::ServerRequest(ServerRequest::ChatgptAuthTokensRefresh {
                         request_id,
@@ -35136,11 +35720,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -35157,8 +35743,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -35452,6 +36040,8 @@ stream_max_retries = 0
                 .resolve_server_request(
                     request_id,
                     serde_json::to_value(PermissionsRequestApprovalResponse {
+                        strict_auto_review: None,
+
                         permissions: codex_app_server_protocol::GrantedPermissionProfile {
                             network: params.permissions.network,
                             file_system: params.permissions.file_system,
@@ -35763,11 +36353,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -35784,8 +36376,10 @@ stream_max_retries = 0
         .expect("server");
 
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -36005,6 +36599,7 @@ stream_max_retries = 0
             client.request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(9),
                 params: ThreadListParams {
+                    use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
                     sort_key: None,
@@ -36052,8 +36647,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker_a.clone(),
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a.clone(),
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -36145,8 +36743,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker_a.clone(),
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a.clone(),
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -36288,11 +36889,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a.clone(),
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b.clone(),
+
                             auth_token: Some("secret-token".to_string()),
                             account_id: None,
                         },
@@ -36537,8 +37140,10 @@ stream_max_retries = 0
 
         let client = reqwest::Client::new();
         let connection = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -36658,8 +37263,10 @@ stream_max_retries = 0
 
         let client = reqwest::Client::new();
         let connection_a = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-a".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -36707,8 +37314,10 @@ stream_max_retries = 0
             .expect("first connection start time");
 
         let connection_b = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-b".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -36772,8 +37381,10 @@ stream_max_retries = 0
         );
 
         let connection_c = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-c".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -36983,8 +37594,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -37106,8 +37720,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker,
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker,
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -37123,8 +37740,10 @@ stream_max_retries = 0
 
         let client = reqwest::Client::new();
         let connection = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37218,8 +37837,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker,
-                        auth_token: Some("secret-token".to_string()),
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker,
+
+                            auth_token: Some("secret-token".to_string()),
+                        },
                         account_id: None,
                     }],
                 }),
@@ -37235,8 +37857,10 @@ stream_max_retries = 0
 
         let client = reqwest::Client::new();
         let connection_a = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-a".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37289,8 +37913,10 @@ stream_max_retries = 0
             .expect("first connection start time");
 
         let connection_b = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-b".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37354,8 +37980,10 @@ stream_max_retries = 0
         );
 
         let connection_c = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-c".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37464,11 +38092,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -37486,8 +38116,10 @@ stream_max_retries = 0
 
         let client = reqwest::Client::new();
         let connection = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37594,11 +38226,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -37616,8 +38250,10 @@ stream_max_retries = 0
 
         let client = reqwest::Client::new();
         let connection_a = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-a".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37670,8 +38306,10 @@ stream_max_retries = 0
             .expect("first connection start time");
 
         let connection_b = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-b".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37735,8 +38373,10 @@ stream_max_retries = 0
         );
 
         let connection_c = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-            websocket_url: format!("ws://{}/", server.local_addr()),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: format!("ws://{}/", server.local_addr()),
+                auth_token: None,
+            },
             client_name: "codex-gateway-test-c".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -37828,8 +38468,11 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        websocket_url: worker,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker,
+
+                            auth_token: None,
+                        },
                         account_id: None,
                     }],
                 }),
@@ -38130,11 +38773,13 @@ stream_max_retries = 0
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
+
                             auth_token: None,
                             account_id: None,
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
+
                             auth_token: None,
                             account_id: None,
                         },
@@ -38835,6 +39480,7 @@ stream_max_retries = 0
                                 params: Some(
                                     serde_json::to_value(
                                         codex_app_server_protocol::ToolRequestUserInputParams {
+                                            auto_resolution_ms: None,
                                             thread_id: "thread-worker-a-2".to_string(),
                                             turn_id: "turn-worker-a-2".to_string(),
                                             item_id: "tool-call-worker-a-2".to_string(),
@@ -39013,9 +39659,11 @@ stream_max_retries = 0
                                     method: "item/started".to_string(),
                                     params: Some(
                                         serde_json::to_value(ItemStartedNotification {
+                                            started_at_ms: 0,
                                             thread_id: "thread-worker-a-2".to_string(),
                                             turn_id: "turn-worker-a-2".to_string(),
                                             item: ThreadItem::DynamicToolCall {
+                                                namespace: None,
                                                 id: "tool-call-after-reconnect".to_string(),
                                                 tool: "image-edit".to_string(),
                                                 arguments: serde_json::json!({
@@ -39181,9 +39829,11 @@ stream_max_retries = 0
                                     method: "item/completed".to_string(),
                                     params: Some(
                                         serde_json::to_value(ItemCompletedNotification {
+                                            completed_at_ms: 0,
                                             thread_id: "thread-worker-a-2".to_string(),
                                             turn_id: "turn-worker-a-2".to_string(),
                                             item: ThreadItem::DynamicToolCall {
+                                                namespace: None,
                                                 id: "tool-call-after-reconnect".to_string(),
                                                 tool: "image-edit".to_string(),
                                                 arguments: serde_json::json!({
@@ -39294,6 +39944,7 @@ stream_max_retries = 0
                                             params: Some(
                                                 serde_json::to_value(
                                                     codex_app_server_protocol::ToolRequestUserInputParams {
+                                            auto_resolution_ms: None,
                                                         thread_id: thread_id.to_string(),
                                                         turn_id: "turn-worker-a-2".to_string(),
                                                         item_id: "tool-call-worker-a-2".to_string(),
@@ -45652,6 +46303,7 @@ stream_max_retries = 0
                                 params: Some(
                                     serde_json::to_value(
                                         codex_app_server_protocol::ToolRequestUserInputParams {
+                                            auto_resolution_ms: None,
                                             thread_id: "thread-worker-a".to_string(),
                                             turn_id: "turn-worker-a".to_string(),
                                             item_id: "tool-call-worker-a".to_string(),
@@ -45739,6 +46391,7 @@ stream_max_retries = 0
                                 params: Some(
                                     serde_json::to_value(
                                         codex_app_server_protocol::ToolRequestUserInputParams {
+                                            auto_resolution_ms: None,
                                             thread_id: "thread-worker-a".to_string(),
                                             turn_id: "turn-worker-a".to_string(),
                                             item_id: "tool-call-worker-a".to_string(),
@@ -50971,6 +51624,7 @@ stream_max_retries = 0
                 method: "item/tool/requestUserInput".to_string(),
                 params: Some(
                     serde_json::to_value(codex_app_server_protocol::ToolRequestUserInputParams {
+                        auto_resolution_ms: None,
                         thread_id: thread_id.to_string(),
                         turn_id: "turn-remote-workflow".to_string(),
                         item_id: "tool-call-remote-workflow".to_string(),
@@ -51118,9 +51772,11 @@ stream_max_retries = 0
                 method: "item/started".to_string(),
                 params: Some(
                     serde_json::to_value(ItemStartedNotification {
+                        started_at_ms: 0,
                         thread_id: thread_id.to_string(),
                         turn_id: "turn-remote-workflow".to_string(),
                         item: ThreadItem::DynamicToolCall {
+                            namespace: None,
                             id: "tool-call-remote-workflow".to_string(),
                             tool: "image-edit".to_string(),
                             arguments: serde_json::json!({
@@ -51201,9 +51857,11 @@ stream_max_retries = 0
                 method: "item/completed".to_string(),
                 params: Some(
                     serde_json::to_value(ItemCompletedNotification {
+                        completed_at_ms: 0,
                         thread_id: thread_id.to_string(),
                         turn_id: "turn-remote-workflow".to_string(),
                         item: ThreadItem::DynamicToolCall {
+                            namespace: None,
                             id: "tool-call-remote-workflow".to_string(),
                             tool: "image-edit".to_string(),
                             arguments: serde_json::json!({
@@ -51478,6 +52136,7 @@ stream_max_retries = 0
                             params: Some(
                                 serde_json::to_value(
                                     codex_app_server_protocol::ToolRequestUserInputParams {
+                                        auto_resolution_ms: None,
                                         thread_id: thread_id.to_string(),
                                         turn_id: "turn-remote-workflow".to_string(),
                                         item_id: "tool-call-remote-workflow".to_string(),
@@ -51976,6 +52635,7 @@ stream_max_retries = 0
                             params: Some(
                                 serde_json::to_value(
                                     codex_app_server_protocol::ToolRequestUserInputParams {
+                                        auto_resolution_ms: None,
                                         thread_id: "thread-remote-workflow".to_string(),
                                         turn_id: "turn-remote-workflow".to_string(),
                                         item_id: "tool-call-remote-workflow".to_string(),
@@ -52211,9 +52871,11 @@ stream_max_retries = 0
                                 method: "item/started".to_string(),
                                 params: Some(
                                     serde_json::to_value(ItemStartedNotification {
+                                        started_at_ms: 0,
                                         thread_id: "thread-remote-workflow".to_string(),
                                         turn_id: "turn-remote-workflow".to_string(),
                                         item: ThreadItem::DynamicToolCall {
+                                            namespace: None,
                                             id: "tool-call-remote-workflow".to_string(),
                                             tool: "image-edit".to_string(),
                                             arguments: serde_json::json!({
@@ -52296,9 +52958,11 @@ stream_max_retries = 0
                                 method: "item/completed".to_string(),
                                 params: Some(
                                     serde_json::to_value(ItemCompletedNotification {
+                                        completed_at_ms: 0,
                                         thread_id: "thread-remote-workflow".to_string(),
                                         turn_id: "turn-remote-workflow".to_string(),
                                         item: ThreadItem::DynamicToolCall {
+                                            namespace: None,
                                             id: "tool-call-remote-workflow".to_string(),
                                             tool: "image-edit".to_string(),
                                             arguments: serde_json::json!({

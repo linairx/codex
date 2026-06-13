@@ -360,30 +360,32 @@ mod tests {
 
     #[test]
     fn builds_gateway_event_from_notification() {
+        let thread = Thread {
+            id: "thread-123".to_string(),
+            session_id: "session-123".to_string(),
+            forked_from_id: None,
+            parent_thread_id: None,
+            preview: "preview".to_string(),
+            ephemeral: true,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status: codex_app_server_protocol::ThreadStatus::Idle,
+            path: None,
+            cwd: std::path::PathBuf::from("/tmp/project")
+                .try_into()
+                .expect("absolute path"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::Custom("gateway".to_string()),
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        };
         let event = GatewayEvent::from_notification(ServerNotification::ThreadStarted(
-            ThreadStartedNotification {
-                thread: Thread {
-                    id: "thread-123".to_string(),
-                    forked_from_id: None,
-                    preview: "preview".to_string(),
-                    ephemeral: true,
-                    model_provider: "openai".to_string(),
-                    created_at: 1,
-                    updated_at: 2,
-                    status: codex_app_server_protocol::ThreadStatus::Idle,
-                    path: None,
-                    cwd: std::path::PathBuf::from("/tmp/project")
-                        .try_into()
-                        .expect("absolute path"),
-                    cli_version: "0.0.0".to_string(),
-                    source: SessionSource::Custom("gateway".to_string()),
-                    agent_nickname: None,
-                    agent_role: None,
-                    git_info: None,
-                    name: None,
-                    turns: Vec::new(),
-                },
-            },
+            ThreadStartedNotification { thread },
         ));
 
         assert_eq!(event.method, "thread/started");
@@ -396,6 +398,7 @@ mod tests {
             &ServerRequest::ToolRequestUserInput {
                 request_id: RequestId::String("req-1".to_string()),
                 params: ToolRequestUserInputParams {
+                    auto_resolution_ms: None,
                     thread_id: "thread-123".to_string(),
                     turn_id: "turn-456".to_string(),
                     item_id: "item-789".to_string(),
@@ -435,6 +438,7 @@ mod tests {
                 thread_id: "thread-123".to_string(),
                 turn_id: "turn-456".to_string(),
                 item_id: "item-789".to_string(),
+                auto_resolution_ms: None,
                 questions: vec![ToolRequestUserInputQuestion {
                     id: "confirm".to_string(),
                     header: "Confirm".to_string(),

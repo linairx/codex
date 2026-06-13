@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_core::config::Config;
-use codex_core::config_loader::LoaderOverrides;
+use codex_core::config::LoaderOverrides;
 use codex_gateway::config::GatewayConfig;
 use codex_gateway::config::GatewayRemoteRuntimeConfig;
 use codex_gateway::config::GatewayRemoteSelectionPolicy;

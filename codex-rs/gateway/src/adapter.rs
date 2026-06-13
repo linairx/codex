@@ -3,6 +3,7 @@ use crate::api::ListThreadsRequest;
 use crate::api::StartTurnRequest;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadStartParams;
@@ -43,7 +44,8 @@ pub fn thread_list_request(request_id: RequestId, request: ListThreadsRequest) -
             model_providers: None,
             source_kinds: None,
             archived: request.archived,
-            cwd: request.cwd,
+            cwd: request.cwd.map(ThreadListCwdFilter::One),
+            use_state_db_only: false,
             search_term: request.search_term,
         },
     }
@@ -74,6 +76,7 @@ pub fn turn_start_request(
             personality: None,
             output_schema: None,
             collaboration_mode: None,
+            ..TurnStartParams::default()
         },
     }
 }
@@ -181,7 +184,10 @@ mod tests {
                     model_providers: None,
                     source_kinds: None,
                     archived: Some(false),
-                    cwd: Some("/tmp/project".to_string()),
+                    cwd: Some(codex_app_server_protocol::ThreadListCwdFilter::One(
+                        "/tmp/project".to_string(),
+                    )),
+                    use_state_db_only: false,
                     search_term: Some("gateway".to_string()),
                 },
             }
@@ -220,6 +226,7 @@ mod tests {
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
+                    ..TurnStartParams::default()
                 },
             }
         );

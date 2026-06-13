@@ -283,7 +283,7 @@ async fn connect_remote_worker(
     initialize: &InitializeParams,
     request_context: &GatewayRequestContext,
 ) -> io::Result<GatewayV2ConnectedSession> {
-    let worker_websocket_url = connect_args.websocket_url.clone();
+    let worker_websocket_url = connect_args.websocket_url().to_string();
     apply_initialize_params(
         &mut connect_args.client_name,
         &mut connect_args.client_version,
@@ -343,8 +343,10 @@ mod tests {
 
     fn test_connect_args(url: &str) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
-            websocket_url: url.to_string(),
-            auth_token: None,
+            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                websocket_url: url.to_string(),
+                auth_token: None,
+            },
             client_name: "codex-gateway".to_string(),
             client_version: "0.0.0".to_string(),
             experimental_api: true,
@@ -372,6 +374,7 @@ mod tests {
                     version: "1.2.3".to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: Some(vec!["thread/started".to_string()]),
                 }),

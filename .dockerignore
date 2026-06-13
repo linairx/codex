@@ -4,7 +4,7 @@
 !codex-rs/
 !codex-rs/**
 !third_party/v8/
-!third_party/v8/rusty_v8_146_4_0.sha256
+!third_party/v8/rusty_v8_149_2_0.sha256
 
 **/target
 **/target-*

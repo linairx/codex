@@ -127,10 +127,21 @@ authenticate to the gateway.
 Use the Dockerfile when you want a packaged local deployment that still
 matches the same CLI flags as the direct `cargo run` path.
 
+The `just` helpers import a local `codex-alpine:3.24` base image from
+Alpine's published minirootfs tarball before invoking `docker build` or
+`docker compose`, so the deployment path does not depend on Docker Hub for
+the base image.
+
 Build the image from the repository root:
 
 ```bash
 docker build -f Dockerfile.gateway -t codex-gateway:local .
+```
+
+The same build is available through `just`:
+
+```bash
+just gateway-docker-build
 ```
 
 Run the embedded baseline with port 8080 published on the host:
@@ -158,6 +169,12 @@ local service definition:
 
 ```bash
 docker compose -f docker-compose.gateway.yml up --build
+```
+
+You can run the same Compose deployment through `just`:
+
+```bash
+just gateway-docker-up
 ```
 
 Multi-worker remote mode is a bounded Stage B profile until the exact

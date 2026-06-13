@@ -445,7 +445,7 @@ impl GatewayV2DownstreamRouter {
                     configured_worker_ids: (0..connect_args.len()).collect(),
                     worker_websocket_urls: connect_args
                         .iter()
-                        .map(|args| args.websocket_url.clone())
+                        .map(|args| args.websocket_url().to_string())
                         .collect(),
                     session_factory: session_factory.clone(),
                     initialize_params: initialize_params.clone(),
@@ -6170,6 +6170,7 @@ async fn aggregate_mcp_server_status_list_response(
                 cursor: None,
                 limit: None,
                 detail: params.detail,
+                thread_id: params.thread_id.clone(),
             })
             .map_err(io::Error::other)?,
         ),
@@ -6652,6 +6653,7 @@ async fn aggregate_experimental_feature_list_response(
             serde_json::to_value(ExperimentalFeatureListParams {
                 cursor: None,
                 limit: None,
+                thread_id: params.thread_id.clone(),
             })
             .map_err(io::Error::other)?,
         ),
@@ -7968,9 +7970,9 @@ mod tests {
     use codex_app_server_protocol::TurnPlanUpdatedNotification;
     use codex_app_server_protocol::WarningNotification;
     use codex_arg0::Arg0DispatchPaths;
+    use codex_config::CloudConfigBundleLoader;
     use codex_core::config::Config;
-    use codex_core::config_loader::CloudRequirementsLoader;
-    use codex_core::config_loader::LoaderOverrides;
+    use codex_core::config::LoaderOverrides;
     use codex_feedback::CodexFeedback;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
@@ -8105,8 +8107,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8191,8 +8196,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8246,6 +8254,7 @@ mod tests {
         send_initialize_with_capabilities(
             &mut websocket,
             Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: None,
             }),
@@ -8270,8 +8279,11 @@ mod tests {
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -8328,6 +8340,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -8358,8 +8371,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8461,8 +8477,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8547,8 +8566,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8597,8 +8619,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8685,8 +8710,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8804,8 +8832,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8893,8 +8924,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -8984,8 +9018,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -8993,8 +9030,11 @@ mod tests {
                         channel_capacity: 8,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -9015,6 +9055,7 @@ mod tests {
         send_initialize_with_capabilities(
             &mut websocket,
             Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: Some(vec![
                     "thread/started".to_string(),
@@ -9031,6 +9072,7 @@ mod tests {
                 version: "0.0.0-test".to_string(),
             },
             capabilities: Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: Some(vec![
                     "thread/started".to_string(),
@@ -9069,8 +9111,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9116,8 +9161,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9187,8 +9235,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9262,8 +9313,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9353,8 +9407,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9438,8 +9495,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://127.0.0.1:1".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9530,8 +9590,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9618,8 +9681,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9700,8 +9766,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -9783,8 +9852,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -9792,8 +9864,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -9855,8 +9930,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -9864,8 +9942,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -9957,8 +10038,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -9966,8 +10050,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -10038,8 +10125,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -10102,8 +10192,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -10190,8 +10283,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -10417,8 +10513,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -10426,8 +10525,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-b.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -11537,8 +11639,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -11546,8 +11651,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -14601,8 +14709,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -14786,8 +14897,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -14927,8 +15041,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15035,8 +15152,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15082,8 +15202,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15156,8 +15279,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15236,8 +15362,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15408,8 +15537,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: start_mock_remote_server_for_initialize().await,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: start_mock_remote_server_for_initialize().await,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15599,8 +15731,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15720,8 +15855,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15773,8 +15911,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15867,8 +16008,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -15959,8 +16103,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -16053,8 +16200,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -16141,8 +16291,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -16296,8 +16449,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -16404,8 +16561,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url: "ws://worker-a.invalid".to_string(),
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -16759,8 +16920,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url: "ws://worker-a.invalid".to_string(),
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -16963,8 +17128,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -17139,8 +17308,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -17352,8 +17524,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -17519,8 +17694,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -17647,8 +17825,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -17815,8 +17996,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -18034,8 +18218,11 @@ mod tests {
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url: format!("ws://{downstream_addr}"),
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: format!("ws://{downstream_addr}"),
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -18232,8 +18419,13 @@ mod tests {
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url: format!("ws://{downstream_addr}"),
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                            websocket_url: format!("ws://{downstream_addr}"),
+
+                            auth_token: None,
+
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -18361,16 +18553,19 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: start_mock_remote_server_for_passthrough_request_with_result(
-                        "account/read",
-                        serde_json::json!({}),
-                        serde_json::json!({
-                            "account": null,
-                            "reasoningModelConfig": null,
-                        }),
-                    )
-                    .await,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url:
+                            start_mock_remote_server_for_passthrough_request_with_result(
+                                "account/read",
+                                serde_json::json!({}),
+                                serde_json::json!({
+                                    "account": null,
+                                    "reasoningModelConfig": null,
+                                }),
+                            )
+                            .await,
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -18495,8 +18690,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -18630,8 +18828,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -18800,8 +19001,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -18985,8 +19189,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -19123,8 +19330,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -19292,8 +19502,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -19492,8 +19705,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -19651,8 +19867,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -19811,8 +20030,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -19913,8 +20135,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -20016,8 +20241,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -20231,6 +20459,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -20396,6 +20625,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -20673,6 +20903,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -20769,8 +21000,11 @@ mod tests {
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -20880,8 +21114,11 @@ mod tests {
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -21021,8 +21258,11 @@ mod tests {
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -21096,8 +21336,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -21220,8 +21463,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -21341,8 +21587,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -21427,8 +21676,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -21561,6 +21813,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -22034,6 +22287,7 @@ mod tests {
         send_initialize_with_capabilities(
             &mut websocket,
             Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: None,
             }),
@@ -22070,8 +22324,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -22181,8 +22438,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -22264,8 +22524,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -22352,8 +22615,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: primary_worker_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: primary_worker_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -22361,8 +22627,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: secondary_worker_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: secondary_worker_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -22429,8 +22698,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: primary_worker_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: primary_worker_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -22438,8 +22710,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: secondary_worker_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: secondary_worker_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -22586,8 +22861,13 @@ mod tests {
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url: format!("ws://{downstream_addr}"),
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                            websocket_url: format!("ws://{downstream_addr}"),
+
+                            auth_token: None,
+
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -22978,8 +23258,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23101,8 +23384,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23110,8 +23396,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23267,8 +23556,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -23276,8 +23568,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -23411,8 +23706,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23420,8 +23718,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23563,8 +23864,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23572,8 +23876,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23774,8 +24081,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23783,8 +24093,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23899,8 +24212,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -23908,8 +24224,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24028,8 +24347,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24037,8 +24359,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24146,8 +24471,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24155,8 +24483,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24284,8 +24615,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24293,8 +24627,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24408,8 +24745,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24417,8 +24757,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24638,8 +24981,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24647,8 +24993,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24731,8 +25080,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24740,8 +25092,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -24877,8 +25232,11 @@ mod tests {
         scope_registry.register_thread("thread-b".to_string(), context.clone());
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![RemoteAppServerConnectArgs {
-                websocket_url: worker,
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: worker,
+
+                    auth_token: None,
+                },
                 client_name: "codex-gateway".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: false,
@@ -24971,8 +25329,11 @@ mod tests {
         scope_registry.register_thread("thread-b".to_string(), context.clone());
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![RemoteAppServerConnectArgs {
-                websocket_url: worker,
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: worker,
+
+                    auth_token: None,
+                },
                 client_name: "codex-gateway".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: false,
@@ -25061,8 +25422,11 @@ mod tests {
         .await;
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![RemoteAppServerConnectArgs {
-                websocket_url: worker,
-                auth_token: None,
+                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                    websocket_url: worker,
+
+                    auth_token: None,
+                },
                 client_name: "codex-gateway".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: false,
@@ -25148,8 +25512,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -25157,8 +25524,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -25268,8 +25638,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25277,8 +25650,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25385,8 +25761,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -25394,8 +25773,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -25478,8 +25860,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25487,8 +25872,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25611,8 +25999,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25620,8 +26011,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25799,8 +26193,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25808,8 +26205,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25978,8 +26378,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25987,8 +26390,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -25996,8 +26402,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_c,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_c,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26158,8 +26567,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26167,8 +26579,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26321,8 +26736,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26330,8 +26748,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26459,8 +26880,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26468,8 +26892,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26602,8 +27029,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26611,8 +27041,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26745,8 +27178,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26754,8 +27190,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26881,8 +27320,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -26890,8 +27332,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27020,8 +27465,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27029,8 +27477,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27147,8 +27598,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27156,8 +27610,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27280,8 +27737,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27289,8 +27749,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27423,8 +27886,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27432,8 +27898,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27559,8 +28028,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27568,8 +28040,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27691,8 +28166,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27700,8 +28178,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27825,8 +28306,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -27834,8 +28318,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28024,8 +28511,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -28033,8 +28523,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -28247,8 +28740,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -28256,8 +28752,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -28420,8 +28919,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28429,8 +28931,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28580,8 +29085,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28589,8 +29097,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28769,8 +29280,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28778,8 +29292,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28955,8 +29472,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -28964,8 +29484,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29112,8 +29635,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29121,8 +29647,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29130,8 +29659,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_c,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_c,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29317,8 +29849,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29326,8 +29861,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29502,8 +30040,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29511,8 +30052,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29697,8 +30241,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29706,8 +30253,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29843,8 +30393,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29852,8 +30405,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29977,8 +30533,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -29986,8 +30545,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30094,8 +30656,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30103,8 +30668,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30234,8 +30802,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30243,8 +30814,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30378,8 +30952,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30387,8 +30964,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30513,8 +31093,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30522,8 +31105,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30704,8 +31290,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30713,8 +31302,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30872,8 +31464,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -30881,8 +31476,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31031,8 +31629,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31040,8 +31641,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31144,8 +31748,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -31153,8 +31760,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -31391,8 +32001,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -31400,8 +32013,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -31480,8 +32096,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31489,8 +32108,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31626,8 +32248,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31635,8 +32260,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31760,8 +32388,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31769,8 +32400,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31878,8 +32512,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31887,8 +32524,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -31992,8 +32632,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32001,8 +32644,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32089,8 +32735,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32098,8 +32747,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32269,8 +32921,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32278,8 +32933,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32395,8 +33053,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32404,8 +33065,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32553,8 +33217,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32562,8 +33229,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32662,8 +33332,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32671,8 +33344,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32792,8 +33468,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32801,8 +33480,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32925,8 +33607,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -32934,8 +33619,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: idle_worker,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: idle_worker,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33027,8 +33715,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33036,8 +33727,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33159,8 +33853,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33168,8 +33865,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33273,8 +33973,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33282,8 +33985,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33383,8 +34089,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33392,8 +34101,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33522,8 +34234,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33531,8 +34246,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33660,8 +34378,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33669,8 +34390,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33773,8 +34497,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33782,8 +34509,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33884,8 +34614,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -33893,8 +34626,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -34065,8 +34801,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -34074,8 +34813,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -34164,8 +34906,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -34173,8 +34918,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -34356,8 +35104,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -34365,8 +35116,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -34440,8 +35194,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -34449,8 +35206,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -34723,8 +35483,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -34732,8 +35495,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -34829,8 +35595,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -34838,8 +35607,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -35149,8 +35921,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35158,8 +35933,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35296,8 +36074,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35305,8 +36086,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35494,8 +36278,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35503,8 +36290,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35721,8 +36511,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35730,8 +36523,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -35847,8 +36643,11 @@ mod tests {
                 let session_factory = GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -35856,8 +36655,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -35960,8 +36762,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -35969,8 +36774,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36090,8 +36898,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36099,8 +36910,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36245,8 +37059,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36254,8 +37071,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36446,8 +37266,11 @@ mod tests {
             let session_factory = GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36455,8 +37278,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36543,8 +37369,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36552,8 +37381,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -36698,8 +37530,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -36707,8 +37542,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -36770,8 +37608,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36779,8 +37620,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36845,8 +37689,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36854,8 +37701,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36915,8 +37765,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36924,8 +37777,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36990,8 +37846,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -36999,8 +37858,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37092,8 +37954,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37101,8 +37966,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37193,8 +38061,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37202,8 +38073,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37292,8 +38166,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37301,8 +38178,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37390,8 +38270,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37399,8 +38282,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37544,8 +38430,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -37553,8 +38442,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -37662,8 +38554,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -37671,8 +38566,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -37758,8 +38656,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37767,8 +38668,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -37872,8 +38776,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -37881,8 +38788,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -38122,8 +39032,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -38131,8 +39044,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -38200,8 +39116,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38209,8 +39128,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38270,8 +39192,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38279,8 +39204,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38337,8 +39265,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38346,8 +39277,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38411,8 +39345,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38420,8 +39357,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38551,8 +39491,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38560,8 +39503,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38637,8 +39583,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38646,8 +39595,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -38879,8 +39831,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -38888,8 +39843,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -38910,6 +39868,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -39013,8 +39972,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -39147,8 +40109,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -39265,8 +40230,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url: format!("ws://{downstream_addr}"),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: format!("ws://{downstream_addr}"),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -39431,8 +40399,11 @@ mod tests {
                 GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: format!("ws://{downstream_addr}"),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: format!("ws://{downstream_addr}"),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -39440,8 +40411,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -39656,8 +40630,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -39665,8 +40642,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -39861,8 +40841,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -39870,8 +40853,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -39971,8 +40957,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -39980,8 +40969,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40072,8 +41064,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40081,8 +41076,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40269,8 +41267,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -40278,8 +41279,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -40300,6 +41304,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -40395,8 +41400,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40404,8 +41412,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40532,8 +41543,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40541,8 +41555,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -40743,8 +41760,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -40752,8 +41772,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -41477,8 +42500,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -41486,8 +42512,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -41673,8 +42702,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -41682,8 +42714,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -41833,8 +42868,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -41842,8 +42880,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42088,8 +43129,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42097,8 +43141,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42175,8 +43222,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -42184,8 +43234,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -42377,8 +43430,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42386,8 +43442,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42476,8 +43535,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -42485,8 +43547,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -42731,8 +43796,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42740,8 +43808,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42762,6 +43833,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -42889,8 +43961,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_a,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_a,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42898,8 +43973,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -42966,8 +44044,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -42975,8 +44056,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -43097,8 +44181,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -43106,8 +44193,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -43204,8 +44294,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -43213,8 +44306,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -43275,8 +44371,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -43284,8 +44383,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -43356,8 +44458,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43365,8 +44470,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b.clone(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b.clone(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43456,8 +44564,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://127.0.0.1:9".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://127.0.0.1:9".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43465,8 +44576,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://127.0.0.1:1".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43546,8 +44660,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://127.0.0.1:9".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://127.0.0.1:9".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43555,8 +44672,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: replay_failure_worker.clone(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: replay_failure_worker.clone(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43639,8 +44759,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43648,8 +44771,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43700,6 +44826,7 @@ mod tests {
                 version: "0.0.0-test".to_string(),
             },
             capabilities: Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: Some(vec![
                     "thread/started".to_string(),
@@ -43727,8 +44854,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43736,8 +44866,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43808,8 +44941,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43817,8 +44953,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://127.0.0.1:1".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://127.0.0.1:1".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43883,8 +45022,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -43892,8 +45034,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: worker_b,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: worker_b,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -44062,8 +45207,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -44071,8 +45219,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: replay_failure_worker,
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: replay_failure_worker,
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -44179,8 +45330,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -44188,8 +45342,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -44246,8 +45403,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44255,8 +45415,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-b.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44335,8 +45498,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44344,8 +45510,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-b.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44448,8 +45617,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44457,8 +45629,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-b.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44787,8 +45962,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -44796,8 +45974,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-b.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -45074,8 +46255,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45083,8 +46267,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45092,8 +46279,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-c.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-c.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45203,8 +46393,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45212,8 +46405,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45221,8 +46417,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-c.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-c.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45327,8 +46526,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45336,8 +46538,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45440,8 +46645,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45449,8 +46657,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45550,8 +46761,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45559,8 +46773,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45664,8 +46881,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi_with_account_ids(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45673,8 +46893,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -45803,8 +47026,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -45812,8 +47038,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -45981,8 +47210,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi_with_account_ids(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_a,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_a,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -45990,8 +47222,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: worker_b,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: worker_b,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -46066,8 +47301,11 @@ mod tests {
         let session_factory = GatewayV2SessionFactory::remote_multi(
             vec![
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-a.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -46075,8 +47313,11 @@ mod tests {
                     channel_capacity: 4,
                 },
                 RemoteAppServerConnectArgs {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: "ws://worker-b.invalid".to_string(),
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -46174,8 +47415,13 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                    websocket_url: websocket_url,
+
+                                    auth_token: None,
+
+                                },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -46214,6 +47460,7 @@ mod tests {
                                             "downstream-request-1".to_string(),
                                         ),
                                         params: codex_app_server_protocol::ToolRequestUserInputParams {
+                                            auto_resolution_ms: None,
                                             thread_id: "thread-visible".to_string(),
                                             turn_id: "turn-visible".to_string(),
                                             item_id: "tool-call-2".to_string(),
@@ -46314,8 +47561,13 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                    websocket_url: websocket_url,
+
+                                    auth_token: None,
+
+                                },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -46354,6 +47606,7 @@ mod tests {
                                             "downstream-request-1".to_string(),
                                         ),
                                         params: codex_app_server_protocol::ToolRequestUserInputParams {
+                                            auto_resolution_ms: None,
                                             thread_id: "thread-visible".to_string(),
                                             turn_id: "turn-visible".to_string(),
                                             item_id: "tool-call-2".to_string(),
@@ -46459,8 +47712,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -46468,8 +47726,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -46592,8 +47855,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -46601,8 +47869,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -46761,8 +48034,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -46877,8 +48154,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -46994,8 +48275,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -47147,8 +48432,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -47272,8 +48561,12 @@ mod tests {
                         };
                         let session_factory = GatewayV2SessionFactory::remote_single(
                             RemoteAppServerConnectArgs {
-                                websocket_url,
-                                auth_token: None,
+                                endpoint:
+                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                        websocket_url: websocket_url,
+
+                                        auth_token: None,
+                                    },
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
@@ -47398,8 +48691,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47407,8 +48705,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47531,8 +48834,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47540,8 +48848,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47660,8 +48973,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47669,8 +48987,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47795,8 +49118,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47804,8 +49132,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47970,8 +49303,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -47979,8 +49317,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -48112,8 +49455,13 @@ mod tests {
                         let session_factory = GatewayV2SessionFactory::remote_multi(
                             vec![
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_a,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_a,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -48121,8 +49469,13 @@ mod tests {
                                     channel_capacity: 4,
                                 },
                                 RemoteAppServerConnectArgs {
-                                    websocket_url: worker_b,
-                                    auth_token: None,
+                                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+
+                                        websocket_url: worker_b,
+
+                                        auth_token: None,
+
+                                    },
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
@@ -48338,8 +49691,11 @@ mod tests {
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: format!("ws://{worker_a_addr}"),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: format!("ws://{worker_a_addr}"),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -48347,8 +49703,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: format!("ws://{worker_b_addr}"),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: format!("ws://{worker_b_addr}"),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -48510,8 +49869,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -48602,8 +49964,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -48693,8 +50058,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -48763,8 +50131,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -48936,6 +50307,7 @@ mod tests {
             ServerNotification::HookStarted(hook_started),
             ServerNotification::HookCompleted(hook_completed),
             ServerNotification::ItemStarted(ItemStartedNotification {
+                started_at_ms: 0,
                 thread_id: "thread-visible".to_string(),
                 turn_id: "turn-visible".to_string(),
                 item: ThreadItem::AgentMessage {
@@ -48946,6 +50318,7 @@ mod tests {
                 },
             }),
             ServerNotification::ItemCompleted(ItemCompletedNotification {
+                completed_at_ms: 0,
                 thread_id: "thread-visible".to_string(),
                 turn_id: "turn-visible".to_string(),
                 item: ThreadItem::AgentMessage {
@@ -48956,6 +50329,7 @@ mod tests {
                 },
             }),
             ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+                completed_at_ms: 0,
                 thread_id: "thread-visible".to_string(),
                 turn_id: "turn-visible".to_string(),
                 item: ResponseItem::Other,
@@ -49082,8 +50456,11 @@ mod tests {
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -49129,8 +50506,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -49196,8 +50576,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -49263,8 +50646,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -49336,8 +50722,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -49399,8 +50788,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -49420,6 +50812,7 @@ mod tests {
         send_initialize_with_capabilities(
             &mut websocket,
             Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: None,
             }),
@@ -49523,8 +50916,11 @@ mod tests {
                 scope_registry,
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -49544,6 +50940,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: true,
                     opt_out_notification_methods: None,
                 }),
@@ -49651,8 +51048,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -49660,8 +51060,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -49682,6 +51085,7 @@ mod tests {
         send_initialize_with_capabilities(
             &mut websocket,
             Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: true,
                 opt_out_notification_methods: None,
             }),
@@ -49875,8 +51279,11 @@ mod tests {
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -49923,8 +51330,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -49956,6 +51366,7 @@ mod tests {
             send_initialize_with_capabilities(
                 &mut websocket,
                 Some(InitializeCapabilities {
+                    request_attestation: false,
                     experimental_api: false,
                     opt_out_notification_methods: Some(vec!["warning".to_string()]),
                 }),
@@ -50016,8 +51427,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -50025,8 +51439,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -50047,6 +51464,7 @@ mod tests {
         send_initialize_with_capabilities(
             &mut websocket,
             Some(InitializeCapabilities {
+                request_attestation: false,
                 experimental_api: false,
                 opt_out_notification_methods: Some(vec!["warning".to_string()]),
             }),
@@ -50083,8 +51501,11 @@ mod tests {
             scope_registry: Arc::new(GatewayScopeRegistry::default()),
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
@@ -50150,8 +51571,11 @@ mod tests {
                 scope_registry: Arc::new(GatewayScopeRegistry::default()),
                 session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                     RemoteAppServerConnectArgs {
-                        websocket_url,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: websocket_url,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -50218,8 +51642,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -50227,8 +51654,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -50314,8 +51744,11 @@ mod tests {
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_multi(
                 vec![
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_a,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_a,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -50323,8 +51756,11 @@ mod tests {
                         channel_capacity: 4,
                     },
                     RemoteAppServerConnectArgs {
-                        websocket_url: worker_b,
-                        auth_token: None,
+                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                            websocket_url: worker_b,
+
+                            auth_token: None,
+                        },
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
@@ -51571,8 +53007,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51580,8 +53019,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51687,8 +53129,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51696,8 +53141,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51803,8 +53251,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51812,8 +53263,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51970,8 +53424,11 @@ mod tests {
                 session_factory: GatewayV2SessionFactory::remote_multi(
                     vec![
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-a.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-a.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -51979,8 +53436,11 @@ mod tests {
                             channel_capacity: 4,
                         },
                         RemoteAppServerConnectArgs {
-                            websocket_url: "ws://worker-b.invalid".to_string(),
-                            auth_token: None,
+                            endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                                websocket_url: "ws://worker-b.invalid".to_string(),
+
+                                auth_token: None,
+                            },
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
@@ -53979,10 +55439,12 @@ mod tests {
             config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
-            cloud_requirements: CloudRequirementsLoader::default(),
+            strict_config: false,
+            cloud_config_bundle: CloudConfigBundleLoader::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
-            environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+            state_db: None,
+            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source: SessionSource::Cli,
             enable_codex_api_key_env: false,
@@ -56654,8 +58116,11 @@ mod tests {
             scope_registry,
             session_factory: Some(Arc::new(GatewayV2SessionFactory::remote_single(
                 RemoteAppServerConnectArgs {
-                    websocket_url,
-                    auth_token: None,
+                    endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
+                        websocket_url: websocket_url,
+
+                        auth_token: None,
+                    },
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,

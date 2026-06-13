@@ -42,7 +42,7 @@ impl GatewayRemoteWorker {
     }
 
     pub(crate) fn websocket_url(&self) -> &str {
-        &self.connect_args.websocket_url
+        self.connect_args.websocket_url()
     }
 
     pub(crate) async fn reconnect(&self) -> io::Result<RemoteAppServerClient> {
