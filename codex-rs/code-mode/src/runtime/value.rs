@@ -1,9 +1,11 @@
 use serde_json::Value as JsonValue;
 
-use crate::response::FunctionCallOutputContentItem;
-use crate::response::ImageDetail;
+use codex_code_mode_protocol::DEFAULT_IMAGE_DETAIL;
+use codex_code_mode_protocol::FunctionCallOutputContentItem;
+use codex_code_mode_protocol::ImageDetail;
 
 const IMAGE_HELPER_EXPECTS_MESSAGE: &str = "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block";
+const REMOTE_IMAGE_URL_ERROR: &str = "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
 
 pub(super) fn serialize_output_text(
@@ -58,11 +60,8 @@ pub(super) fn normalize_output_image(
             return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
         }
         let lower = image_url.to_ascii_lowercase();
-        if !(lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("data:"))
-        {
-            return Err("image expects an http(s) or data URL".to_string());
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Err(REMOTE_IMAGE_URL_ERROR.to_string());
         }
 
         let detail = detail_override.or(detail);
@@ -81,7 +80,7 @@ pub(super) fn normalize_output_image(
                     }
                 })
             }
-            None => None,
+            None => Some(DEFAULT_IMAGE_DETAIL),
         };
 
         Ok(FunctionCallOutputContentItem::InputImage { image_url, detail })
@@ -159,7 +158,7 @@ fn parse_mcp_output_image(
         .and_then(JsonValue::as_object)
         .and_then(|meta| meta.get(CODEX_IMAGE_DETAIL_META_KEY))
         .and_then(JsonValue::as_str)
-        .filter(|detail| *detail == "original")
+        .filter(|detail| matches!(*detail, "auto" | "low" | "high" | "original"))
         .map(str::to_string);
     Ok((image_url, detail))
 }

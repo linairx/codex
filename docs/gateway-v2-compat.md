@@ -875,6 +875,38 @@ Recent progress:
   README, worksheet, and decision file, and requires the README top-level
   worker-build metadata to match the README topology rows before promotion
   evidence is accepted
+- the operator-facing profile matrix in
+  [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now makes the release-quality baseline versus bounded Stage B split
+  explicit for embedded, single-worker remote, and multi-worker remote
+  deployments before promotion evidence is gathered
+- the same operator guide now also defines the rollout terms
+  `release-quality`, `bounded Stage B`, `promotion evidence`, and
+  `exact topology`, so the compatibility plan and the operator guide share one
+  fixed vocabulary
+- the same operator guide now also spells out the runtime signals to watch
+  per profile, so rollout evidence and live health checks use the same field
+  set instead of relying on implicit caveats
+- the same operator guide now also includes a short rollout checklist that
+  sequences profile selection, signal capture, evidence comparison, and
+  decision review before traffic is widened
+- the same operator guide now also groups common failure signals by account
+  exhaustion, worker reconnect, slow-client pressure, protocol violation, and
+  invalid multi-worker shape, so rollout debugging can jump straight to the
+  right health and event fields
+- the same operator guide now also provides a triage order for rollout
+  incidents, so health, events, metrics, and logs are checked in a predictable
+  sequence before widening a deployment
+- the same operator guide now also adds a response matrix so the common
+  failure signals lead to a concrete hold, rerun, or keep-bounded decision
+  instead of leaving the operator to infer next steps
+- the same operator guide now also adds a rerun matrix so common failures map
+  back to the scenario groups that should be re-captured first
+- the same operator guide now also includes an artifact matrix so the role of
+  README, worksheet, decision, transcript, health, events, metrics, and logs
+  files is fixed for one promotion evidence bundle
+- the same operator guide now also fixes the promotion scenario order in one
+  place, so the generator, checker, and human review use the same sequence
 - northbound v2 connections now enforce an explicit initialize handshake
   timeout and close the WebSocket with a concrete gateway-owned reason instead
   of waiting indefinitely for a client that never completes the JSON-RPC

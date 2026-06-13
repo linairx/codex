@@ -1,7 +1,7 @@
 use super::manager::ExternalAuth;
+use super::manager::ExternalAuthFuture;
 use super::manager::ExternalAuthRefreshContext;
 use super::manager::ExternalAuthTokens;
-use async_trait::async_trait;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use std::fmt;
@@ -25,14 +25,11 @@ impl BearerTokenRefresher {
             state: Arc::new(ExternalBearerAuthState::new(config)),
         }
     }
-}
 
-#[async_trait]
-impl ExternalAuth for BearerTokenRefresher {
-    fn auth_mode(&self) -> AuthMode {
-        AuthMode::ApiKey
-    }
-
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "external bearer cache misses intentionally hold cached_token across the provider command to avoid duplicate refreshes"
+    )]
     async fn resolve(&self) -> io::Result<Option<ExternalAuthTokens>> {
         let access_token = {
             let mut cached = self.state.cached_token.lock().await;
@@ -69,6 +66,23 @@ impl ExternalAuth for BearerTokenRefresher {
             fetched_at: Instant::now(),
         });
         Ok(ExternalAuthTokens::access_token_only(access_token))
+    }
+}
+
+impl ExternalAuth for BearerTokenRefresher {
+    fn auth_mode(&self) -> AuthMode {
+        AuthMode::ApiKey
+    }
+
+    fn resolve(&self) -> ExternalAuthFuture<'_, Option<ExternalAuthTokens>> {
+        Box::pin(BearerTokenRefresher::resolve(self))
+    }
+
+    fn refresh(
+        &self,
+        context: ExternalAuthRefreshContext,
+    ) -> ExternalAuthFuture<'_, ExternalAuthTokens> {
+        Box::pin(BearerTokenRefresher::refresh(self, context))
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::endpoint::realtime_websocket::methods_common::conversation_handoff_append_message;
+use crate::endpoint::realtime_websocket::methods_common::conversation_function_call_output_message;
 use crate::endpoint::realtime_websocket::methods_common::conversation_item_create_message;
 use crate::endpoint::realtime_websocket::methods_common::normalized_session_mode;
 use crate::endpoint::realtime_websocket::methods_common::session_update_session;
@@ -17,6 +17,7 @@ use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::backoff;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
@@ -217,6 +218,9 @@ pub struct RealtimeWebsocketEvents {
 #[derive(Default)]
 struct ActiveTranscriptState {
     entries: Vec<RealtimeTranscriptEntry>,
+    last_handoff_entry_count: usize,
+    new_input_entry: bool,
+    new_output_entry: bool,
 }
 
 impl RealtimeWebsocketConnection {
@@ -224,17 +228,21 @@ impl RealtimeWebsocketConnection {
         self.writer.send_audio_frame(frame).await
     }
 
-    pub async fn send_conversation_item_create(&self, text: String) -> Result<(), ApiError> {
-        self.writer.send_conversation_item_create(text).await
+    pub async fn send_conversation_item_create(
+        &self,
+        text: String,
+        role: ConversationTextRole,
+    ) -> Result<(), ApiError> {
+        self.writer.send_conversation_item_create(text, role).await
     }
 
-    pub async fn send_conversation_handoff_append(
+    pub async fn send_conversation_function_call_output(
         &self,
-        handoff_id: String,
+        call_id: String,
         output_text: String,
     ) -> Result<(), ApiError> {
         self.writer
-            .send_conversation_handoff_append(handoff_id, output_text)
+            .send_conversation_function_call_output(call_id, output_text)
             .await
     }
 
@@ -283,9 +291,17 @@ impl RealtimeWebsocketWriter {
             .await
     }
 
-    pub async fn send_conversation_item_create(&self, text: String) -> Result<(), ApiError> {
-        self.send_json(&conversation_item_create_message(self.event_parser, text))
-            .await
+    pub async fn send_conversation_item_create(
+        &self,
+        text: String,
+        role: ConversationTextRole,
+    ) -> Result<(), ApiError> {
+        self.send_json(&conversation_item_create_message(
+            self.event_parser,
+            text,
+            role,
+        ))
+        .await
     }
 
     pub async fn send_conversation_handoff_append(
@@ -293,9 +309,21 @@ impl RealtimeWebsocketWriter {
         handoff_id: String,
         output_text: String,
     ) -> Result<(), ApiError> {
-        self.send_json(&conversation_handoff_append_message(
-            self.event_parser,
+        self.send_json(&RealtimeOutboundMessage::ConversationHandoffAppend {
             handoff_id,
+            output_text,
+        })
+        .await
+    }
+
+    pub async fn send_conversation_function_call_output(
+        &self,
+        call_id: String,
+        output_text: String,
+    ) -> Result<(), ApiError> {
+        self.send_json(&conversation_function_call_output_message(
+            self.event_parser,
+            call_id,
             output_text,
         ))
         .await
@@ -417,38 +445,80 @@ impl RealtimeWebsocketEvents {
     async fn update_active_transcript(&self, event: &mut RealtimeEvent) {
         let mut active_transcript = self.active_transcript.lock().await;
         match event {
-            RealtimeEvent::InputAudioSpeechStarted(_) => {}
+            RealtimeEvent::InputAudioSpeechStarted(_) => {
+                active_transcript.new_input_entry = true;
+            }
             RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
-                append_transcript_delta(&mut active_transcript.entries, "user", delta);
+                let force_new = active_transcript.new_input_entry;
+                append_transcript_delta(&mut active_transcript.entries, "user", delta, force_new);
+                active_transcript.new_input_entry = false;
             }
             RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
-                append_transcript_delta(&mut active_transcript.entries, "assistant", delta);
+                let force_new = active_transcript.new_output_entry;
+                append_transcript_delta(
+                    &mut active_transcript.entries,
+                    "assistant",
+                    delta,
+                    force_new,
+                );
+                active_transcript.new_output_entry = false;
+            }
+            RealtimeEvent::InputTranscriptDone(done) => {
+                let force_new = active_transcript.new_input_entry;
+                apply_transcript_done(
+                    &mut active_transcript.entries,
+                    "user",
+                    &done.text,
+                    force_new,
+                );
+                active_transcript.new_input_entry = false;
+            }
+            RealtimeEvent::OutputTranscriptDone(done) => {
+                let force_new = active_transcript.new_output_entry;
+                apply_transcript_done(
+                    &mut active_transcript.entries,
+                    "assistant",
+                    &done.text,
+                    force_new,
+                );
+                active_transcript.new_output_entry = false;
             }
             RealtimeEvent::HandoffRequested(handoff) => {
-                if self.event_parser == RealtimeEventParser::V1 {
-                    handoff.active_transcript = std::mem::take(&mut active_transcript.entries);
-                }
+                append_handoff_input(&mut active_transcript.entries, &handoff.input_transcript);
+                handoff.active_transcript = active_transcript.entries
+                    [active_transcript.last_handoff_entry_count..]
+                    .to_vec();
+                active_transcript.last_handoff_entry_count = active_transcript.entries.len();
+                active_transcript.new_input_entry = true;
+                active_transcript.new_output_entry = true;
+            }
+            RealtimeEvent::ResponseCreated(_) => {
+                active_transcript.new_output_entry = true;
             }
             RealtimeEvent::SessionUpdated { .. }
-            | RealtimeEvent::InputTranscriptDone(_)
-            | RealtimeEvent::OutputTranscriptDone(_)
             | RealtimeEvent::AudioOut(_)
-            | RealtimeEvent::ResponseCreated(_)
             | RealtimeEvent::ResponseCancelled(_)
             | RealtimeEvent::ResponseDone(_)
-            | RealtimeEvent::ConversationItemAdded(_)
             | RealtimeEvent::ConversationItemDone { .. }
+            | RealtimeEvent::NoopRequested(_)
+            | RealtimeEvent::ConversationItemAdded(_)
             | RealtimeEvent::Error(_) => {}
         }
     }
 }
 
-fn append_transcript_delta(entries: &mut Vec<RealtimeTranscriptEntry>, role: &str, delta: &str) {
+fn append_transcript_delta(
+    entries: &mut Vec<RealtimeTranscriptEntry>,
+    role: &str,
+    delta: &str,
+    force_new: bool,
+) {
     if delta.is_empty() {
         return;
     }
 
-    if let Some(last_entry) = entries.last_mut()
+    if !force_new
+        && let Some(last_entry) = entries.last_mut()
         && last_entry.role == role
     {
         last_entry.text.push_str(delta);
@@ -459,6 +529,48 @@ fn append_transcript_delta(entries: &mut Vec<RealtimeTranscriptEntry>, role: &st
         role: role.to_string(),
         text: delta.to_string(),
     });
+}
+
+fn apply_transcript_done(
+    entries: &mut Vec<RealtimeTranscriptEntry>,
+    role: &str,
+    text: &str,
+    force_new: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    if !force_new
+        && let Some(last_entry) = entries.last_mut()
+        && last_entry.role == role
+    {
+        last_entry.text = text.to_string();
+        return;
+    }
+
+    entries.push(RealtimeTranscriptEntry {
+        role: role.to_string(),
+        text: text.to_string(),
+    });
+}
+
+fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str) {
+    let input = input.trim();
+    if input.is_empty() || contains_transcript_entry(entries, "user", input) {
+        return;
+    }
+
+    entries.push(RealtimeTranscriptEntry {
+        role: "user".to_string(),
+        text: input.to_string(),
+    });
+}
+
+fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, text: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.role == role && entry.text.trim() == text.trim())
 }
 
 pub struct RealtimeWebsocketClient {
@@ -743,6 +855,7 @@ mod tests {
     use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
     use codex_protocol::protocol::RealtimeHandoffRequested;
     use codex_protocol::protocol::RealtimeInputAudioSpeechStarted;
+    use codex_protocol::protocol::RealtimeNoopRequested;
     use codex_protocol::protocol::RealtimeResponseCancelled;
     use codex_protocol::protocol::RealtimeResponseCreated;
     use codex_protocol::protocol::RealtimeResponseDone;
@@ -770,7 +883,7 @@ mod tests {
         assert_eq!(
             parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
             Some(RealtimeEvent::SessionUpdated {
-                session_id: "sess_123".to_string(),
+                realtime_session_id: "sess_123".to_string(),
                 instructions: Some("backend prompt".to_string()),
             })
         );
@@ -868,6 +981,60 @@ mod tests {
     }
 
     #[test]
+    fn parse_v1_input_audio_transcription_delta_event() {
+        let payload = json!({
+            "type": "conversation.item.input_audio_transcription.delta",
+            "item_id": "item_input_1",
+            "content_index": 0,
+            "delta": "hello"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::InputTranscriptDelta(
+                RealtimeTranscriptDelta {
+                    delta: "hello".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_v1_input_audio_transcription_completed_event() {
+        let payload = json!({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item_input_1",
+            "content_index": 0,
+            "transcript": "hello world"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
+                text: "hello world".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_v1_input_transcript_turn_marked_event() {
+        let payload = json!({
+            "type": "conversation.input_transcript.turn_marked",
+            "transcript": "hello realtime"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
+                text: "hello realtime".to_string(),
+            }))
+        );
+    }
+
+    #[test]
     fn parse_output_transcript_delta_event() {
         let payload = json!({
             "type": "conversation.output_transcript.delta",
@@ -882,6 +1049,66 @@ mod tests {
                     delta: "hi".to_string(),
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn parse_v1_output_audio_transcript_delta_event() {
+        let payload = json!({
+            "type": "response.output_audio_transcript.delta",
+            "delta": "hi"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::OutputTranscriptDelta(
+                RealtimeTranscriptDelta {
+                    delta: "hi".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_v1_output_audio_transcript_done_event() {
+        let payload = json!({
+            "type": "response.output_audio_transcript.done",
+            "transcript": "hi there"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::OutputTranscriptDone(
+                RealtimeTranscriptDone {
+                    text: "hi there".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_v1_item_done_output_text_event() {
+        let payload = json!({
+            "type": "conversation.item.done",
+            "item": {
+                "id": "item_output_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "hello"},
+                    {"type": "output_text", "text": " world"}
+                ]
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::ConversationItemDone {
+                item_id: "item_output_1".to_string(),
+            })
         );
     }
 
@@ -911,6 +1138,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_realtime_v2_noop_tool_call_event() {
+        let payload = json!({
+            "type": "conversation.item.done",
+            "item": {
+                "id": "item_silent",
+                "type": "function_call",
+                "name": "remain_silent",
+                "call_id": "call_silent",
+                "arguments": "{}"
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
+            Some(RealtimeEvent::NoopRequested(RealtimeNoopRequested {
+                call_id: "call_silent".to_string(),
+                item_id: "item_silent".to_string(),
+            }))
+        );
+    }
+
+    #[test]
     fn parse_realtime_v2_input_audio_transcription_delta_event() {
         let payload = json!({
             "type": "conversation.item.input_audio_transcription.delta",
@@ -926,6 +1176,58 @@ mod tests {
                 RealtimeTranscriptDelta {
                     delta: "hello".to_string(),
                 }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_realtime_v2_output_audio_transcript_done_event() {
+        let payload = json!({
+            "type": "response.output_audio_transcript.done",
+            "transcript": "hello there"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
+            Some(RealtimeEvent::OutputTranscriptDone(
+                RealtimeTranscriptDone {
+                    text: "hello there".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_realtime_v2_output_text_done_event() {
+        let payload = json!({
+            "type": "response.output_text.done",
+            "text": "hello there"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
+            Some(RealtimeEvent::OutputTranscriptDone(
+                RealtimeTranscriptDone {
+                    text: "hello there".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_realtime_v2_conversation_item_created_event() {
+        let payload = json!({
+            "type": "conversation.item.created",
+            "item": {"type": "message", "role": "user"}
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
+            Some(RealtimeEvent::ConversationItemAdded(
+                json!({"type": "message", "role": "user"})
             ))
         );
     }
@@ -948,11 +1250,9 @@ mod tests {
 
         assert_eq!(
             parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
-            Some(RealtimeEvent::OutputTranscriptDone(
-                RealtimeTranscriptDone {
-                    text: "hello world".to_string(),
-                }
-            ))
+            Some(RealtimeEvent::ConversationItemDone {
+                item_id: "item_output_1".to_string(),
+            })
         );
     }
 
@@ -1322,6 +1622,11 @@ mod tests {
                 .expect("text");
             let third_json: Value = serde_json::from_str(&third).expect("json");
             assert_eq!(third_json["type"], "conversation.item.create");
+            assert_eq!(third_json["item"]["role"], "developer");
+            assert_eq!(
+                third_json["item"]["content"][0]["type"],
+                Value::String("input_text".to_string())
+            );
             assert_eq!(third_json["item"]["content"][0]["text"], "hello agent");
 
             let fourth = ws
@@ -1439,7 +1744,7 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_mock".to_string(),
+                realtime_session_id: "sess_mock".to_string(),
                 instructions: Some("backend prompt".to_string()),
             }
         );
@@ -1455,11 +1760,14 @@ mod tests {
             .await
             .expect("send audio");
         connection
-            .send_conversation_item_create("hello agent".to_string())
+            .send_conversation_item_create(
+                "hello agent".to_string(),
+                ConversationTextRole::Developer,
+            )
             .await
             .expect("send item");
         connection
-            .send_conversation_handoff_append(
+            .send_conversation_function_call_output(
                 "handoff_1".to_string(),
                 "hello from background agent".to_string(),
             )
@@ -1583,6 +1891,12 @@ mod tests {
                 })
             );
             assert_eq!(
+                first_json["session"]["audio"]["input"]["transcription"],
+                json!({
+                    "model": "gpt-4o-mini-transcribe",
+                })
+            );
+            assert_eq!(
                 first_json["session"]["audio"]["input"]["turn_detection"],
                 json!({
                     "type": "server_vad",
@@ -1615,6 +1929,18 @@ mod tests {
                 json!(["prompt"])
             );
             assert_eq!(
+                first_json["session"]["tools"][1]["type"],
+                Value::String("function".to_string())
+            );
+            assert_eq!(
+                first_json["session"]["tools"][1]["name"],
+                Value::String("remain_silent".to_string())
+            );
+            assert_eq!(
+                first_json["session"]["tools"][1]["parameters"]["properties"],
+                json!({})
+            );
+            assert_eq!(
                 first_json["session"]["tool_choice"],
                 Value::String("auto".to_string())
             );
@@ -1639,6 +1965,7 @@ mod tests {
                 .expect("text");
             let second_json: Value = serde_json::from_str(&second).expect("json");
             assert_eq!(second_json["type"], "conversation.item.create");
+            assert_eq!(second_json["item"]["role"], "developer");
             assert_eq!(
                 second_json["item"]["type"],
                 Value::String("message".to_string())
@@ -1715,17 +2042,23 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_v2".to_string(),
+                realtime_session_id: "sess_v2".to_string(),
                 instructions: Some("backend prompt".to_string()),
             }
         );
 
         connection
-            .send_conversation_item_create("delegate this".to_string())
+            .send_conversation_item_create(
+                "delegate this".to_string(),
+                ConversationTextRole::Developer,
+            )
             .await
             .expect("send text item");
         connection
-            .send_conversation_handoff_append("call_1".to_string(), "delegated result".to_string())
+            .send_conversation_function_call_output(
+                "call_1".to_string(),
+                "delegated result".to_string(),
+            )
             .await
             .expect("send handoff output");
 
@@ -1756,6 +2089,12 @@ mod tests {
                 Value::String("transcription".to_string())
             );
             assert!(first_json["session"].get("instructions").is_none());
+            assert_eq!(
+                first_json["session"]["audio"]["input"]["transcription"],
+                json!({
+                    "model": "gpt-4o-mini-transcribe",
+                })
+            );
             assert!(first_json["session"]["audio"].get("output").is_none());
             assert!(first_json["session"].get("tools").is_none());
 
@@ -1821,7 +2160,7 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_transcription".to_string(),
+                realtime_session_id: "sess_transcription".to_string(),
                 instructions: None,
             }
         );
@@ -1925,7 +2264,7 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_v1_mode".to_string(),
+                realtime_session_id: "sess_v1_mode".to_string(),
                 instructions: None,
             }
         );
@@ -2031,7 +2370,7 @@ mod tests {
         assert_eq!(
             next_event,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_after_send".to_string(),
+                realtime_session_id: "sess_after_send".to_string(),
                 instructions: Some("backend prompt".to_string()),
             }
         );

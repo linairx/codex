@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use crate::FileSystemSandboxContext;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_config::types::ShellEnvironmentPolicyInherit;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -15,17 +15,24 @@ pub const INITIALIZED_METHOD: &str = "initialized";
 pub const EXEC_METHOD: &str = "process/start";
 pub const EXEC_READ_METHOD: &str = "process/read";
 pub const EXEC_WRITE_METHOD: &str = "process/write";
+pub const EXEC_SIGNAL_METHOD: &str = "process/signal";
 pub const EXEC_TERMINATE_METHOD: &str = "process/terminate";
 pub const EXEC_OUTPUT_DELTA_METHOD: &str = "process/output";
 pub const EXEC_EXITED_METHOD: &str = "process/exited";
 pub const EXEC_CLOSED_METHOD: &str = "process/closed";
+pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 pub const FS_WRITE_FILE_METHOD: &str = "fs/writeFile";
 pub const FS_CREATE_DIRECTORY_METHOD: &str = "fs/createDirectory";
 pub const FS_GET_METADATA_METHOD: &str = "fs/getMetadata";
+pub const FS_CANONICALIZE_METHOD: &str = "fs/canonicalize";
 pub const FS_READ_DIRECTORY_METHOD: &str = "fs/readDirectory";
 pub const FS_REMOVE_METHOD: &str = "fs/remove";
 pub const FS_COPY_METHOD: &str = "fs/copy";
+/// JSON-RPC request method for executor-side HTTP requests.
+pub const HTTP_REQUEST_METHOD: &str = "http/request";
+/// JSON-RPC notification method for streamed executor HTTP response bodies.
+pub const HTTP_REQUEST_BODY_DELTA_METHOD: &str = "http/request/bodyDelta";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -55,6 +62,23 @@ pub struct InitializeParams {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub session_id: String,
+}
+
+/// Information about an execution/filesystem environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentInfo {
+    pub shell: ShellInfo,
+}
+
+/// Shell detected for an execution/filesystem environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellInfo {
+    /// Stable shell name, for example `zsh`, `bash`, `powershell`, `sh`, or `cmd`.
+    pub name: String,
+    /// Path the exec server would use for that shell.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +165,23 @@ pub struct WriteResponse {
     pub status: WriteStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessSignal {
+    Interrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalParams {
+    pub process_id: ProcessId,
+    pub signal: ProcessSignal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalResponse {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminateParams {
@@ -156,7 +197,7 @@ pub struct TerminateResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsReadFileParams {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -169,7 +210,7 @@ pub struct FsReadFileResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsWriteFileParams {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub data_base64: String,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
@@ -181,7 +222,7 @@ pub struct FsWriteFileResponse {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsCreateDirectoryParams {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub recursive: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
@@ -193,7 +234,7 @@ pub struct FsCreateDirectoryResponse {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsGetMetadataParams {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -203,14 +244,28 @@ pub struct FsGetMetadataResponse {
     pub is_directory: bool,
     pub is_file: bool,
     pub is_symlink: bool,
+    pub size: u64,
     pub created_at_ms: i64,
     pub modified_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FsCanonicalizeParams {
+    pub path: PathUri,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsCanonicalizeResponse {
+    pub path: PathUri,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FsReadDirectoryParams {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -231,7 +286,7 @@ pub struct FsReadDirectoryResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsRemoveParams {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub recursive: Option<bool>,
     pub force: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
@@ -244,8 +299,8 @@ pub struct FsRemoveResponse {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsCopyParams {
-    pub source_path: AbsolutePathBuf,
-    pub destination_path: AbsolutePathBuf,
+    pub source_path: PathUri,
+    pub destination_path: PathUri,
     pub recursive: bool,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
@@ -253,6 +308,87 @@ pub struct FsCopyParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsCopyResponse {}
+
+/// HTTP header represented in the executor protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpHeader {
+    /// Header name as it appears on the HTTP wire.
+    pub name: String,
+    /// Header value after UTF-8 conversion.
+    pub value: String,
+}
+
+/// Executor-side HTTP request envelope.
+///
+/// This intentionally stays transport-shaped rather than MCP-shaped so callers
+/// can use it for Streamable HTTP, OAuth discovery, and future executor-owned
+/// HTTP probes without introducing one protocol method per higher-level use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpRequestParams {
+    /// HTTP method, for example `GET`, `POST`, or `DELETE`.
+    pub method: String,
+    /// Absolute `http://` or `https://` URL.
+    pub url: String,
+    /// Ordered request headers. Repeated header names are preserved.
+    #[serde(default)]
+    pub headers: Vec<HttpHeader>,
+    /// Optional request body bytes.
+    #[serde(default, rename = "bodyBase64")]
+    pub body: Option<ByteChunk>,
+    /// Request timeout in milliseconds.
+    ///
+    /// Omitted or `null` disables the timeout. A number applies that exact
+    /// millisecond deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Caller-chosen stream id for `http/request/bodyDelta` notifications.
+    ///
+    /// The id must remain unique on a connection until the terminal body delta
+    /// arrives, even if the caller stops reading the stream earlier. Buffered
+    /// requests still send an id so callers can keep one consistent request
+    /// envelope shape.
+    pub request_id: String,
+    /// Return after response headers and stream the response body as deltas.
+    #[serde(default)]
+    pub stream_response: bool,
+}
+
+/// HTTP response envelope returned from an executor `http/request` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpRequestResponse {
+    /// Numeric HTTP response status code.
+    pub status: u16,
+    /// Ordered response headers. Repeated header names are preserved.
+    pub headers: Vec<HttpHeader>,
+    /// Buffered response body bytes. Empty when `streamResponse` is true.
+    #[serde(rename = "bodyBase64")]
+    pub body: ByteChunk,
+}
+
+/// Ordered response-body frame for `streamResponse` HTTP requests.
+///
+/// Headers are returned in the `http/request` response so the caller can choose
+/// a parser immediately; body bytes then arrive on this notification stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpRequestBodyDeltaNotification {
+    /// Request id from the streamed `http/request` call.
+    pub request_id: String,
+    /// Monotonic one-based body frame sequence number.
+    pub seq: u64,
+    /// Response-body bytes carried by this frame.
+    #[serde(rename = "deltaBase64")]
+    pub delta: ByteChunk,
+    /// Marks response-body EOF. No later deltas are expected for this request.
+    #[serde(default)]
+    pub done: bool,
+    /// Terminal stream error. Set only on the final notification.
+    #[serde(default)]
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,5 +444,89 @@ mod base64_bytes {
         BASE64_STANDARD
             .decode(encoded)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsReadFileParams;
+    use super::HttpRequestParams;
+    use crate::FileSystemSandboxContext;
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_path_uri::PathUri;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn filesystem_protocol_accepts_legacy_absolute_paths_and_serializes_path_uris() {
+        let legacy_path = std::env::current_dir()
+            .expect("current directory")
+            .join("legacy-file.txt");
+        let legacy_cwd = std::env::current_dir().expect("current directory");
+        let expected_sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+            PermissionProfile::default(),
+            PathUri::from_path(&legacy_cwd).expect("cwd URI"),
+        );
+        let mut legacy_sandbox =
+            serde_json::to_value(&expected_sandbox).expect("sandbox should serialize");
+        legacy_sandbox["cwd"] = serde_json::json!(legacy_cwd.to_string_lossy());
+        let params: FsReadFileParams = serde_json::from_value(serde_json::json!({
+            "path": legacy_path.to_string_lossy(),
+            "sandbox": legacy_sandbox,
+        }))
+        .expect("legacy absolute path should deserialize");
+        let expected = FsReadFileParams {
+            path: PathUri::from_path(legacy_path).expect("path URI"),
+            sandbox: Some(expected_sandbox.clone()),
+        };
+
+        assert_eq!(params, expected);
+        assert_eq!(
+            serde_json::to_value(params).expect("params should serialize"),
+            serde_json::json!({
+                "path": expected.path.to_string(),
+                "sandbox": serde_json::to_value(expected_sandbox)
+                    .expect("sandbox should serialize"),
+            })
+        );
+    }
+
+    #[test]
+    fn http_request_timeout_treats_omitted_and_null_as_no_timeout() {
+        let omitted: HttpRequestParams = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "url": "https://example.test",
+            "requestId": "req-omitted-timeout",
+        }))
+        .expect("omitted timeout should deserialize");
+        let null_timeout: HttpRequestParams = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "url": "https://example.test",
+            "requestId": "req-null-timeout",
+            "timeoutMs": null,
+        }))
+        .expect("null timeout should deserialize");
+        let explicit_timeout: HttpRequestParams = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "url": "https://example.test",
+            "requestId": "req-explicit-timeout",
+            "timeoutMs": 1234,
+        }))
+        .expect("numeric timeout should deserialize");
+
+        assert_eq!(
+            (omitted.request_id.as_str(), omitted.timeout_ms),
+            ("req-omitted-timeout", None)
+        );
+        assert_eq!(
+            (null_timeout.request_id.as_str(), null_timeout.timeout_ms),
+            ("req-null-timeout", None)
+        );
+        assert_eq!(
+            (
+                explicit_timeout.request_id.as_str(),
+                explicit_timeout.timeout_ms
+            ),
+            ("req-explicit-timeout", Some(1234))
+        );
     }
 }

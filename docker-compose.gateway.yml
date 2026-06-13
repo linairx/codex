@@ -1,0 +1,13 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: codex-gateway:local
+    ports:
+      - "8080:8080"
+    command:
+      - --listen
+      - 0.0.0.0:8080
+      - --runtime
+      - embedded

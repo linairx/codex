@@ -3529,6 +3529,46 @@ Phase 6 includes the following validated transport and rollout properties:
   remote profiles, so the Phase 6 rollout gate has an operational entry point
   in addition to the detailed compatibility plan
 - [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also includes a profile matrix that calls out embedded and
+  single-worker remote as release-quality baselines and multi-worker remote
+  as the bounded Stage B validation profile, making the rollout boundary
+  explicit at the operator entry point
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also defines the rollout terms `release-quality`, `bounded Stage B`,
+  `promotion evidence`, and `exact topology`, so the operator guide uses one
+  fixed vocabulary instead of mixing synonyms
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also spells out the runtime signals to watch for each profile, so
+  operators can read the same `/healthz`, `/v1/events`, metrics, and log
+  fields consistently instead of inferring them from caveats
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also includes a rollout checklist that orders profile selection, signal
+  capture, evidence comparison, and decision review before a deployment is
+  widened
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also groups the common failure signals by account exhaustion, worker
+  reconnect, slow-client pressure, protocol violation, and invalid
+  multi-worker shape, so operators can jump directly to the relevant health,
+  event, metric, and log fields
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also provides a triage order for rollout incidents, so operators know
+  to check health first, then events, then metrics, then logs, before
+  deciding whether the deployment shape should stay scoped
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also adds a response matrix that tells operators whether to hold, rerun,
+  or keep a deployment bounded after the common failure signals appear
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also adds a rerun matrix that maps common failure signals back to the
+  scenario groups that should be re-captured first
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also includes an artifact matrix that fixes the role of README,
+  worksheet, decision, transcript, health, events, metrics, and logs files in
+  one promotion evidence bundle
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
+  now also fixes the promotion scenario order in one place, so README,
+  worksheet, and capture directories stay aligned with the generator and
+  checker expectations
+- [docs/gateway-operations.md](/home/lin/project/codex/docs/gateway-operations.md)
   now also includes a concrete promotion evidence bundle layout and worksheet
   template, including capture rows for baseline, steady-state, route
   selection, reconnect, degraded-route, account-capacity, bounded

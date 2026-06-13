@@ -68,7 +68,7 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     };
     append_error_log(format!("startup: base_url={base_url} path_style={style}"));
 
-    let auth_manager = util::load_auth_manager().await;
+    let auth_manager = util::load_auth_manager(Some(base_url.clone())).await;
     let auth = match auth_manager.as_ref() {
         Some(manager) => manager.auth().await,
         None => None,
@@ -87,23 +87,17 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
         append_error_log(format!("auth: mode=ChatGPT account_id={acc}"));
     }
 
-    let token = match auth.get_token() {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            eprintln!(
-                "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
-            );
-            std::process::exit(1);
-        }
-    };
+    if !auth.uses_codex_backend() {
+        eprintln!(
+            "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
+        );
+        std::process::exit(1);
+    }
 
-    http = http.with_bearer_token(token.clone());
-    if let Some(acc) = auth
-        .get_account_id()
-        .or_else(|| util::extract_chatgpt_account_id(&token))
-    {
+    let auth_provider = codex_model_provider::auth_provider_from_auth(&auth);
+    http = http.with_auth_provider(auth_provider);
+    if let Some(acc) = auth.get_account_id() {
         append_error_log(format!("auth: set ChatGPT-Account-Id header: {acc}"));
-        http = http.with_chatgpt_account_id(acc);
     }
 
     Ok(BackendContext {
@@ -112,16 +106,20 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     })
 }
 
-#[async_trait::async_trait]
 trait GitInfoProvider {
-    async fn default_branch_name(&self, path: &std::path::Path) -> Option<String>;
+    fn default_branch_name(
+        &self,
+        path: &std::path::Path,
+    ) -> impl std::future::Future<Output = Option<String>> + Send;
 
-    async fn current_branch_name(&self, path: &std::path::Path) -> Option<String>;
+    fn current_branch_name(
+        &self,
+        path: &std::path::Path,
+    ) -> impl std::future::Future<Output = Option<String>> + Send;
 }
 
 struct RealGitInfo;
 
-#[async_trait::async_trait]
 impl GitInfoProvider for RealGitInfo {
     async fn default_branch_name(&self, path: &std::path::Path) -> Option<String> {
         default_branch_name(path).await
@@ -2162,7 +2160,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl super::GitInfoProvider for StubGitInfo {
         async fn default_branch_name(&self, _path: &std::path::Path) -> Option<String> {
             self.default_branch.clone()

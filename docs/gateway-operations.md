@@ -8,6 +8,94 @@ The detailed compatibility plan lives in
 The method-level routing profile lives in
 [gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md).
 
+## Profile Matrix
+
+| Profile | Status | Use when | Validation expectation |
+| --- | --- | --- | --- |
+| Embedded | Release-quality local baseline | You want the simplest drop-in v2 compatibility check and the app-server can run in process | Normal client harnesses pass for the exact workflow being added |
+| Single-worker remote | Release-quality remote baseline | The app-server must run out of process but one worker still owns the whole northbound session | Normal client harnesses pass and the single worker stays aligned with direct app-server behavior |
+| Multi-worker remote | Bounded Stage B validation profile | You need account-aware multi-worker routing for a specific deployment shape | Promotion evidence must be collected for the exact topology before release-quality guidance is claimed |
+
+## Status Terms
+
+- `release-quality`: the deployment profile is treated as a drop-in baseline
+  for the workflows covered by the current evidence
+- `bounded Stage B`: the deployment profile is validated, but only for the
+  exact topology and route classes recorded in the evidence bundle
+- `promotion evidence`: the captured health, events, metrics, logs, and
+  transcripts that justify the decision for one topology
+- `exact topology`: the specific gateway build, worker builds, worker URLs,
+  account labels, auth mode, timeouts, and pending-request limits in the
+  evidence bundle
+
+## Runtime Signals
+
+Use the same runtime signals across profiles, but interpret them by profile:
+
+- `Embedded`: look for normal `/healthz` stability, ordinary `/v1/events`
+  delivery, and client transcripts that match the direct app-server workflow
+- `Single-worker remote`: look for the same client-visible behavior plus a
+  single downstream worker route and matching reconnect or account-capacity
+  signals when that worker changes state
+- `Multi-worker remote`: look for `remoteAccountLabelsComplete`, `projectWorkerRoutes`,
+  `accountCapacityEvent*`, `/v1/events`, metrics, and structured logs that
+  agree on the same tenant, project, worker, and account scope
+
+## Failure Signals
+
+| Situation | Primary signals | Expected operator read |
+| --- | --- | --- |
+| Account exhaustion | `remoteWorkers[].accountCapacity*`, `accountCapacityEvent*`, `gateway_v2_account_capacity_events`, `/v1/events` account-capacity entries | The exhausted account should be visible in health, events, metrics, and logs, and any live work should fail closed unless a bounded restore surface is being exercised |
+| Worker reconnect or loss | `remoteWorkers[].reconnecting`, worker reconnect counters, `gateway_v2_worker_reconnects`, reconnect events | Reconnect/backoff should be obvious without inferring from stale routes; if a required worker is down, the affected route classes should fail closed or re-add the worker later |
+| Slow client or downstream lag | pending-client and backlog health fields, `gateway_v2_client_send_timeouts`, downstream backpressure counters, close/send failure logs | The connection should show explicit pressure or timeout state instead of silently stalling, and terminal logs should line up with the same time window |
+| Protocol violation | `gateway_v2_protocol_violations`, protocol-violation health fields, close-frame / request rejection metrics, audit logs | Malformed or out-of-order traffic should be attributed to the same worker or phase that triggered it, not disguised as an ordinary disconnect |
+| Invalid multi-worker shape | `remoteAccountLabelsComplete=false`, unlabeled-worker counters, `projectWorkerRoutes[].accountRoutingEligible=false`, rollout checklist failure | The deployment should stay bounded Stage B until every worker is labeled and the promotion evidence bundle matches the exact topology |
+
+## Triage Order
+
+When a rollout looks wrong, check the signals in this order:
+
+1. `GET /healthz` for the current worker, account, and route state.
+2. `/v1/events` for the exact operator-visible transition that happened.
+3. Metrics for the same wall-clock window to confirm whether the problem is
+   isolated or repeating.
+4. Structured logs for the tenant, project, worker, account, thread, and
+   request ids that match the same incident.
+5. The evidence worksheet or decision file if the question is whether the
+   deployment shape should stay scoped or can be widened.
+
+## Response Matrix
+
+| Situation | Recommended response |
+| --- | --- |
+| Account exhaustion in a release-quality baseline | Verify whether a bounded restore surface exists; if not, keep the deployment scoped and record the exhausted account, worker, and tenant/project scope in the evidence bundle |
+| Worker reconnect or loss during multi-worker validation | Wait for the required worker to rejoin or for the recovery path to fail closed; do not widen traffic until the route classes that depend on that worker pass again |
+| Slow-client or downstream lag | Hold the current rollout shape until the pending-client or backlog pressure clears or the terminal timeout/backpressure behavior is proven in the same window |
+| Protocol violation | Treat the deployment shape as unstable, capture the malformed or out-of-order traffic details, and rerun the exact scenario after fixing the client or worker behavior |
+| Invalid multi-worker shape | Keep the profile bounded Stage B, fix the worker labels or topology mismatch, and regenerate the promotion evidence bundle before widening traffic |
+
+## Rerun Matrix
+
+| Situation | Rerun first |
+| --- | --- |
+| Account exhaustion in a release-quality baseline | Account-capacity transition, bounded restoration, and live active-context no-handoff |
+| Worker reconnect or loss during multi-worker validation | Reconnect and recovery, degraded-route fail-closed, and project route selection |
+| Slow-client or downstream lag | Slow-client or backlog window, cleanup or delivery failure, and the affected steady-state scenario |
+| Protocol violation | The exact affected scenario plus the baseline before traffic capture for the same topology |
+| Invalid multi-worker shape | Baseline before traffic, project route selection, and the full scenario order after the topology is corrected |
+
+## Rollout Checklist
+
+1. Pick the deployment profile first: embedded, single-worker remote, or
+   multi-worker remote.
+2. Capture the profile-appropriate runtime signals before widening traffic.
+3. Compare `/healthz`, `/v1/events`, metrics, and logs for the same
+   tenant/project/worker/account scope.
+4. Confirm the evidence worksheet and decision taxonomy match the validated
+   topology and method families.
+5. Treat multi-worker remote as release-quality only when the exact topology
+   is fully labeled and the evidence bundle passes review.
+
 ## Deployment Profiles
 
 Embedded mode is the release-quality local baseline. It runs the gateway and
@@ -33,6 +121,44 @@ cargo run -p codex-gateway -- \
 Use `--remote-auth-token` when downstream workers require bearer
 authentication, and use `--bearer-token` when northbound clients must
 authenticate to the gateway.
+
+## Docker Deployment
+
+Use the Dockerfile when you want a packaged local deployment that still
+matches the same CLI flags as the direct `cargo run` path.
+
+Build the image from the repository root:
+
+```bash
+docker build -f Dockerfile.gateway -t codex-gateway:local .
+```
+
+Run the embedded baseline with port 8080 published on the host:
+
+```bash
+docker run --rm -p 8080:8080 codex-gateway:local
+```
+
+Run a remote worker topology by passing the same CLI flags through the
+container entrypoint:
+
+```bash
+docker run --rm -p 8080:8080 \
+  codex-gateway:local \
+  --runtime remote \
+  --remote-websocket-url ws://host.docker.internal:9001/v2
+```
+
+If your Docker daemon does not resolve `host.docker.internal` automatically,
+add `--add-host=host.docker.internal:host-gateway` on Linux or replace the
+worker URL with the host address that your container network can reach.
+
+Use the Compose file for the embedded baseline when you want a repeatable
+local service definition:
+
+```bash
+docker compose -f docker-compose.gateway.yml up --build
+```
 
 Multi-worker remote mode is a bounded Stage B profile until the exact
 deployment shape has promotion evidence. Every account-backed worker in an
@@ -119,6 +245,35 @@ At minimum, capture:
   reconnect, degraded-route, account-capacity, and cleanup scenarios
 - an explicit decision taxonomy value that names the topology and method
   families covered by the evidence
+
+## Artifact Matrix
+
+| Artifact | Primary purpose |
+| --- | --- |
+| `README.md` | Record the exact gateway build, topology id, worker builds, worker URLs, account labels, auth mode, capture window, and evidence index |
+| `worksheet.md` | Record the scenario-by-scenario capture references and reconciliation notes for the deployment shape being reviewed |
+| `decision.md` | Record the decision taxonomy value, promotion scope, route-family exclusions, reconciliation summary, blocking mismatches, and invalidation rules |
+| `transcripts/` | Store the client-visible scenario transcript for each captured flow |
+| `healthz/` | Store the `/healthz` snapshot for each captured flow and capture window |
+| `events/` | Store the `/v1/events` stream for each captured flow and capture window |
+| `metrics/` | Store the metric query output for the same wall-clock window as each captured flow |
+| `logs/` | Store the structured audit and warning logs for the same wall-clock window as each captured flow |
+
+## Scenario Order
+
+Keep the scenario order identical in `README.md`, `worksheet.md`, and the
+capture directories:
+
+1. Baseline before traffic
+2. Steady-state bootstrap and thread/turn
+3. Project route selection
+4. Reconnect and recovery
+5. Degraded-route fail-closed
+6. Account-capacity transition
+7. Bounded restoration
+8. Live active-context no-handoff
+9. Slow-client or backlog window
+10. Cleanup or delivery failure
 
 The promotion evidence worksheet in
 [gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md)

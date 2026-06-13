@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use async_trait::async_trait;
 use bytes::Bytes;
 use codex_api::AuthProvider;
 use codex_api::Compression;
@@ -32,7 +31,6 @@ impl FixtureSseTransport {
     }
 }
 
-#[async_trait]
 impl HttpTransport for FixtureSseTransport {
     async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
         Err(TransportError::Build("execute should not run".to_string()))
@@ -158,9 +156,11 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
         ResponseEvent::Completed {
             response_id,
             token_usage,
+            end_turn,
         } => {
             assert_eq!(response_id, "resp1");
             assert!(token_usage.is_none());
+            assert!(end_turn.is_none());
         }
         other => panic!("unexpected third event: {other:?}"),
     }

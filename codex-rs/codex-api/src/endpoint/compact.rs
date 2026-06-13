@@ -11,6 +11,7 @@ use http::Method;
 use serde::Deserialize;
 use serde_json::to_value;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct CompactClient<T: HttpTransport> {
     session: EndpointSession<T>,
@@ -37,10 +38,19 @@ impl<T: HttpTransport> CompactClient<T> {
         &self,
         body: serde_json::Value,
         extra_headers: HeaderMap,
+        request_timeout: Duration,
     ) -> Result<Vec<ResponseItem>, ApiError> {
         let resp = self
             .session
-            .execute(Method::POST, Self::path(), extra_headers, Some(body))
+            .execute_with(
+                Method::POST,
+                Self::path(),
+                extra_headers,
+                Some(body),
+                |req| {
+                    req.timeout = Some(request_timeout);
+                },
+            )
             .await?;
         let parsed: CompactHistoryResponse =
             serde_json::from_slice(&resp.body).map_err(|e| ApiError::Stream(e.to_string()))?;
@@ -51,10 +61,11 @@ impl<T: HttpTransport> CompactClient<T> {
         &self,
         input: &CompactionInput<'_>,
         extra_headers: HeaderMap,
+        request_timeout: Duration,
     ) -> Result<Vec<ResponseItem>, ApiError> {
         let body = to_value(input)
             .map_err(|e| ApiError::Stream(format!("failed to encode compaction input: {e}")))?;
-        self.compact(body, extra_headers).await
+        self.compact(body, extra_headers, request_timeout).await
     }
 }
 
@@ -66,7 +77,6 @@ struct CompactHistoryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use codex_client::Request;
     use codex_client::Response;
     use codex_client::StreamResponse;
@@ -75,7 +85,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct DummyTransport;
 
-    #[async_trait]
     impl HttpTransport for DummyTransport {
         async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
             Err(TransportError::Build("execute should not run".to_string()))

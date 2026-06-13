@@ -1,13 +1,14 @@
+use core_test_support::test_codex::local_selections;
 use std::sync::Arc;
 
 use codex_core::CodexThread;
 use codex_protocol::AgentPath;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -25,6 +26,7 @@ use core_test_support::streaming_sse::StreamingSseServer;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -85,7 +87,7 @@ fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
 
 async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
     test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .build_with_streaming_server(server)
         .await
         .unwrap_or_else(|err| panic!("build streaming Codex test session: {err}"))
@@ -101,29 +103,40 @@ async fn submit_user_input(codex: &CodexThread, text: &str) {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap_or_else(|err| panic!("submit user input: {err}"));
 }
 
 async fn submit_danger_full_access_user_turn(test: &TestCodex, text: &str) {
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserTurn {
+        .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: test.config.cwd.to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: test.session_configured.model.clone(),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
         })
         .await
         .unwrap_or_else(|err| panic!("submit user turn: {err}"));
@@ -136,7 +149,9 @@ async fn steer_user_input(codex: &CodexThread, text: &str) {
                 text: text.to_string(),
                 text_elements: Vec::new(),
             }],
+            /*additional_context*/ Default::default(),
             /*expected_turn_id*/ None,
+            /*client_user_message_id*/ None,
             /*responsesapi_client_metadata*/ None,
         )
         .await
@@ -158,11 +173,11 @@ async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
         .await
         .unwrap_or_else(|err| panic!("submit queue-only agent mail: {err}"));
     codex
-        .submit(Op::ListMcpTools)
+        .submit(Op::RealtimeConversationListVoices)
         .await
-        .unwrap_or_else(|err| panic!("submit list-mcp-tools barrier: {err}"));
+        .unwrap_or_else(|err| panic!("submit list-voices barrier: {err}"));
     wait_for_event(codex, |event| {
-        matches!(event, EventMsg::McpListToolsResponse(_))
+        matches!(event, EventMsg::RealtimeConversationListVoicesResponse(_))
     })
     .await;
 }
@@ -264,7 +279,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         start_streaming_sse_server(vec![first_chunks, second_chunks]).await;
 
     let codex = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .build_with_streaming_server(&server)
         .await
         .unwrap()
@@ -278,6 +293,8 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -295,6 +312,8 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -321,7 +340,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_inter_agent_mail_waits_for_request_boundary_after_reasoning_item() {
+async fn queued_inter_agent_mail_triggers_follow_up_after_reasoning_item() {
     let (gate_reasoning_done_tx, gate_reasoning_done_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -331,18 +350,14 @@ async fn queued_inter_agent_mail_waits_for_request_boundary_after_reasoning_item
             gate_reasoning_done_rx,
             vec![
                 ev_reasoning_item("reason-1", &["thinking"], &[]),
-                ev_message_item_added("msg-preserved", ""),
-                ev_output_text_delta("preserved commentary"),
-                json!({
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "id": "msg-preserved",
-                        "content": [{"type": "output_text", "text": "preserved commentary"}],
-                        "phase": "commentary",
-                    }
-                }),
+                ev_function_call(
+                    "call-stale",
+                    "shell",
+                    r#"{"command":"echo stale tool call"}"#,
+                ),
+                ev_message_item_added("msg-stale", ""),
+                ev_output_text_delta("stale final"),
+                ev_message_item_done("msg-stale", "stale final"),
                 ev_completed("resp-1"),
             ],
         ),
@@ -370,7 +385,7 @@ async fn queued_inter_agent_mail_waits_for_request_boundary_after_reasoning_item
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_inter_agent_mail_waits_for_request_boundary_after_commentary_message_item() {
+async fn queued_inter_agent_mail_triggers_follow_up_after_commentary_message_item() {
     let (gate_message_done_tx, gate_message_done_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -379,18 +394,25 @@ async fn queued_inter_agent_mail_waits_for_request_boundary_after_commentary_mes
         gated_chunk(
             gate_message_done_rx,
             vec![
-                ev_output_text_delta("first commentary"),
+                ev_output_text_delta("first answer"),
                 json!({
                     "type": "response.output_item.done",
                     "item": {
                         "type": "message",
                         "role": "assistant",
                         "id": "msg-1",
-                        "content": [{"type": "output_text", "text": "first commentary"}],
+                        "content": [{"type": "output_text", "text": "first answer"}],
                         "phase": "commentary",
                     }
                 }),
-                ev_function_call("call-preserved", "test_tool", "{}"),
+                ev_function_call(
+                    "call-stale",
+                    "shell",
+                    r#"{"command":"echo stale tool call"}"#,
+                ),
+                ev_message_item_added("msg-stale", ""),
+                ev_output_text_delta("stale final"),
+                ev_message_item_done("msg-stale", "stale final"),
                 ev_completed("resp-1"),
             ],
         ),
@@ -416,7 +438,7 @@ async fn queued_inter_agent_mail_waits_for_request_boundary_after_commentary_mes
 
     let _ = gate_message_done_tx.send(());
 
-    wait_for_agent_message(&codex, "first commentary").await;
+    wait_for_agent_message(&codex, "first answer").await;
 
     wait_for_turn_complete(&codex).await;
 
@@ -527,7 +549,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
     .await;
 
     let codex = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
@@ -614,7 +636,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
             .await;
 
     let codex = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
@@ -664,12 +686,24 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
 async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_request() {
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 
+    let large_output_command = if cfg!(windows) {
+        "[Console]::Out.Write([string]::new([char]'0', 4000))"
+    } else {
+        "printf '%04000d' 0"
+    };
+    let large_output_args = json!({
+        "command": large_output_command,
+        "login": false,
+        "timeout_ms": 2000,
+    })
+    .to_string();
+
     let first_chunks = vec![
         chunk(ev_response_created("resp-1")),
         chunk(ev_function_call(
             "call-1",
             "shell_command",
-            r#"{"command":"printf '%04000d' 0","login":false,"timeout_ms":2000}"#,
+            &large_output_args,
         )),
         gated_chunk(
             gate_first_completed_rx,
@@ -721,7 +755,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
     .await;
 
     let test = test_codex()
-        .with_model("gpt-5.1")
+        .with_model("gpt-5.4")
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
             config.model_provider.supports_websockets = false;
