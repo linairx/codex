@@ -127,6 +127,14 @@ authenticate to the gateway.
 Use the Dockerfile when you want a packaged local deployment that still
 matches the same CLI flags as the direct `cargo run` path.
 
+The embedded container image resolves its local exec-server helper paths from
+the gateway binary inside the container, so the packaged deployment only needs
+the built gateway executable.
+
+The container entrypoint reads `CODEX_GATEWAY_*` environment variables when no
+explicit command is passed. That lets Compose drive embedded and remote
+deployments through the same image.
+
 The `just` helpers import a local `codex-alpine:3.24` base image from
 Alpine's published minirootfs tarball before invoking `docker build` or
 `docker compose`, so the deployment path does not depend on Docker Hub for
@@ -144,6 +152,18 @@ The same build is available through `just`:
 just gateway-docker-build
 ```
 
+If you want to inspect the worker image directly, build it the same way:
+
+```bash
+docker build -f Dockerfile.app-server -t codex-app-server:local .
+```
+
+The same worker build is available through `just`:
+
+```bash
+just app-server-docker-build
+```
+
 Run the embedded baseline with port 8080 published on the host:
 
 ```bash
@@ -156,6 +176,7 @@ container entrypoint:
 ```bash
 docker run --rm -p 8080:8080 \
   codex-gateway:local \
+  --listen 0.0.0.0:8080 \
   --runtime remote \
   --remote-websocket-url ws://host.docker.internal:9001/v2
 ```
@@ -176,6 +197,56 @@ You can run the same Compose deployment through `just`:
 ```bash
 just gateway-docker-up
 ```
+
+The same Compose file also contains a `remote` profile with a built-in worker
+service. Use it when you want a self-contained single-worker deployment:
+
+```bash
+CODEX_GATEWAY_RUNTIME=remote \
+CODEX_GATEWAY_REMOTE_WEBSOCKET_URLS=ws://127.0.0.1:9001/v2 \
+docker compose -f docker-compose.gateway.yml --profile remote up --build
+```
+
+You can run the same remote profile through `just`:
+
+```bash
+just gateway-docker-up-remote
+```
+
+For a multi-worker topology, keep using the gateway container and provide
+comma-separated worker URLs and matching comma-separated account ids:
+
+```bash
+CODEX_GATEWAY_RUNTIME=remote \
+CODEX_GATEWAY_REMOTE_WEBSOCKET_URLS=ws://host.docker.internal:9001/v2,ws://host.docker.internal:9002/v2 \
+CODEX_GATEWAY_REMOTE_ACCOUNT_IDS=acct-a,acct-b \
+docker compose -f docker-compose.gateway.yml up --build
+```
+
+Common `CODEX_GATEWAY_*` variables:
+
+- `CODEX_GATEWAY_PORT`
+- `CODEX_GATEWAY_RUNTIME`
+- `CODEX_GATEWAY_BEARER_TOKEN`
+- `CODEX_GATEWAY_EXEC_SERVER_URL`
+- `CODEX_GATEWAY_REMOTE_AUTH_TOKEN`
+- `CODEX_GATEWAY_REMOTE_WEBSOCKET_URLS`
+- `CODEX_GATEWAY_REMOTE_ACCOUNT_IDS`
+- `CODEX_GATEWAY_V2_INITIALIZE_TIMEOUT_SECONDS`
+- `CODEX_GATEWAY_V2_CLIENT_SEND_TIMEOUT_SECONDS`
+- `CODEX_GATEWAY_V2_RECONNECT_RETRY_BACKOFF_SECONDS`
+- `CODEX_GATEWAY_V2_MAX_PENDING_SERVER_REQUESTS`
+- `CODEX_GATEWAY_V2_MAX_PENDING_CLIENT_REQUESTS`
+
+The built-in remote worker profile also uses `CODEX_APP_SERVER_WS_TOKEN` inside
+the worker container. In the default Compose wiring, both containers share the
+`codex-local-worker-token` value and the worker shares the gateway network
+namespace, so the upstream auth header can target the worker on
+`ws://127.0.0.1:9001/v2`.
+
+The gateway entrypoint waits for the local worker `/readyz` probe before it
+starts in that built-in remote profile, so the remote stack comes up in a
+usable order instead of racing the first connection attempt.
 
 Multi-worker remote mode is a bounded Stage B profile until the exact
 deployment shape has promotion evidence. Every account-backed worker in an

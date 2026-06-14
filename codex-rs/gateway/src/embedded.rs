@@ -36,6 +36,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_core::config::Config;
 use codex_core::config::LoaderOverrides;
+use codex_exec_server::ExecServerRuntimePaths;
 use codex_feedback::CodexFeedback;
 use codex_otel::OtelProvider;
 use std::io;
@@ -117,7 +118,8 @@ pub async fn start_gateway_server(
 
     match &gateway_config.runtime_mode {
         GatewayRuntimeMode::Embedded => {
-            let environment_manager = gateway_environment_manager(&gateway_config).await;
+            let environment_manager =
+                gateway_environment_manager(&gateway_config, &arg0_paths).await?;
             validate_gateway_environment_manager(&environment_manager).await?;
             tracing::info!(
                 runtime_mode = "embedded",
@@ -465,10 +467,24 @@ fn validate_gateway_config(gateway_config: &GatewayConfig) -> io::Result<()> {
     Ok(())
 }
 
-async fn gateway_environment_manager(gateway_config: &GatewayConfig) -> Arc<EnvironmentManager> {
-    Arc::new(
-        EnvironmentManager::create_for_tests(gateway_config.exec_server_url.clone(), None).await,
-    )
+async fn gateway_environment_manager(
+    gateway_config: &GatewayConfig,
+    arg0_paths: &Arg0DispatchPaths,
+) -> io::Result<Arc<EnvironmentManager>> {
+    let local_runtime_paths = arg0_paths
+        .codex_self_exe
+        .clone()
+        .map(|codex_self_exe| {
+            ExecServerRuntimePaths::new(codex_self_exe, arg0_paths.codex_linux_sandbox_exe.clone())
+        })
+        .transpose()?;
+    Ok(Arc::new(
+        EnvironmentManager::create_for_tests(
+            gateway_config.exec_server_url.clone(),
+            local_runtime_paths,
+        )
+        .await,
+    ))
 }
 
 async fn validate_gateway_environment_manager(
@@ -1853,16 +1869,38 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_gateway_environment_manager_preserves_remote_exec_server_url() {
-        let environment_manager = gateway_environment_manager(&GatewayConfig {
-            exec_server_url: Some("ws://127.0.0.1:9753".to_string()),
-            ..GatewayConfig::default()
-        })
-        .await;
+        let environment_manager = gateway_environment_manager(
+            &GatewayConfig {
+                exec_server_url: Some("ws://127.0.0.1:9753".to_string()),
+                ..GatewayConfig::default()
+            },
+            &Arg0DispatchPaths {
+                codex_self_exe: Some(std::env::current_exe().expect("current exe")),
+                ..Arg0DispatchPaths::default()
+            },
+        )
+        .await
+        .expect("environment manager");
 
-        assert_eq!(
-            environment_manager.exec_server_url(),
-            Some("ws://127.0.0.1:9753")
-        );
+        let environment = environment_manager
+            .default_environment()
+            .expect("default environment");
+        assert_eq!(environment.exec_server_url(), Some("ws://127.0.0.1:9753"));
+    }
+
+    #[tokio::test]
+    async fn embedded_gateway_environment_manager_builds_local_environment() {
+        let environment_manager = gateway_environment_manager(
+            &GatewayConfig::default(),
+            &Arg0DispatchPaths {
+                codex_self_exe: Some(std::env::current_exe().expect("current exe")),
+                ..Arg0DispatchPaths::default()
+            },
+        )
+        .await
+        .expect("environment manager");
+
+        assert_eq!(environment_manager.default_environment_id(), Some("local"));
     }
 
     #[tokio::test]

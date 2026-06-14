@@ -3033,6 +3033,7 @@ dependencies = [
  "codex-arg0",
  "codex-config",
  "codex-core",
+ "codex-exec-server",
  "codex-feedback",
  "codex-otel",
  "codex-protocol",

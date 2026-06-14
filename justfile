@@ -175,11 +175,38 @@ gateway-docker-build:
     {{ justfile_directory() }}/scripts/ensure-gateway-docker-base.sh
     docker build -f {{ justfile_directory() }}/Dockerfile.gateway -t codex-gateway:local {{ justfile_directory() }}
 
+# Build the app-server Docker image from the repository root.
+[no-cd]
+app-server-docker-build:
+    {{ justfile_directory() }}/scripts/ensure-gateway-docker-base.sh
+    docker build -f {{ justfile_directory() }}/Dockerfile.app-server -t codex-app-server:local {{ justfile_directory() }}
+
+# Smoke-test the gateway Docker entrypoint wrapper.
+[no-cd]
+gateway-docker-entrypoint-test:
+    sh {{ justfile_directory() }}/scripts/test-gateway-docker-entrypoint.sh
+
+# Smoke-test the app-server Docker entrypoint wrapper.
+[no-cd]
+app-server-docker-entrypoint-test:
+    sh {{ justfile_directory() }}/scripts/test-app-server-docker-entrypoint.sh
+
+# Smoke-test the gateway Docker Compose wiring.
+[no-cd]
+gateway-docker-compose-test:
+    sh {{ justfile_directory() }}/scripts/test-gateway-docker-compose.sh
+
 # Start the gateway Docker Compose deployment from the repository root.
 [no-cd]
 gateway-docker-up:
     {{ justfile_directory() }}/scripts/ensure-gateway-docker-base.sh
     docker compose -f {{ justfile_directory() }}/docker-compose.gateway.yml up --build
+
+# Start the gateway Docker Compose deployment with the built-in remote worker profile.
+[no-cd]
+gateway-docker-up-remote:
+    {{ justfile_directory() }}/scripts/ensure-gateway-docker-base.sh
+    CODEX_GATEWAY_RUNTIME=remote CODEX_GATEWAY_REMOTE_WEBSOCKET_URLS=ws://127.0.0.1:9001/v2 docker compose -f {{ justfile_directory() }}/docker-compose.gateway.yml --profile remote up --build
 
 # Smoke-test the gateway promotion bundle checker.
 [no-cd]

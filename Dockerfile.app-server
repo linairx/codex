@@ -35,7 +35,7 @@ ENV CARGO_BUILD_JOBS=2
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 ENV CARGO_PROFILE_RELEASE_LTO=false
 
-RUN cargo build --locked -p codex-gateway --release
+RUN cargo build --locked -p codex-app-server --release
 
 FROM codex-alpine:3.24 AS runtime
 
@@ -45,13 +45,13 @@ RUN adduser -D -u 10001 codex
 
 WORKDIR /app
 
-COPY --from=builder /workspace/codex-rs/target/release/codex-gateway /usr/local/bin/codex-gateway
-COPY scripts/gateway-docker-entrypoint.sh /usr/local/bin/gateway-docker-entrypoint.sh
+COPY --from=builder /workspace/codex-rs/target/release/codex-app-server /usr/local/bin/codex-app-server
+COPY scripts/app-server-docker-entrypoint.sh /usr/local/bin/app-server-docker-entrypoint.sh
 
-EXPOSE 8080
+EXPOSE 9001
 
-HEALTHCHECK --interval=10s --timeout=2s --retries=3 --start-period=15s CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 --start-period=15s CMD wget -qO- http://127.0.0.1:9001/readyz >/dev/null || exit 1
 
 USER codex
 
-ENTRYPOINT ["/bin/sh", "/usr/local/bin/gateway-docker-entrypoint.sh"]
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/app-server-docker-entrypoint.sh"]

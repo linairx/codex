@@ -1,8 +1,11 @@
 *
 !.dockerignore
 !Dockerfile.gateway
+!Dockerfile.app-server
 !codex-rs/
 !codex-rs/**
+!scripts/
+!scripts/**
 !third_party/v8/
 !third_party/v8/rusty_v8_149_2_0.sha256
 
