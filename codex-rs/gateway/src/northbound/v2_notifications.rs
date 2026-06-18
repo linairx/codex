@@ -1,7 +1,10 @@
 use crate::northbound::v2_connection::ForwardedConnectionNotification;
+use crate::northbound::v2_scope::notification_thread_id;
+use crate::scope::GatewayRequestContext;
 use codex_app_server_protocol::JSONRPCNotification;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use tracing::warn;
 
 pub(crate) const MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD: usize = 256;
 
@@ -65,4 +68,80 @@ pub(crate) fn record_forwarded_connection_notification(
         worker_id,
         params: notification.params.clone(),
     });
+}
+
+pub(crate) fn log_suppressed_skills_changed_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method = notification.method,
+        params = ?notification.params,
+        "suppressing duplicate multi-worker skills/changed notification until the client refreshes skills/list"
+    );
+}
+
+pub(crate) fn log_suppressed_opted_out_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method = notification.method,
+        params = ?notification.params,
+        "suppressing downstream notification opted out by northbound v2 client"
+    );
+}
+
+pub(crate) fn log_suppressed_duplicate_connection_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    original_worker_id: Option<usize>,
+    original_worker_websocket_url: &str,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        original_worker_id = ?original_worker_id,
+        original_worker_websocket_url,
+        method = notification.method,
+        params = ?notification.params,
+        "suppressing exact-duplicate multi-worker connection notification"
+    );
+}
+
+pub(crate) fn log_suppressed_hidden_thread_notification(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    notification: &JSONRPCNotification,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method = notification.method,
+        thread_id = notification
+            .params
+            .as_ref()
+            .and_then(notification_thread_id),
+        params = ?notification.params,
+        "suppressing downstream notification for a thread outside the gateway request scope"
+    );
 }

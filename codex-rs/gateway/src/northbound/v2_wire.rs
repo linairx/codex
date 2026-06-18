@@ -1,4 +1,7 @@
 use crate::error::GatewayError;
+use crate::northbound::v2_connection::GatewayV2EventState;
+use crate::northbound::v2_server_requests::pending_server_request_log_fields;
+use crate::northbound::v2_server_requests::resolved_server_request_log_fields;
 use crate::observability::GatewayObservability;
 use crate::scope::GatewayRequestContext;
 use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
@@ -23,6 +26,7 @@ use std::io;
 use std::io::ErrorKind;
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing::warn;
 
 pub(crate) const DOWNSTREAM_BACKPRESSURE_CLOSE_REASON: &str =
     "downstream app-server event stream lagged";
@@ -201,6 +205,79 @@ pub(crate) fn downstream_protocol_violation_reason(message: &str) -> Option<&'st
     } else {
         None
     }
+}
+
+pub(crate) fn log_downstream_connect_protocol_violation(
+    request_context: &GatewayRequestContext,
+    reason: &str,
+    message: &str,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        reason,
+        downstream_message = message,
+        "downstream app-server sent a malformed v2 protocol frame during initialize"
+    );
+}
+
+pub(crate) fn log_downstream_reconnect_protocol_violation(
+    request_context: &GatewayRequestContext,
+    worker_id: usize,
+    worker_websocket_url: &str,
+    reason: &str,
+    message: &str,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id,
+        worker_websocket_url,
+        reason,
+        downstream_message = message,
+        "downstream app-server sent a malformed v2 protocol frame during worker reconnect"
+    );
+}
+
+pub(crate) fn log_downstream_protocol_violation(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    reason: &str,
+    message: &str,
+    active_worker_count: usize,
+    event_state: &GatewayV2EventState,
+) {
+    let pending_log_fields =
+        pending_server_request_log_fields(&event_state.pending_server_requests);
+    let resolved_log_fields =
+        resolved_server_request_log_fields(&event_state.resolved_server_requests);
+
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        reason,
+        downstream_message = message,
+        active_worker_count,
+        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
+        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
+        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
+        pending_server_request_methods = ?pending_log_fields.methods,
+        pending_thread_ids = ?pending_log_fields.thread_ids,
+        pending_worker_ids = ?pending_log_fields.worker_ids,
+        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
+        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
+        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
+        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
+        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
+        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
+        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
+        answered_but_unresolved_worker_websocket_urls =
+            ?resolved_log_fields.worker_websocket_urls,
+        "downstream app-server sent a malformed v2 protocol frame"
+    );
 }
 
 pub(crate) fn server_request_to_jsonrpc(

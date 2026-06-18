@@ -24,6 +24,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 #[derive(Clone)]
 pub(crate) struct GatewayV2ConnectionContext<'a> {
@@ -282,3 +283,187 @@ impl std::fmt::Display for FailClosedMultiWorkerRouteError {
 }
 
 impl std::error::Error for FailClosedMultiWorkerRouteError {}
+
+pub(crate) fn log_fail_closed_multi_worker_request(
+    downstream: &GatewayV2DownstreamRouter,
+    connection: &GatewayV2ConnectionContext<'_>,
+    method: &str,
+    err: &io::Error,
+) {
+    if !downstream.multi_worker_topology() {
+        return;
+    }
+
+    let is_fail_closed_route_error = is_fail_closed_multi_worker_route_error(err);
+    let unavailable_workers = downstream.unavailable_worker_route_diagnostics(Instant::now());
+    if unavailable_workers.is_empty() && !is_fail_closed_route_error {
+        return;
+    }
+
+    let available_worker_ids = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let available_worker_websocket_urls = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_websocket_url.as_deref())
+        .collect::<Vec<_>>();
+    let unavailable_worker_ids = unavailable_workers
+        .iter()
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let unavailable_worker_websocket_urls = unavailable_workers
+        .iter()
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_ids = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_websocket_urls = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_remaining_seconds = unavailable_workers
+        .iter()
+        .filter_map(|worker| worker.reconnect_backoff_remaining_seconds)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_routes = reconnect_backoff_worker_routes(&unavailable_workers);
+    if is_fail_closed_route_error {
+        connection
+            .observability
+            .record_v2_fail_closed_request(method, !reconnect_backoff_worker_ids.is_empty());
+
+        warn!(
+            method,
+            tenant_id = connection.request_context.tenant_id.as_str(),
+            project_id = connection.request_context.project_id.as_deref(),
+            available_worker_ids = ?available_worker_ids,
+            available_worker_websocket_urls = ?available_worker_websocket_urls,
+            unavailable_worker_ids = ?unavailable_worker_ids,
+            unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
+            reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+            reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
+            reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
+            reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
+            %err,
+            "gateway v2 request failed closed because required worker routes are unavailable"
+        );
+    } else {
+        connection
+            .observability
+            .record_v2_upstream_request_failure(method, !reconnect_backoff_worker_ids.is_empty());
+
+        warn!(
+            method,
+            tenant_id = connection.request_context.tenant_id.as_str(),
+            project_id = connection.request_context.project_id.as_deref(),
+            available_worker_ids = ?available_worker_ids,
+            available_worker_websocket_urls = ?available_worker_websocket_urls,
+            unavailable_worker_ids = ?unavailable_worker_ids,
+            unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
+            reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+            reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
+            reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
+            reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
+            %err,
+            "gateway v2 upstream request failed while worker routes are unavailable"
+        );
+    }
+}
+
+pub(crate) fn log_degraded_multi_worker_thread_discovery(
+    downstream: &GatewayV2DownstreamRouter,
+    request_context: &GatewayRequestContext,
+    observability: &GatewayObservability,
+    method: &str,
+) {
+    if !downstream.multi_worker_topology() {
+        return;
+    }
+
+    let unavailable_workers = downstream.unavailable_worker_route_diagnostics(Instant::now());
+    if unavailable_workers.is_empty() {
+        return;
+    }
+
+    let available_worker_ids = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let available_worker_websocket_urls = downstream
+        .workers
+        .iter()
+        .filter_map(|worker| worker.worker_websocket_url.as_deref())
+        .collect::<Vec<_>>();
+    let unavailable_worker_ids = unavailable_workers
+        .iter()
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let unavailable_worker_websocket_urls = unavailable_workers
+        .iter()
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_ids = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.worker_id)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_websocket_urls = unavailable_workers
+        .iter()
+        .filter(|worker| worker.reconnect_backoff_active)
+        .map(|worker| worker.websocket_url.as_str())
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_remaining_seconds = unavailable_workers
+        .iter()
+        .filter_map(|worker| worker.reconnect_backoff_remaining_seconds)
+        .collect::<Vec<_>>();
+    let reconnect_backoff_worker_routes = reconnect_backoff_worker_routes(&unavailable_workers);
+    observability
+        .record_v2_degraded_thread_discovery(method, !reconnect_backoff_worker_ids.is_empty());
+
+    warn!(
+        method,
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        available_worker_ids = ?available_worker_ids,
+        available_worker_websocket_urls = ?available_worker_websocket_urls,
+        unavailable_worker_ids = ?unavailable_worker_ids,
+        unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
+        reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
+        reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
+        reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
+        reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
+        "serving degraded multi-worker thread discovery from available workers"
+    );
+}
+
+fn is_fail_closed_multi_worker_route_error(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<FailClosedMultiWorkerRouteError>())
+        .is_some()
+}
+
+fn reconnect_backoff_worker_routes(
+    unavailable_workers: &[UnavailableWorkerRouteDiagnostics],
+) -> Vec<(usize, &str, u64)> {
+    unavailable_workers
+        .iter()
+        .filter_map(|worker| {
+            worker
+                .reconnect_backoff_remaining_seconds
+                .map(|remaining_seconds| {
+                    (
+                        worker.worker_id,
+                        worker.websocket_url.as_str(),
+                        remaining_seconds,
+                    )
+                })
+        })
+        .collect()
+}

@@ -30,6 +30,8 @@ use crate::northbound::v2_connection::UnavailableWorkerRouteDiagnostics;
 use crate::northbound::v2_connection::WorkerCleanupResolvedNotification;
 use crate::northbound::v2_connection::WorkerServerRequestCleanup;
 use crate::northbound::v2_connection::WorkerServerRequestCleanupReport;
+use crate::northbound::v2_connection::log_degraded_multi_worker_thread_discovery;
+use crate::northbound::v2_connection::log_fail_closed_multi_worker_request;
 use crate::northbound::v2_connection::update_active_v2_connection_pending_counts;
 use crate::northbound::v2_counts::answered_but_unresolved_server_request_count;
 use crate::northbound::v2_counts::pending_client_request_method_counts;
@@ -47,6 +49,10 @@ use crate::northbound::v2_limits::pending_server_request_limit_error;
 #[cfg(test)]
 use crate::northbound::v2_notifications::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD;
 use crate::northbound::v2_notifications::forwarded_connection_notification_duplicate;
+pub(crate) use crate::northbound::v2_notifications::log_suppressed_duplicate_connection_notification;
+pub(crate) use crate::northbound::v2_notifications::log_suppressed_hidden_thread_notification;
+pub(crate) use crate::northbound::v2_notifications::log_suppressed_opted_out_notification;
+pub(crate) use crate::northbound::v2_notifications::log_suppressed_skills_changed_notification;
 use crate::northbound::v2_notifications::record_forwarded_connection_notification;
 use crate::northbound::v2_notifications::should_deduplicate_connection_notification;
 use crate::northbound::v2_pagination::AGGREGATED_APPS_CURSOR_PREFIX;
@@ -61,8 +67,12 @@ use crate::northbound::v2_pagination::collect_worker_paginated_data;
 use crate::northbound::v2_pagination::decode_aggregated_offset_cursor;
 use crate::northbound::v2_pagination::encode_aggregated_offset_cursor;
 use crate::northbound::v2_pagination::sort_threads_for_aggregation;
+use crate::northbound::v2_scope::DeduplicatedThreadListEntryLog;
 use crate::northbound::v2_scope::apply_response_scope_policy;
 use crate::northbound::v2_scope::enforce_request_scope;
+use crate::northbound::v2_scope::log_deduplicated_thread_list_entry;
+use crate::northbound::v2_scope::log_failed_visible_thread_worker_route_recovery;
+use crate::northbound::v2_scope::log_recovered_visible_thread_worker_route;
 use crate::northbound::v2_scope::notification_thread_id;
 use crate::northbound::v2_scope::notification_visible_to;
 use crate::northbound::v2_scope::request_thread_id;
@@ -81,6 +91,9 @@ use crate::northbound::v2_server_requests::record_client_server_request_cleanup_
 use crate::northbound::v2_server_requests::record_v2_server_request_lifecycle_method_counts;
 use crate::northbound::v2_server_requests::record_worker_server_request_cleanup_metrics;
 use crate::northbound::v2_server_requests::resolved_server_request_log_fields;
+use crate::northbound::v2_wire::log_downstream_connect_protocol_violation;
+use crate::northbound::v2_wire::log_downstream_protocol_violation;
+use crate::northbound::v2_wire::log_downstream_reconnect_protocol_violation;
 pub(crate) use crate::northbound::v2_wire::tagged_type_to_notification;
 use crate::northbound::v2_wire::*;
 use crate::observability::GatewayObservability;
@@ -296,7 +309,7 @@ impl GatewayV2DownstreamRouter {
             .find(|worker| worker.worker_id == worker_id)
     }
 
-    fn multi_worker_topology(&self) -> bool {
+    pub(crate) fn multi_worker_topology(&self) -> bool {
         self.reconnect_state
             .as_ref()
             .is_some_and(|state| state.configured_worker_ids.len() > 1)
@@ -689,7 +702,7 @@ impl GatewayV2DownstreamRouter {
         }))
     }
 
-    fn unavailable_worker_route_diagnostics(
+    pub(crate) fn unavailable_worker_route_diagnostics(
         &self,
         now: Instant,
     ) -> Vec<UnavailableWorkerRouteDiagnostics> {
@@ -3323,155 +3336,6 @@ fn observe_aborted_pending_client_requests(
     }
 }
 
-fn log_suppressed_skills_changed_notification(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    notification: &JSONRPCNotification,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        method = notification.method,
-        params = ?notification.params,
-        "suppressing duplicate multi-worker skills/changed notification until the client refreshes skills/list"
-    );
-}
-
-fn log_suppressed_opted_out_notification(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    notification: &JSONRPCNotification,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        method = notification.method,
-        params = ?notification.params,
-        "suppressing downstream notification opted out by northbound v2 client"
-    );
-}
-
-fn log_downstream_connect_protocol_violation(
-    request_context: &GatewayRequestContext,
-    reason: &str,
-    message: &str,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        reason,
-        downstream_message = message,
-        "downstream app-server sent a malformed v2 protocol frame during initialize"
-    );
-}
-
-fn log_downstream_reconnect_protocol_violation(
-    request_context: &GatewayRequestContext,
-    worker_id: usize,
-    worker_websocket_url: &str,
-    reason: &str,
-    message: &str,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id,
-        worker_websocket_url,
-        reason,
-        downstream_message = message,
-        "downstream app-server sent a malformed v2 protocol frame during worker reconnect"
-    );
-}
-
-fn log_downstream_protocol_violation(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    reason: &str,
-    message: &str,
-    active_worker_count: usize,
-    event_state: &GatewayV2EventState,
-) {
-    let pending_log_fields =
-        pending_server_request_log_fields(&event_state.pending_server_requests);
-    let resolved_log_fields =
-        resolved_server_request_log_fields(&event_state.resolved_server_requests);
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        reason,
-        downstream_message = message,
-        active_worker_count,
-        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        pending_thread_ids = ?pending_log_fields.thread_ids,
-        pending_worker_ids = ?pending_log_fields.worker_ids,
-        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
-        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
-        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
-        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
-        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
-        answered_but_unresolved_worker_websocket_urls =
-            ?resolved_log_fields.worker_websocket_urls,
-        "downstream app-server sent a malformed v2 protocol frame"
-    );
-}
-
-fn log_suppressed_duplicate_connection_notification(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    original_worker_id: Option<usize>,
-    original_worker_websocket_url: &str,
-    notification: &JSONRPCNotification,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        original_worker_id = ?original_worker_id,
-        original_worker_websocket_url,
-        method = notification.method,
-        params = ?notification.params,
-        "suppressing exact-duplicate multi-worker connection notification"
-    );
-}
-
-fn log_suppressed_hidden_thread_notification(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    notification: &JSONRPCNotification,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        method = notification.method,
-        thread_id = notification
-            .params
-            .as_ref()
-            .and_then(notification_thread_id),
-        params = ?notification.params,
-        "suppressing downstream notification for a thread outside the gateway request scope"
-    );
-}
-
 fn log_notification_send_failure(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
@@ -4990,254 +4854,6 @@ fn worker_for_server_request(
             "gateway v2 connection has no downstream server-request route for worker {worker_id:?}"
         ))
     })
-}
-
-fn log_fail_closed_multi_worker_request(
-    downstream: &GatewayV2DownstreamRouter,
-    connection: &GatewayV2ConnectionContext<'_>,
-    method: &str,
-    err: &io::Error,
-) {
-    if !downstream.multi_worker_topology() {
-        return;
-    }
-
-    let is_fail_closed_route_error = is_fail_closed_multi_worker_route_error(err);
-    let unavailable_workers = downstream.unavailable_worker_route_diagnostics(Instant::now());
-    if unavailable_workers.is_empty() && !is_fail_closed_route_error {
-        return;
-    }
-
-    let available_worker_ids = downstream
-        .workers
-        .iter()
-        .filter_map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let available_worker_websocket_urls = downstream
-        .workers
-        .iter()
-        .filter_map(|worker| worker.worker_websocket_url.as_deref())
-        .collect::<Vec<_>>();
-    let unavailable_worker_ids = unavailable_workers
-        .iter()
-        .map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let unavailable_worker_websocket_urls = unavailable_workers
-        .iter()
-        .map(|worker| worker.websocket_url.as_str())
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_ids = unavailable_workers
-        .iter()
-        .filter(|worker| worker.reconnect_backoff_active)
-        .map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_websocket_urls = unavailable_workers
-        .iter()
-        .filter(|worker| worker.reconnect_backoff_active)
-        .map(|worker| worker.websocket_url.as_str())
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_remaining_seconds = unavailable_workers
-        .iter()
-        .filter_map(|worker| worker.reconnect_backoff_remaining_seconds)
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_routes = reconnect_backoff_worker_routes(&unavailable_workers);
-    if is_fail_closed_route_error {
-        connection
-            .observability
-            .record_v2_fail_closed_request(method, !reconnect_backoff_worker_ids.is_empty());
-
-        warn!(
-            method,
-            tenant_id = connection.request_context.tenant_id.as_str(),
-            project_id = connection.request_context.project_id.as_deref(),
-            available_worker_ids = ?available_worker_ids,
-            available_worker_websocket_urls = ?available_worker_websocket_urls,
-            unavailable_worker_ids = ?unavailable_worker_ids,
-            unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
-            reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
-            reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
-            reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
-            reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
-            %err,
-            "gateway v2 request failed closed because required worker routes are unavailable"
-        );
-    } else {
-        connection
-            .observability
-            .record_v2_upstream_request_failure(method, !reconnect_backoff_worker_ids.is_empty());
-
-        warn!(
-            method,
-            tenant_id = connection.request_context.tenant_id.as_str(),
-            project_id = connection.request_context.project_id.as_deref(),
-            available_worker_ids = ?available_worker_ids,
-            available_worker_websocket_urls = ?available_worker_websocket_urls,
-            unavailable_worker_ids = ?unavailable_worker_ids,
-            unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
-            reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
-            reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
-            reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
-            reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
-            %err,
-            "gateway v2 upstream request failed while worker routes are unavailable"
-        );
-    }
-}
-
-fn is_fail_closed_multi_worker_route_error(err: &io::Error) -> bool {
-    err.get_ref()
-        .and_then(|source| source.downcast_ref::<FailClosedMultiWorkerRouteError>())
-        .is_some()
-}
-
-fn log_degraded_multi_worker_thread_discovery(
-    downstream: &GatewayV2DownstreamRouter,
-    request_context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    method: &str,
-) {
-    if !downstream.multi_worker_topology() {
-        return;
-    }
-
-    let unavailable_workers = downstream.unavailable_worker_route_diagnostics(Instant::now());
-    if unavailable_workers.is_empty() {
-        return;
-    }
-
-    let available_worker_ids = downstream
-        .workers
-        .iter()
-        .filter_map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let available_worker_websocket_urls = downstream
-        .workers
-        .iter()
-        .filter_map(|worker| worker.worker_websocket_url.as_deref())
-        .collect::<Vec<_>>();
-    let unavailable_worker_ids = unavailable_workers
-        .iter()
-        .map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let unavailable_worker_websocket_urls = unavailable_workers
-        .iter()
-        .map(|worker| worker.websocket_url.as_str())
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_ids = unavailable_workers
-        .iter()
-        .filter(|worker| worker.reconnect_backoff_active)
-        .map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_websocket_urls = unavailable_workers
-        .iter()
-        .filter(|worker| worker.reconnect_backoff_active)
-        .map(|worker| worker.websocket_url.as_str())
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_remaining_seconds = unavailable_workers
-        .iter()
-        .filter_map(|worker| worker.reconnect_backoff_remaining_seconds)
-        .collect::<Vec<_>>();
-    let reconnect_backoff_worker_routes = reconnect_backoff_worker_routes(&unavailable_workers);
-    observability
-        .record_v2_degraded_thread_discovery(method, !reconnect_backoff_worker_ids.is_empty());
-
-    warn!(
-        method,
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        available_worker_ids = ?available_worker_ids,
-        available_worker_websocket_urls = ?available_worker_websocket_urls,
-        unavailable_worker_ids = ?unavailable_worker_ids,
-        unavailable_worker_websocket_urls = ?unavailable_worker_websocket_urls,
-        reconnect_backoff_worker_ids = ?reconnect_backoff_worker_ids,
-        reconnect_backoff_worker_websocket_urls = ?reconnect_backoff_worker_websocket_urls,
-        reconnect_backoff_worker_remaining_seconds = ?reconnect_backoff_worker_remaining_seconds,
-        reconnect_backoff_worker_routes = ?reconnect_backoff_worker_routes,
-        "serving degraded multi-worker thread discovery from available workers"
-    );
-}
-
-fn reconnect_backoff_worker_routes(
-    unavailable_workers: &[UnavailableWorkerRouteDiagnostics],
-) -> Vec<(usize, &str, u64)> {
-    unavailable_workers
-        .iter()
-        .filter_map(|worker| {
-            worker
-                .reconnect_backoff_remaining_seconds
-                .map(|remaining_seconds| {
-                    (
-                        worker.worker_id,
-                        worker.websocket_url.as_str(),
-                        remaining_seconds,
-                    )
-                })
-        })
-        .collect()
-}
-
-struct DeduplicatedThreadListEntryLog<'a> {
-    thread_id: &'a str,
-    selected_worker_id: Option<usize>,
-    selected_worker_websocket_url: &'a str,
-    discarded_worker_id: Option<usize>,
-    discarded_worker_websocket_url: &'a str,
-    selected_updated_at: i64,
-    discarded_updated_at: i64,
-    selected_created_at: i64,
-    discarded_created_at: i64,
-}
-
-fn log_deduplicated_thread_list_entry(
-    request_context: &GatewayRequestContext,
-    entry: DeduplicatedThreadListEntryLog<'_>,
-) {
-    info!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        thread_id = entry.thread_id,
-        selected_worker_id = ?entry.selected_worker_id,
-        selected_worker_websocket_url = entry.selected_worker_websocket_url,
-        discarded_worker_id = ?entry.discarded_worker_id,
-        discarded_worker_websocket_url = entry.discarded_worker_websocket_url,
-        selected_updated_at = entry.selected_updated_at,
-        discarded_updated_at = entry.discarded_updated_at,
-        selected_created_at = entry.selected_created_at,
-        discarded_created_at = entry.discarded_created_at,
-        "deduplicating repeated thread/list entry across downstream workers"
-    );
-}
-
-fn log_recovered_visible_thread_worker_route(
-    request_context: &GatewayRequestContext,
-    thread_id: &str,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-) {
-    info!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        thread_id,
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        "recovered missing visible thread route via downstream thread/read probe"
-    );
-}
-
-fn log_failed_visible_thread_worker_route_recovery(
-    request_context: &GatewayRequestContext,
-    thread_id: &str,
-    attempted_worker_ids: &[Option<usize>],
-    attempted_worker_websocket_urls: &[&str],
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        thread_id,
-        attempted_worker_ids = ?attempted_worker_ids,
-        attempted_worker_websocket_urls = ?attempted_worker_websocket_urls,
-        "failed to recover visible thread route via downstream thread/read probe"
-    );
 }
 
 fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
