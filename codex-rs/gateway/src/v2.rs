@@ -13,6 +13,8 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[derive(Clone)]
 pub enum GatewayV2SessionFactory {
@@ -150,18 +152,106 @@ impl GatewayV2SessionFactory {
                 .map(|app_server| vec![app_server]),
             Self::RemoteMulti { connect_args, .. } => {
                 let mut sessions = Vec::with_capacity(connect_args.len());
+                let mut last_error = None;
                 for worker_id in 0..connect_args.len() {
-                    sessions.push(
-                        self.connect_worker(worker_id, initialize, request_context)
-                            .await?,
-                    );
+                    match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        self.connect_worker_once(worker_id, initialize, request_context),
+                    )
+                    .await
+                    {
+                        Ok(Ok(session)) => sessions.push(session),
+                        Ok(Err(err)) => {
+                            last_error = Some(err.to_string());
+                            if let Some(worker_health) = self.worker_health() {
+                                worker_health.mark_reconnecting(
+                                    worker_id,
+                                    last_error.clone(),
+                                    Duration::from_millis(250),
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            let err = io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("gateway v2 worker {worker_id} initial connect timed out"),
+                            );
+                            last_error = Some(err.to_string());
+                            if let Some(worker_health) = self.worker_health() {
+                                worker_health.mark_reconnecting(
+                                    worker_id,
+                                    last_error.clone(),
+                                    Duration::from_millis(250),
+                                );
+                            }
+                        }
+                    }
                 }
+
+                if sessions.is_empty() {
+                    let message = last_error.unwrap_or_else(|| {
+                        "gateway v2 multi-worker startup connected no downstream sessions"
+                            .to_string()
+                    });
+                    return Err(io::Error::other(message));
+                }
+
                 Ok(sessions)
             }
         }
     }
 
     pub async fn connect_worker(
+        &self,
+        worker_id: usize,
+        initialize: &InitializeParams,
+        request_context: &GatewayRequestContext,
+    ) -> io::Result<GatewayV2ConnectedSession> {
+        let retry_delay = Duration::from_millis(250);
+        let mut connect_attempts = 0usize;
+        loop {
+            let result = self
+                .connect_worker_once(worker_id, initialize, request_context)
+                .await;
+
+            match result {
+                Ok(session) => {
+                    return Ok(session);
+                }
+                Err(err) => {
+                    if !retry_worker_connect_error(&err) {
+                        return Err(err);
+                    }
+                    connect_attempts = connect_attempts.saturating_add(1);
+                    match self {
+                        Self::RemoteSingle {
+                            worker_health: Some(worker_health),
+                            ..
+                        }
+                        | Self::RemoteMulti {
+                            worker_health: Some(worker_health),
+                            ..
+                        } => {
+                            worker_health.mark_reconnecting(
+                                worker_id,
+                                Some(format!(
+                                    "failed to connect gateway v2 worker {worker_id}: {err}"
+                                )),
+                                retry_delay,
+                            );
+                        }
+                        _ => {}
+                    }
+                    if connect_attempts >= 40 {
+                        return Err(err);
+                    }
+                    sleep(retry_delay).await;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn connect_worker_once(
         &self,
         worker_id: usize,
         initialize: &InitializeParams,
@@ -228,6 +318,15 @@ impl GatewayV2SessionFactory {
         self
     }
 
+    fn worker_health(&self) -> Option<&Arc<RemoteWorkerHealthRegistry>> {
+        match self {
+            Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
+                worker_health.as_ref()
+            }
+            Self::Embedded { .. } => None,
+        }
+    }
+
     pub fn worker_account_has_capacity(&self, worker_id: usize) -> bool {
         match self {
             Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
@@ -275,6 +374,24 @@ impl GatewayV2SessionFactory {
             Self::Embedded { .. } => false,
         }
     }
+
+    pub fn mark_worker_healthy(&self, worker_id: usize) {
+        match self {
+            Self::RemoteSingle { worker_health, .. } | Self::RemoteMulti { worker_health, .. } => {
+                if let Some(worker_health) = worker_health {
+                    worker_health.mark_healthy(worker_id);
+                }
+            }
+            Self::Embedded { .. } => {}
+        }
+    }
+}
+
+fn retry_worker_connect_error(err: &io::Error) -> bool {
+    !matches!(
+        err.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+    )
 }
 
 async fn connect_remote_worker(

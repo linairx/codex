@@ -35,6 +35,7 @@ use codex_app_server_protocol::TurnInterruptResponse as AppServerTurnInterruptRe
 use codex_app_server_protocol::TurnStartResponse;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -86,7 +87,7 @@ pub trait GatewayRuntime: Send + Sync {
 
 #[derive(Clone)]
 pub struct AppServerGatewayRuntime {
-    app_server: AppServerRequestHandle,
+    app_server: Arc<RwLock<AppServerRequestHandle>>,
     worker_id: Option<usize>,
     execution_mode: GatewayExecutionMode,
     next_request_id: Arc<AtomicI64>,
@@ -108,7 +109,7 @@ pub struct GatewayRuntimeHealthConfig {
 
 impl AppServerGatewayRuntime {
     pub fn new(
-        app_server: AppServerRequestHandle,
+        app_server: Arc<RwLock<AppServerRequestHandle>>,
         execution_mode: GatewayExecutionMode,
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
@@ -125,7 +126,7 @@ impl AppServerGatewayRuntime {
     }
 
     pub fn new_with_worker_id(
-        app_server: AppServerRequestHandle,
+        app_server: Arc<RwLock<AppServerRequestHandle>>,
         worker_id: Option<usize>,
         execution_mode: GatewayExecutionMode,
         events: broadcast::Sender<GatewayEvent>,
@@ -143,6 +144,13 @@ impl AppServerGatewayRuntime {
             v2_transport: health_config.v2_transport,
             v2_connection_health: health_config.v2_connection_health,
             observability: health_config.observability,
+        }
+    }
+
+    fn app_server(&self) -> AppServerRequestHandle {
+        match self.app_server.read() {
+            Ok(handle) => handle.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -242,7 +250,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
         request: CreateThreadRequest,
     ) -> Result<ThreadResponse, GatewayError> {
         let response: ThreadStartResponse = self
-            .app_server
+            .app_server()
             .request_typed(thread_start_request(self.next_request_id(), request))
             .await?;
         self.scope_registry.register_thread_with_worker(
@@ -262,7 +270,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
         request: ListThreadsRequest,
     ) -> Result<ListThreadsResponse, GatewayError> {
         let mut response: AppServerThreadListResponse = self
-            .app_server
+            .app_server()
             .request_typed(thread_list_request(self.next_request_id(), request))
             .await?;
         let visible_thread_ids = self.scope_registry.filter_thread_ids(
@@ -284,7 +292,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
     ) -> Result<ThreadResponse, GatewayError> {
         self.ensure_thread_access(&context, &thread_id)?;
         let response: ThreadReadResponse = self
-            .app_server
+            .app_server()
             .request_typed(thread_read_request(self.next_request_id(), thread_id))
             .await?;
 
@@ -307,7 +315,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
         }
 
         let response: TurnStartResponse = self
-            .app_server
+            .app_server()
             .request_typed(turn_start_request(
                 self.next_request_id(),
                 thread_id,
@@ -328,7 +336,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
     ) -> Result<InterruptTurnResponse, GatewayError> {
         self.ensure_thread_access(&context, &thread_id)?;
         let _: AppServerTurnInterruptResponse = self
-            .app_server
+            .app_server()
             .request_typed(turn_interrupt_request(
                 self.next_request_id(),
                 thread_id,
@@ -389,7 +397,7 @@ impl GatewayRuntime for AppServerGatewayRuntime {
         self.observability
             .record_server_request_lifecycle_event("client_server_request_answered", response_kind);
         if let Err(err) = self
-            .app_server
+            .app_server()
             .resolve_server_request(request_id.clone(), result)
             .await
         {

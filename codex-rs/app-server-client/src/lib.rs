@@ -2398,7 +2398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_unexpected_response_id_after_initialize_surfaces_as_disconnect() {
+    async fn remote_unexpected_response_id_after_initialize_is_ignored() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             write_websocket_message(
@@ -2409,25 +2409,45 @@ mod tests {
                 }),
             )
             .await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(GetAccountResponse {
+                        account: None,
+                        requires_openai_auth: false,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
         })
         .await;
-        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
             .await
             .expect("remote client should connect");
 
-        let event = client
-            .next_event()
+        let response: GetAccountResponse = client
+            .request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            })
             .await
-            .expect("disconnect event should arrive");
-        let AppServerEvent::Disconnected { message } = event else {
-            panic!("expected disconnect event");
-        };
-        assert!(message.contains("sent unexpected JSON-RPC response id"));
-        assert!(message.contains("unknown-response"));
+            .expect("typed request should succeed after stray response");
+        assert_eq!(response.account, None);
+
+        client.shutdown().await.expect("shutdown should complete");
     }
 
     #[tokio::test]
-    async fn remote_unexpected_error_id_after_initialize_surfaces_as_disconnect() {
+    async fn remote_unexpected_error_id_after_initialize_is_ignored() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             write_websocket_message(
@@ -2442,21 +2462,41 @@ mod tests {
                 }),
             )
             .await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(GetAccountResponse {
+                        account: None,
+                        requires_openai_auth: false,
+                    })
+                    .expect("response should serialize"),
+                }),
+            )
+            .await;
         })
         .await;
-        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
             .await
             .expect("remote client should connect");
 
-        let event = client
-            .next_event()
+        let response: GetAccountResponse = client
+            .request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            })
             .await
-            .expect("disconnect event should arrive");
-        let AppServerEvent::Disconnected { message } = event else {
-            panic!("expected disconnect event");
-        };
-        assert!(message.contains("sent unexpected JSON-RPC error id"));
-        assert!(message.contains("unknown-error"));
+            .expect("typed request should succeed after stray error");
+        assert_eq!(response.account, None);
+
+        client.shutdown().await.expect("shutdown should complete");
     }
 
     #[test]

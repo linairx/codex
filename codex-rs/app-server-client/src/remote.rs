@@ -345,11 +345,23 @@ impl RemoteAppServerClient {
                                     Ok(JSONRPCMessage::Response(response)) => {
                                         if let Some(response_tx) = pending_requests.remove(&response.id) {
                                             let _ = response_tx.send(Ok(Ok(response.result)));
+                                        } else {
+                                            warn!(
+                                                %endpoint,
+                                                id = %response.id,
+                                                "ignoring unexpected JSON-RPC response from remote app server"
+                                            );
                                         }
                                     }
                                     Ok(JSONRPCMessage::Error(error)) => {
                                         if let Some(response_tx) = pending_requests.remove(&error.id) {
                                             let _ = response_tx.send(Ok(Err(error.error)));
+                                        } else {
+                                            warn!(
+                                                %endpoint,
+                                                id = %error.id,
+                                                "ignoring unexpected JSON-RPC error from remote app server"
+                                            );
                                         }
                                     }
                                     Ok(JSONRPCMessage::Notification(notification)) => {
@@ -450,8 +462,20 @@ impl RemoteAppServerClient {
                                 ));
                                 break;
                             }
-                            Some(Ok(Message::Binary(_)))
-                            | Some(Ok(Message::Ping(_)))
+                            Some(Ok(Message::Binary(_))) => {
+                                let message = format!(
+                                    "remote app server at `{endpoint}` sent non-text JSON-RPC frame"
+                                );
+                                let _ = deliver_event(
+                                    &event_tx,
+                                    AppServerEvent::Disconnected {
+                                        message: message.clone(),
+                                    },
+                                );
+                                worker_exit_error = Some((ErrorKind::InvalidData, message));
+                                break;
+                            }
+                            Some(Ok(Message::Ping(_)))
                             | Some(Ok(Message::Pong(_)))
                             | Some(Ok(Message::Frame(_))) => {}
                             Some(Err(err)) => {
@@ -929,15 +953,17 @@ where
         endpoint,
     )
     .await?;
-
     timeout(initialize_timeout, async {
         loop {
             match stream.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let message = serde_json::from_str::<JSONRPCMessage>(&text).map_err(|err| {
-                        IoError::other(format!(
-                            "remote app server at `{endpoint}` sent invalid initialize response: {err}"
-                        ))
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "remote app server at `{endpoint}` sent invalid initialize response: {err}"
+                            ),
+                        )
                     })?;
                     match message {
                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
@@ -962,6 +988,24 @@ where
                                 "remote app server at `{endpoint}` rejected initialize: {}",
                                 error.error.message
                             )));
+                        }
+                        JSONRPCMessage::Response(response) => {
+                            break Err(IoError::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "remote app server at `{endpoint}` sent invalid initialize response: unexpected JSON-RPC response id `{}`",
+                                    response.id
+                                ),
+                            ));
+                        }
+                        JSONRPCMessage::Error(error) => {
+                            break Err(IoError::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "remote app server at `{endpoint}` sent invalid initialize response: unexpected JSON-RPC error id `{}`",
+                                    error.id
+                                ),
+                            ));
                         }
                         JSONRPCMessage::Notification(notification) => {
                             if let Some(event) = app_server_event_from_notification(notification) {
@@ -995,11 +1039,15 @@ where
                                 }
                             }
                         }
-                        JSONRPCMessage::Response(_) | JSONRPCMessage::Error(_) => {}
                     }
                 }
-                Some(Ok(Message::Binary(_)))
-                | Some(Ok(Message::Ping(_)))
+                Some(Ok(Message::Binary(_))) => {
+                    break Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        format!("remote app server at `{endpoint}` sent non-text initialize frame"),
+                    ));
+                }
+                Some(Ok(Message::Ping(_)))
                 | Some(Ok(Message::Pong(_)))
                 | Some(Ok(Message::Frame(_))) => {}
                 Some(Ok(Message::Close(frame))) => {
@@ -1045,7 +1093,6 @@ where
         endpoint,
     )
     .await?;
-
     Ok((pending_events, server_version, codex_home))
 }
 

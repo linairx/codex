@@ -41,6 +41,10 @@ impl GatewayRemoteWorker {
         read_guard(&self.request_handle).clone()
     }
 
+    pub(crate) fn request_handle_arc(&self) -> Arc<RwLock<AppServerRequestHandle>> {
+        Arc::clone(&self.request_handle)
+    }
+
     pub(crate) fn websocket_url(&self) -> &str {
         self.connect_args.websocket_url()
     }

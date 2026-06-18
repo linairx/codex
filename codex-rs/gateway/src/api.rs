@@ -831,7 +831,7 @@ impl TryFrom<ServerRequest> for GatewayServerRequest {
                     reason,
                     network_approval_context,
                     command,
-                    cwd: cwd.map(|cwd| cwd.as_path().display().to_string()),
+                    cwd: cwd.map(|cwd| cwd.into_string()),
                     command_actions,
                     additional_permissions,
                     proposed_execpolicy_amendment,

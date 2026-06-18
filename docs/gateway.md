@@ -10,6 +10,14 @@ The right boundary is:
 The gateway should wrap `codex-app-server`; it should not expose `codex-core`
 directly as the northbound API surface.
 
+The current gateway implementation has grown beyond that boundary. It owns
+transport lifecycle, worker reconnect behavior, multi-worker routing, event
+fan-in, and compatibility edge cases that now overlap with newer upstream
+app-server client and transport abstractions. Before promoting the gateway
+further, the next highest-priority task is to modernize the old gateway layer
+against the current upstream app-server architecture and shrink it back toward
+a thin policy, routing, and observability boundary.
+
 ## Existing Modules To Reuse
 
 - `codex-rs/app-server-protocol/src/protocol/v2.rs`
@@ -114,8 +122,13 @@ Principles:
 
 Roadmap focus:
 
-- Phase 1-5 are complete; the remaining roadmap is entirely about finishing and
-  hardening Phase 6
+- Phase 1-5 are complete; the remaining roadmap is about finishing and
+  hardening Phase 6, with gateway modernization now the first release-gate
+  workstream
+- do not add more ad hoc lifecycle, reconnect, or event-stream behavior to the
+  old gateway path until the modernization plan below decides whether that
+  behavior belongs in `codex-app-server-client`, `codex-app-server-transport`,
+  or a small gateway-owned adapter
 - keep HTTP/SSE as the operator- and platform-oriented API while v2 WebSocket
   remains the compatibility API
 - treat embedded mode and single-worker remote mode as the release-quality
@@ -124,7 +137,50 @@ Roadmap focus:
 
 Remaining workstreams:
 
-1. Embedded and single-worker parity closure
+1. Gateway modernization and upstream alignment
+
+Status: highest priority, release-gate prerequisite
+
+Goal:
+
+- refactor the existing gateway so it aligns with the current upstream
+  app-server architecture instead of continuing to grow a parallel transport
+  and lifecycle stack
+
+Required behavior:
+
+- compare the old gateway implementation against current upstream
+  `codex-app-server-client`, `codex-app-server`, and
+  `codex-app-server-transport` responsibilities before adding more gateway
+  behavior
+- keep gateway-owned code focused on northbound policy, auth, scoping,
+  admission, audit, observability, and worker-selection decisions
+- move or delete duplicated lifecycle responsibilities when an upstream layer
+  already owns them, especially initialize handling, reconnect backoff,
+  connection health, shutdown, and event-stream cleanup
+- replace fragile reconnect probes and timing-dependent recovery behavior with
+  one explicit downstream session lifecycle contract shared by embedded,
+  single-worker remote, and multi-worker remote paths
+- split high-churn gateway modules into smaller owner-specific modules before
+  adding more v2 compatibility surface, keeping routing, reconnect, event
+  fan-in, account capacity, and health reporting separable
+- keep the northbound v2 contract stable while internals move; client-visible
+  behavior must remain governed by `codex-app-server-protocol` semantics
+
+Exit criteria:
+
+- the gateway has a documented responsibility boundary that names which layer
+  owns transport lifecycle, reconnect, event buffering, health, and protocol
+  translation
+- reconnect and session-recovery behavior is implemented through one shared
+  abstraction rather than special-case probes inside the old gateway loop
+- the single-worker reconnect regressions and the multi-worker same-session
+  recovery regressions pass without timing-dependent sleeps that stand in for
+  a real readiness contract
+- new gateway work can be reviewed as policy/routing/observability changes
+  instead of changes to a parallel app-server transport stack
+
+2. Embedded and single-worker parity closure
 
 - preserve the current release-quality baseline for embedded and
   single-worker remote mode as more real Codex client flows are exercised
@@ -141,7 +197,7 @@ Exit criteria:
   control turns, complete server-request round trips, and recover from ordinary
   reconnects through the gateway in both embedded and single-worker remote mode
 
-2. Northbound v2 transport hardening
+3. Northbound v2 transport hardening
 
 - continue tightening load, backpressure, timeout, and slow-client behavior so
   one stalled v2 client cannot degrade gateway or worker stability
@@ -160,7 +216,7 @@ Exit criteria:
 - unresolved server-request, reconnect, and client-send edge cases are bounded
   and observable in production
 
-3. Multi-worker routing and coordination
+4. Multi-worker routing and coordination
 
 - broaden the current multi-worker Stage B transport until normal client flows
   behave like one logical app-server session instead of a bounded validation
@@ -181,7 +237,7 @@ Exit criteria:
 - thread ownership, notification delivery, and server-request resolution remain
   correct during ordinary worker failures and recoveries
 
-4. Compatibility definition and rollout gate
+5. Compatibility definition and rollout gate
 
 - keep the supported v2 compatibility profile explicit in
   [docs/gateway-v2-compat.md](/home/lin/project/codex/docs/gateway-v2-compat.md)
@@ -203,7 +259,7 @@ Exit criteria:
 - the gateway can be rolled out with clear guardrails for embedded,
   single-worker remote, and multi-worker remote environments
 
-5. Project-aware account routing and quota failover
+6. Project-aware account routing and quota failover
 
 Status: same-project affinity, account-capacity tracking, quota-aware
 new-thread selection, and bounded resumable-thread handoff are implemented;

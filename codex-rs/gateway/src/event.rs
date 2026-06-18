@@ -370,6 +370,7 @@ mod tests {
             model_provider: "openai".to_string(),
             created_at: 1,
             updated_at: 2,
+            recency_at: Some(2),
             status: codex_app_server_protocol::ThreadStatus::Idle,
             path: None,
             cwd: std::path::PathBuf::from("/tmp/project")
@@ -464,6 +465,7 @@ mod tests {
                     "threadId": "thread-123",
                     "turnId": "turn-456",
                     "itemId": "item-789",
+                    "autoResolutionMs": null,
                     "questions": [{
                         "id": "confirm",
                         "header": "Confirm",

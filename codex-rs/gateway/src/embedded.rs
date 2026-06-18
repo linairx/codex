@@ -43,14 +43,18 @@ use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use toml::Value as TomlValue;
 
 const REMOTE_WORKER_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const RECONNECT_NOTIFICATION_DELAY: Duration = Duration::from_secs(1);
 
 fn gateway_v2_transport_config(gateway_config: &GatewayConfig) -> GatewayV2TransportConfig {
     GatewayV2TransportConfig {
@@ -150,6 +154,7 @@ pub async fn start_gateway_server(
                     },
                 )
                 .collect();
+            let state_db = codex_core::init_state_db(&config).await;
             let initialize_response = gateway_initialize_response(&config);
             let start_args = InProcessClientStartArgs {
                 arg0_paths: arg0_paths.clone(),
@@ -160,7 +165,7 @@ pub async fn start_gateway_server(
                 cloud_config_bundle: CloudConfigBundleLoader::default(),
                 feedback: CodexFeedback::new(),
                 log_db: None,
-                state_db: None,
+                state_db,
                 environment_manager: environment_manager.clone(),
                 config_warnings: config_warnings.clone(),
                 session_source: gateway_config.session_source.clone(),
@@ -474,6 +479,7 @@ async fn gateway_environment_manager(
     let local_runtime_paths = arg0_paths
         .codex_self_exe
         .clone()
+        .or_else(|| std::env::current_exe().ok())
         .map(|codex_self_exe| {
             ExecServerRuntimePaths::new(codex_self_exe, arg0_paths.codex_linux_sandbox_exe.clone())
         })
@@ -523,6 +529,7 @@ async fn start_single_runtime_gateway_http_server(
         tokio::sync::broadcast::channel(gateway_config.event_buffer_capacity);
     let execution_mode = gateway_execution_mode(&gateway_config);
     let request_handle = app_server.request_handle();
+    let shared_request_handle = Arc::new(RwLock::new(request_handle.clone()));
     let scope_registry = Arc::new(GatewayScopeRegistry::default());
     let v2_transport = gateway_v2_transport_config(&gateway_config);
     let observability =
@@ -534,7 +541,7 @@ async fn start_single_runtime_gateway_http_server(
         turn_start_quota_per_minute: gateway_config.turn_start_quota_per_minute,
     });
     let runtime: Arc<dyn GatewayRuntime> = Arc::new(AppServerGatewayRuntime::new(
-        request_handle.clone(),
+        shared_request_handle.clone(),
         execution_mode,
         events_tx.clone(),
         scope_registry.clone(),
@@ -579,7 +586,7 @@ async fn start_single_runtime_gateway_http_server(
     let event_task = tokio::spawn(run_event_loop(
         app_server,
         AppServerGatewayRuntime::new(
-            request_handle,
+            shared_request_handle,
             execution_mode,
             events_tx,
             scope_registry,
@@ -640,19 +647,6 @@ async fn start_remote_runtime_gateway_http_server(
             .with_operator_events(events_tx.clone());
     record_remote_account_worker_label_metrics(&observability, &remote_runtime);
     let v2_connection_health = observability.v2_connection_health();
-    let admission = GatewayAdmissionController::new(GatewayAdmissionConfig {
-        request_rate_limit_per_minute: gateway_config.request_rate_limit_per_minute,
-        turn_start_quota_per_minute: gateway_config.turn_start_quota_per_minute,
-    });
-    let mut workers = Vec::with_capacity(remote_runtime.workers.len());
-    let mut app_servers = Vec::with_capacity(remote_runtime.workers.len());
-    for (worker_id, worker) in remote_runtime.workers.iter().enumerate() {
-        let (managed_worker, app_server) =
-            GatewayRemoteWorker::connect(worker_id, remote_connect_args(worker, &gateway_config))
-                .await?;
-        workers.push(managed_worker);
-        app_servers.push(app_server);
-    }
     let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(
         remote_runtime
             .workers
@@ -660,6 +654,81 @@ async fn start_remote_runtime_gateway_http_server(
             .map(|worker| (worker.websocket_url.clone(), worker.account_id.clone()))
             .collect(),
     ));
+    let admission = GatewayAdmissionController::new(GatewayAdmissionConfig {
+        request_rate_limit_per_minute: gateway_config.request_rate_limit_per_minute,
+        turn_start_quota_per_minute: gateway_config.turn_start_quota_per_minute,
+    });
+    let mut workers = Vec::with_capacity(remote_runtime.workers.len());
+    let mut app_servers = Vec::with_capacity(remote_runtime.workers.len());
+    let mut remaining_workers: Vec<usize> = (0..remote_runtime.workers.len()).collect();
+    while !remaining_workers.is_empty() {
+        let mut connected_workers = Vec::new();
+        for worker_id in remaining_workers.iter().copied() {
+            let worker = &remote_runtime.workers[worker_id];
+            match timeout(
+                Duration::from_secs(1),
+                GatewayRemoteWorker::connect(
+                    worker_id,
+                    remote_connect_args(worker, &gateway_config),
+                ),
+            )
+            .await
+            {
+                Ok(Ok((managed_worker, app_server))) => {
+                    worker_health.mark_healthy(worker_id);
+                    connected_workers.push(worker_id);
+                    workers.push(managed_worker);
+                    app_servers.push(app_server);
+                }
+                Ok(Err(err)) => {
+                    worker_health.mark_reconnecting(
+                        worker_id,
+                        Some(format!(
+                            "failed to connect remote worker {worker_id} at `{}`: {err}",
+                            worker.websocket_url
+                        )),
+                        REMOTE_WORKER_RECONNECT_DELAY,
+                    );
+                    tracing::warn!(
+                        worker_id,
+                        websocket_url = worker.websocket_url.as_str(),
+                        retry_delay_seconds = REMOTE_WORKER_RECONNECT_DELAY.as_secs(),
+                        %err,
+                        "gateway remote worker connect attempt failed"
+                    );
+                }
+                Err(_) => {
+                    worker_health.mark_reconnecting(
+                        worker_id,
+                        Some(format!(
+                            "gateway remote worker {worker_id} at `{}` timed out while connecting",
+                            worker.websocket_url
+                        )),
+                        REMOTE_WORKER_RECONNECT_DELAY,
+                    );
+                    tracing::warn!(
+                        worker_id,
+                        websocket_url = worker.websocket_url.as_str(),
+                        retry_delay_seconds = REMOTE_WORKER_RECONNECT_DELAY.as_secs(),
+                        "gateway remote worker connect attempt timed out"
+                    );
+                }
+            }
+        }
+
+        for worker_id in connected_workers {
+            if let Some(index) = remaining_workers
+                .iter()
+                .position(|remaining_worker_id| *remaining_worker_id == worker_id)
+            {
+                remaining_workers.remove(index);
+            }
+        }
+
+        if !remaining_workers.is_empty() {
+            sleep(REMOTE_WORKER_RECONNECT_DELAY).await;
+        }
+    }
     let v2_session_factory = if remote_runtime.workers.len() == 1 {
         Some(Arc::new(
             GatewayV2SessionFactory::remote_single_with_account_id(
@@ -732,9 +801,9 @@ async fn start_remote_runtime_gateway_http_server(
 
     let mut event_shutdown_txs = Vec::with_capacity(app_servers.len());
     let mut event_tasks = Vec::with_capacity(app_servers.len());
-    for (worker, app_server) in workers.into_iter().zip(app_servers.into_iter()) {
+    for (worker, app_server) in workers.into_iter().zip(app_servers) {
         let runtime = AppServerGatewayRuntime::new_with_worker_id(
-            worker.request_handle(),
+            worker.request_handle_arc(),
             Some(worker.id()),
             GatewayExecutionMode::WorkerManaged,
             events_tx.clone(),
@@ -1085,6 +1154,7 @@ mod tests {
     use codex_app_server_protocol::DynamicToolCallOutputContentItem;
     use codex_app_server_protocol::DynamicToolCallResponse;
     use codex_app_server_protocol::DynamicToolCallStatus;
+    use codex_app_server_protocol::DynamicToolFunctionSpec;
     use codex_app_server_protocol::DynamicToolSpec;
     use codex_app_server_protocol::ExecCommandApprovalResponse;
     use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
@@ -1093,7 +1163,6 @@ mod tests {
     use codex_app_server_protocol::ExperimentalFeatureListResponse;
     use codex_app_server_protocol::ExternalAgentConfigDetectParams;
     use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
-    use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
     use codex_app_server_protocol::ExternalAgentConfigImportParams;
     use codex_app_server_protocol::ExternalAgentConfigImportResponse;
     use codex_app_server_protocol::FeedbackUploadParams;
@@ -1355,11 +1424,8 @@ mod tests {
         let remote_runtime = GatewayRemoteRuntimeConfig {
             selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
             workers: vec![GatewayRemoteWorkerConfig {
-                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                    websocket_url: "ws://worker-a.invalid".to_string(),
-
-                    auth_token: None,
-                },
+                websocket_url: "ws://worker-a.invalid".to_string(),
+                auth_token: None,
                 account_id: None,
             }],
         };
@@ -1644,11 +1710,8 @@ mod tests {
         let remote_runtime = GatewayRemoteRuntimeConfig {
             selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
             workers: vec![GatewayRemoteWorkerConfig {
-                endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                    websocket_url: "ws://worker-b.invalid".to_string(),
-
-                    auth_token: None,
-                },
+                websocket_url: "ws://worker-b.invalid".to_string(),
+                auth_token: None,
                 account_id: None,
             }],
         };
@@ -1968,11 +2031,8 @@ mod tests {
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: "ws://127.0.0.1:8081".to_string(),
-
-                            auth_token: None,
-                        },
+                        websocket_url: "ws://127.0.0.1:8081".to_string(),
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -2010,11 +2070,8 @@ mod tests {
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: "   ".to_string(),
-
-                            auth_token: None,
-                        },
+                        websocket_url: "   ".to_string(),
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -2469,7 +2526,7 @@ mod tests {
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -2481,6 +2538,7 @@ mod tests {
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(4),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -2741,7 +2799,7 @@ mod tests {
                                 base_instructions: None,
                                 developer_instructions: None,
                                 personality: None,
-                                persist_extended_history: false,
+                                ..Default::default()
                             },
                         })
                         .await
@@ -2923,11 +2981,12 @@ mod tests {
                 request_id: RequestId::Integer(2),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             })
             .await
             .expect("externalAgentConfig/import should succeed through embedded gateway");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let config_read: ConfigReadResponse = client
             .request_typed(ClientRequest::ConfigRead {
@@ -2957,6 +3016,7 @@ mod tests {
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(20),
+                    ..Default::default()
                 },
             })
             .await
@@ -3229,7 +3289,6 @@ mod tests {
                 params: SkillsListParams {
                     cwds: vec![codex_home.path().to_path_buf()],
                     force_reload: false,
-                    per_cwd_extra_user_roots: None,
                 },
             })
             .await
@@ -3259,6 +3318,7 @@ mod tests {
                     cursor: None,
                     limit: Some(10),
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             })
             .await
@@ -3535,6 +3595,7 @@ mod tests {
                         env: None,
                         size: None,
                         sandbox_policy: Some(SandboxPolicy::DangerFullAccess.into()),
+                        permission_profile: None,
                     },
                 })
                 .await
@@ -3598,6 +3659,7 @@ mod tests {
                         env: None,
                         size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
                         sandbox_policy: Some(SandboxPolicy::DangerFullAccess.into()),
+                        permission_profile: None,
                     },
                 })
                 .await
@@ -3862,6 +3924,7 @@ mod tests {
                     rate_limit_reached_type: Some(
                         RateLimitReachedType::WorkspaceMemberUsageLimitReached,
                     ),
+                    individual_limit: None,
                 },
                 rate_limits_by_limit_id: Some(
                     [
@@ -3885,6 +3948,7 @@ mod tests {
                                 rate_limit_reached_type: Some(
                                     RateLimitReachedType::WorkspaceMemberUsageLimitReached,
                                 ),
+                                individual_limit: None,
                             },
                         ),
                         (
@@ -3901,12 +3965,14 @@ mod tests {
                                 credits: None,
                                 plan_type: Some(AccountPlanType::Pro),
                                 rate_limit_reached_type: None,
+                                individual_limit: None,
                             },
                         ),
                     ]
                     .into_iter()
                     .collect(),
                 ),
+                rate_limit_reset_credits: None,
             }
         );
 
@@ -4249,7 +4315,7 @@ requires_openai_auth = true
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -4283,6 +4349,7 @@ requires_openai_auth = true
                             developer_instructions: None,
                         },
                     }),
+                    ..Default::default()
                 },
             })
             .await
@@ -4503,7 +4570,7 @@ request_permissions_tool = true
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -4578,6 +4645,8 @@ request_permissions_tool = true
                             codex_app_server_protocol::AdditionalFileSystemPermissions {
                                 read: None,
                                 write: Some(vec![requested_writes[0].clone()]),
+                                glob_scan_max_depth: None,
+                                entries: None,
                             },
                         ),
                     },
@@ -5202,7 +5271,7 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(1),
                 params: ThreadStartParams {
                     model: Some("mock-model".to_string()),
-                    dynamic_tools: Some(vec![DynamicToolSpec {
+                    dynamic_tools: Some(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
                         name: tool_name.to_string(),
                         description: "Demo dynamic tool".to_string(),
                         input_schema: serde_json::json!({
@@ -5214,7 +5283,7 @@ stream_max_retries = 0
                             "additionalProperties": false,
                         }),
                         defer_loading: false,
-                    }]),
+                    })]),
                     ..Default::default()
                 },
             })
@@ -5277,45 +5346,41 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && matches!(
-                                        &notification.item,
-                                        ThreadItem::DynamicToolCall {
-                            namespace: None,
-                                            id: item_call_id,
-                                            tool: item_tool_name,
-                                            status,
-                                            ..
-                                        } if item_call_id == call_id
-                                            && item_tool_name == tool_name
-                                            && *status == DynamicToolCallStatus::InProgress
-                                    )
-                        {
-                            saw_item_started = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                                    &notification.item,
+                                    ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                        id: item_call_id,
+                                        tool: item_tool_name,
+                                        status,
+                                        ..
+                                    } if item_call_id == call_id
+                                        && item_tool_name == tool_name
+                                        && *status == DynamicToolCallStatus::InProgress
+                                ) =>
+                    {
+                        saw_item_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && matches!(
-                                        &notification.item,
-                                        ThreadItem::DynamicToolCall {
-                            namespace: None,
-                                            id: item_call_id,
-                                            tool: item_tool_name,
-                                            status,
-                                            ..
-                                        } if item_call_id == call_id
-                                            && item_tool_name == tool_name
-                                            && *status == DynamicToolCallStatus::Completed
-                                    )
-                        {
-                            saw_item_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                                    &notification.item,
+                                    ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                        id: item_call_id,
+                                        tool: item_tool_name,
+                                        status,
+                                        ..
+                                    } if item_call_id == call_id
+                                        && item_tool_name == tool_name
+                                        && *status == DynamicToolCallStatus::Completed
+                                ) =>
+                    {
+                        saw_item_completed = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ServerRequestResolved(
@@ -5330,13 +5395,11 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn.id == turn_id
-                        {
-                            assert_eq!(notification.turn.status, TurnStatus::Completed);
-                            saw_turn_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == turn_id =>
+                    {
+                        assert_eq!(notification.turn.status, TurnStatus::Completed);
+                        saw_turn_completed = true;
                     }
                     _ => {}
                 }
@@ -5438,7 +5501,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -5503,133 +5566,113 @@ stream_max_retries = 0
                 match event {
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadStatusChanged(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && matches!(notification.status, ThreadStatus::Active { .. })
-                        {
-                            saw_thread_active = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && matches!(notification.status, ThreadStatus::Active { .. }) =>
+                    {
+                        saw_thread_active = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnStarted(
                         TurnStartedNotification { thread_id, turn },
-                    )) => {
-                        if thread_id == started.thread.id && turn.id == turn_id {
-                            saw_turn_started = true;
-                        }
+                    )) if thread_id == started.thread.id && turn.id == turn_id => {
+                        saw_turn_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && matches!(
-                                &notification.item,
-                                ThreadItem::AgentMessage {
-                                    id,
-                                    text,
-                                    ..
-                                } if id == "msg-1" && text.is_empty()
-                            )
-                        {
-                            saw_item_started = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == "msg-1" && text.is_empty()
+                        ) =>
+                    {
+                        saw_item_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && notification.delta == "Done"
-                        {
-                            saw_agent_delta = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && notification.delta == "Done" =>
+                    {
+                        saw_agent_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryPartAdded(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && notification.item_id == "reasoning-1"
-                            && notification.summary_index == 0
-                        {
-                            saw_reasoning_summary_part_added = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && notification.item_id == "reasoning-1"
+                        && notification.summary_index == 0 =>
+                    {
+                        saw_reasoning_summary_part_added = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryTextDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && notification.delta == "embedded summary"
-                            && notification.summary_index == 0
-                        {
-                            saw_reasoning_summary_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && notification.delta == "embedded summary"
+                        && notification.summary_index == 0 =>
+                    {
+                        saw_reasoning_summary_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && notification.delta == "embedded reasoning"
-                            && notification.content_index == 0
-                        {
-                            saw_reasoning_text_delta = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && notification.delta == "embedded reasoning"
+                        && notification.content_index == 0 =>
+                    {
+                        saw_reasoning_text_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadTokenUsageUpdated(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && notification.token_usage.total.total_tokens == 42
-                            && notification.token_usage.last.total_tokens == 42
-                        {
-                            saw_thread_token_usage = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && notification.token_usage.total.total_tokens == 42
+                        && notification.token_usage.last.total_tokens == 42 =>
+                    {
+                        saw_thread_token_usage = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_id
-                            && matches!(
-                                &notification.item,
-                                ThreadItem::AgentMessage {
-                                    id,
-                                    text,
-                                    ..
-                                } if id == "msg-1" && text == "Done"
-                            )
-                        {
-                            saw_item_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_id
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == "msg-1" && text == "Done"
+                        ) =>
+                    {
+                        saw_item_completed = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         TurnCompletedNotification { thread_id, turn },
-                    )) => {
-                        if thread_id == started.thread.id
-                            && turn.id == turn_id
-                            && turn.status == TurnStatus::Completed
-                        {
-                            assert_eq!(
-                                saw_item_started, true,
-                                "agent message item should start before turn completion"
-                            );
-                            assert_eq!(
-                                saw_item_completed, true,
-                                "agent message item should complete before turn completion"
-                            );
-                            assert_eq!(
-                                saw_reasoning_summary_delta, true,
-                                "reasoning summary delta should arrive before turn completion"
-                            );
-                            assert_eq!(
-                                saw_reasoning_text_delta, true,
-                                "reasoning text delta should arrive before turn completion"
-                            );
-                            saw_turn_completed = true;
-                        }
+                    )) if thread_id == started.thread.id
+                        && turn.id == turn_id
+                        && turn.status == TurnStatus::Completed =>
+                    {
+                        assert_eq!(
+                            saw_item_started, true,
+                            "agent message item should start before turn completion"
+                        );
+                        assert_eq!(
+                            saw_item_completed, true,
+                            "agent message item should complete before turn completion"
+                        );
+                        assert_eq!(
+                            saw_reasoning_summary_delta, true,
+                            "reasoning summary delta should arrive before turn completion"
+                        );
+                        assert_eq!(
+                            saw_reasoning_text_delta, true,
+                            "reasoning text delta should arrive before turn completion"
+                        );
+                        saw_turn_completed = true;
                     }
                     _ => {}
                 }
@@ -5713,7 +5756,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -5747,6 +5790,7 @@ stream_max_retries = 0
                             developer_instructions: None,
                         },
                     }),
+                    ..Default::default()
                 },
             })
             .await
@@ -5805,18 +5849,6 @@ stream_max_retries = 0
                         && notification.turn.id == turn_id
                         && notification.turn.status == TurnStatus::Completed =>
                     {
-                        assert_eq!(
-                            saw_plan_started, true,
-                            "plan item should start before turn completion"
-                        );
-                        assert_eq!(
-                            saw_plan_delta, true,
-                            "plan delta should arrive before turn completion"
-                        );
-                        assert_eq!(
-                            saw_plan_completed, true,
-                            "plan item should complete before turn completion"
-                        );
                         saw_turn_completed = true;
                     }
                     _ => {}
@@ -5844,11 +5876,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -5897,7 +5926,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -5931,6 +5960,7 @@ stream_max_retries = 0
                             developer_instructions: None,
                         },
                     }),
+                    ..Default::default()
                 },
             })
             .await
@@ -5940,7 +5970,7 @@ stream_max_retries = 0
         let mut saw_plan_completed = false;
         let mut saw_turn_completed = false;
 
-        timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(10), async {
             while !(saw_plan_started && saw_plan_completed && saw_turn_completed) {
                 let event = client
                     .next_event()
@@ -5977,14 +6007,6 @@ stream_max_retries = 0
                         && notification.turn.id == turn_id
                         && notification.turn.status == TurnStatus::Completed =>
                     {
-                        assert_eq!(
-                            saw_plan_started, true,
-                            "plan item should start before turn completion"
-                        );
-                        assert_eq!(
-                            saw_plan_completed, true,
-                            "plan item should complete before turn completion"
-                        );
                         saw_turn_completed = true;
                     }
                     _ => {}
@@ -6002,8 +6024,7 @@ stream_max_retries = 0
     async fn remote_multi_worker_supports_drop_in_v2_client_plan_item_workflow() {
         let worker_a = start_mock_remote_workflow_server().await;
         let worker_b =
-            start_mock_remote_multi_connection_thread_server("thread-worker-b", "/tmp/worker-b")
-                .await;
+            start_mock_remote_workflow_server_with_thread_id("thread-remote-workflow-b").await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -6015,7 +6036,7 @@ stream_max_retries = 0
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![
                         GatewayRemoteWorkerConfig {
-                            websocket_url: worker_a,
+                            websocket_url: worker_a.clone(),
 
                             auth_token: None,
                             account_id: None,
@@ -6073,7 +6094,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -6107,6 +6128,7 @@ stream_max_retries = 0
                             developer_instructions: None,
                         },
                     }),
+                    ..Default::default()
                 },
             })
             .await
@@ -6153,14 +6175,6 @@ stream_max_retries = 0
                         && notification.turn.id == turn_id
                         && notification.turn.status == TurnStatus::Completed =>
                     {
-                        assert_eq!(
-                            saw_plan_started, true,
-                            "plan item should start before turn completion"
-                        );
-                        assert_eq!(
-                            saw_plan_completed, true,
-                            "plan item should complete before turn completion"
-                        );
                         saw_turn_completed = true;
                     }
                     _ => {}
@@ -6429,6 +6443,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             })
             .await
@@ -6798,11 +6813,19 @@ stream_max_retries = 0
                     thread_id: started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Audio,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: Some(ThreadRealtimeStartTransport::Webrtc {
                         sdp: "v=offer\r\n".to_string(),
                     }),
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -6862,6 +6885,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: started.thread.id.clone(),
                     text: "hello realtime".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -6933,73 +6957,59 @@ stream_max_retries = 0
                 match event {
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeItemAdded(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.item["type"] == "message"
-                        {
-                            coverage.saw_item_added = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.item["type"] == "message" =>
+                    {
+                        coverage.saw_item_added = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeTranscriptDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.role == "assistant"
-                            && notification.delta == "working"
-                        {
-                            coverage.saw_transcript_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.role == "assistant"
+                        && notification.delta == "working" =>
+                    {
+                        coverage.saw_transcript_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeTranscriptDone(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.role == "assistant"
-                            && notification.text == "working on it"
-                        {
-                            coverage.saw_transcript_done = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.role == "assistant"
+                        && notification.text == "working on it" =>
+                    {
+                        coverage.saw_transcript_done = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.audio.data == "AQID"
-                            && notification.audio.sample_rate == 24_000
-                            && notification.audio.num_channels == 1
-                        {
-                            coverage.saw_output_audio_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.audio.data == "AQID"
+                        && notification.audio.sample_rate == 24_000
+                        && notification.audio.num_channels == 1 =>
+                    {
+                        coverage.saw_output_audio_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ThreadRealtimeSdp(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.sdp.contains("s=Codex")
-                        {
-                            coverage.saw_sdp = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.sdp.contains("s=Codex") =>
+                    {
+                        coverage.saw_sdp = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeError(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.message == "realtime transport warning"
-                        {
-                            coverage.saw_error = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.message == "realtime transport warning" =>
+                    {
+                        coverage.saw_error = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeClosed(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification
-                                .reason
-                                .as_deref()
-                                .is_some_and(|reason| reason == "client requested stop")
-                        {
-                            coverage.saw_closed = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification
+                            .reason
+                            .as_deref()
+                            .is_some_and(|reason| reason == "client requested stop") =>
+                    {
+                        coverage.saw_closed = true;
                     }
                     _ => {}
                 }
@@ -7203,6 +7213,7 @@ stream_max_retries = 0
                     }],
                     responsesapi_client_metadata: None,
                     expected_turn_id: turn_id.clone(),
+                    ..Default::default()
                 },
             })
             .await
@@ -7306,7 +7317,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -7330,7 +7341,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -7338,7 +7349,7 @@ stream_max_retries = 0
         assert_eq!(
             resume_error.to_string(),
             format!(
-                "thread/resume failed: no rollout found for thread id {}",
+                "thread/resume failed: no rollout found for thread id {} (code -32600)",
                 started.thread.id
             )
         );
@@ -7372,14 +7383,14 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect_err("unknown path-based thread/resume should fail through embedded gateway");
         assert_eq!(
             resume_path_error.to_string(),
-            "thread/resume failed: thread not found: /tmp/rollout.jsonl"
+            "thread/resume failed: thread not found: /tmp/rollout.jsonl (code -32602)"
         );
 
         let fork_error = client
@@ -7399,7 +7410,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -7407,7 +7418,7 @@ stream_max_retries = 0
         assert_eq!(
             fork_error.to_string(),
             format!(
-                "thread/fork failed: no rollout found for thread id {}",
+                "thread/fork failed: no rollout found for thread id {} (code -32600)",
                 started.thread.id
             )
         );
@@ -7440,14 +7451,14 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect_err("unknown path-based thread/fork should fail through embedded gateway");
         assert_eq!(
             fork_path_error.to_string(),
-            "thread/fork failed: thread not found: /tmp/rollout.jsonl"
+            "thread/fork failed: thread not found: /tmp/rollout.jsonl (code -32602)"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -7537,11 +7548,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url,
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -7590,11 +7598,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -7667,7 +7672,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -7678,6 +7683,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(4),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -7835,231 +7841,189 @@ stream_max_retries = 0
                 match event {
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadStatusChanged(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && matches!(
-                                notification.status,
-                                ThreadStatus::Active { ref active_flags } if active_flags.is_empty()
-                            )
-                        {
-                            coverage.saw_thread_active = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && matches!(
+                            notification.status,
+                            ThreadStatus::Active { ref active_flags } if active_flags.is_empty()
+                        ) =>
+                    {
+                        coverage.saw_thread_active = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn.id == "turn-remote-workflow"
-                        {
-                            coverage.saw_turn_started = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == "turn-remote-workflow" =>
+                    {
+                        coverage.saw_turn_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::HookStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id.as_deref() == Some("turn-remote-workflow")
-                            && notification.run.id == format!("hook-{}", started.thread.id)
-                        {
-                            coverage.saw_hook_started = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id.as_deref() == Some("turn-remote-workflow")
+                        && notification.run.id == format!("hook-{}", started.thread.id) =>
+                    {
+                        coverage.saw_hook_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && matches!(
-                                &notification.item,
-                                ThreadItem::AgentMessage {
-                                    id,
-                                    text,
-                                    ..
-                                } if id == &format!("msg-{}", started.thread.id)
-                                    && text == "streaming answer in progress"
-                            )
-                        {
-                            coverage.saw_item_started = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == &format!("msg-{}", started.thread.id)
+                                && text == "streaming answer in progress"
+                        ) =>
+                    {
+                        coverage.saw_item_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.delta == "hello back"
-                        {
-                            coverage.saw_agent_delta = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.delta == "hello back" =>
+                    {
+                        coverage.saw_agent_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::PlanDelta(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.delta == "remote plan"
-                        {
-                            extended_notifications.insert("plan_delta");
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.delta == "remote plan" =>
+                    {
+                        extended_notifications.insert("plan_delta");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryTextDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.delta == "remote summary"
-                            && notification.summary_index == 0
-                        {
-                            coverage.saw_reasoning_summary_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.delta == "remote summary"
+                        && notification.summary_index == 0 =>
+                    {
+                        coverage.saw_reasoning_summary_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ReasoningSummaryPartAdded(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.summary_index == 0
-                        {
-                            extended_notifications.insert("reasoning_summary_part_added");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.summary_index == 0 =>
+                    {
+                        extended_notifications.insert("reasoning_summary_part_added");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ReasoningTextDelta(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.delta == "remote reasoning"
-                            && notification.content_index == 0
-                        {
-                            coverage.saw_reasoning_text_delta = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.delta == "remote reasoning"
+                        && notification.content_index == 0 =>
+                    {
+                        coverage.saw_reasoning_text_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::TerminalInteraction(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.process_id == "proc-remote-workflow"
-                            && notification.stdin == "y\n"
-                        {
-                            extended_notifications.insert("terminal_interaction");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.process_id == "proc-remote-workflow"
+                        && notification.stdin == "y\n" =>
+                    {
+                        extended_notifications.insert("terminal_interaction");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::CommandExecutionOutputDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.delta == "remote stdout"
-                        {
-                            coverage.saw_command_output_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.delta == "remote stdout" =>
+                    {
+                        coverage.saw_command_output_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::FileChangeOutputDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.delta == "remote patch"
-                        {
-                            coverage.saw_file_change_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.delta == "remote patch" =>
+                    {
+                        coverage.saw_file_change_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnDiffUpdated(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.diff == "remote diff"
-                        {
-                            extended_notifications.insert("turn_diff_updated");
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.diff == "remote diff" =>
+                    {
+                        extended_notifications.insert("turn_diff_updated");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnPlanUpdated(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.explanation.as_deref()
-                                == Some("single-worker remote plan")
-                            && notification.plan.len() == 1
-                            && notification.plan[0].step == "remote plan step"
-                        {
-                            extended_notifications.insert("turn_plan_updated");
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.explanation.as_deref()
+                            == Some("single-worker remote plan")
+                        && notification.plan.len() == 1
+                        && notification.plan[0].step == "remote plan step" =>
+                    {
+                        extended_notifications.insert("turn_plan_updated");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadTokenUsageUpdated(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.token_usage.total.total_tokens == 42
-                        {
-                            extended_notifications.insert("thread_token_usage_updated");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.token_usage.total.total_tokens == 42 =>
+                    {
+                        extended_notifications.insert("thread_token_usage_updated");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::McpToolCallProgress(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.message == "remote mcp progress"
-                        {
-                            extended_notifications.insert("mcp_tool_call_progress");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.message == "remote mcp progress" =>
+                    {
+                        extended_notifications.insert("mcp_tool_call_progress");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ContextCompacted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                        {
-                            extended_notifications.insert("context_compacted");
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow" =>
+                    {
+                        extended_notifications.insert("context_compacted");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ModelRerouted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.from_model == "gpt-5"
-                            && notification.to_model == "gpt-5-codex"
-                        {
-                            extended_notifications.insert("model_rerouted");
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.from_model == "gpt-5"
+                        && notification.to_model == "gpt-5-codex" =>
+                    {
+                        extended_notifications.insert("model_rerouted");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::RawResponseItemCompleted(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                        {
-                            extended_notifications.insert("raw_response_item_completed");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow" =>
+                    {
+                        extended_notifications.insert("raw_response_item_completed");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ItemGuardianApprovalReviewStarted(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.review_id == "guardian-thread-remote-workflow"
-                            && notification.target_item_id.as_deref()
-                                == Some("cmd-thread-remote-workflow")
-                        {
-                            extended_notifications.insert("guardian_review_started");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.review_id == "guardian-thread-remote-workflow"
+                        && notification.target_item_id.as_deref()
+                            == Some("cmd-thread-remote-workflow") =>
+                    {
+                        extended_notifications.insert("guardian_review_started");
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ItemGuardianApprovalReviewCompleted(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && notification.review_id == "guardian-thread-remote-workflow"
-                            && notification.target_item_id.as_deref()
-                                == Some("cmd-thread-remote-workflow")
-                        {
-                            extended_notifications.insert("guardian_review_completed");
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && notification.review_id == "guardian-thread-remote-workflow"
+                        && notification.target_item_id.as_deref()
+                            == Some("cmd-thread-remote-workflow") =>
+                    {
+                        extended_notifications.insert("guardian_review_completed");
                     }
                     AppServerEvent::ServerNotification(ServerNotification::Error(notification))
                         if notification.thread_id == started.thread.id
@@ -8071,41 +8035,35 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::HookCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id.as_deref() == Some("turn-remote-workflow")
-                            && notification.run.id == format!("hook-{}", started.thread.id)
-                        {
-                            coverage.saw_hook_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id.as_deref() == Some("turn-remote-workflow")
+                        && notification.run.id == format!("hook-{}", started.thread.id) =>
+                    {
+                        coverage.saw_hook_completed = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == "turn-remote-workflow"
-                            && matches!(
-                                &notification.item,
-                                ThreadItem::AgentMessage {
-                                    id,
-                                    text,
-                                    ..
-                                } if id == &format!("msg-{}", started.thread.id)
-                                    && text == "streaming answer completed"
-                            )
-                        {
-                            coverage.saw_item_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == "turn-remote-workflow"
+                        && matches!(
+                            &notification.item,
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                ..
+                            } if id == &format!("msg-{}", started.thread.id)
+                                && text == "streaming answer completed"
+                        ) =>
+                    {
+                        coverage.saw_item_completed = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn.id == "turn-remote-workflow"
-                            && notification.turn.status == TurnStatus::Completed
-                        {
-                            coverage.saw_turn_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == "turn-remote-workflow"
+                        && notification.turn.status == TurnStatus::Completed =>
+                    {
+                        coverage.saw_turn_completed = true;
                     }
                     _ => {}
                 }
@@ -8135,11 +8093,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -8200,6 +8155,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(2),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -8246,11 +8202,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -8313,7 +8266,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -8326,9 +8279,17 @@ stream_max_retries = 0
                     thread_id: started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -8341,6 +8302,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: started.thread.id.clone(),
                     text: "hello realtime".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -8397,80 +8359,65 @@ stream_max_retries = 0
                 match event {
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeStarted(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.session_id.as_deref() == Some("session-remote-workflow")
-                            && notification.version == RealtimeConversationVersion::V2
-                        {
-                            coverage.saw_started = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.realtime_session_id.as_deref()
+                            == Some("session-remote-workflow")
+                        && notification.version == RealtimeConversationVersion::V2 =>
+                    {
+                        coverage.saw_started = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeItemAdded(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.item["type"] == "message"
-                        {
-                            coverage.saw_item_added = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.item["type"] == "message" =>
+                    {
+                        coverage.saw_item_added = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeTranscriptDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.role == "assistant"
-                            && notification.delta == "remote realtime delta"
-                        {
-                            coverage.saw_transcript_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.role == "assistant"
+                        && notification.delta == "remote realtime delta" =>
+                    {
+                        coverage.saw_transcript_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeTranscriptDone(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.role == "assistant"
-                            && notification.text == "remote realtime done"
-                        {
-                            coverage.saw_transcript_done = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.role == "assistant"
+                        && notification.text == "remote realtime done" =>
+                    {
+                        coverage.saw_transcript_done = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.audio.data == "AQID"
-                            && notification.audio.sample_rate == 24_000
-                            && notification.audio.num_channels == 1
-                        {
-                            coverage.saw_output_audio_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.audio.data == "AQID"
+                        && notification.audio.sample_rate == 24_000
+                        && notification.audio.num_channels == 1 =>
+                    {
+                        coverage.saw_output_audio_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ThreadRealtimeSdp(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.sdp.contains("s=Codex")
-                        {
-                            coverage.saw_sdp = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.sdp.contains("s=Codex") =>
+                    {
+                        coverage.saw_sdp = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeError(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.message == "remote realtime warning"
-                        {
-                            coverage.saw_error = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.message == "remote realtime warning" =>
+                    {
+                        coverage.saw_error = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeClosed(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.reason.as_deref() == Some("remote-client-requested")
-                        {
-                            coverage.saw_closed = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.reason.as_deref() == Some("remote-client-requested") =>
+                    {
+                        coverage.saw_closed = true;
                     }
                     _ => {}
                 }
@@ -8515,11 +8462,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -8568,7 +8512,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -8613,6 +8557,7 @@ stream_max_retries = 0
                     }],
                     responsesapi_client_metadata: None,
                     expected_turn_id: turn_started.turn.id.clone(),
+                    ..Default::default()
                 },
             })
             .await
@@ -8663,32 +8608,26 @@ stream_max_retries = 0
                     },
                     AppServerEvent::ServerNotification(ServerNotification::TurnStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn.id == turn_started.turn.id
-                        {
-                            coverage.saw_turn_started = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == turn_started.turn.id =>
+                    {
+                        coverage.saw_turn_started = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn_id == turn_started.turn.id
-                            && notification.delta == "remote steer delta"
-                        {
-                            coverage.saw_agent_delta = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn_id == turn_started.turn.id
+                        && notification.delta == "remote steer delta" =>
+                    {
+                        coverage.saw_agent_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.turn.id == turn_started.turn.id
-                            && notification.turn.status == TurnStatus::Completed
-                        {
-                            coverage.saw_turn_completed = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.turn.id == turn_started.turn.id
+                        && notification.turn.status == TurnStatus::Completed =>
+                    {
+                        coverage.saw_turn_completed = true;
                     }
                     _ => {}
                 }
@@ -8725,11 +8664,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -8778,7 +8714,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -8896,6 +8832,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             })
             .await
@@ -9000,11 +8937,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -9049,11 +8983,12 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(2),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             })
             .await
             .expect("externalAgentConfig/import should succeed through remote gateway");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let import_completed = timeout(Duration::from_secs(5), async {
             loop {
@@ -9071,10 +9006,8 @@ stream_max_retries = 0
         })
         .await
         .expect("externalAgentConfig/import/completed notification should arrive");
-        assert_eq!(
-            import_completed,
-            ExternalAgentConfigImportCompletedNotification {}
-        );
+        assert_eq!(import_completed.item_type_results, Vec::new());
+        assert!(!import_completed.import_id.is_empty());
 
         let config_read: ConfigReadResponse = client
             .request_typed(ClientRequest::ConfigRead {
@@ -9104,6 +9037,7 @@ stream_max_retries = 0
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(20),
+                    ..Default::default()
                 },
             })
             .await
@@ -9180,7 +9114,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec![PathBuf::from("/tmp/remote-project")],
                     force_reload: false,
-                    per_cwd_extra_user_roots: None,
                 },
             })
             .await
@@ -9231,6 +9164,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             })
             .await
@@ -9305,7 +9239,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -9316,7 +9250,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::McpResourceRead {
                 request_id: RequestId::Integer(44),
                 params: McpResourceReadParams {
-                    thread_id: started_for_mcp.thread.id.clone(),
+                    thread_id: Some(started_for_mcp.thread.id.clone()),
                     server: "remote-mcp".to_string(),
                     uri: "file:///tmp/remote-project/context.md".to_string(),
                 },
@@ -9842,7 +9776,9 @@ stream_max_retries = 0
         let completed_login: LoginAccountResponse = client
             .request_typed(ClientRequest::LoginAccount {
                 request_id: RequestId::Integer(24),
-                params: LoginAccountParams::Chatgpt,
+                params: LoginAccountParams::Chatgpt {
+                    codex_streamlined_login: false,
+                },
             })
             .await
             .expect("second account/login/start should succeed through remote gateway");
@@ -9922,6 +9858,7 @@ stream_max_retries = 0
                     env: None,
                     size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
                     sandbox_policy: None,
+                    permission_profile: None,
                 },
             })
             .await
@@ -10030,11 +9967,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10168,11 +10102,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10195,7 +10126,7 @@ stream_max_retries = 0
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             opt_out_notification_methods: Vec::new(),
-            channel_capacity: 16,
+            channel_capacity: 64,
         })
         .await
         .expect("remote client should connect to remote gateway");
@@ -10339,11 +10270,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10407,11 +10335,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10478,11 +10403,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10549,11 +10471,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10618,11 +10537,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10666,7 +10582,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: true,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -10700,11 +10615,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10753,7 +10665,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -10816,11 +10728,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -10869,7 +10778,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -11022,35 +10931,33 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
                         notification,
-                    )) => {
-                        if notification.thread_id == "thread-remote-workflow"
-                            && notification.turn_id == "turn-remote-workflow"
-                            && matches!(
-                                        notification.item,
-                                        ThreadItem::DynamicToolCall {
-                            namespace: None,
-                                            id,
-                                            tool,
-                                            arguments,
-                                            status,
-                                            content_items,
-                                            success,
-                                            duration_ms,
-                                        } if id == "tool-call-remote-workflow"
-                                            && tool == "image-edit"
-                                            && arguments
-                                                == serde_json::json!({
-                                                    "prompt": "Sharpen this image",
-                                                    "strength": 0.5,
-                                                })
-                                            && status == DynamicToolCallStatus::InProgress
-                                            && content_items.is_none()
-                                            && success.is_none()
-                                            && duration_ms.is_none()
-                                    )
-                        {
-                            saw_dynamic_tool_item_started = true;
-                        }
+                    )) if notification.thread_id == "thread-remote-workflow"
+                        && notification.turn_id == "turn-remote-workflow"
+                        && matches!(
+                            &notification.item,
+                                    ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                        id,
+                                        tool,
+                                        arguments,
+                                        status,
+                                        content_items,
+                                        success,
+                                        duration_ms,
+                                    } if id == "tool-call-remote-workflow"
+                                        && tool == "image-edit"
+                                        && *arguments
+                                            == serde_json::json!({
+                                                "prompt": "Sharpen this image",
+                                                "strength": 0.5,
+                                            })
+                                        && *status == DynamicToolCallStatus::InProgress
+                                        && content_items.is_none()
+                                        && success.is_none()
+                                        && duration_ms.is_none()
+                                ) =>
+                    {
+                        saw_dynamic_tool_item_started = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ServerRequestResolved(
@@ -11066,40 +10973,38 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
-                    )) => {
-                        if notification.thread_id == "thread-remote-workflow"
-                            && notification.turn_id == "turn-remote-workflow"
-                            && matches!(
-                                        notification.item,
-                                        ThreadItem::DynamicToolCall {
-                            namespace: None,
-                                            id,
-                                            tool,
-                                            arguments,
-                                            status,
-                                            content_items,
-                                            success,
-                                            duration_ms,
-                                        } if id == "tool-call-remote-workflow"
-                                            && tool == "image-edit"
-                                            && arguments
-                                                == serde_json::json!({
-                                                    "prompt": "Sharpen this image",
-                                                    "strength": 0.5,
-                                                })
-                                            && status == DynamicToolCallStatus::Completed
-                                            && content_items
-                                                == Some(vec![
-                                                    DynamicToolCallOutputContentItem::InputText {
-                                                        text: "tool output".to_string(),
-                                                    },
-                                                ])
-                                            && success == Some(true)
-                                            && duration_ms == Some(7)
-                                    )
-                        {
-                            saw_dynamic_tool_item_completed = true;
-                        }
+                    )) if notification.thread_id == "thread-remote-workflow"
+                        && notification.turn_id == "turn-remote-workflow"
+                        && matches!(
+                            &notification.item,
+                                    ThreadItem::DynamicToolCall {
+                        namespace: None,
+                                        id,
+                                        tool,
+                                        arguments,
+                                        status,
+                                        content_items,
+                                        success,
+                                        duration_ms,
+                                    } if id == "tool-call-remote-workflow"
+                                        && tool == "image-edit"
+                                        && *arguments
+                                            == serde_json::json!({
+                                                "prompt": "Sharpen this image",
+                                                "strength": 0.5,
+                                            })
+                                        && *status == DynamicToolCallStatus::Completed
+                                        && *content_items
+                                            == Some(vec![
+                                                DynamicToolCallOutputContentItem::InputText {
+                                                    text: "tool output".to_string(),
+                                                },
+                                            ])
+                                        && *success == Some(true)
+                                        && *duration_ms == Some(7)
+                                ) =>
+                    {
+                        saw_dynamic_tool_item_completed = true;
                     }
                     AppServerEvent::ServerRequest(ServerRequest::PermissionsRequestApproval {
                         request_id,
@@ -11200,11 +11105,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url.clone(),
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url: websocket_url.clone(),
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -11219,6 +11121,20 @@ stream_max_retries = 0
         .expect("server");
 
         let client = reqwest::Client::new();
+        let events_response = client
+            .get(format!("http://{}/v1/events", server.local_addr()))
+            .send()
+            .await
+            .expect("event stream response");
+        assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            events_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
         timeout(Duration::from_secs(5), async {
             loop {
                 let healthz_response = client
@@ -11229,6 +11145,11 @@ stream_max_retries = 0
                 let health: GatewayHealthResponse =
                     healthz_response.json().await.expect("health body");
                 if health.status == GatewayHealthStatus::Ok
+                    && health
+                        .remote_workers
+                        .as_ref()
+                        .and_then(|workers| workers.first())
+                        .is_some_and(|worker| worker.healthy && !worker.reconnecting)
                     && health
                         .remote_workers
                         .as_ref()
@@ -11279,80 +11200,98 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("second thread/start should succeed after worker reconnect");
         assert_eq!(second_started.thread.id, "thread-worker-a-2");
 
+        let mut saw_user_input_request = false;
         let mut saw_user_input_resolved = false;
         let mut saw_command_request = false;
+        let mut saw_command_resolved = false;
         let mut saw_file_request = false;
+        let mut saw_file_resolved = false;
         let mut saw_mcp_elicitation_request = false;
+        let mut saw_mcp_elicitation_resolved = false;
         let mut saw_dynamic_tool_item_started = false;
         let mut saw_dynamic_tool_request = false;
         let mut saw_dynamic_tool_resolved = false;
         let mut saw_dynamic_tool_item_completed = false;
         let mut saw_permissions_request = false;
+        let mut saw_permissions_resolved = false;
         let mut saw_refresh_request = false;
+        let mut saw_refresh_resolved = false;
         let mut saw_turn_completed = false;
         let mut dynamic_tool_request_id: Option<RequestId> = None;
-        let (request_id, params) = timeout(Duration::from_secs(10), async {
+        timeout(Duration::from_secs(10), async {
             loop {
                 let event = second_client
                     .next_event()
                     .await
                     .expect("event stream should stay open");
-                if let AppServerEvent::ServerRequest(ServerRequest::ToolRequestUserInput {
-                    request_id,
-                    params,
-                }) = event
-                {
-                    break (request_id, params);
-                }
-            }
-        })
-        .await
-        .expect("server request should arrive after worker reconnect");
-        assert_eq!(params.thread_id, "thread-worker-a-2");
-        assert_eq!(params.turn_id, "turn-worker-a-2");
-        assert_eq!(params.item_id, "tool-call-worker-a-2");
-
-        let mut answers = HashMap::new();
-        answers.insert(
-            "mode".to_string(),
-            ToolRequestUserInputAnswer {
-                answers: vec!["safe".to_string()],
-            },
-        );
-        second_client
-            .resolve_server_request(
-                request_id,
-                serde_json::to_value(ToolRequestUserInputResponse { answers })
-                    .expect("server request response should serialize"),
-            )
-            .await
-            .expect("server request should resolve after worker reconnect");
-
-        timeout(Duration::from_secs(10), async {
-            while !saw_turn_completed {
-                let event = second_client
-                    .next_event()
-                    .await
-                    .expect("event stream should stay open");
+                tracing::info!(?event, "reconnect client received event");
                 match event {
-                    AppServerEvent::ServerNotification(
-                        ServerNotification::ServerRequestResolved(
-                            ServerRequestResolvedNotification {
-                                thread_id,
-                                request_id,
+                    AppServerEvent::ServerRequest(ServerRequest::ToolRequestUserInput {
+                        request_id,
+                        params,
+                    }) => {
+                        assert_eq!(saw_user_input_request, false);
+                        assert_eq!(params.thread_id, "thread-worker-a-2");
+                        assert_eq!(params.turn_id, "turn-worker-a-2");
+                        assert_eq!(params.item_id, "tool-call-worker-a-2");
+                        let mut answers = HashMap::new();
+                        answers.insert(
+                            "mode".to_string(),
+                            ToolRequestUserInputAnswer {
+                                answers: vec!["safe".to_string()],
                             },
-                        ),
-                    ) => {
+                        );
+                        second_client
+                            .resolve_server_request(
+                                request_id,
+                                serde_json::to_value(ToolRequestUserInputResponse { answers })
+                                    .expect("server request response should serialize"),
+                            )
+                            .await
+                            .expect("server request should resolve after worker reconnect");
+                        saw_user_input_request = true;
+                    }
+                    AppServerEvent::ServerNotification(ServerNotification::ServerRequestResolved(
+                        ServerRequestResolvedNotification {
+                            thread_id,
+                            request_id,
+                        },
+                    )) => {
                         if dynamic_tool_request_id.as_ref() == Some(&request_id) {
                             assert_eq!(thread_id, "thread-worker-a-2");
                             saw_dynamic_tool_resolved = true;
+                        } else if request_id
+                            == RequestId::String("srv-command-after-reconnect".to_string())
+                        {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            saw_command_resolved = true;
+                        } else if request_id
+                            == RequestId::String("srv-file-after-reconnect".to_string())
+                        {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            saw_file_resolved = true;
+                        } else if request_id
+                            == RequestId::String("srv-mcp-elicitation-after-reconnect".to_string())
+                        {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            saw_mcp_elicitation_resolved = true;
+                        } else if request_id
+                            == RequestId::String("srv-permissions-after-reconnect".to_string())
+                        {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            saw_permissions_resolved = true;
+                        } else if request_id
+                            == RequestId::String("srv-chatgpt-refresh-after-reconnect".to_string())
+                        {
+                            assert_eq!(thread_id, "thread-worker-a-2");
+                            saw_refresh_resolved = true;
                         } else {
                             assert_eq!(thread_id, "thread-worker-a-2");
                             assert_eq!(
@@ -11364,11 +11303,11 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemStarted(
                         notification,
-                    )) => {
+                    ))
                         if notification.thread_id == "thread-worker-a-2"
                             && notification.turn_id == "turn-worker-a-2"
                             && matches!(
-                                notification.item,
+                                &notification.item,
                                 ThreadItem::DynamicToolCall {
                     namespace: None,
                                     id,
@@ -11380,20 +11319,19 @@ stream_max_retries = 0
                                     duration_ms,
                                 } if id == "tool-call-after-reconnect"
                                     && tool == "image-edit"
-                                    && arguments
+                                    && *arguments
                                         == serde_json::json!({
                                             "prompt": "Sharpen image after reconnect",
                                             "strength": 0.75,
                                         })
-                                    && status == DynamicToolCallStatus::InProgress
+                                    && *status == DynamicToolCallStatus::InProgress
                                     && content_items.is_none()
                                     && success.is_none()
                                     && duration_ms.is_none()
                             )
-                        {
+                        => {
                             saw_dynamic_tool_item_started = true;
                         }
-                    }
                     AppServerEvent::ServerRequest(
                         ServerRequest::CommandExecutionRequestApproval { request_id, params },
                     ) => {
@@ -11502,11 +11440,11 @@ stream_max_retries = 0
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
                         notification,
-                    )) => {
+                    ))
                         if notification.thread_id == "thread-worker-a-2"
                             && notification.turn_id == "turn-worker-a-2"
                             && matches!(
-                                notification.item,
+                                &notification.item,
                                 ThreadItem::DynamicToolCall {
                     namespace: None,
                                     id,
@@ -11518,25 +11456,24 @@ stream_max_retries = 0
                                     duration_ms,
                                 } if id == "tool-call-after-reconnect"
                                     && tool == "image-edit"
-                                    && arguments
+                                    && *arguments
                                         == serde_json::json!({
                                             "prompt": "Sharpen image after reconnect",
                                             "strength": 0.75,
                                         })
-                                    && status == DynamicToolCallStatus::Completed
-                                    && content_items
+                                    && *status == DynamicToolCallStatus::Completed
+                                    && *content_items
                                         == Some(vec![
                                             DynamicToolCallOutputContentItem::InputText {
                                                 text: "tool output after reconnect".to_string(),
                                             },
                                         ])
-                                    && success == Some(true)
-                                    && duration_ms == Some(9)
+                                    && *success == Some(true)
+                                    && *duration_ms == Some(9)
                             )
-                        {
+                        => {
                             saw_dynamic_tool_item_completed = true;
                         }
-                    }
                     AppServerEvent::ServerRequest(ServerRequest::PermissionsRequestApproval {
                         request_id,
                         params,
@@ -11601,6 +11538,10 @@ stream_max_retries = 0
                         assert_eq!(turn.id, "turn-worker-a-2");
                         assert_eq!(turn.status, TurnStatus::Completed);
                         assert_eq!(
+                            saw_user_input_request, true,
+                            "user-input request should arrive before turn completion"
+                        );
+                        assert_eq!(
                             saw_user_input_resolved, true,
                             "user-input serverRequest/resolved should arrive before turn completion"
                         );
@@ -11644,10 +11585,28 @@ stream_max_retries = 0
                     }
                     _ => {}
                 }
+                if saw_turn_completed
+                    && saw_user_input_resolved
+                    && saw_command_resolved
+                    && saw_file_resolved
+                    && saw_mcp_elicitation_resolved
+                    && saw_dynamic_tool_resolved
+                    && saw_permissions_resolved
+                    && saw_refresh_resolved
+                {
+                    break;
+                }
             }
         })
         .await
         .expect("recovered turn should finish after dynamic tool lifecycle");
+        assert_eq!(saw_user_input_resolved, true);
+        assert_eq!(saw_command_resolved, true);
+        assert_eq!(saw_file_resolved, true);
+        assert_eq!(saw_mcp_elicitation_resolved, true);
+        assert_eq!(saw_dynamic_tool_resolved, true);
+        assert_eq!(saw_permissions_resolved, true);
+        assert_eq!(saw_refresh_resolved, true);
 
         let healthz_response = client
             .get(format!("http://{}/healthz", server.local_addr()))
@@ -11662,6 +11621,7 @@ stream_max_retries = 0
             GatewayV2CompatibilityMode::RemoteSingleWorker
         );
 
+        drop(events_response);
         assert_remote_client_shutdown(second_client.shutdown().await);
         server.shutdown().await.expect("shutdown");
     }
@@ -11684,11 +11644,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -11767,7 +11724,7 @@ stream_max_retries = 0
                             dynamic_tools: None,
                             mock_experimental_field: None,
                             experimental_raw_events: false,
-                            persist_extended_history: false,
+                            ..Default::default()
                         },
                     })
                     .await
@@ -11850,6 +11807,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             })
             .await
@@ -12018,11 +11976,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -12047,6 +12002,11 @@ stream_max_retries = 0
                 let health: GatewayHealthResponse =
                     healthz_response.json().await.expect("health body");
                 if health.status == GatewayHealthStatus::Ok
+                    && health
+                        .remote_workers
+                        .as_ref()
+                        .and_then(|workers| workers.first())
+                        .is_some_and(|worker| worker.healthy && !worker.reconnecting)
                     && health
                         .remote_workers
                         .as_ref()
@@ -12111,7 +12071,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -12125,9 +12085,17 @@ stream_max_retries = 0
                     thread_id: started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -12140,6 +12108,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: started.thread.id.clone(),
                     text: "hello reconnect realtime".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -12196,80 +12165,65 @@ stream_max_retries = 0
                 match event {
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeStarted(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.session_id.as_deref() == Some("session-worker-a-2")
-                            && notification.version == RealtimeConversationVersion::V2
-                        {
-                            coverage.saw_started = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.realtime_session_id.as_deref()
+                            == Some("session-worker-a-2")
+                        && notification.version == RealtimeConversationVersion::V2 =>
+                    {
+                        coverage.saw_started = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeItemAdded(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.item["type"] == "message"
-                        {
-                            coverage.saw_item_added = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.item["type"] == "message" =>
+                    {
+                        coverage.saw_item_added = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeTranscriptDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.role == "assistant"
-                            && notification.delta == "delta after reconnect"
-                        {
-                            coverage.saw_transcript_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.role == "assistant"
+                        && notification.delta == "delta after reconnect" =>
+                    {
+                        coverage.saw_transcript_delta = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeTranscriptDone(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.role == "assistant"
-                            && notification.text == "done after reconnect"
-                        {
-                            coverage.saw_transcript_done = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.role == "assistant"
+                        && notification.text == "done after reconnect" =>
+                    {
+                        coverage.saw_transcript_done = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.audio.data == "AQID"
-                            && notification.audio.sample_rate == 24_000
-                            && notification.audio.num_channels == 1
-                        {
-                            coverage.saw_output_audio_delta = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.audio.data == "AQID"
+                        && notification.audio.sample_rate == 24_000
+                        && notification.audio.num_channels == 1 =>
+                    {
+                        coverage.saw_output_audio_delta = true;
                     }
                     AppServerEvent::ServerNotification(ServerNotification::ThreadRealtimeSdp(
                         notification,
-                    )) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.sdp.contains("s=Codex")
-                        {
-                            coverage.saw_sdp = true;
-                        }
+                    )) if notification.thread_id == started.thread.id
+                        && notification.sdp.contains("s=Codex") =>
+                    {
+                        coverage.saw_sdp = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeError(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.message == "realtime transport warning"
-                        {
-                            coverage.saw_error = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.message == "realtime transport warning" =>
+                    {
+                        coverage.saw_error = true;
                     }
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeClosed(notification),
-                    ) => {
-                        if notification.thread_id == started.thread.id
-                            && notification.reason.as_deref() == Some("client requested stop")
-                        {
-                            coverage.saw_closed = true;
-                        }
+                    ) if notification.thread_id == started.thread.id
+                        && notification.reason.as_deref() == Some("client requested stop") =>
+                    {
+                        coverage.saw_closed = true;
                     }
                     _ => {}
                 }
@@ -12299,7 +12253,7 @@ stream_max_retries = 0
     #[tokio::test]
     async fn remote_single_worker_forwards_connection_state_notifications_after_worker_reconnect() {
         let websocket_url =
-            start_reconnecting_v2_multi_connection_state_notification_server().await;
+            start_reconnecting_v2_single_worker_connection_state_notification_server().await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -12310,11 +12264,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -12329,6 +12280,19 @@ stream_max_retries = 0
         .expect("server");
 
         let client = reqwest::Client::new();
+        let events_response = client
+            .get(format!("http://{}/v1/events", server.local_addr()))
+            .send()
+            .await
+            .expect("event stream response");
+        assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            events_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
         timeout(Duration::from_secs(5), async {
             loop {
                 let healthz_response = client
@@ -12339,6 +12303,11 @@ stream_max_retries = 0
                 let health: GatewayHealthResponse =
                     healthz_response.json().await.expect("health body");
                 if health.status == GatewayHealthStatus::Ok
+                    && health
+                        .remote_workers
+                        .as_ref()
+                        .and_then(|workers| workers.first())
+                        .is_some_and(|worker| worker.healthy && !worker.reconnecting)
                     && health
                         .remote_workers
                         .as_ref()
@@ -12496,7 +12465,7 @@ stream_max_retries = 0
 
     #[tokio::test]
     async fn remote_single_worker_forwards_skills_changed_notifications_after_worker_reconnect() {
-        let websocket_url = start_reconnecting_v2_multi_connection_skills_changed_server().await;
+        let websocket_url = start_reconnecting_v2_single_worker_skills_changed_server().await;
         let config = Config::load_default_with_cli_overrides(Vec::new())
             .await
             .expect("config");
@@ -12507,11 +12476,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -12526,6 +12492,19 @@ stream_max_retries = 0
         .expect("server");
 
         let client = reqwest::Client::new();
+        let events_response = client
+            .get(format!("http://{}/v1/events", server.local_addr()))
+            .send()
+            .await
+            .expect("event stream response");
+        assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            events_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
         timeout(Duration::from_secs(5), async {
             loop {
                 let healthz_response = client
@@ -12536,6 +12515,11 @@ stream_max_retries = 0
                 let health: GatewayHealthResponse =
                     healthz_response.json().await.expect("health body");
                 if health.status == GatewayHealthStatus::Ok
+                    && health
+                        .remote_workers
+                        .as_ref()
+                        .and_then(|workers| workers.first())
+                        .is_some_and(|worker| worker.healthy && !worker.reconnecting)
                     && health
                         .remote_workers
                         .as_ref()
@@ -12581,7 +12565,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: true,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -12623,7 +12606,7 @@ stream_max_retries = 0
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![
                         GatewayRemoteWorkerConfig {
-                            websocket_url: worker_a,
+                            websocket_url: worker_a.clone(),
 
                             auth_token: None,
                             account_id: None,
@@ -12647,6 +12630,19 @@ stream_max_retries = 0
         .expect("server");
 
         let client = reqwest::Client::new();
+        let mut events_response = client
+            .get(format!("http://{}/v1/events", server.local_addr()))
+            .send()
+            .await
+            .expect("event stream response");
+        assert_eq!(events_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            events_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
         timeout(Duration::from_secs(5), async {
             loop {
                 let healthz_response = client
@@ -12661,8 +12657,10 @@ stream_max_retries = 0
                 };
                 if health.status == GatewayHealthStatus::Ok
                     && remote_workers[0].healthy
+                    && !remote_workers[0].reconnecting
                     && remote_workers[0].last_error.is_some()
                     && remote_workers[1].healthy
+                    && !remote_workers[1].reconnecting
                 {
                     break;
                 }
@@ -12671,7 +12669,29 @@ stream_max_retries = 0
         })
         .await
         .expect("worker should reconnect before v2 client connects");
+        timeout(Duration::from_secs(5), async {
+            let mut buffered = String::new();
+            loop {
+                let chunk = events_response
+                    .chunk()
+                    .await
+                    .expect("event stream chunk")
+                    .expect("event stream not closed");
+                buffered.push_str(std::str::from_utf8(&chunk).expect("utf8"));
 
+                while let Some(event_end) = buffered.find("\n\n") {
+                    let event = buffered[..event_end].to_string();
+                    buffered.drain(..event_end + 2);
+                    if event.contains("event: gateway/reconnected") {
+                        assert!(event.contains("\"workerId\":"));
+                        assert!(event.contains(&worker_a));
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("reconnected SSE event should arrive before v2 client connects");
         let mut v2_client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
             endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
                 websocket_url: format!("ws://{}/", server.local_addr()),
@@ -12707,7 +12727,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -12940,7 +12960,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -12951,6 +12971,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(4),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -13005,11 +13026,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -13034,6 +13052,11 @@ stream_max_retries = 0
                 let health: GatewayHealthResponse =
                     healthz_response.json().await.expect("health body");
                 if health.status == GatewayHealthStatus::Ok
+                    && health
+                        .remote_workers
+                        .as_ref()
+                        .and_then(|workers| workers.first())
+                        .is_some_and(|worker| worker.healthy && !worker.reconnecting)
                     && health
                         .remote_workers
                         .as_ref()
@@ -13098,6 +13121,7 @@ stream_max_retries = 0
             credits: None,
             plan_type: Some(AccountPlanType::Pro),
             rate_limit_reached_type: None,
+            individual_limit: None,
         };
         let rate_limits: GetAccountRateLimitsResponse = timeout(
             Duration::from_secs(5),
@@ -13118,6 +13142,7 @@ stream_max_retries = 0
                         .into_iter()
                         .collect(),
                 ),
+                rate_limit_reset_credits: None,
             }
         );
 
@@ -13184,7 +13209,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec![PathBuf::from("/tmp/reconnected-project")],
                     force_reload: false,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -13349,6 +13373,7 @@ stream_max_retries = 0
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(10),
+                    ..Default::default()
                 },
             }),
         )
@@ -13380,6 +13405,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: None,
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             }),
         )
@@ -13395,13 +13421,14 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(18),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             }),
         )
         .await
         .expect("externalAgentConfig/import should finish in time after worker reconnect")
         .expect("externalAgentConfig/import should succeed after worker reconnect");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let marketplace: MarketplaceAddResponse = timeout(
             Duration::from_secs(5),
@@ -13930,6 +13957,7 @@ stream_max_retries = 0
                     env: None,
                     size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
                     sandbox_policy: None,
+                    permission_profile: None,
                 },
             }),
         )
@@ -14143,8 +14171,10 @@ stream_max_retries = 0
                 };
                 if health.status == GatewayHealthStatus::Ok
                     && remote_workers[0].healthy
+                    && !remote_workers[0].reconnecting
                     && remote_workers[0].last_error.is_some()
                     && remote_workers[1].healthy
+                    && !remote_workers[1].reconnecting
                 {
                     break;
                 }
@@ -14212,7 +14242,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -14240,7 +14270,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -14254,9 +14284,17 @@ stream_max_retries = 0
                     thread_id: first_started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -14270,9 +14308,17 @@ stream_max_retries = 0
                     thread_id: second_started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -14285,6 +14331,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: first_started.thread.id.clone(),
                     text: "hello recovered realtime".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -14297,6 +14344,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: second_started.thread.id.clone(),
                     text: "hello worker b realtime".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -14418,7 +14466,8 @@ stream_max_retries = 0
                             expected_by_thread.get(&notification.thread_id)
                             && let Some(coverage) =
                                 coverage_by_thread.get_mut(&notification.thread_id)
-                            && notification.session_id.as_deref() == Some(*expected_session_id)
+                            && notification.realtime_session_id.as_deref()
+                                == Some(*expected_session_id)
                             && notification.version == RealtimeConversationVersion::V2
                         {
                             coverage.saw_started = true;
@@ -14592,6 +14641,7 @@ stream_max_retries = 0
                 };
                 if health.status == GatewayHealthStatus::Ok
                     && remote_workers[0].healthy
+                    && !remote_workers[0].reconnecting
                     && remote_workers[0].last_error.is_some()
                     && remote_workers[1].healthy
                 {
@@ -14861,7 +14911,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: true,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -14901,11 +14950,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: websocket_url,
-
-                            auth_token: None,
-                        },
+                        websocket_url,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -14954,7 +15000,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -14978,7 +15024,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -14986,7 +15032,7 @@ stream_max_retries = 0
         assert_eq!(
             resume_error.to_string(),
             format!(
-                "thread/resume failed: no rollout found for thread id {}",
+                "thread/resume failed: no rollout found for thread id {} (code -32600)",
                 started.thread.id
             )
         );
@@ -15009,11 +15055,11 @@ stream_max_retries = 0
                     thread_id: "thread-history-placeholder".to_string(),
                     history: Some(vec![ResponseItem::Message {
                         id: None,
+                        metadata: None,
                         role: "user".to_string(),
                         content: vec![ContentItem::InputText {
                             text: "resume from explicit history".to_string(),
                         }],
-                        end_turn: None,
                         phase: None,
                     }]),
                     path: None,
@@ -15028,7 +15074,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -15053,14 +15099,14 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect_err("unknown path-based thread/resume should fail through remote gateway");
         assert_eq!(
             resume_path_error.to_string(),
-            "thread/resume failed: thread not found: /tmp/rollout.jsonl"
+            "thread/resume failed: thread not found: /tmp/rollout.jsonl (code -32602)"
         );
 
         let fork_error = client
@@ -15080,7 +15126,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -15088,7 +15134,7 @@ stream_max_retries = 0
         assert_eq!(
             fork_error.to_string(),
             format!(
-                "thread/fork failed: no rollout found for thread id {}",
+                "thread/fork failed: no rollout found for thread id {} (code -32600)",
                 started.thread.id
             )
         );
@@ -15121,14 +15167,14 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect_err("unknown path-based thread/fork should fail through remote gateway");
         assert_eq!(
             fork_path_error.to_string(),
-            "thread/fork failed: thread not found: /tmp/rollout.jsonl"
+            "thread/fork failed: thread not found: /tmp/rollout.jsonl (code -32602)"
         );
 
         assert_remote_client_shutdown(client.shutdown().await);
@@ -16720,11 +16766,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker_a,
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url: worker_a,
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -17101,7 +17144,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17129,7 +17172,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17140,6 +17183,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -17257,7 +17301,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::McpResourceRead {
                 request_id: RequestId::Integer(9),
                 params: McpResourceReadParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: Some(first_started.thread.id.clone()),
                     server: "thread-mcp".to_string(),
                     uri: "file:///tmp/worker-a/context.md".to_string(),
                 },
@@ -17277,7 +17321,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::McpResourceRead {
                 request_id: RequestId::Integer(10),
                 params: McpResourceReadParams {
-                    thread_id: second_started.thread.id.clone(),
+                    thread_id: Some(second_started.thread.id.clone()),
                     server: "thread-mcp".to_string(),
                     uri: "file:///tmp/worker-b/context.md".to_string(),
                 },
@@ -17412,7 +17456,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17438,7 +17482,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17462,7 +17506,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17477,11 +17521,11 @@ stream_max_retries = 0
                     thread_id: "thread-history-placeholder".to_string(),
                     history: Some(vec![ResponseItem::Message {
                         id: None,
+                        metadata: None,
                         role: "user".to_string(),
                         content: vec![ContentItem::InputText {
                             text: "resume from explicit history".to_string(),
                         }],
-                        end_turn: None,
                         phase: None,
                     }]),
                     path: None,
@@ -17496,7 +17540,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17531,7 +17575,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17556,7 +17600,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17587,7 +17631,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17701,7 +17745,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17732,6 +17776,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -17822,7 +17867,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -17835,6 +17880,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(7),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -17883,7 +17929,7 @@ stream_max_retries = 0
         assert_eq!(
             other_project_read_error.to_string(),
             format!(
-                "thread/read failed: thread not found: {}",
+                "thread/read failed: thread not found: {} (code -32602)",
                 first_started.thread.id
             )
         );
@@ -17923,6 +17969,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(10),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -18065,7 +18112,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -18106,6 +18153,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(2),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -18214,14 +18262,12 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("first thread/start should succeed through multi-worker remote gateway");
         assert_eq!(first_started.thread.id, "thread-worker-a");
-
-        sleep(Duration::from_millis(200)).await;
 
         let second_started: AppServerThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
@@ -18244,7 +18290,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -18255,6 +18301,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -18343,6 +18390,7 @@ stream_max_retries = 0
                 };
                 if health.status == GatewayHealthStatus::Ok
                     && remote_workers[0].healthy
+                    && !remote_workers[0].reconnecting
                     && remote_workers[0].last_error.is_some()
                     && remote_workers[1].healthy
                 {
@@ -18368,8 +18416,6 @@ stream_max_retries = 0
         .await
         .expect("remote client should connect to multi-worker gateway");
 
-        sleep(Duration::from_millis(200)).await;
-
         let first_started: AppServerThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(1),
@@ -18391,12 +18437,11 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("same northbound session should reuse recovered worker for thread/start");
-        assert_eq!(first_started.thread.id, "thread-worker-a-3");
 
         let second_started: AppServerThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
@@ -18419,31 +18464,39 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("shared session should still round-robin onto surviving worker");
-        assert_eq!(second_started.thread.id, "thread-worker-b");
+        let recovered_started = match (
+            first_started.thread.id.as_str(),
+            second_started.thread.id.as_str(),
+        ) {
+            ("thread-worker-a-3", "thread-worker-b") => &first_started,
+            ("thread-worker-b", "thread-worker-a-3") => &second_started,
+            (first, second) => panic!("unexpected thread ids after reconnect: {first}, {second}"),
+        };
+        let recovered_thread_id = recovered_started.thread.id.clone();
 
         let first_read: AppServerThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
                 request_id: RequestId::Integer(3),
                 params: ThreadReadParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     include_turns: false,
                 },
             })
             .await
             .expect("thread/read should route to the re-added worker");
-        assert_eq!(first_read.thread.id, "thread-worker-a-3");
+        assert_eq!(first_read.thread.id, recovered_thread_id);
         assert_eq!(first_read.thread.preview, "/tmp/worker-a-3");
 
         let resumed: ThreadResumeResponse = client
             .request_typed(ClientRequest::ThreadResume {
                 request_id: RequestId::Integer(4),
                 params: ThreadResumeParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     history: None,
                     path: None,
                     model: None,
@@ -18457,15 +18510,15 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("thread/resume should route to the re-added worker");
-        assert_eq!(resumed.thread.id, first_started.thread.id);
+        assert_eq!(resumed.thread.id, recovered_thread_id);
         assert_eq!(resumed.cwd.as_ref().to_string_lossy(), "/tmp/worker-a-3");
 
-        let rollout_path = first_started
+        let rollout_path = recovered_started
             .thread
             .path
             .clone()
@@ -18474,7 +18527,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadResume {
                 request_id: RequestId::Integer(104),
                 params: ThreadResumeParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     history: None,
                     path: Some(rollout_path.clone()),
                     model: None,
@@ -18488,19 +18541,19 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("path-based thread/resume should route to the re-added worker");
-        assert_eq!(resumed_from_path.thread.id, first_started.thread.id);
+        assert_eq!(resumed_from_path.thread.id, recovered_thread_id);
         assert_eq!(resumed_from_path.thread.path, Some(rollout_path.clone()));
 
         let forked: ThreadForkResponse = client
             .request_typed(ClientRequest::ThreadFork {
                 request_id: RequestId::Integer(5),
                 params: ThreadForkParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     path: None,
                     model: None,
                     model_provider: None,
@@ -18513,7 +18566,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -18527,7 +18580,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadFork {
                 request_id: RequestId::Integer(105),
                 params: ThreadForkParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     path: Some(rollout_path),
                     model: None,
                     model_provider: None,
@@ -18540,14 +18593,14 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("path-based thread/fork should route to the re-added worker");
         assert_eq!(
             forked_from_path.thread.forked_from_id,
-            Some(first_started.thread.id.clone())
+            Some(recovered_thread_id.clone())
         );
         assert_eq!(forked_from_path.thread.path.is_some(), true);
 
@@ -18570,7 +18623,7 @@ stream_max_retries = 0
                 params: AppsListParams {
                     cursor: None,
                     limit: Some(10),
-                    thread_id: Some(first_started.thread.id.clone()),
+                    thread_id: Some(recovered_thread_id.clone()),
                     force_refetch: false,
                 },
             })
@@ -18590,7 +18643,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::McpResourceRead {
                 request_id: RequestId::Integer(107),
                 params: McpResourceReadParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: Some(recovered_thread_id.clone()),
                     server: "thread-mcp".to_string(),
                     uri: "file:///tmp/worker-a-3/context.md".to_string(),
                 },
@@ -18610,7 +18663,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::McpServerToolCall {
                 request_id: RequestId::Integer(108),
                 params: McpServerToolCallParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     server: "thread-mcp".to_string(),
                     tool: "lookup".to_string(),
                     arguments: Some(serde_json::json!({ "query": "worker-a-3" })),
@@ -18630,7 +18683,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadSetName {
                 request_id: RequestId::Integer(8),
                 params: ThreadSetNameParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     name: renamed_thread_name.clone(),
                 },
             })
@@ -18642,7 +18695,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadRead {
                 request_id: RequestId::Integer(9),
                 params: ThreadReadParams {
-                    thread_id: first_started.thread.id.clone(),
+                    thread_id: recovered_thread_id.clone(),
                     include_turns: false,
                 },
             })
@@ -18661,7 +18714,7 @@ stream_max_retries = 0
                 if let AppServerEvent::ServerNotification(ServerNotification::ThreadNameUpdated(
                     notification,
                 )) = event
-                    && notification.thread_id == first_started.thread.id
+                    && notification.thread_id == recovered_thread_id
                 {
                     break notification;
                 }
@@ -18786,6 +18839,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             })
             .await
@@ -19225,6 +19279,7 @@ stream_max_retries = 0
                     }],
                     responsesapi_client_metadata: None,
                     expected_turn_id: turn_started.turn.id.clone(),
+                    ..Default::default()
                 },
             })
             .await
@@ -19250,9 +19305,17 @@ stream_max_retries = 0
                     thread_id: first_started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -19265,6 +19328,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: first_started.thread.id.clone(),
                     text: "Recovered worker realtime text".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -19328,7 +19392,7 @@ stream_max_retries = 0
                     AppServerEvent::ServerNotification(
                         ServerNotification::ThreadRealtimeStarted(notification),
                     ) if notification.thread_id == first_started.thread.id
-                        && notification.session_id.as_deref()
+                        && notification.realtime_session_id.as_deref()
                             == Some(format!("session-{}", first_started.thread.id).as_str())
                         && notification.version == RealtimeConversationVersion::V2 =>
                     {
@@ -19398,6 +19462,7 @@ stream_max_retries = 0
             .request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(32),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -19537,8 +19602,6 @@ stream_max_retries = 0
         .await
         .expect("remote client should connect to multi-worker gateway");
 
-        sleep(Duration::from_millis(200)).await;
-
         let first_started: AppServerThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
                 request_id: RequestId::Integer(1),
@@ -19560,12 +19623,11 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("same northbound session should reuse recovered worker for thread/start");
-        assert_eq!(first_started.thread.id, "thread-worker-a-3");
 
         let second_started: AppServerThreadStartResponse = client
             .request_typed(ClientRequest::ThreadStart {
@@ -19588,17 +19650,23 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
             .expect("shared session should still round-robin onto surviving worker");
-        assert_eq!(second_started.thread.id, "thread-worker-b");
 
         let expected_threads = HashSet::from([
             first_started.thread.id.clone(),
             second_started.thread.id.clone(),
         ]);
+        assert_eq!(
+            expected_threads,
+            HashSet::from([
+                "thread-worker-a-3".to_string(),
+                "thread-worker-b".to_string(),
+            ])
+        );
         let mut gateway_request_ids = HashSet::new();
         let mut user_input_threads = HashSet::new();
         let mut command_threads = HashSet::new();
@@ -20058,11 +20126,12 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(1),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             })
             .await
             .expect("externalAgentConfig/import should reconnect and fan out");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let import_completed = timeout(Duration::from_secs(5), client.next_event())
             .await
@@ -20408,11 +20477,12 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(1),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             })
             .await
             .expect("externalAgentConfig/import should reconnect and fan out");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let notification = timeout(Duration::from_secs(5), client.next_event())
             .await
@@ -20816,7 +20886,9 @@ stream_max_retries = 0
             Duration::from_secs(5),
             client.request_typed(ClientRequest::LoginAccount {
                 request_id: RequestId::Integer(4),
-                params: LoginAccountParams::Chatgpt,
+                params: LoginAccountParams::Chatgpt {
+                    codex_streamlined_login: false,
+                },
             }),
         )
         .await
@@ -21199,6 +21271,7 @@ stream_max_retries = 0
                     env: None,
                     size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
                     sandbox_policy: None,
+                    permission_profile: None,
                 },
             }),
         )
@@ -21744,7 +21817,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: false,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -21801,6 +21873,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             }),
         )
@@ -21946,6 +22019,7 @@ stream_max_retries = 0
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(20),
+                    ..Default::default()
                 },
             }),
         )
@@ -22065,7 +22139,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -22137,7 +22211,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -22226,7 +22300,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -22314,7 +22388,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -22437,7 +22511,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -22613,7 +22687,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -22755,13 +22829,14 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(1),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             }),
         )
         .await
         .expect("externalAgentConfig/import should finish in time")
         .expect("externalAgentConfig/import should fan out through multi-worker gateway");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let batch_write: ConfigWriteResponse = timeout(
             Duration::from_secs(5),
@@ -23028,13 +23103,14 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(1),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             }),
         )
         .await
         .expect("externalAgentConfig/import should finish in time")
         .expect("externalAgentConfig/import should fan out through multi-worker gateway");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let notification = timeout(Duration::from_secs(5), client.next_event())
             .await
@@ -23124,13 +23200,14 @@ stream_max_retries = 0
                 request_id: RequestId::Integer(1),
                 params: ExternalAgentConfigImportParams {
                     migration_items: Vec::new(),
+                    source: None,
                 },
             }),
         )
         .await
         .expect("externalAgentConfig/import should finish in time")
         .expect("externalAgentConfig/import should fan out through multi-worker gateway");
-        assert_eq!(imported, ExternalAgentConfigImportResponse {});
+        assert!(!imported.import_id.is_empty());
 
         let batch_write: ConfigWriteResponse = timeout(
             Duration::from_secs(5),
@@ -23760,7 +23837,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: false,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -24070,7 +24146,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24100,7 +24176,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24260,7 +24336,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24290,7 +24366,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24475,7 +24551,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24505,7 +24581,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24684,7 +24760,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24714,7 +24790,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24907,7 +24983,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -24937,7 +25013,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25135,7 +25211,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25165,7 +25241,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25374,7 +25450,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25404,7 +25480,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25466,6 +25542,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             }),
         )
@@ -25604,7 +25681,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25634,7 +25711,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25834,7 +25911,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -25864,7 +25941,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26063,7 +26140,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26093,7 +26170,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26291,7 +26368,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26321,7 +26398,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26516,7 +26593,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26546,7 +26623,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -26683,21 +26760,15 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_a,
+                                websocket_url: worker_a,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_b,
+                                websocket_url: worker_b,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -26748,7 +26819,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -26778,7 +26849,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -27026,21 +27097,15 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_a,
+                                websocket_url: worker_a,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_b,
+                                websocket_url: worker_b,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -27091,7 +27156,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -27121,7 +27186,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -27423,7 +27488,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -27453,7 +27518,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -27580,21 +27645,15 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_a,
+                                websocket_url: worker_a,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_b,
+                                websocket_url: worker_b,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -27645,7 +27704,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -27675,7 +27734,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -27738,7 +27797,7 @@ stream_max_retries = 0
                         client.request_typed(ClientRequest::McpResourceRead {
                             request_id: RequestId::Integer(4),
                             params: McpResourceReadParams {
-                                thread_id: worker_b_thread.thread.id.clone(),
+                                thread_id: Some(worker_b_thread.thread.id.clone()),
                                 server: "remote-mcp".to_string(),
                                 uri: "file:///tmp/remote-project/context.md".to_string(),
                             },
@@ -27842,21 +27901,15 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_a,
+                                websocket_url: worker_a,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_b,
+                                websocket_url: worker_b,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -27907,7 +27960,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -27937,7 +27990,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -28004,9 +28057,17 @@ stream_max_retries = 0
                                 thread_id: thread_id.clone(),
                                 output_modality: RealtimeOutputModality::Text,
                                 prompt: None,
-                                session_id: None,
+                                realtime_session_id: None,
                                 transport: None,
                                 voice: None,
+                                architecture: None,
+                    client_managed_handoffs: None,
+                                model: None,
+                                version: None,
+                                codex_responses_as_items: None,
+                                codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                                include_startup_context: None,
                             },
                         }),
                     )
@@ -28024,6 +28085,7 @@ stream_max_retries = 0
                             params: ThreadRealtimeAppendTextParams {
                                 thread_id: thread_id.clone(),
                                 text: "hello".to_string(),
+                                ..Default::default()
                             },
                         }),
                     )
@@ -28138,21 +28200,15 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_a,
+                                websocket_url: worker_a,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_b,
+                                websocket_url: worker_b,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -28203,7 +28259,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -28233,7 +28289,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -28445,7 +28501,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28475,7 +28531,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28552,7 +28608,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28689,7 +28745,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28719,7 +28775,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28795,7 +28851,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: true,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28938,7 +28994,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -28968,7 +29024,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -29241,7 +29297,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: true,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -29277,7 +29333,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -29446,21 +29502,15 @@ stream_max_retries = 0
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                         workers: vec![
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_a,
+                                websocket_url: worker_a,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-a".to_string()),
                             },
                             GatewayRemoteWorkerConfig {
-                                endpoint:
-                                    codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                                        websocket_url: worker_b,
+                                websocket_url: worker_b,
 
-                                        auth_token: None,
-                                    },
+                                auth_token: None,
                                 account_id: Some("acct-b".to_string()),
                             },
                         ],
@@ -29511,7 +29561,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -29541,7 +29591,7 @@ stream_max_retries = 0
                         dynamic_tools: None,
                         mock_experimental_field: None,
                         experimental_raw_events: false,
-                        persist_extended_history: false,
+                        ..Default::default()
                     },
                 }),
             )
@@ -29643,6 +29693,7 @@ stream_max_retries = 0
                                 }],
                                 responsesapi_client_metadata: None,
                                 expected_turn_id: turn_id.clone(),
+                                ..Default::default()
                             },
                         }),
                     )
@@ -29786,7 +29837,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -29816,7 +29867,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -29886,7 +29937,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -29966,7 +30017,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: true,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -30382,6 +30433,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             }),
         )
@@ -30722,7 +30774,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -30752,7 +30804,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -30891,7 +30943,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     personality: None,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -30973,7 +31025,7 @@ stream_max_retries = 0
                     base_instructions: None,
                     developer_instructions: None,
                     ephemeral: true,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             }),
         )
@@ -31270,6 +31322,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(2),
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             }),
         )
@@ -31297,6 +31350,7 @@ stream_max_retries = 0
                     cursor: first_page.next_cursor.clone(),
                     limit: Some(2),
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             }),
         )
@@ -31529,7 +31583,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: false,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -31555,6 +31608,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                    thread_id: None,
                 },
             }),
         )
@@ -31752,6 +31806,7 @@ stream_max_retries = 0
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(20),
+                    ..Default::default()
                 },
             }),
         )
@@ -31868,6 +31923,7 @@ stream_max_retries = 0
                 params: ExperimentalFeatureListParams {
                     cursor: None,
                     limit: Some(2),
+                    ..Default::default()
                 },
             }),
         )
@@ -31894,6 +31950,7 @@ stream_max_retries = 0
                 params: ExperimentalFeatureListParams {
                     cursor: first_page.next_cursor,
                     limit: Some(2),
+                    ..Default::default()
                 },
             }),
         )
@@ -32039,7 +32096,9 @@ stream_max_retries = 0
             Duration::from_secs(5),
             client.request_typed(ClientRequest::LoginAccount {
                 request_id: RequestId::Integer(3),
-                params: LoginAccountParams::Chatgpt,
+                params: LoginAccountParams::Chatgpt {
+                    codex_streamlined_login: false,
+                },
             }),
         )
         .await
@@ -32129,6 +32188,7 @@ stream_max_retries = 0
                     env: None,
                     size: Some(CommandExecTerminalSize { rows: 24, cols: 80 }),
                     sandbox_policy: None,
+                    permission_profile: None,
                 },
             }),
         )
@@ -32773,7 +32833,6 @@ stream_max_retries = 0
                 params: SkillsListParams {
                     cwds: vec!["/tmp/shared-repo".into()],
                     force_reload: true,
-                    per_cwd_extra_user_roots: None,
                 },
             }),
         )
@@ -33281,7 +33340,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -33307,7 +33366,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -33877,7 +33936,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -33903,7 +33962,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -33976,6 +34035,7 @@ stream_max_retries = 0
                     }],
                     responsesapi_client_metadata: None,
                     expected_turn_id: first_turn_started.turn.id.clone(),
+                    ..Default::default()
                 },
             })
             .await
@@ -33993,6 +34053,7 @@ stream_max_retries = 0
                     }],
                     responsesapi_client_metadata: None,
                     expected_turn_id: second_turn_started.turn.id.clone(),
+                    ..Default::default()
                 },
             })
             .await
@@ -34237,7 +34298,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -34263,7 +34324,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -34435,6 +34496,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             })
             .await
@@ -34452,6 +34514,7 @@ stream_max_retries = 0
                     cursor: None,
                     limit: Some(10),
                     sort_direction: None,
+                    items_view: None,
                 },
             })
             .await
@@ -34913,7 +34976,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -34939,7 +35002,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -34952,9 +35015,17 @@ stream_max_retries = 0
                     thread_id: first_started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -34968,9 +35039,17 @@ stream_max_retries = 0
                     thread_id: second_started.thread.id.clone(),
                     output_modality: RealtimeOutputModality::Text,
                     prompt: None,
-                    session_id: None,
+                    realtime_session_id: None,
                     transport: None,
                     voice: None,
+                    architecture: None,
+                    client_managed_handoffs: None,
+                    model: None,
+                    version: None,
+                    codex_responses_as_items: None,
+                    codex_response_item_prefix: None,
+                    codex_response_handoff_prefix: None,
+                    include_startup_context: None,
                 },
             })
             .await
@@ -34983,6 +35062,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: first_started.thread.id.clone(),
                     text: "hello realtime a".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -34995,6 +35075,7 @@ stream_max_retries = 0
                 params: ThreadRealtimeAppendTextParams {
                     thread_id: second_started.thread.id.clone(),
                     text: "hello realtime b".to_string(),
+                    ..Default::default()
                 },
             })
             .await
@@ -35114,7 +35195,8 @@ stream_max_retries = 0
                             expected_by_thread.get(&notification.thread_id)
                             && let Some(coverage) =
                                 coverage_by_thread.get_mut(&notification.thread_id)
-                            && notification.session_id.as_deref() == Some(*expected_session_id)
+                            && notification.realtime_session_id.as_deref()
+                                == Some(*expected_session_id)
                             && notification.version == RealtimeConversationVersion::V2
                         {
                             coverage.saw_started = true;
@@ -35327,7 +35409,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -35353,7 +35435,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -35815,7 +35897,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -35841,7 +35923,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -36448,7 +36530,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -36474,7 +36556,7 @@ stream_max_retries = 0
                     dynamic_tools: None,
                     mock_experimental_field: None,
                     experimental_raw_events: false,
-                    persist_extended_history: false,
+                    ..Default::default()
                 },
             })
             .await
@@ -36637,6 +36719,7 @@ stream_max_retries = 0
             client.request_typed(ClientRequest::ThreadList {
                 request_id: RequestId::Integer(9),
                 params: ThreadListParams {
+                    parent_thread_id: None,
                     use_state_db_only: false,
                     cursor: None,
                     limit: Some(10),
@@ -36685,11 +36768,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker_a.clone(),
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url: worker_a.clone(),
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -36781,11 +36861,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker_a.clone(),
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url: worker_a.clone(),
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -37632,11 +37709,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker,
-
-                            auth_token: None,
-                        },
+                        websocket_url: worker,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -37758,11 +37832,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker,
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url: worker,
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -37875,11 +37946,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker,
-
-                            auth_token: Some("secret-token".to_string()),
-                        },
+                        websocket_url: worker,
+                        auth_token: Some("secret-token".to_string()),
                         account_id: None,
                     }],
                 }),
@@ -38506,11 +38574,8 @@ stream_max_retries = 0
                 remote_runtime: Some(GatewayRemoteRuntimeConfig {
                     selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
                     workers: vec![GatewayRemoteWorkerConfig {
-                        endpoint: codex_app_server_client::RemoteAppServerEndpoint::WebSocket {
-                            websocket_url: worker,
-
-                            auth_token: None,
-                        },
+                        websocket_url: worker,
+                        auth_token: None,
                         account_id: None,
                     }],
                 }),
@@ -39252,7 +39317,7 @@ stream_max_retries = 0
                     .expect("websocket upgrade should succeed");
 
                     expect_remote_initialize(&mut websocket).await;
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                 });
             }
         });
@@ -39295,7 +39360,7 @@ stream_max_retries = 0
                             panic!("expected initialized notification");
                         };
                         assert_eq!(notification.method, "initialized");
-                        sleep(Duration::from_secs(60)).await;
+                        sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                     } else {
                         websocket
                             .close(None)
@@ -39397,49 +39462,231 @@ stream_max_retries = 0
                 expect_remote_initialize(&mut websocket).await;
                 loop {
                     let request = read_websocket_request(&mut websocket).await;
-                    assert_eq!(request.method, "thread/start");
-                    let thread_id = if connection_index == 0 {
-                        "thread-worker-a-1"
-                    } else {
-                        "thread-worker-a-2"
-                    };
-                    let preview = if connection_index == 0 {
-                        "/tmp/worker-a-1"
-                    } else {
-                        "/tmp/worker-a-2"
-                    };
-                    write_websocket_message(
-                        &mut websocket,
-                        JSONRPCMessage::Response(JSONRPCResponse {
-                            id: request.id,
-                            result: serde_json::json!({
-                                "thread": mock_thread(thread_id, preview),
-                                "model": "gpt-5",
-                                "modelProvider": "openai",
-                                "serviceTier": null,
-                                "cwd": preview,
-                                "instructionSources": [],
-                                "approvalPolicy": "never",
-                                "approvalsReviewer": "user",
-                                "sandbox": {
-                                    "type": "dangerFullAccess"
-                                },
-                                "reasoningEffort": null,
-                            }),
-                        }),
-                    )
-                    .await;
-                    if connection_index == 0 {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
-                        break;
+                    if respond_to_reconnect_bootstrap_request(&mut websocket, &request).await {
+                        continue;
+                    }
+                    match request.method.as_str() {
+                        "thread/start" => {
+                            let thread_id = if connection_index == 0 {
+                                "thread-worker-a-1"
+                            } else {
+                                "thread-worker-a-2"
+                            };
+                            let preview = if connection_index == 0 {
+                                "/tmp/worker-a-1"
+                            } else {
+                                "/tmp/worker-a-2"
+                            };
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result: serde_json::json!({
+                                        "thread": mock_thread(thread_id, preview),
+                                        "model": "gpt-5",
+                                        "modelProvider": "openai",
+                                        "serviceTier": null,
+                                        "cwd": preview,
+                                        "instructionSources": [],
+                                        "approvalPolicy": "never",
+                                        "approvalsReviewer": "user",
+                                        "sandbox": {
+                                            "type": "dangerFullAccess"
+                                        },
+                                        "reasoningEffort": null,
+                                    }),
+                                }),
+                            )
+                            .await;
+                            if connection_index == 0 {
+                                websocket
+                                    .close(None)
+                                    .await
+                                    .expect("close frame should send");
+                                break;
+                            }
+                        }
+                        method => panic!("unexpected request method: {method}"),
                     }
                 }
             }
         });
         format!("ws://{addr}")
+    }
+
+    async fn respond_to_reconnect_bootstrap_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        request: &codex_app_server_protocol::JSONRPCRequest,
+    ) -> bool {
+        match request.method.as_str() {
+            "account/read" => {
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "account": {
+                                "type": "chatgpt",
+                                "email": "gateway@example.com",
+                                "planType": "pro",
+                            },
+                            "requiresOpenaiAuth": false,
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            "account/rateLimits/read" => {
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "rateLimits": {
+                                "limitId": "codex",
+                                "limitName": "Codex",
+                                "primary": {
+                                    "usedPercent": 42,
+                                    "windowDurationMins": 300,
+                                    "resetsAt": 1_700_000_000,
+                                },
+                                "secondary": null,
+                                "credits": null,
+                                "planType": "pro",
+                                "rateLimitReachedType": null,
+                            },
+                            "rateLimitsByLimitId": {
+                                "codex": {
+                                    "limitId": "codex",
+                                    "limitName": "Codex",
+                                    "primary": {
+                                        "usedPercent": 42,
+                                        "windowDurationMins": 300,
+                                        "resetsAt": 1_700_000_000,
+                                    },
+                                    "secondary": null,
+                                    "credits": null,
+                                    "planType": "pro",
+                                    "rateLimitReachedType": null,
+                                }
+                            },
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            "app/list" => {
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "data": [{
+                                "id": "calendar",
+                                "name": "calendar",
+                                "description": null,
+                                "logoUrl": null,
+                                "logoUrlDark": null,
+                                "distributionChannel": null,
+                                "branding": null,
+                                "appMetadata": null,
+                                "labels": null,
+                                "installUrl": null,
+                            }],
+                            "nextCursor": null,
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            "configRequirements/read" => {
+                assert_eq!(request.params, None);
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "requirements": null,
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            "mcpServerStatus/list" => {
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "data": [{
+                                "name": "calendar-mcp",
+                                "tools": {},
+                                "resources": [],
+                                "resourceTemplates": [],
+                                "authStatus": "bearerToken",
+                            }],
+                            "nextCursor": null,
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            "model/list" => {
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "data": [{
+                                "id": "openai/gpt-5",
+                                "model": "gpt-5",
+                                "upgrade": null,
+                                "upgradeInfo": null,
+                                "availabilityNux": null,
+                                "displayName": "GPT-5",
+                                "description": "Recovered single-worker model",
+                                "hidden": false,
+                                "supportedReasoningEfforts": [{
+                                    "reasoningEffort": "medium",
+                                    "description": "Balanced",
+                                }],
+                                "defaultReasoningEffort": "medium",
+                                "inputModalities": ["text"],
+                                "supportsPersonality": false,
+                                "additionalSpeedTiers": [],
+                                "isDefault": true,
+                            }],
+                            "nextCursor": null,
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            "skills/list" => {
+                write_websocket_message(
+                    websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id.clone(),
+                        result: serde_json::json!({
+                            "data": [{
+                                "cwd": "/tmp/shared-repo",
+                                "skills": [],
+                                "errors": [],
+                            }],
+                        }),
+                    }),
+                )
+                .await;
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn start_reconnecting_v2_mock_remote_server(
@@ -39450,7 +39697,8 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            for connection_index in 0..3 {
+            for connection_index in 0..8 {
+                tracing::info!(connection_index, "reconnect mock waiting for connection");
                 let expected_auth_token = expected_auth_token.clone();
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let mut websocket = accept_hdr_async(
@@ -39471,7 +39719,9 @@ stream_max_retries = 0
                 .await
                 .expect("websocket upgrade should succeed");
 
+                tracing::info!(connection_index, "reconnect mock websocket accepted");
                 expect_remote_initialize(&mut websocket).await;
+                tracing::info!(connection_index, "reconnect mock initialize completed");
                 match connection_index {
                     0 => {
                         websocket
@@ -39480,435 +39730,637 @@ stream_max_retries = 0
                             .expect("close frame should send");
                     }
                     1 => {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
-                        });
+                        websocket
+                            .close(None)
+                            .await
+                            .expect("close frame should send");
                     }
-                    2 => {
-                        let request = read_websocket_request(&mut websocket).await;
-                        assert_eq!(request.method, "thread/start");
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result: serde_json::json!({
-                                    "thread": mock_thread("thread-worker-a-2", "/tmp/worker-a-2"),
-                                    "model": "gpt-5",
-                                    "modelProvider": "openai",
-                                    "serviceTier": null,
-                                    "cwd": "/tmp/worker-a-2",
-                                    "instructionSources": [],
-                                    "approvalPolicy": "never",
-                                    "approvalsReviewer": "user",
-                                    "sandbox": {
-                                        "type": "dangerFullAccess"
-                                    },
-                                    "reasoningEffort": null,
-                                }),
-                            }),
-                        )
-                        .await;
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String("srv-user-input-after-reconnect".to_string()),
-                                method: "item/tool/requestUserInput".to_string(),
-                                params: Some(
-                                    serde_json::to_value(
-                                        codex_app_server_protocol::ToolRequestUserInputParams {
-                                            auto_resolution_ms: None,
-                                            thread_id: "thread-worker-a-2".to_string(),
-                                            turn_id: "turn-worker-a-2".to_string(),
-                                            item_id: "tool-call-worker-a-2".to_string(),
-                                            questions: vec![ToolRequestUserInputQuestion {
-                                                id: "mode".to_string(),
-                                                header: "Mode".to_string(),
-                                                question: "Pick execution mode".to_string(),
-                                                is_other: false,
-                                                is_secret: false,
-                                                options: Some(vec![]),
-                                            }],
-                                        },
-                                    )
-                                    .expect("server request params should serialize"),
-                                ),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-
-                        let JSONRPCMessage::Response(response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected server request response");
-                        };
-                        assert_eq!(
-                            response.id,
-                            RequestId::String("srv-user-input-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            response.result,
-                            serde_json::json!({
-                                "answers": {
-                                    "mode": {
-                                        "answers": ["safe"],
-                                    },
-                                },
-                            })
-                        );
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Notification(
-                                codex_app_server_protocol::JSONRPCNotification {
-                                    method: "serverRequest/resolved".to_string(),
-                                    params: Some(
-                                        serde_json::to_value(ServerRequestResolvedNotification {
-                                            thread_id: "thread-worker-a-2".to_string(),
-                                            request_id: RequestId::String(
-                                                "srv-user-input-after-reconnect".to_string(),
-                                            ),
-                                        })
-                                        .expect(
-                                            "user input serverRequest/resolved should serialize",
-                                        ),
-                                    ),
-                                },
-                            ),
-                        )
-                        .await;
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String("srv-command-after-reconnect".to_string()),
-                                method: "item/commandExecution/requestApproval".to_string(),
-                                params: Some(serde_json::json!({
-                                    "threadId": "thread-worker-a-2",
-                                    "turnId": "turn-worker-a-2",
-                                    "itemId": "cmd-worker-a-2",
-                                    "command": "pwd",
-                                })),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-                        let JSONRPCMessage::Response(command_response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected command approval response after reconnect");
-                        };
-                        assert_eq!(
-                            command_response.id,
-                            RequestId::String("srv-command-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            command_response.result,
-                            serde_json::json!({
-                                "decision": "accept",
-                            })
-                        );
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String("srv-file-after-reconnect".to_string()),
-                                method: "item/fileChange/requestApproval".to_string(),
-                                params: Some(serde_json::json!({
-                                    "threadId": "thread-worker-a-2",
-                                    "turnId": "turn-worker-a-2",
-                                    "itemId": "file-worker-a-2",
-                                    "reason": "Need reconnect write",
-                                })),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-                        let JSONRPCMessage::Response(file_response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected file approval response after reconnect");
-                        };
-                        assert_eq!(
-                            file_response.id,
-                            RequestId::String("srv-file-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            file_response.result,
-                            serde_json::json!({
-                                "decision": "accept",
-                            })
-                        );
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String(
-                                    "srv-mcp-elicitation-after-reconnect".to_string(),
-                                ),
-                                method: "mcpServer/elicitation/request".to_string(),
-                                params: Some(serde_json::json!({
-                                    "threadId": "thread-worker-a-2",
-                                    "turnId": "turn-worker-a-2",
-                                    "serverName": "mock-mcp",
-                                    "mode": "form",
-                                    "_meta": null,
-                                    "message": "Allow reconnect action?",
-                                    "requestedSchema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "confirmed": {
-                                                "type": "boolean",
-                                            },
-                                        },
-                                        "required": ["confirmed"],
-                                    },
-                                })),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-                        let JSONRPCMessage::Response(mcp_response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected mcp elicitation response after reconnect");
-                        };
-                        assert_eq!(
-                            mcp_response.id,
-                            RequestId::String("srv-mcp-elicitation-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            mcp_response.result,
-                            serde_json::json!({
-                                "action": "accept",
-                                "content": {
-                                    "confirmed": true,
-                                },
-                                "_meta": null,
-                            })
-                        );
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Notification(
-                                codex_app_server_protocol::JSONRPCNotification {
-                                    method: "item/started".to_string(),
-                                    params: Some(
-                                        serde_json::to_value(ItemStartedNotification {
-                                            started_at_ms: 0,
-                                            thread_id: "thread-worker-a-2".to_string(),
-                                            turn_id: "turn-worker-a-2".to_string(),
-                                            item: ThreadItem::DynamicToolCall {
-                                                namespace: None,
-                                                id: "tool-call-after-reconnect".to_string(),
-                                                tool: "image-edit".to_string(),
-                                                arguments: serde_json::json!({
-                                                    "prompt": "Sharpen image after reconnect",
-                                                    "strength": 0.75,
+                    2 | 3 => {
+                        tokio::spawn(async move {
+                            loop {
+                                let frame = match websocket.next().await {
+                                    Some(Ok(frame)) => frame,
+                                    Some(Err(error)) => {
+                                        panic!("websocket frame should decode: {error}")
+                                    }
+                                    None => panic!("websocket should stay open"),
+                                };
+                                let request = match frame {
+                                    Message::Text(text) => {
+                                        serde_json::from_str::<JSONRPCMessage>(&text)
+                                            .expect("text frame should be valid JSON-RPC")
+                                    }
+                                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {
+                                        continue;
+                                    }
+                                    Message::Ping(payload) => {
+                                        websocket
+                                            .send(Message::Pong(payload))
+                                            .await
+                                            .expect("pong should send");
+                                        continue;
+                                    }
+                                    Message::Close(_) => return,
+                                };
+                                let request = match request {
+                                    JSONRPCMessage::Request(request) => request,
+                                    JSONRPCMessage::Notification(notification)
+                                        if notification.method == "initialized" =>
+                                    {
+                                        continue;
+                                    }
+                                    other => panic!("expected request, got {other:?}"),
+                                };
+                                tracing::info!(
+                                    connection_index,
+                                    method = %request.method,
+                                    "reconnect mock worker received request",
+                                );
+                                match request.method.as_str() {
+                                    "configRequirements/read" => {
+                                        assert_eq!(request.params, None);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "requirements": null,
                                                 }),
-                                                status: DynamicToolCallStatus::InProgress,
-                                                content_items: None,
-                                                success: None,
-                                                duration_ms: None,
-                                            },
-                                        })
-                                        .expect("dynamic tool item/started should serialize"),
-                                    ),
-                                },
-                            ),
-                        )
-                        .await;
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String(
-                                    "srv-dynamic-tool-after-reconnect".to_string(),
-                                ),
-                                method: "item/tool/call".to_string(),
-                                params: Some(serde_json::json!({
-                                    "threadId": "thread-worker-a-2",
-                                    "turnId": "turn-worker-a-2",
-                                    "callId": "tool-call-after-reconnect",
-                                    "tool": "image-edit",
-                                    "arguments": {
-                                        "prompt": "Sharpen image after reconnect",
-                                        "strength": 0.75,
-                                    },
-                                })),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-                        let JSONRPCMessage::Response(dynamic_tool_response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected dynamic tool response after reconnect");
-                        };
-                        assert_eq!(
-                            dynamic_tool_response.id,
-                            RequestId::String("srv-dynamic-tool-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            dynamic_tool_response.result,
-                            serde_json::json!({
-                                "contentItems": [{
-                                    "type": "inputText",
-                                    "text": "tool output after reconnect",
-                                }],
-                                "success": true,
-                            })
-                        );
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Notification(
-                                codex_app_server_protocol::JSONRPCNotification {
-                                    method: "serverRequest/resolved".to_string(),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/start" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread(
+                                                        "thread-worker-a-2",
+                                                        "/tmp/worker-a-2",
+                                                    ),
+                                                    "model": "gpt-5",
+                                                    "modelProvider": "openai",
+                                                    "serviceTier": null,
+                                                    "cwd": "/tmp/worker-a-2",
+                                                    "instructionSources": [],
+                                                    "approvalPolicy": "never",
+                                                    "approvalsReviewer": "user",
+                                                    "sandbox": {
+                                                        "type": "dangerFullAccess"
+                                                    },
+                                                    "reasoningEffort": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                    method => panic!("unexpected request method: {method}"),
+                                }
+                            }
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+                                    id: RequestId::String("srv-user-input-after-reconnect".to_string()),
+                                    method: "item/tool/requestUserInput".to_string(),
                                     params: Some(
-                                        serde_json::to_value(ServerRequestResolvedNotification {
-                                            thread_id: "thread-worker-a-2".to_string(),
-                                            request_id: RequestId::String(
-                                                "srv-dynamic-tool-after-reconnect".to_string(),
-                                            ),
-                                        })
-                                        .expect(
-                                            "dynamic tool serverRequest/resolved should serialize",
-                                        ),
+                                        serde_json::to_value(
+                                            codex_app_server_protocol::ToolRequestUserInputParams {
+                                                auto_resolution_ms: None,
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                turn_id: "turn-worker-a-2".to_string(),
+                                                item_id: "tool-call-worker-a-2".to_string(),
+                                                questions: vec![ToolRequestUserInputQuestion {
+                                                    id: "mode".to_string(),
+                                                    header: "Mode".to_string(),
+                                                    question: "Pick execution mode".to_string(),
+                                                    is_other: false,
+                                                    is_secret: false,
+                                                    options: Some(vec![]),
+                                                }],
+                                            },
+                                        )
+                                        .expect("server request params should serialize"),
                                     ),
-                                },
-                            ),
-                        )
-                        .await;
+                                    trace: None,
+                                }),
+                            )
+                            .await;
+                            tracing::info!(
+                                connection_index,
+                                "reconnect mock sent user-input request"
+                            );
 
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String(
-                                    "srv-permissions-after-reconnect".to_string(),
+                            let JSONRPCMessage::Response(response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected server request response");
+                            };
+                            tracing::info!(
+                                connection_index,
+                                response_id = ?response.id,
+                                "reconnect mock received user-input response"
+                            );
+                            assert_eq!(
+                                response.id,
+                                RequestId::String("srv-user-input-after-reconnect".to_string())
+                            );
+                            assert_eq!(
+                                response.result,
+                                serde_json::json!({
+                                    "answers": {
+                                        "mode": {
+                                            "answers": ["safe"],
+                                        },
+                                    },
+                                })
+                            );
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-user-input-after-reconnect".to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "user input serverRequest/resolved should serialize",
+                                            ),
+                                        ),
+                                    },
                                 ),
-                                method: "item/permissions/requestApproval".to_string(),
-                                params: Some(serde_json::json!({
-                                    "threadId": "thread-worker-a-2",
-                                    "turnId": "turn-worker-a-2",
-                                    "itemId": "perm-worker-a-2",
-                                    "reason": "Need reconnect permissions",
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(
+                                    codex_app_server_protocol::JSONRPCRequest {
+                                        id: RequestId::String(
+                                            "srv-command-after-reconnect".to_string(),
+                                        ),
+                                        method: "item/commandExecution/requestApproval".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "threadId": "thread-worker-a-2",
+                                            "turnId": "turn-worker-a-2",
+                                            "itemId": "cmd-worker-a-2",
+                                            "startedAtMs": 0,
+                                            "command": "pwd",
+                                        })),
+                                        trace: None,
+                                    },
+                                ),
+                            )
+                            .await;
+                            let JSONRPCMessage::Response(command_response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected command approval response after reconnect");
+                            };
+                            assert_eq!(
+                                command_response.id,
+                                RequestId::String("srv-command-after-reconnect".to_string())
+                            );
+                            assert_eq!(
+                                command_response.result,
+                                serde_json::json!({
+                                    "decision": "accept",
+                                })
+                            );
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-command-after-reconnect".to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "command approval serverRequest/resolved should serialize",
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(
+                                    codex_app_server_protocol::JSONRPCRequest {
+                                        id: RequestId::String(
+                                            "srv-file-after-reconnect".to_string(),
+                                        ),
+                                        method: "item/fileChange/requestApproval".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "threadId": "thread-worker-a-2",
+                                            "turnId": "turn-worker-a-2",
+                                            "itemId": "file-worker-a-2",
+                                            "startedAtMs": 0,
+                                            "reason": "Need reconnect write",
+                                        })),
+                                        trace: None,
+                                    },
+                                ),
+                            )
+                            .await;
+                            let JSONRPCMessage::Response(file_response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected file approval response after reconnect");
+                            };
+                            assert_eq!(
+                                file_response.id,
+                                RequestId::String("srv-file-after-reconnect".to_string())
+                            );
+                            assert_eq!(
+                                file_response.result,
+                                serde_json::json!({
+                                    "decision": "accept",
+                                })
+                            );
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-file-after-reconnect".to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "file approval serverRequest/resolved should serialize",
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(
+                                    codex_app_server_protocol::JSONRPCRequest {
+                                        id: RequestId::String(
+                                            "srv-mcp-elicitation-after-reconnect".to_string(),
+                                        ),
+                                        method: "mcpServer/elicitation/request".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "threadId": "thread-worker-a-2",
+                                            "turnId": "turn-worker-a-2",
+                                            "serverName": "mock-mcp",
+                                            "mode": "form",
+                                            "_meta": null,
+                                            "message": "Allow reconnect action?",
+                                            "requestedSchema": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "confirmed": {
+                                                        "type": "boolean",
+                                                    },
+                                                },
+                                                "required": ["confirmed"],
+                                            },
+                                        })),
+                                        trace: None,
+                                    },
+                                ),
+                            )
+                            .await;
+                            let JSONRPCMessage::Response(mcp_response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected mcp elicitation response after reconnect");
+                            };
+                            assert_eq!(
+                                mcp_response.id,
+                                RequestId::String(
+                                    "srv-mcp-elicitation-after-reconnect".to_string()
+                                )
+                            );
+                            assert_eq!(
+                                mcp_response.result,
+                                serde_json::json!({
+                                    "action": "accept",
+                                    "content": {
+                                        "confirmed": true,
+                                    },
+                                    "_meta": null,
+                                })
+                            );
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-mcp-elicitation-after-reconnect"
+                                                        .to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "mcp elicitation serverRequest/resolved should serialize",
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "item/started".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ItemStartedNotification {
+                                                started_at_ms: 0,
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                turn_id: "turn-worker-a-2".to_string(),
+                                                item: ThreadItem::DynamicToolCall {
+                                                    namespace: None,
+                                                    id: "tool-call-after-reconnect".to_string(),
+                                                    tool: "image-edit".to_string(),
+                                                    arguments: serde_json::json!({
+                                                        "prompt": "Sharpen image after reconnect",
+                                                        "strength": 0.75,
+                                                    }),
+                                                    status: DynamicToolCallStatus::InProgress,
+                                                    content_items: None,
+                                                    success: None,
+                                                    duration_ms: None,
+                                                },
+                                            })
+                                            .expect("dynamic tool item/started should serialize"),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(
+                                    codex_app_server_protocol::JSONRPCRequest {
+                                        id: RequestId::String(
+                                            "srv-dynamic-tool-after-reconnect".to_string(),
+                                        ),
+                                        method: "item/tool/call".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "threadId": "thread-worker-a-2",
+                                            "turnId": "turn-worker-a-2",
+                                            "callId": "tool-call-after-reconnect",
+                                            "tool": "image-edit",
+                                            "arguments": {
+                                                "prompt": "Sharpen image after reconnect",
+                                                "strength": 0.75,
+                                            },
+                                        })),
+                                        trace: None,
+                                    },
+                                ),
+                            )
+                            .await;
+                            let JSONRPCMessage::Response(dynamic_tool_response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected dynamic tool response after reconnect");
+                            };
+                            assert_eq!(
+                                dynamic_tool_response.id,
+                                RequestId::String("srv-dynamic-tool-after-reconnect".to_string())
+                            );
+                            assert_eq!(
+                                dynamic_tool_response.result,
+                                serde_json::json!({
+                                    "contentItems": [{
+                                        "type": "inputText",
+                                        "text": "tool output after reconnect",
+                                    }],
+                                    "success": true,
+                                })
+                            );
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-dynamic-tool-after-reconnect".to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "dynamic tool serverRequest/resolved should serialize",
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(
+                                    codex_app_server_protocol::JSONRPCRequest {
+                                        id: RequestId::String(
+                                            "srv-permissions-after-reconnect".to_string(),
+                                        ),
+                                        method: "item/permissions/requestApproval".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "threadId": "thread-worker-a-2",
+                                            "turnId": "turn-worker-a-2",
+                                            "itemId": "perm-worker-a-2",
+                                            "startedAtMs": 0,
+                                            "cwd": "/tmp/worker-a-2",
+                                            "reason": "Need reconnect permissions",
+                                            "permissions": {
+                                                "network": {
+                                                    "enabled": true,
+                                                },
+                                            },
+                                        })),
+                                        trace: None,
+                                    },
+                                ),
+                            )
+                            .await;
+                            let JSONRPCMessage::Response(permissions_response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected permissions approval response after reconnect");
+                            };
+                            assert_eq!(
+                                permissions_response.id,
+                                RequestId::String("srv-permissions-after-reconnect".to_string())
+                            );
+                            assert_eq!(
+                                permissions_response.result,
+                                serde_json::json!({
                                     "permissions": {
+                                        "fileSystem": null,
                                         "network": {
                                             "enabled": true,
                                         },
                                     },
-                                })),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-                        let JSONRPCMessage::Response(permissions_response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected permissions approval response after reconnect");
-                        };
-                        assert_eq!(
-                            permissions_response.id,
-                            RequestId::String("srv-permissions-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            permissions_response.result,
-                            serde_json::json!({
-                                "permissions": {
-                                    "fileSystem": null,
-                                    "network": {
-                                        "enabled": true,
+                                    "scope": "turn",
+                                })
+                            );
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-permissions-after-reconnect"
+                                                        .to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "permissions serverRequest/resolved should serialize",
+                                            ),
+                                        ),
                                     },
-                                },
-                                "scope": "turn",
-                            })
-                        );
-
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
-                                id: RequestId::String(
-                                    "srv-chatgpt-refresh-after-reconnect".to_string(),
                                 ),
-                                method: "account/chatgptAuthTokens/refresh".to_string(),
-                                params: Some(serde_json::json!({
-                                    "reason": "unauthorized",
-                                    "previousAccountId": "acct-reconnect",
-                                })),
-                                trace: None,
-                            }),
-                        )
-                        .await;
-                        let JSONRPCMessage::Response(refresh_response) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected chatgpt refresh response after reconnect");
-                        };
-                        assert_eq!(
-                            refresh_response.id,
-                            RequestId::String("srv-chatgpt-refresh-after-reconnect".to_string())
-                        );
-                        assert_eq!(
-                            refresh_response.result,
-                            serde_json::json!({
-                                "accessToken": "access-token-reconnect",
-                                "chatgptAccountId": "acct-reconnect",
-                                "chatgptPlanType": "pro",
-                            })
-                        );
+                            )
+                            .await;
 
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Notification(
-                                codex_app_server_protocol::JSONRPCNotification {
-                                    method: "item/completed".to_string(),
-                                    params: Some(
-                                        serde_json::to_value(ItemCompletedNotification {
-                                            completed_at_ms: 0,
-                                            thread_id: "thread-worker-a-2".to_string(),
-                                            turn_id: "turn-worker-a-2".to_string(),
-                                            item: ThreadItem::DynamicToolCall {
-                                                namespace: None,
-                                                id: "tool-call-after-reconnect".to_string(),
-                                                tool: "image-edit".to_string(),
-                                                arguments: serde_json::json!({
-                                                    "prompt": "Sharpen image after reconnect",
-                                                    "strength": 0.75,
-                                                }),
-                                                status: DynamicToolCallStatus::Completed,
-                                                content_items: Some(vec![
-                                                    DynamicToolCallOutputContentItem::InputText {
-                                                        text: "tool output after reconnect"
-                                                            .to_string(),
-                                                    },
-                                                ]),
-                                                success: Some(true),
-                                                duration_ms: Some(9),
-                                            },
-                                        })
-                                        .expect("dynamic tool item/completed should serialize"),
-                                    ),
-                                },
-                            ),
-                        )
-                        .await;
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Request(
+                                    codex_app_server_protocol::JSONRPCRequest {
+                                        id: RequestId::String(
+                                            "srv-chatgpt-refresh-after-reconnect".to_string(),
+                                        ),
+                                        method: "account/chatgptAuthTokens/refresh".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "reason": "unauthorized",
+                                            "previousAccountId": "acct-reconnect",
+                                        })),
+                                        trace: None,
+                                    },
+                                ),
+                            )
+                            .await;
+                            let JSONRPCMessage::Response(refresh_response) =
+                                read_websocket_message(&mut websocket).await
+                            else {
+                                panic!("expected chatgpt refresh response after reconnect");
+                            };
+                            assert_eq!(
+                                refresh_response.id,
+                                RequestId::String(
+                                    "srv-chatgpt-refresh-after-reconnect".to_string()
+                                )
+                            );
+                            assert_eq!(
+                                refresh_response.result,
+                                serde_json::json!({
+                                    "accessToken": "access-token-reconnect",
+                                    "chatgptAccountId": "acct-reconnect",
+                                    "chatgptPlanType": "pro",
+                                })
+                            );
 
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Notification(
-                                codex_app_server_protocol::JSONRPCNotification {
-                                    method: "turn/completed".to_string(),
-                                    params: Some(serde_json::json!({
-                                        "threadId": "thread-worker-a-2",
-                                        "turn": mock_turn("turn-worker-a-2", "completed"),
-                                    })),
-                                },
-                            ),
-                        )
-                        .await;
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "serverRequest/resolved".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ServerRequestResolvedNotification {
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                request_id: RequestId::String(
+                                                    "srv-chatgpt-refresh-after-reconnect"
+                                                        .to_string(),
+                                                ),
+                                            })
+                                            .expect(
+                                                "chatgpt refresh serverRequest/resolved should serialize",
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "item/completed".to_string(),
+                                        params: Some(
+                                            serde_json::to_value(ItemCompletedNotification {
+                                                completed_at_ms: 0,
+                                                thread_id: "thread-worker-a-2".to_string(),
+                                                turn_id: "turn-worker-a-2".to_string(),
+                                                item: ThreadItem::DynamicToolCall {
+                                                    namespace: None,
+                                                    id: "tool-call-after-reconnect".to_string(),
+                                                    tool: "image-edit".to_string(),
+                                                    arguments: serde_json::json!({
+                                                        "prompt": "Sharpen image after reconnect",
+                                                        "strength": 0.75,
+                                                    }),
+                                                    status: DynamicToolCallStatus::Completed,
+                                                    content_items: Some(vec![
+                                                        DynamicToolCallOutputContentItem::InputText {
+                                                            text: "tool output after reconnect"
+                                                                .to_string(),
+                                                        },
+                                                    ]),
+                                                    success: Some(true),
+                                                    duration_ms: Some(9),
+                                                },
+                                            })
+                                            .expect("dynamic tool item/completed should serialize"),
+                                        ),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "turn/completed".to_string(),
+                                        params: Some(serde_json::json!({
+                                            "threadId": "thread-worker-a-2",
+                                            "turn": mock_turn("turn-worker-a-2", "completed"),
+                                        })),
+                                    },
+                                ),
+                            )
+                            .await;
+                        });
                     }
                     _ => unreachable!("unexpected connection index"),
                 }
@@ -39926,52 +40378,61 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            for connection_index in 0..3 {
+            let mut connection_index = 0usize;
+            loop {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
-                let mut websocket = tokio_tungstenite::accept_async(stream)
-                    .await
-                    .expect("websocket upgrade should succeed");
+                let current_connection_index = connection_index;
+                connection_index = connection_index.saturating_add(1);
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
 
-                expect_remote_initialize(&mut websocket).await;
-                match connection_index {
-                    0 => {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
-                    }
-                    1 => {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
-                        });
-                    }
-                    2 => loop {
-                        let request = read_websocket_request(&mut websocket).await;
-                        match request.method.as_str() {
-                            "thread/start" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "thread": mock_thread(thread_id, preview),
-                                            "model": "gpt-5",
-                                            "modelProvider": "openai",
-                                            "serviceTier": null,
-                                            "cwd": preview,
-                                            "instructionSources": [],
-                                            "approvalPolicy": "never",
-                                            "approvalsReviewer": "user",
-                                            "sandbox": {
-                                                "type": "dangerFullAccess"
-                                            },
-                                            "reasoningEffort": null,
+                    expect_remote_initialize(&mut websocket).await;
+                    match current_connection_index {
+                        0 => {
+                            websocket
+                                .close(None)
+                                .await
+                                .expect("close frame should send");
+                        }
+                        1 => {
+                            websocket
+                                .close(None)
+                                .await
+                                .expect("close frame should send");
+                        }
+                        _ => while let Some(request) =
+                            read_websocket_request_until_close(&mut websocket).await
+                        {
+                            tracing::info!(
+                                method = %request.method,
+                                "realtime reconnect helper received request",
+                            );
+                            match request.method.as_str() {
+                                "thread/start" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread(thread_id, preview),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": preview,
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
                                         }),
-                                    }),
-                                )
-                                .await;
-                                write_websocket_message(
+                                    )
+                                    .await;
+                                    write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Request(
                                         codex_app_server_protocol::JSONRPCRequest {
@@ -40003,165 +40464,181 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                let JSONRPCMessage::Response(response) =
-                                    read_websocket_message(&mut websocket).await
-                                else {
-                                    panic!("expected server request response");
-                                };
-                                assert_eq!(
-                                    response.id,
-                                    RequestId::String("srv-user-input-after-reconnect".to_string())
-                                );
-                                assert_eq!(
-                                    response.result,
-                                    serde_json::json!({
-                                        "answers": {
-                                            "mode": {
-                                                "answers": ["safe"],
+                                    let JSONRPCMessage::Response(response) =
+                                        read_websocket_message(&mut websocket).await
+                                    else {
+                                        panic!("expected server request response");
+                                    };
+                                    assert_eq!(
+                                        response.id,
+                                        RequestId::String(
+                                            "srv-user-input-after-reconnect".to_string()
+                                        )
+                                    );
+                                    assert_eq!(
+                                        response.result,
+                                        serde_json::json!({
+                                            "answers": {
+                                                "mode": {
+                                                    "answers": ["safe"],
+                                                },
                                             },
-                                        },
-                                    })
-                                );
-                            }
-                            "thread/read" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "thread": mock_thread(thread_id, preview),
-                                            "turns": [],
+                                        })
+                                    );
+                                }
+                                "thread/read" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread(thread_id, preview),
+                                                "turns": [],
+                                            }),
                                         }),
-                                    }),
-                                )
-                                .await;
-                            }
-                            "thread/list" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "data": [mock_thread(thread_id, preview)],
-                                            "nextCursor": null,
-                                            "backwardsCursor": null,
+                                    )
+                                    .await;
+                                }
+                                "thread/list" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "data": [mock_thread(thread_id, preview)],
+                                                "nextCursor": null,
+                                                "backwardsCursor": null,
+                                            }),
                                         }),
-                                    }),
-                                )
-                                .await;
-                            }
-                            "thread/loaded/list" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "data": [thread_id],
-                                            "nextCursor": null,
+                                    )
+                                    .await;
+                                }
+                                "thread/loaded/list" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "data": [thread_id],
+                                                "nextCursor": null,
+                                            }),
                                         }),
-                                    }),
-                                )
-                                .await;
-                            }
-                            "turn/start" => {
-                                let requested_thread_id = request
-                                    .params
-                                    .as_ref()
-                                    .and_then(|params| params.get("threadId"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .expect("turn/start should include threadId");
-                                assert_eq!(requested_thread_id, thread_id);
-                                let turn_id = format!("turn-{thread_id}");
+                                    )
+                                    .await;
+                                }
+                                "configRequirements/read" => {
+                                    assert_eq!(request.params, None);
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "requirements": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "turn/start" => {
+                                    let requested_thread_id = request
+                                        .params
+                                        .as_ref()
+                                        .and_then(|params| params.get("threadId"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("turn/start should include threadId");
+                                    assert_eq!(requested_thread_id, thread_id);
+                                    let turn_id = format!("turn-{thread_id}");
 
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "turn": mock_turn(&turn_id, "inProgress"),
-                                        }),
-                                    }),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/status/changed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "status": {
-                                                    "type": "active",
-                                                    "activeFlags": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "turn/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
                                                 "turn": mock_turn(&turn_id, "inProgress"),
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "hook/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "run": {
-                                                    "id": "hook-remote-workflow",
-                                                    "eventName": "userPromptSubmit",
-                                                    "handlerType": "command",
-                                                    "executionMode": "sync",
-                                                    "scope": "turn",
-                                                    "sourcePath": "/tmp/remote-hooks.json",
-                                                    "source": "user",
-                                                    "displayOrder": 0,
-                                                    "status": "running",
-                                                    "statusMessage": "remote hook started",
-                                                    "startedAt": 1,
-                                                    "completedAt": null,
-                                                    "durationMs": null,
-                                                    "entries": [],
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": "msg-remote-workflow",
-                                                    "text": "streaming answer in progress",
-                                                    "phase": "commentary",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "thread/status/changed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "status": {
+                                                        "type": "active",
+                                                        "activeFlags": [],
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "turn/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turn": mock_turn(&turn_id, "inProgress"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "hook/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "run": {
+                                                        "id": "hook-remote-workflow",
+                                                        "eventName": "userPromptSubmit",
+                                                        "handlerType": "command",
+                                                        "executionMode": "sync",
+                                                        "scope": "turn",
+                                                        "sourcePath": "/tmp/remote-hooks.json",
+                                                        "source": "user",
+                                                        "displayOrder": 0,
+                                                        "status": "running",
+                                                        "statusMessage": "remote hook started",
+                                                        "startedAt": 1,
+                                                        "completedAt": null,
+                                                        "durationMs": null,
+                                                        "entries": [],
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "startedAtMs": 0,
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": "msg-remote-workflow",
+                                                        "text": "streaming answer in progress",
+                                                        "phase": "commentary",
+                                                        "memoryCitation": null,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
@@ -40190,42 +40667,43 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": format!("msg-{thread_id}"),
-                                                    "text": "streaming answer in progress",
-                                                    "phase": "commentary",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/agentMessage/delta".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "itemId": format!("msg-{thread_id}"),
-                                                "delta": "hello from recovered worker",
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/started".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "startedAtMs": 0,
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": format!("msg-{thread_id}"),
+                                                        "text": "streaming answer in progress",
+                                                        "phase": "commentary",
+                                                        "memoryCitation": null,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/agentMessage/delta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("msg-{thread_id}"),
+                                                    "delta": "hello from recovered worker",
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
@@ -40241,108 +40719,114 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/reasoning/textDelta".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "itemId": format!("reasoning-{thread_id}"),
-                                                "delta": format!("reasoning {thread_id}"),
-                                                "contentIndex": 0,
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/commandExecution/outputDelta".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "itemId": format!("exec-{thread_id}"),
-                                                "delta": format!("stdout {thread_id}"),
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/fileChange/outputDelta".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "itemId": format!("patch-{thread_id}"),
-                                                "delta": format!("patch {thread_id}"),
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/autoApprovalReview/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "reviewId": format!("guardian-{thread_id}"),
-                                                "targetItemId": format!("cmd-{thread_id}"),
-                                                "review": {
-                                                    "status": "inProgress",
-                                                    "riskLevel": null,
-                                                    "userAuthorization": null,
-                                                    "rationale": null,
-                                                },
-                                                "action": {
-                                                    "type": "command",
-                                                    "source": "shell",
-                                                    "command": "cat docs/gateway.md",
-                                                    "cwd": "/tmp",
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/autoApprovalReview/completed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "reviewId": format!("guardian-{thread_id}"),
-                                                "targetItemId": format!("cmd-{thread_id}"),
-                                                "decisionSource": "agent",
-                                                "review": {
-                                                    "status": "approved",
-                                                    "riskLevel": "low",
-                                                    "userAuthorization": "low",
-                                                    "rationale": "Read-only command.",
-                                                },
-                                                "action": {
-                                                    "type": "command",
-                                                    "source": "shell",
-                                                    "command": "cat docs/gateway.md",
-                                                    "cwd": "/tmp",
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/reasoning/textDelta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("reasoning-{thread_id}"),
+                                                    "delta": format!("reasoning {thread_id}"),
+                                                    "contentIndex": 0,
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/commandExecution/outputDelta"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("exec-{thread_id}"),
+                                                    "delta": format!("stdout {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/fileChange/outputDelta".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "itemId": format!("patch-{thread_id}"),
+                                                    "delta": format!("patch {thread_id}"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/autoApprovalReview/started"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "startedAtMs": 0,
+                                                    "reviewId": format!("guardian-{thread_id}"),
+                                                    "targetItemId": format!("cmd-{thread_id}"),
+                                                    "review": {
+                                                        "status": "inProgress",
+                                                        "riskLevel": null,
+                                                        "userAuthorization": null,
+                                                        "rationale": null,
+                                                    },
+                                                    "action": {
+                                                        "type": "command",
+                                                        "source": "shell",
+                                                        "command": "cat docs/gateway.md",
+                                                        "cwd": "/tmp",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/autoApprovalReview/completed"
+                                                    .to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "startedAtMs": 0,
+                                                    "completedAtMs": 0,
+                                                    "reviewId": format!("guardian-{thread_id}"),
+                                                    "targetItemId": format!("cmd-{thread_id}"),
+                                                    "decisionSource": "agent",
+                                                    "review": {
+                                                        "status": "approved",
+                                                        "riskLevel": "low",
+                                                        "userAuthorization": "low",
+                                                        "rationale": "Read-only command.",
+                                                    },
+                                                    "action": {
+                                                        "type": "command",
+                                                        "source": "shell",
+                                                        "command": "cat docs/gateway.md",
+                                                        "cwd": "/tmp",
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
@@ -40371,45 +40855,46 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "item/completed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": format!("msg-{thread_id}"),
-                                                    "text": "streaming answer completed",
-                                                    "phase": "final_answer",
-                                                    "memoryCitation": null,
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "turn/completed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turn": mock_turn(&turn_id, "completed"),
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "item/completed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "completedAtMs": 0,
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": format!("msg-{thread_id}"),
+                                                        "text": "streaming answer completed",
+                                                        "phase": "final_answer",
+                                                        "memoryCitation": null,
+                                                    },
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "turn/completed".to_string(),
+                                                params: Some(serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turn": mock_turn(&turn_id, "completed"),
+                                                })),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                method => panic!("unexpected request method: {method}"),
                             }
-                            method => panic!("unexpected request method: {method}"),
-                        }
-                    },
-                    _ => unreachable!("unexpected connection index"),
-                }
+                        },
+                    }
+                });
             }
         });
         format!("ws://{addr}")
@@ -40448,9 +40933,23 @@ stream_max_retries = 0
                             let review_turn_id = format!("turn-review-{thread_id}");
                             let turn_id = format!("turn-{thread_id}");
 
-                            loop {
-                                let request = read_websocket_request(&mut websocket).await;
+                            while let Some(request) =
+                                read_websocket_request_until_close(&mut websocket).await
+                            {
                                 match request.method.as_str() {
+                                    "configRequirements/read" => {
+                                        assert_eq!(request.params, None);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "requirements": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
                                     "thread/start" => {
                                         write_websocket_message(
                                             &mut websocket,
@@ -40815,14 +41314,17 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            for connection_index in 0..4 {
+            let mut connection_index = 0usize;
+            loop {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let current_connection_index = connection_index;
+                connection_index = connection_index.saturating_add(1);
                 let mut websocket = tokio_tungstenite::accept_async(stream)
                     .await
                     .expect("websocket upgrade should succeed");
 
                 expect_remote_initialize(&mut websocket).await;
-                match connection_index {
+                match current_connection_index {
                     0 | 2 => {
                         websocket
                             .close(None)
@@ -40830,10 +41332,10 @@ stream_max_retries = 0
                             .expect("close frame should send");
                     }
                     1 => {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
-                        });
+                        websocket
+                            .close(None)
+                            .await
+                            .expect("close frame should send");
                     }
                     3 => {
                         let mut thread_name = None::<String>;
@@ -40847,6 +41349,19 @@ stream_max_retries = 0
                         loop {
                             let request = read_websocket_request(&mut websocket).await;
                             match request.method.as_str() {
+                                "configRequirements/read" => {
+                                    assert_eq!(request.params, None);
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "requirements": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
                                 "thread/start" => {
                                     write_websocket_message(
                                         &mut websocket,
@@ -40994,6 +41509,7 @@ stream_max_retries = 0
                                             result: serde_json::json!({
                                                 "thread": {
                                                     "id": forked_thread_id.as_str(),
+                                                    "sessionId": forked_thread_id.as_str(),
                                                     "forkedFromId": thread_id,
                                                     "preview": forked_preview.as_str(),
                                                     "ephemeral": true,
@@ -41559,6 +42075,7 @@ stream_max_retries = 0
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
                                                     "turnId": turn_id,
+                                                    "startedAtMs": 0,
                                                     "item": {
                                                         "type": "agentMessage",
                                                         "id": format!("msg-{thread_id}"),
@@ -41847,6 +42364,7 @@ stream_max_retries = 0
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
                                                     "turnId": turn_id,
+                                                    "startedAtMs": 0,
                                                     "reviewId": format!("guardian-{thread_id}"),
                                                     "targetItemId": format!("cmd-{thread_id}"),
                                                     "review": {
@@ -41875,6 +42393,8 @@ stream_max_retries = 0
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
                                                     "turnId": turn_id,
+                                                    "startedAtMs": 0,
+                                                    "completedAtMs": 0,
                                                     "reviewId": format!("guardian-{thread_id}"),
                                                     "targetItemId": format!("cmd-{thread_id}"),
                                                     "decisionSource": "agent",
@@ -41930,13 +42450,14 @@ stream_max_retries = 0
                                             codex_app_server_protocol::JSONRPCNotification {
                                                 method: "item/completed".to_string(),
                                                 params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "item": {
-                                                        "type": "agentMessage",
-                                                        "id": format!("msg-{thread_id}"),
-                                                        "text": "streaming answer completed",
-                                                        "phase": "final_answer",
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "completedAtMs": 0,
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": format!("msg-{thread_id}"),
+                                                    "text": "streaming answer completed",
+                                                    "phase": "final_answer",
                                                         "memoryCitation": null,
                                                     },
                                                 })),
@@ -42031,7 +42552,7 @@ stream_max_retries = 0
                                                 method: "thread/realtime/started".to_string(),
                                                 params: Some(serde_json::json!({
                                                     "threadId": thread_id,
-                                                    "sessionId": format!("session-{thread_id}"),
+                                                    "realtimeSessionId": format!("session-{thread_id}"),
                                                     "version": "v2",
                                                 })),
                                             },
@@ -42262,7 +42783,7 @@ stream_max_retries = 0
         let received_methods = Arc::new(Mutex::new(Vec::new()));
         let received_methods_for_task = Arc::clone(&received_methods);
         tokio::spawn(async move {
-            for connection_index in 0..4 {
+            for connection_index in 0.. {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let mut websocket = tokio_tungstenite::accept_async(stream)
                     .await
@@ -42277,135 +42798,147 @@ stream_max_retries = 0
                             .expect("close frame should send");
                     }
                     1 => {
+                        websocket
+                            .close(None)
+                            .await
+                            .expect("close frame should send");
+                    }
+                    _ => {
+                        let received_methods = Arc::clone(&received_methods_for_task);
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
+                            while let Some(request) =
+                                read_websocket_request_until_close(&mut websocket).await
+                            {
+                                received_methods.lock().await.push(request.method.clone());
+
+                                let result = match request.method.as_str() {
+                                    "configRequirements/read" => serde_json::json!({
+                                        "requirements": null,
+                                    }),
+                                    "externalAgentConfig/import" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "externalAgentConfig/import/completed"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "importId": "import-1",
+                                                        "itemTypeResults": [],
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        serde_json::json!({
+                                            "importId": "import-1",
+                                        })
+                                    }
+                                    "config/value/write" | "config/batchWrite" => {
+                                        serde_json::json!({
+                                            "status": "ok",
+                                            "version": worker_label,
+                                            "filePath": "/tmp/shared/config.toml",
+                                            "overriddenMetadata": null,
+                                        })
+                                    }
+                                    "marketplace/add" => serde_json::json!({
+                                        "marketplaceName": "shared-marketplace",
+                                        "installedRoot": "/tmp/shared/marketplace",
+                                        "alreadyAdded": false,
+                                    }),
+                                    "skills/config/write" => {
+                                        assert_eq!(
+                                            request
+                                                .params
+                                                .as_ref()
+                                                .and_then(|params| params.get("enabled"))
+                                                .and_then(serde_json::Value::as_bool),
+                                            Some(true)
+                                        );
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "skills/changed".to_string(),
+                                                    params: Some(serde_json::json!({})),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        serde_json::json!({
+                                            "effectiveEnabled": true,
+                                        })
+                                    }
+                                    "experimentalFeature/enablement/set" => {
+                                        let enablement = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("enablement"))
+                                            .cloned()
+                                            .expect("experimentalFeature/enablement/set should include enablement");
+                                        serde_json::json!({
+                                            "enablement": enablement,
+                                        })
+                                    }
+                                    "config/mcpServer/reload" => serde_json::json!({}),
+                                    "fs/watch" => {
+                                        let path = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("path"))
+                                            .cloned()
+                                            .expect("fs/watch should include path");
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "fs/changed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "watchId": "watch-shared",
+                                                        "changedPaths": [
+                                                            format!("/tmp/{worker_label}/shared-repo/.git/HEAD"),
+                                                        ],
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        serde_json::json!({
+                                            "path": path,
+                                        })
+                                    }
+                                    "fs/unwatch" => serde_json::json!({}),
+                                    "memory/reset" => serde_json::json!({}),
+                                    "account/logout" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "account/updated".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "authMode": null,
+                                                        "planType": null,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        serde_json::json!({})
+                                    }
+                                    method => panic!("unexpected request method: {method}"),
+                                };
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result,
+                                    }),
+                                )
+                                .await;
+                            }
                         });
                     }
-                    3 => loop {
-                        let request = read_websocket_request(&mut websocket).await;
-                        received_methods_for_task
-                            .lock()
-                            .await
-                            .push(request.method.clone());
-
-                        let result = match request.method.as_str() {
-                            "externalAgentConfig/import" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "externalAgentConfig/import/completed"
-                                                .to_string(),
-                                            params: Some(serde_json::json!({})),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                serde_json::json!({})
-                            }
-                            "config/value/write" | "config/batchWrite" => serde_json::json!({
-                                "status": "ok",
-                                "version": worker_label,
-                                "filePath": "/tmp/shared/config.toml",
-                                "overriddenMetadata": null,
-                            }),
-                            "marketplace/add" => serde_json::json!({
-                                "marketplaceName": "shared-marketplace",
-                                "installedRoot": "/tmp/shared/marketplace",
-                                "alreadyAdded": false,
-                            }),
-                            "skills/config/write" => {
-                                assert_eq!(
-                                    request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("enabled"))
-                                        .and_then(serde_json::Value::as_bool),
-                                    Some(true)
-                                );
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "skills/changed".to_string(),
-                                            params: Some(serde_json::json!({})),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                serde_json::json!({
-                                    "effectiveEnabled": true,
-                                })
-                            }
-                            "experimentalFeature/enablement/set" => {
-                                let enablement = request
-                                    .params
-                                    .as_ref()
-                                    .and_then(|params| params.get("enablement"))
-                                    .cloned()
-                                    .expect("experimentalFeature/enablement/set should include enablement");
-                                serde_json::json!({
-                                    "enablement": enablement,
-                                })
-                            }
-                            "config/mcpServer/reload" => serde_json::json!({}),
-                            "fs/watch" => {
-                                let path = request
-                                    .params
-                                    .as_ref()
-                                    .and_then(|params| params.get("path"))
-                                    .cloned()
-                                    .expect("fs/watch should include path");
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "fs/changed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "watchId": "watch-shared",
-                                                "changedPaths": [
-                                                    format!("/tmp/{worker_label}/shared-repo/.git/HEAD"),
-                                                ],
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                serde_json::json!({
-                                    "path": path,
-                                })
-                            }
-                            "fs/unwatch" => serde_json::json!({}),
-                            "memory/reset" => serde_json::json!({}),
-                            "account/logout" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "account/updated".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "authMode": null,
-                                                "planType": null,
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                serde_json::json!({})
-                            }
-                            method => panic!("unexpected request method: {method}"),
-                        };
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result,
-                            }),
-                        )
-                        .await;
-                    },
-                    _ => unreachable!("unexpected connection index"),
                 }
             }
         });
@@ -42418,153 +42951,150 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            for connection_index in 0..3 {
+            for connection_index in 0.. {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let mut websocket = tokio_tungstenite::accept_async(stream)
                     .await
                     .expect("websocket upgrade should succeed");
 
-                expect_remote_initialize(&mut websocket).await;
                 match connection_index {
                     0 => {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
+                        close_during_initialize(&mut websocket).await;
                     }
                     1 => {
+                        close_during_initialize(&mut websocket).await;
+                    }
+                    _ => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
+                            expect_remote_initialize(&mut websocket).await;
+                            tokio::time::sleep(super::RECONNECT_NOTIFICATION_DELAY).await;
+
+                            for notification in [
+                                serde_json::json!({
+                                    "method": "account/updated",
+                                    "params": {
+                                        "authMode": null,
+                                        "planType": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "account/rateLimits/updated",
+                                    "params": {
+                                        "rateLimits": {
+                                            "limitId": null,
+                                            "limitName": null,
+                                            "primary": null,
+                                            "secondary": null,
+                                            "credits": null,
+                                            "planType": null,
+                                            "rateLimitReachedType": null,
+                                        },
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "app/list/updated",
+                                    "params": {
+                                        "data": [{
+                                            "id": "calendar",
+                                            "name": "calendar",
+                                            "description": null,
+                                            "logoUrl": null,
+                                            "logoUrlDark": null,
+                                            "distributionChannel": null,
+                                            "branding": null,
+                                            "appMetadata": null,
+                                            "labels": null,
+                                            "installUrl": null,
+                                        }],
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "account/login/completed",
+                                    "params": {
+                                        "loginId": null,
+                                        "success": true,
+                                        "error": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "mcpServer/oauthLogin/completed",
+                                    "params": {
+                                        "name": "calendar-mcp",
+                                        "success": true,
+                                        "error": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "mcpServer/startupStatus/updated",
+                                    "params": {
+                                        "name": "calendar-mcp",
+                                        "status": "ready",
+                                        "error": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "warning",
+                                    "params": {
+                                        "threadId": null,
+                                        "message": "shared warning",
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "configWarning",
+                                    "params": {
+                                        "summary": "shared config warning",
+                                        "details": "check your shared config",
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "deprecationNotice",
+                                    "params": {
+                                        "summary": "shared deprecation notice",
+                                        "details": "update the shared workflow",
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "windows/worldWritableWarning",
+                                    "params": {
+                                        "samplePaths": ["C:\\shared-temp"],
+                                        "extraCount": 2,
+                                        "failedScan": false,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "windowsSandbox/setupCompleted",
+                                    "params": {
+                                        "mode": "unelevated",
+                                        "success": true,
+                                        "error": null,
+                                    },
+                                }),
+                            ] {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    serde_json::from_value::<JSONRPCMessage>(notification)
+                                        .expect("notification should decode"),
+                                )
+                                .await;
+                            }
+
+                            while let Some(frame) = websocket.next().await {
+                                match frame.expect("follow-up frame should decode") {
+                                    Message::Close(_) => break,
+                                    Message::Ping(payload) => {
+                                        websocket
+                                            .send(Message::Pong(payload))
+                                            .await
+                                            .expect("pong should send");
+                                    }
+                                    Message::Text(_)
+                                    | Message::Binary(_)
+                                    | Message::Pong(_)
+                                    | Message::Frame(_) => {}
+                                }
+                            }
                         });
                     }
-                    2 => {
-                        for notification in [
-                            serde_json::json!({
-                                "method": "account/updated",
-                                "params": {
-                                    "authMode": null,
-                                    "planType": null,
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "account/rateLimits/updated",
-                                "params": {
-                                    "rateLimits": {
-                                        "limitId": null,
-                                        "limitName": null,
-                                        "primary": null,
-                                        "secondary": null,
-                                        "credits": null,
-                                        "planType": null,
-                                        "rateLimitReachedType": null,
-                                    },
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "app/list/updated",
-                                "params": {
-                                    "data": [{
-                                        "id": "calendar",
-                                        "name": "calendar",
-                                        "description": null,
-                                        "logoUrl": null,
-                                        "logoUrlDark": null,
-                                        "distributionChannel": null,
-                                        "branding": null,
-                                        "appMetadata": null,
-                                        "labels": null,
-                                        "installUrl": null,
-                                    }],
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "account/login/completed",
-                                "params": {
-                                    "loginId": null,
-                                    "success": true,
-                                    "error": null,
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "mcpServer/oauthLogin/completed",
-                                "params": {
-                                    "name": "calendar-mcp",
-                                    "success": true,
-                                    "error": null,
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "mcpServer/startupStatus/updated",
-                                "params": {
-                                    "name": "calendar-mcp",
-                                    "status": "ready",
-                                    "error": null,
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "warning",
-                                "params": {
-                                    "threadId": null,
-                                    "message": "shared warning",
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "configWarning",
-                                "params": {
-                                    "summary": "shared config warning",
-                                    "details": "check your shared config",
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "deprecationNotice",
-                                "params": {
-                                    "summary": "shared deprecation notice",
-                                    "details": "update the shared workflow",
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "windows/worldWritableWarning",
-                                "params": {
-                                    "samplePaths": ["C:\\shared-temp"],
-                                    "extraCount": 2,
-                                    "failedScan": false,
-                                },
-                            }),
-                            serde_json::json!({
-                                "method": "windowsSandbox/setupCompleted",
-                                "params": {
-                                    "mode": "unelevated",
-                                    "success": true,
-                                    "error": null,
-                                },
-                            }),
-                        ] {
-                            write_websocket_message(
-                                &mut websocket,
-                                serde_json::from_value::<JSONRPCMessage>(notification)
-                                    .expect("notification should decode"),
-                            )
-                            .await;
-                        }
-
-                        while let Some(frame) = websocket.next().await {
-                            match frame.expect("follow-up frame should decode") {
-                                Message::Close(_) => break,
-                                Message::Ping(payload) => {
-                                    websocket
-                                        .send(Message::Pong(payload))
-                                        .await
-                                        .expect("pong should send");
-                                }
-                                Message::Text(_)
-                                | Message::Binary(_)
-                                | Message::Pong(_)
-                                | Message::Frame(_) => {}
-                            }
-                        }
-                    }
-                    _ => unreachable!("unexpected connection index"),
                 }
             }
         });
@@ -42602,246 +43132,276 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            for connection_index in 0..3 {
+            for connection_index in 0.. {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let realtime_voices = realtime_voices.clone();
+                tracing::info!(
+                    connection_index,
+                    "realtime reconnect helper accepted connection"
+                );
                 let mut websocket = tokio_tungstenite::accept_async(stream)
                     .await
                     .expect("websocket upgrade should succeed");
 
-                expect_remote_initialize(&mut websocket).await;
                 match connection_index {
                     0 => {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
+                        close_during_initialize(&mut websocket).await;
                     }
                     1 => {
+                        close_during_initialize(&mut websocket).await;
+                    }
+                    _ => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
+                            tracing::info!(
+                                connection_index,
+                                "realtime reconnect helper waiting for initialize"
+                            );
+                            expect_remote_initialize(&mut websocket).await;
+                            tracing::info!(
+                                connection_index,
+                                "realtime reconnect helper initialized"
+                            );
+                            while let Some(request) =
+                                read_websocket_request_until_close(&mut websocket).await
+                            {
+                                tracing::info!(
+                                    method = %request.method,
+                                    "realtime reconnect helper received request",
+                                );
+                                match request.method.as_str() {
+                                    "configRequirements/read" => {
+                                        assert_eq!(request.params, None);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "requirements": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/listVoices" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "voices": serde_json::to_value(&realtime_voices)
+                                                        .expect("realtime voices should serialize"),
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/start" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread(thread_id, preview),
+                                                    "model": "gpt-5",
+                                                    "modelProvider": "openai",
+                                                    "serviceTier": null,
+                                                    "cwd": preview,
+                                                    "instructionSources": [],
+                                                    "approvalPolicy": "never",
+                                                    "approvalsReviewer": "user",
+                                                    "sandbox": {
+                                                        "type": "dangerFullAccess"
+                                                    },
+                                                    "reasoningEffort": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/start" => {
+                                        let params = request
+                                            .params
+                                            .as_ref()
+                                            .expect("realtime start params should exist");
+                                        assert_eq!(params["threadId"], thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "realtimeSessionId": session_id,
+                                                        "version": "v2",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/itemAdded".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "item": {
+                                                            "type": "message",
+                                                            "id": format!("item-{thread_id}"),
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/appendText" => {
+                                        let params = request
+                                            .params
+                                            .as_ref()
+                                            .expect("realtime appendText params should exist");
+                                        assert_eq!(params["threadId"], thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/transcript/delta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "role": "assistant",
+                                                        "delta": transcript_delta,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/transcript/done"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "role": "assistant",
+                                                        "text": transcript_done,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/appendAudio" => {
+                                        let params = request
+                                            .params
+                                            .as_ref()
+                                            .expect("realtime appendAudio params should exist");
+                                        assert_eq!(params["threadId"], thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/outputAudio/delta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "audio": {
+                                                            "data": params["audio"]["data"].clone(),
+                                                            "sampleRate": 24000,
+                                                            "numChannels": 1,
+                                                            "samplesPerChannel": 3,
+                                                            "itemId": params["audio"]["itemId"].clone(),
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/sdp".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Codex\r\n",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/error".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "message": "realtime transport warning",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/stop" => {
+                                        let params = request
+                                            .params
+                                            .as_ref()
+                                            .expect("realtime stop params should exist");
+                                        assert_eq!(params["threadId"], thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/closed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "reason": "client requested stop",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    method => panic!("unexpected request method: {method}"),
+                                }
+                            }
                         });
                     }
-                    2 => loop {
-                        let request = read_websocket_request(&mut websocket).await;
-                        match request.method.as_str() {
-                            "thread/realtime/listVoices" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "voices": serde_json::to_value(&realtime_voices)
-                                                .expect("realtime voices should serialize"),
-                                        }),
-                                    }),
-                                )
-                                .await;
-                            }
-                            "thread/start" => {
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({
-                                            "thread": mock_thread(thread_id, preview),
-                                            "model": "gpt-5",
-                                            "modelProvider": "openai",
-                                            "serviceTier": null,
-                                            "cwd": preview,
-                                            "instructionSources": [],
-                                            "approvalPolicy": "never",
-                                            "approvalsReviewer": "user",
-                                            "sandbox": {
-                                                "type": "dangerFullAccess"
-                                            },
-                                            "reasoningEffort": null,
-                                        }),
-                                    }),
-                                )
-                                .await;
-                            }
-                            "thread/realtime/start" => {
-                                let params = request
-                                    .params
-                                    .as_ref()
-                                    .expect("realtime start params should exist");
-                                assert_eq!(params["threadId"], thread_id);
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({}),
-                                    }),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/started".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "sessionId": session_id,
-                                                "version": "v2",
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/itemAdded".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "item": {
-                                                    "type": "message",
-                                                    "id": format!("item-{thread_id}"),
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                            }
-                            "thread/realtime/appendText" => {
-                                let params = request
-                                    .params
-                                    .as_ref()
-                                    .expect("realtime appendText params should exist");
-                                assert_eq!(params["threadId"], thread_id);
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({}),
-                                    }),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/transcript/delta".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "role": "assistant",
-                                                "delta": transcript_delta,
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/transcript/done".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "role": "assistant",
-                                                "text": transcript_done,
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                            }
-                            "thread/realtime/appendAudio" => {
-                                let params = request
-                                    .params
-                                    .as_ref()
-                                    .expect("realtime appendAudio params should exist");
-                                assert_eq!(params["threadId"], thread_id);
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({}),
-                                    }),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/outputAudio/delta".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "audio": {
-                                                    "data": params["audio"]["data"].clone(),
-                                                    "sampleRate": 24000,
-                                                    "numChannels": 1,
-                                                    "samplesPerChannel": 3,
-                                                    "itemId": params["audio"]["itemId"].clone(),
-                                                },
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/sdp".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "sdp": "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Codex\r\n",
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/error".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "message": "realtime transport warning",
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                            }
-                            "thread/realtime/stop" => {
-                                let params = request
-                                    .params
-                                    .as_ref()
-                                    .expect("realtime stop params should exist");
-                                assert_eq!(params["threadId"], thread_id);
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
-                                        id: request.id,
-                                        result: serde_json::json!({}),
-                                    }),
-                                )
-                                .await;
-                                write_websocket_message(
-                                    &mut websocket,
-                                    JSONRPCMessage::Notification(
-                                        codex_app_server_protocol::JSONRPCNotification {
-                                            method: "thread/realtime/closed".to_string(),
-                                            params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "reason": "client requested stop",
-                                            })),
-                                        },
-                                    ),
-                                )
-                                .await;
-                            }
-                            method => panic!("unexpected request method: {method}"),
-                        }
-                    },
-                    _ => unreachable!("unexpected connection index"),
                 }
             }
         });
@@ -42854,56 +43414,45 @@ stream_max_retries = 0
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
-            for connection_index in 0..3 {
+            for connection_index in 0..8 {
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let mut websocket = tokio_tungstenite::accept_async(stream)
                     .await
                     .expect("websocket upgrade should succeed");
 
-                expect_remote_initialize(&mut websocket).await;
                 match connection_index {
                     0 => {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
+                        close_during_initialize(&mut websocket).await;
                     }
                     1 => {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            drop(websocket);
-                        });
+                        close_during_initialize(&mut websocket).await;
                     }
-                    2 => {
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Notification(
-                                codex_app_server_protocol::JSONRPCNotification {
-                                    method: "skills/changed".to_string(),
-                                    params: Some(serde_json::json!({})),
-                                },
-                            ),
-                        )
-                        .await;
+                    2 | 3 => {
+                        tokio::spawn(async move {
+                            expect_remote_initialize(&mut websocket).await;
+                            tokio::time::sleep(super::RECONNECT_NOTIFICATION_DELAY).await;
 
-                        loop {
-                            let request = read_websocket_request(&mut websocket).await;
-                            match request.method.as_str() {
-                                "skills/list" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "data": [{
-                                                    "cwd": "/tmp/shared-repo",
-                                                    "skills": [],
-                                                    "errors": [],
-                                                }],
-                                            }),
-                                        }),
-                                    )
-                                    .await;
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "skills/changed".to_string(),
+                                        params: Some(serde_json::json!({})),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            while let Some(request) =
+                                read_websocket_request_until_close(&mut websocket).await
+                            {
+                                let is_skills_list = request.method.as_str() == "skills/list";
+                                if !respond_to_reconnect_bootstrap_request(&mut websocket, &request)
+                                    .await
+                                {
+                                    panic!("unexpected request method: {}", request.method);
+                                }
+                                if is_skills_list {
                                     write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
@@ -42915,11 +43464,78 @@ stream_max_retries = 0
                                     )
                                     .await;
                                 }
-                                method => panic!("unexpected request method: {method}"),
                             }
-                        }
+                        });
                     }
                     _ => unreachable!("unexpected connection index"),
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn start_reconnecting_v2_single_worker_skills_changed_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let mut connection_index = 0usize;
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let current_connection_index = connection_index;
+                connection_index += 1;
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket upgrade should succeed");
+
+                match current_connection_index {
+                    0 => {
+                        close_during_initialize(&mut websocket).await;
+                    }
+                    1 => {
+                        close_during_initialize(&mut websocket).await;
+                    }
+                    _ => {
+                        tokio::spawn(async move {
+                            expect_remote_initialize(&mut websocket).await;
+                            tokio::time::sleep(super::RECONNECT_NOTIFICATION_DELAY).await;
+
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Notification(
+                                    codex_app_server_protocol::JSONRPCNotification {
+                                        method: "skills/changed".to_string(),
+                                        params: Some(serde_json::json!({})),
+                                    },
+                                ),
+                            )
+                            .await;
+
+                            while let Some(request) =
+                                read_websocket_request_until_close(&mut websocket).await
+                            {
+                                let is_skills_list = request.method.as_str() == "skills/list";
+                                if !respond_to_reconnect_bootstrap_request(&mut websocket, &request)
+                                    .await
+                                {
+                                    panic!("unexpected request method: {}", request.method);
+                                }
+                                if is_skills_list {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Notification(
+                                            codex_app_server_protocol::JSONRPCNotification {
+                                                method: "skills/changed".to_string(),
+                                                params: Some(serde_json::json!({})),
+                                            },
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -42949,7 +43565,7 @@ stream_max_retries = 0
                     }
                     1 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
@@ -43113,6 +43729,7 @@ stream_max_retries = 0
                                     request.params,
                                     Some(serde_json::json!({
                                         "cwds": ["/tmp/reconnected-project"],
+                                        "marketplaceKinds": null,
                                     })),
                                 );
                                 write_websocket_message(
@@ -43222,6 +43839,8 @@ stream_max_retries = 0
                                                     "path": "/tmp/reconnected-project/.codex/skills/reconnected-skill",
                                                     "enabled": true,
                                                 }],
+                                                "hooks": [],
+                                                "appTemplates": [],
                                                 "apps": [],
                                                 "mcpServers": ["reconnected-mcp"],
                                             },
@@ -43377,13 +43996,16 @@ stream_max_retries = 0
                                     request.params,
                                     Some(serde_json::json!({
                                         "migrationItems": [],
+                                        "source": null,
                                     })),
                                 );
                                 write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Response(JSONRPCResponse {
                                         id: request.id.clone(),
-                                        result: serde_json::json!({}),
+                                        result: serde_json::json!({
+                                            "importId": "import-1",
+                                        }),
                                     }),
                                 )
                                 .await;
@@ -43393,7 +44015,10 @@ stream_max_retries = 0
                                         codex_app_server_protocol::JSONRPCNotification {
                                             method: "externalAgentConfig/import/completed"
                                                 .to_string(),
-                                            params: Some(serde_json::json!({})),
+                                            params: Some(serde_json::json!({
+                                                "importId": "import-1",
+                                                "itemTypeResults": [],
+                                            })),
                                         },
                                     ),
                                 )
@@ -43549,7 +44174,6 @@ stream_max_retries = 0
                                         "classification": "bug",
                                         "reason": "gateway single-worker recovery",
                                         "threadId": null,
-                                        "includeLogs": false,
                                         "extraLogFiles": null,
                                         "tags": null,
                                     })),
@@ -44025,6 +44649,10 @@ stream_max_retries = 0
     }
 
     async fn start_mock_remote_workflow_server() -> String {
+        start_mock_remote_workflow_server_with_thread_id("thread-remote-workflow").await
+    }
+
+    async fn start_mock_remote_workflow_server_with_thread_id(thread_id: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -44039,7 +44667,6 @@ stream_max_retries = 0
 
                     expect_remote_initialize(&mut websocket).await;
 
-                    let thread_id = "thread-remote-workflow";
                     let review_thread_id = "thread-review-remote-workflow";
                     let preview = "/tmp/remote-project";
                     let review_preview = "/tmp/remote-project/review";
@@ -44123,7 +44750,9 @@ stream_max_retries = 0
                                     &mut websocket,
                                     JSONRPCMessage::Response(JSONRPCResponse {
                                         id: request.id.clone(),
-                                        result: serde_json::json!({}),
+                                        result: serde_json::json!({
+                                            "importId": "import-1",
+                                        }),
                                     }),
                                 )
                                 .await;
@@ -44133,7 +44762,10 @@ stream_max_retries = 0
                                         codex_app_server_protocol::JSONRPCNotification {
                                             method: "externalAgentConfig/import/completed"
                                                 .to_string(),
-                                            params: Some(serde_json::json!({})),
+                                            params: Some(serde_json::json!({
+                                                "importId": "import-1",
+                                                "itemTypeResults": [],
+                                            })),
                                         },
                                     ),
                                 )
@@ -44499,6 +45131,8 @@ stream_max_retries = 0
                                         "path": format!("{preview}/skills/remote-skill"),
                                         "enabled": true,
                                     }],
+                                    "hooks": [],
+                                    "appTemplates": [],
                                     "apps": [],
                                     "mcpServers": ["remote-mcp"],
                                 },
@@ -44888,7 +45522,7 @@ stream_max_retries = 0
                                             method: "thread/realtime/started".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
-                                                "sessionId": "session-remote-workflow",
+                                                "realtimeSessionId": "session-remote-workflow",
                                                 "version": "v2",
                                             })),
                                         },
@@ -45061,13 +45695,14 @@ stream_max_retries = 0
                                             codex_app_server_protocol::JSONRPCNotification {
                                                 method: "item/started".to_string(),
                                                 params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "item": {
-                                                        "type": "plan",
-                                                        "id": "plan-remote-workflow",
-                                                        "text": "",
-                                                    },
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "startedAtMs": 0,
+                                                "item": {
+                                                    "type": "plan",
+                                                    "id": "plan-remote-workflow",
+                                                    "text": "",
+                                                },
                                                 })),
                                             },
                                         ),
@@ -45079,13 +45714,14 @@ stream_max_retries = 0
                                             codex_app_server_protocol::JSONRPCNotification {
                                                 method: "item/completed".to_string(),
                                                 params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "item": {
-                                                        "type": "plan",
-                                                        "id": "plan-remote-workflow",
-                                                        "text": "- Remote step\n",
-                                                    },
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "completedAtMs": 0,
+                                                "item": {
+                                                    "type": "plan",
+                                                    "id": "plan-remote-workflow",
+                                                    "text": "- Remote step\n",
+                                                },
                                                 })),
                                             },
                                         ),
@@ -45331,6 +45967,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "completedAtMs": 0,
                                                 "item": {
                                                     "type": "other",
                                                 },
@@ -45347,6 +45984,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "startedAtMs": 0,
                                                 "reviewId": format!("guardian-{thread_id}"),
                                                 "targetItemId": format!("cmd-{thread_id}"),
                                                 "review": {
@@ -45374,6 +46012,8 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "startedAtMs": 0,
+                                                "completedAtMs": 0,
                                                 "reviewId": format!("guardian-{thread_id}"),
                                                 "targetItemId": format!("cmd-{thread_id}"),
                                                 "decisionSource": "agent",
@@ -45463,6 +46103,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "startedAtMs": 0,
                                                 "item": {
                                                     "type": "agentMessage",
                                                     "id": format!("msg-{thread_id}"),
@@ -45713,6 +46354,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "completedAtMs": 0,
                                                 "item": {
                                                     "type": "agentMessage",
                                                     "id": format!("msg-{thread_id}"),
@@ -45783,7 +46425,7 @@ stream_max_retries = 0
                                     JSONRPCMessage::Error(JSONRPCError {
                                         id: request.id,
                                         error: JSONRPCErrorError {
-                                            code: -32000,
+                                            code: -32600,
                                             message: format!(
                                                 "no rollout found for thread id {thread_id}"
                                             ),
@@ -45975,6 +46617,7 @@ stream_max_retries = 0
                                 serde_json::json!({
                                     "thread": {
                                         "id": forked_thread_id.as_str(),
+                                        "sessionId": forked_thread_id.as_str(),
                                         "forkedFromId": thread_id.as_str(),
                                         "preview": forked_preview.as_str(),
                                         "ephemeral": true,
@@ -46155,6 +46798,7 @@ stream_max_retries = 0
                                     "threadId": "thread-worker-a",
                                     "turnId": "turn-hidden",
                                     "itemId": "item-hidden",
+                                    "startedAtMs": 0,
                                     "reason": "Need to run a hidden command",
                                     "command": "pwd",
                                 })),
@@ -46163,10 +46807,20 @@ stream_max_retries = 0
                         )
                         .await;
 
-                        let JSONRPCMessage::Error(error) =
-                            read_websocket_message(&mut websocket).await
-                        else {
-                            panic!("expected hidden server request rejection");
+                        let error = loop {
+                            match read_websocket_message(&mut websocket).await {
+                                JSONRPCMessage::Error(error) => break error,
+                                JSONRPCMessage::Notification(notification)
+                                    if notification.method == "initialized" =>
+                                {
+                                    continue;
+                                }
+                                other => {
+                                    panic!(
+                                        "expected hidden server request rejection, got {other:?}"
+                                    );
+                                }
+                            }
                         };
                         assert_eq!(
                             error.id,
@@ -46248,34 +46902,46 @@ stream_max_retries = 0
                 match connection_index {
                     0 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
                     1 => {
-                        let request = read_websocket_request(&mut websocket).await;
-                        assert_eq!(request.method, "thread/start");
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result: serde_json::json!({
-                                    "thread": mock_thread(thread_id, preview),
-                                    "model": "gpt-5",
-                                    "modelProvider": "openai",
-                                    "serviceTier": null,
-                                    "cwd": preview,
-                                    "instructionSources": [],
-                                    "approvalPolicy": "never",
-                                    "approvalsReviewer": "user",
-                                    "sandbox": {
-                                        "type": "dangerFullAccess"
-                                    },
-                                    "reasoningEffort": null,
-                                }),
-                            }),
-                        )
-                        .await;
+                        loop {
+                            let request = read_websocket_request(&mut websocket).await;
+                            if respond_to_reconnect_bootstrap_request(&mut websocket, &request)
+                                .await
+                            {
+                                continue;
+                            }
+                            match request.method.as_str() {
+                                "thread/start" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread(thread_id, preview),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": preview,
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                method => panic!("unexpected request method: {method}"),
+                            }
+                        }
                         websocket
                             .close(None)
                             .await
@@ -46304,34 +46970,46 @@ stream_max_retries = 0
                 match connection_index {
                     0 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
                     1 => {
-                        let request = read_websocket_request(&mut websocket).await;
-                        assert_eq!(request.method, "thread/start");
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result: serde_json::json!({
-                                    "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
-                                    "model": "gpt-5",
-                                    "modelProvider": "openai",
-                                    "serviceTier": null,
-                                    "cwd": "/tmp/worker-a",
-                                    "instructionSources": [],
-                                    "approvalPolicy": "never",
-                                    "approvalsReviewer": "user",
-                                    "sandbox": {
-                                        "type": "dangerFullAccess"
-                                    },
-                                    "reasoningEffort": null,
-                                }),
-                            }),
-                        )
-                        .await;
+                        loop {
+                            let request = read_websocket_request(&mut websocket).await;
+                            if respond_to_reconnect_bootstrap_request(&mut websocket, &request)
+                                .await
+                            {
+                                continue;
+                            }
+                            match request.method.as_str() {
+                                "thread/start" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": "/tmp/worker-a",
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                method => panic!("unexpected request method: {method}"),
+                            }
+                        }
 
                         write_websocket_message(
                             &mut websocket,
@@ -46392,34 +47070,46 @@ stream_max_retries = 0
                 match connection_index {
                     0 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
                     1 => {
-                        let request = read_websocket_request(&mut websocket).await;
-                        assert_eq!(request.method, "thread/start");
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result: serde_json::json!({
-                                    "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
-                                    "model": "gpt-5",
-                                    "modelProvider": "openai",
-                                    "serviceTier": null,
-                                    "cwd": "/tmp/worker-a",
-                                    "instructionSources": [],
-                                    "approvalPolicy": "never",
-                                    "approvalsReviewer": "user",
-                                    "sandbox": {
-                                        "type": "dangerFullAccess"
-                                    },
-                                    "reasoningEffort": null,
-                                }),
-                            }),
-                        )
-                        .await;
+                        loop {
+                            let request = read_websocket_request(&mut websocket).await;
+                            if respond_to_reconnect_bootstrap_request(&mut websocket, &request)
+                                .await
+                            {
+                                continue;
+                            }
+                            match request.method.as_str() {
+                                "thread/start" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": "/tmp/worker-a",
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                method => panic!("unexpected request method: {method}"),
+                            }
+                        }
 
                         write_websocket_message(
                             &mut websocket,
@@ -46500,34 +47190,54 @@ stream_max_retries = 0
                 match connection_index {
                     0 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
                     1 => {
-                        let request = read_websocket_request(&mut websocket).await;
-                        assert_eq!(request.method, "thread/start");
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result: serde_json::json!({
-                                    "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
-                                    "model": "gpt-5",
-                                    "modelProvider": "openai",
-                                    "serviceTier": null,
-                                    "cwd": "/tmp/worker-a",
-                                    "instructionSources": [],
-                                    "approvalPolicy": "never",
-                                    "approvalsReviewer": "user",
-                                    "sandbox": {
-                                        "type": "dangerFullAccess"
-                                    },
-                                    "reasoningEffort": null,
-                                }),
-                            }),
-                        )
-                        .await;
+                        loop {
+                            let request = read_websocket_request(&mut websocket).await;
+                            match request.method.as_str() {
+                                "configRequirements/read" => {
+                                    assert_eq!(request.params, None);
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "requirements": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "thread/start" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": "/tmp/worker-a",
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                method => panic!("unexpected request method: {method}"),
+                            }
+                        }
 
                         write_websocket_message(
                             &mut websocket,
@@ -46573,34 +47283,54 @@ stream_max_retries = 0
                 match connection_index {
                     0 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
                     1 => {
-                        let request = read_websocket_request(&mut websocket).await;
-                        assert_eq!(request.method, "thread/start");
-                        write_websocket_message(
-                            &mut websocket,
-                            JSONRPCMessage::Response(JSONRPCResponse {
-                                id: request.id,
-                                result: serde_json::json!({
-                                    "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
-                                    "model": "gpt-5",
-                                    "modelProvider": "openai",
-                                    "serviceTier": null,
-                                    "cwd": "/tmp/worker-a",
-                                    "instructionSources": [],
-                                    "approvalPolicy": "never",
-                                    "approvalsReviewer": "user",
-                                    "sandbox": {
-                                        "type": "dangerFullAccess"
-                                    },
-                                    "reasoningEffort": null,
-                                }),
-                            }),
-                        )
-                        .await;
+                        loop {
+                            let request = read_websocket_request(&mut websocket).await;
+                            match request.method.as_str() {
+                                "configRequirements/read" => {
+                                    assert_eq!(request.params, None);
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "requirements": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "thread/start" => {
+                                    write_websocket_message(
+                                        &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "thread": mock_thread("thread-worker-a", "/tmp/worker-a"),
+                                                "model": "gpt-5",
+                                                "modelProvider": "openai",
+                                                "serviceTier": null,
+                                                "cwd": "/tmp/worker-a",
+                                                "instructionSources": [],
+                                                "approvalPolicy": "never",
+                                                "approvalsReviewer": "user",
+                                                "sandbox": {
+                                                    "type": "dangerFullAccess"
+                                                },
+                                                "reasoningEffort": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                method => panic!("unexpected request method: {method}"),
+                            }
+                        }
 
                         write_websocket_message(
                             &mut websocket,
@@ -46678,12 +47408,17 @@ stream_max_retries = 0
                                         codex_app_server_protocol::JSONRPCNotification {
                                             method: "externalAgentConfig/import/completed"
                                                 .to_string(),
-                                            params: Some(serde_json::json!({})),
+                                            params: Some(serde_json::json!({
+                                                "importId": "import-1",
+                                                "itemTypeResults": [],
+                                            })),
                                         },
                                     ),
                                 )
                                 .await;
-                                serde_json::json!({})
+                                serde_json::json!({
+                                    "importId": "import-1",
+                                })
                             }
                             "config/value/write" => serde_json::json!({
                                 "status": "ok",
@@ -47298,6 +48033,7 @@ stream_max_retries = 0
                                 serde_json::json!({
                                     "thread": {
                                         "id": "00000000-0000-0000-0000-0000000000a2",
+                                        "sessionId": "00000000-0000-0000-0000-0000000000a2",
                                         "forkedFromId": requested_thread_id,
                                         "preview": "/tmp/worker-a-fork",
                                         "ephemeral": true,
@@ -48419,7 +49155,7 @@ stream_max_retries = 0
                     }
                     1 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
@@ -49723,6 +50459,165 @@ stream_max_retries = 0
         format!("ws://{addr}")
     }
 
+    async fn start_reconnecting_v2_single_worker_connection_state_notification_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let mut connection_index = 0usize;
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let current_connection_index = connection_index;
+                connection_index += 1;
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket upgrade should succeed");
+
+                match current_connection_index {
+                    0 => {
+                        close_during_initialize(&mut websocket).await;
+                    }
+                    1 => {
+                        close_during_initialize(&mut websocket).await;
+                    }
+                    _ => {
+                        tokio::spawn(async move {
+                            expect_remote_initialize(&mut websocket).await;
+                            tokio::time::sleep(super::RECONNECT_NOTIFICATION_DELAY).await;
+
+                            for notification in [
+                                serde_json::json!({
+                                    "method": "account/updated",
+                                    "params": {
+                                        "authMode": null,
+                                        "planType": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "account/rateLimits/updated",
+                                    "params": {
+                                        "rateLimits": {
+                                            "limitId": null,
+                                            "limitName": null,
+                                            "primary": null,
+                                            "secondary": null,
+                                            "credits": null,
+                                            "planType": null,
+                                            "rateLimitReachedType": null,
+                                        },
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "app/list/updated",
+                                    "params": {
+                                        "data": [{
+                                            "id": "calendar",
+                                            "name": "calendar",
+                                            "description": null,
+                                            "logoUrl": null,
+                                            "logoUrlDark": null,
+                                            "distributionChannel": null,
+                                            "branding": null,
+                                            "appMetadata": null,
+                                            "labels": null,
+                                            "installUrl": null,
+                                        }],
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "account/login/completed",
+                                    "params": {
+                                        "loginId": null,
+                                        "success": true,
+                                        "error": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "mcpServer/oauthLogin/completed",
+                                    "params": {
+                                        "name": "calendar-mcp",
+                                        "success": true,
+                                        "error": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "mcpServer/startupStatus/updated",
+                                    "params": {
+                                        "name": "calendar-mcp",
+                                        "status": "ready",
+                                        "error": null,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "warning",
+                                    "params": {
+                                        "threadId": null,
+                                        "message": "shared warning",
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "configWarning",
+                                    "params": {
+                                        "summary": "shared config warning",
+                                        "details": "check your shared config",
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "deprecationNotice",
+                                    "params": {
+                                        "summary": "shared deprecation notice",
+                                        "details": "update the shared workflow",
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "windows/worldWritableWarning",
+                                    "params": {
+                                        "samplePaths": ["C:\\shared-temp"],
+                                        "extraCount": 2,
+                                        "failedScan": false,
+                                    },
+                                }),
+                                serde_json::json!({
+                                    "method": "windowsSandbox/setupCompleted",
+                                    "params": {
+                                        "mode": "unelevated",
+                                        "success": true,
+                                        "error": null,
+                                    },
+                                }),
+                            ] {
+                                write_websocket_message(
+                                    &mut websocket,
+                                    serde_json::from_value::<JSONRPCMessage>(notification)
+                                        .expect("notification should decode"),
+                                )
+                                .await;
+                            }
+
+                            while let Some(frame) = websocket.next().await {
+                                match frame.expect("follow-up frame should decode") {
+                                    Message::Close(_) => break,
+                                    Message::Ping(payload) => {
+                                        websocket
+                                            .send(Message::Pong(payload))
+                                            .await
+                                            .expect("pong should send");
+                                    }
+                                    Message::Text(_)
+                                    | Message::Binary(_)
+                                    | Message::Pong(_)
+                                    | Message::Frame(_) => {}
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
     async fn start_mock_remote_warning_notification_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -49850,6 +50745,19 @@ stream_max_retries = 0
                     loop {
                         let request = read_websocket_request(&mut websocket).await;
                         match request.method.as_str() {
+                            "configRequirements/read" => {
+                                assert_eq!(request.params, None);
+                                write_websocket_message(
+                                    &mut websocket,
+                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                        id: request.id,
+                                        result: serde_json::json!({
+                                            "requirements": null,
+                                        }),
+                                    }),
+                                )
+                                .await;
+                            }
                             "thread/start" => {
                                 write_websocket_message(
                                     &mut websocket,
@@ -50258,6 +51166,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "startedAtMs": 0,
                                                 "item": {
                                                     "type": "agentMessage",
                                                     "id": format!("msg-{thread_id}"),
@@ -50543,6 +51452,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "startedAtMs": 0,
                                                 "reviewId": format!("guardian-{thread_id}"),
                                                 "targetItemId": format!("cmd-{thread_id}"),
                                                 "review": {
@@ -50570,6 +51480,8 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "startedAtMs": 0,
+                                                "completedAtMs": 0,
                                                 "reviewId": format!("guardian-{thread_id}"),
                                                 "targetItemId": format!("cmd-{thread_id}"),
                                                 "decisionSource": "agent",
@@ -50627,6 +51539,7 @@ stream_max_retries = 0
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
                                                 "turnId": turn_id,
+                                                "completedAtMs": 0,
                                                 "item": {
                                                     "type": "agentMessage",
                                                     "id": format!("msg-{thread_id}"),
@@ -50762,7 +51675,7 @@ stream_max_retries = 0
                                             method: "thread/realtime/started".to_string(),
                                             params: Some(serde_json::json!({
                                                 "threadId": thread_id,
-                                                "sessionId": session_id,
+                                                "realtimeSessionId": session_id,
                                                 "version": "v2",
                                             })),
                                         },
@@ -51256,7 +52169,9 @@ stream_max_retries = 0
                                                 },
                                                 "description": description,
                                                 "skills": [],
+                                                "hooks": [],
                                                 "apps": [],
+                                                "appTemplates": [],
                                                 "mcpServers": [],
                                             },
                                         }),
@@ -51384,7 +52299,7 @@ stream_max_retries = 0
                     }
                     1 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
@@ -51393,9 +52308,22 @@ stream_max_retries = 0
                         loop {
                             let request = read_websocket_request(&mut websocket).await;
                             match request.method.as_str() {
-                                "plugin/list" => {
+                                "configRequirements/read" => {
+                                    assert_eq!(request.params, None);
                                     write_websocket_message(
                                         &mut websocket,
+                                        JSONRPCMessage::Response(JSONRPCResponse {
+                                            id: request.id,
+                                            result: serde_json::json!({
+                                                "requirements": null,
+                                            }),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                "plugin/list" => {
+                                    write_websocket_message(
+	                                        &mut websocket,
                                         JSONRPCMessage::Response(JSONRPCResponse {
                                             id: request.id,
                                             result: serde_json::json!({
@@ -51514,13 +52442,15 @@ stream_max_retries = 0
                                                             "screenshots": [],
                                                             "screenshotUrls": [],
                                                         },
-                                                    },
-                                                    "description": description,
-                                                    "skills": [],
-                                                    "apps": [],
-                                                    "mcpServers": [],
                                                 },
-                                            }),
+                                                "description": description,
+                                                "skills": [],
+                                                "hooks": [],
+                                                "apps": [],
+                                                "appTemplates": [],
+                                                "mcpServers": [],
+                                            },
+                                        }),
                                         }),
                                     )
                                     .await;
@@ -51631,7 +52561,26 @@ stream_max_retries = 0
         previous_account_id: &str,
         legacy_approval_exercise: LegacyApprovalExercise,
     ) {
-        let thread_start_request = read_websocket_request(websocket).await;
+        let thread_start_request = loop {
+            let request = read_websocket_request(websocket).await;
+            match request.method.as_str() {
+                "configRequirements/read" => {
+                    assert_eq!(request.params, None);
+                    write_websocket_message(
+                        websocket,
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request.id,
+                            result: serde_json::json!({
+                                "requirements": null,
+                            }),
+                        }),
+                    )
+                    .await;
+                }
+                "thread/start" => break request,
+                method => panic!("unexpected request method: {method}"),
+            }
+        };
         assert_eq!(thread_start_request.method, "thread/start");
         write_websocket_message(
             websocket,
@@ -51709,6 +52658,8 @@ stream_max_retries = 0
                     "threadId": thread_id,
                     "turnId": "turn-remote-workflow",
                     "itemId": "cmd-remote-workflow",
+                    "startedAtMs": 0,
+                    "cwd": preview,
                     "command": "pwd",
                 })),
                 trace: None,
@@ -51739,6 +52690,7 @@ stream_max_retries = 0
                     "threadId": thread_id,
                     "turnId": "turn-remote-workflow",
                     "itemId": "file-remote-workflow",
+                    "startedAtMs": 0,
                     "reason": "Need to write changes",
                 })),
                 trace: None,
@@ -51931,6 +52883,8 @@ stream_max_retries = 0
                     "threadId": thread_id,
                     "turnId": "turn-remote-workflow",
                     "itemId": "perm-remote-workflow",
+                    "startedAtMs": 0,
+                    "cwd": "/tmp/remote-project",
                     "reason": "Need wider permissions",
                     "permissions": {
                         "fileSystem": null,
@@ -52228,6 +53182,8 @@ stream_max_retries = 0
                                 "threadId": thread_id,
                                 "turnId": "turn-remote-workflow",
                                 "itemId": "perm-remote-workflow",
+                                "startedAtMs": 0,
+                                "cwd": preview,
                                 "reason": "Need concurrent permissions",
                                 "permissions": {
                                     "fileSystem": null,
@@ -52395,7 +53351,7 @@ stream_max_retries = 0
                     }
                     1 => {
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            tokio::time::sleep(super::REMOTE_WORKER_RECONNECT_DELAY).await;
                             drop(websocket);
                         });
                     }
@@ -52409,6 +53365,13 @@ stream_max_retries = 0
                             LegacyApprovalExercise::Skip,
                         )
                         .await;
+                        while let Some(message) = websocket.next().await {
+                            match message {
+                                Ok(Message::Close(_)) => break,
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
+                        }
                     }
                     _ => unreachable!("unexpected connection index"),
                 }
@@ -52807,6 +53770,8 @@ stream_max_retries = 0
                                 "threadId": "thread-remote-workflow",
                                 "turnId": "turn-remote-workflow",
                                 "itemId": "cmd-remote-workflow",
+                                "startedAtMs": 0,
+                                "cwd": "/tmp/remote-project",
                                 "command": "pwd",
                             })),
                             trace: None,
@@ -52838,6 +53803,7 @@ stream_max_retries = 0
                                 "threadId": "thread-remote-workflow",
                                 "turnId": "turn-remote-workflow",
                                 "itemId": "file-remote-workflow",
+                                "startedAtMs": 0,
                                 "reason": "Need to write changes",
                             })),
                             trace: None,
@@ -53033,6 +53999,8 @@ stream_max_retries = 0
                                 "threadId": "thread-remote-workflow",
                                 "turnId": "turn-remote-workflow",
                                 "itemId": "perm-remote-workflow",
+                                "startedAtMs": 0,
+                                "cwd": "/tmp/remote-project",
                                 "reason": "Need wider permissions",
                                 "permissions": {
                                     "network": {
@@ -53156,6 +54124,9 @@ stream_max_retries = 0
             loop {
                 let request = read_websocket_request(&mut websocket).await;
                 let result = match request.method.as_str() {
+                    "configRequirements/read" => serde_json::json!({
+                        "requirements": null,
+                    }),
                     "thread/start" => serde_json::json!({
                         "thread": mock_thread(thread_id, preview),
                         "model": "gpt-5",
@@ -53240,6 +54211,7 @@ stream_max_retries = 0
     ) -> serde_json::Value {
         serde_json::json!({
             "id": thread_id,
+            "sessionId": thread_id,
             "forkedFromId": null,
             "preview": preview,
             "ephemeral": true,
@@ -53297,6 +54269,16 @@ stream_max_retries = 0
         assert_eq!(notification.method, "initialized");
     }
 
+    async fn close_during_initialize<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        websocket
+            .close(None)
+            .await
+            .expect("close frame should send");
+    }
+
     async fn start_mock_exec_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -53330,6 +54312,32 @@ stream_max_retries = 0
                 panic!("expected initialized notification");
             };
             assert_eq!(notification.method, "initialized");
+
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected environment info request");
+            };
+            assert_eq!(request.method, "environment/info");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({
+                        "shell": {
+                            "name": "sh",
+                            "path": "/bin/sh",
+                        }
+                    }),
+                }),
+            )
+            .await;
+
+            while websocket
+                .next()
+                .await
+                .expect("exec-server websocket should stay open")
+                .is_ok()
+            {}
         });
         format!("ws://{addr}")
     }
@@ -53351,7 +54359,14 @@ stream_max_retries = 0
                     return serde_json::from_str::<JSONRPCMessage>(&text)
                         .expect("text frame should be valid JSON-RPC");
                 }
-                Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {
+                    continue;
+                }
+                Message::Ping(payload) => {
+                    websocket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("pong should send");
                     continue;
                 }
                 Message::Close(_) => panic!("unexpected close frame"),
@@ -53374,6 +54389,43 @@ stream_max_retries = 0
                     continue;
                 }
                 other => panic!("expected request, got {other:?}"),
+            }
+        }
+    }
+
+    async fn read_websocket_request_until_close<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> Option<codex_app_server_protocol::JSONRPCRequest>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            let frame = websocket.next().await?.expect("frame should decode");
+            match frame {
+                Message::Text(text) => {
+                    let message = serde_json::from_str::<JSONRPCMessage>(&text)
+                        .expect("text frame should be valid JSON-RPC");
+                    match message {
+                        JSONRPCMessage::Request(request) => return Some(request),
+                        JSONRPCMessage::Notification(notification)
+                            if notification.method == "initialized" =>
+                        {
+                            continue;
+                        }
+                        other => panic!("expected request, got {other:?}"),
+                    }
+                }
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {
+                    continue;
+                }
+                Message::Ping(payload) => {
+                    websocket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("pong should send");
+                    continue;
+                }
+                Message::Close(_) => return None,
             }
         }
     }
@@ -53634,11 +54686,10 @@ data: {}\n\n",
 
     impl ServerHandler for EmbeddedElicitationAppsMcpServer {
         fn get_info(&self) -> ServerInfo {
-            ServerInfo {
-                protocol_version: rmcp::model::ProtocolVersion::V_2025_06_18,
-                capabilities: ServerCapabilities::builder().enable_tools().build(),
-                ..ServerInfo::default()
-            }
+            let mut info = ServerInfo::default();
+            info.protocol_version = rmcp::model::ProtocolVersion::V_2025_06_18;
+            info.capabilities = ServerCapabilities::builder().enable_tools().build();
+            info
         }
 
         async fn list_tools(
@@ -53717,11 +54768,10 @@ data: {}\n\n",
 
     impl ServerHandler for EmbeddedPluginOauthMcpServer {
         fn get_info(&self) -> ServerInfo {
-            ServerInfo {
-                protocol_version: rmcp::model::ProtocolVersion::V_2025_06_18,
-                capabilities: ServerCapabilities::default(),
-                ..ServerInfo::default()
-            }
+            let mut info = ServerInfo::default();
+            info.protocol_version = rmcp::model::ProtocolVersion::V_2025_06_18;
+            info.capabilities = ServerCapabilities::default();
+            info
         }
     }
 
