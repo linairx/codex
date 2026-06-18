@@ -58,6 +58,9 @@ async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
             let arguments = serde_json::to_string(&json!({
                 "cmd": COMMAND,
                 "login": false,
+                // An absolute foreign workdir should replace the selected environment cwd and
+                // reach exec-server without conversion to the host path convention.
+                "workdir": r"C:\windows",
                 "yield_time_ms": 10_000,
             }))?;
             let response_mock = mount_sse_sequence(
@@ -152,12 +155,11 @@ async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
                 "unexpected command: {:?}",
                 begin.command
             );
-            assert_eq!(
-                &begin.command[1..],
-                ["-NoProfile", "-Command", COMMAND]
-            );
+            assert_eq!(&begin.command[1..], ["-NoProfile", "-Command", COMMAND]);
 
             let end = end.context("exec_command should emit an end event")?;
+            let expected_cwd = PathUri::parse("file:///C:/windows")?;
+            assert_eq!((&begin.cwd, &end.cwd), (&expected_cwd, &expected_cwd));
             assert_eq!((end.exit_code, end.status), (0, ExecCommandStatus::Completed));
 
             let request = response_mock
