@@ -1,21 +1,19 @@
 use crate::admission::GatewayAdmissionController;
 use crate::auth::GatewayAuth;
 use crate::auth::GatewayAuthError;
-use crate::config::normalize_remote_account_id;
-use crate::error::GatewayError;
 use crate::event::GatewayAccountActiveThreadHandoffFailed;
 use crate::event::GatewayAccountPathHandoffFailed;
 use crate::event::GatewayAccountPathHandoffSucceeded;
 use crate::event::GatewayAccountThreadHandoffFailed;
 use crate::event::GatewayAccountThreadHandoffSucceeded;
 use crate::event::GatewayEvent;
-use crate::event::GatewayProjectWorkerRouteSelected;
+use crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_notification;
+use crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_rate_limits_response;
 use crate::northbound::v2_connection::ClientServerRequestAnswer;
 use crate::northbound::v2_connection::DownstreamServerRequestKey;
 use crate::northbound::v2_connection::DownstreamWorkerEvent;
 use crate::northbound::v2_connection::DownstreamWorkerHandle;
 use crate::northbound::v2_connection::FailClosedMultiWorkerRouteError;
-use crate::northbound::v2_connection::ForwardedConnectionNotification;
 use crate::northbound::v2_connection::GatewayRejectedServerRequest;
 use crate::northbound::v2_connection::GatewayV2ConnectionClose;
 use crate::northbound::v2_connection::GatewayV2ConnectionContext;
@@ -38,7 +36,51 @@ use crate::northbound::v2_counts::pending_client_request_method_counts;
 use crate::northbound::v2_counts::pending_client_request_worker_counts;
 use crate::northbound::v2_counts::server_request_backlog_method_counts;
 use crate::northbound::v2_counts::server_request_backlog_worker_counts;
-pub(crate) use crate::northbound::v2_wire::await_io_with_timeout;
+#[cfg(test)]
+use crate::northbound::v2_limits::RATE_LIMITED_ERROR_CODE;
+#[cfg(test)]
+use crate::northbound::v2_limits::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE;
+#[cfg(test)]
+use crate::northbound::v2_limits::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE;
+use crate::northbound::v2_limits::pending_client_request_limit_error;
+use crate::northbound::v2_limits::pending_server_request_limit_error;
+#[cfg(test)]
+use crate::northbound::v2_notifications::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD;
+use crate::northbound::v2_notifications::forwarded_connection_notification_duplicate;
+use crate::northbound::v2_notifications::record_forwarded_connection_notification;
+use crate::northbound::v2_notifications::should_deduplicate_connection_notification;
+use crate::northbound::v2_pagination::AGGREGATED_APPS_CURSOR_PREFIX;
+use crate::northbound::v2_pagination::AGGREGATED_EXPERIMENTAL_FEATURE_CURSOR_PREFIX;
+use crate::northbound::v2_pagination::AGGREGATED_LOADED_THREAD_CURSOR_PREFIX;
+use crate::northbound::v2_pagination::AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX;
+use crate::northbound::v2_pagination::AGGREGATED_MODEL_CURSOR_PREFIX;
+use crate::northbound::v2_pagination::AGGREGATED_THREAD_CURSOR_PREFIX;
+use crate::northbound::v2_pagination::DEFAULT_AGGREGATED_THREAD_LIST_LIMIT;
+use crate::northbound::v2_pagination::aggregated_page_bounds;
+use crate::northbound::v2_pagination::collect_worker_paginated_data;
+use crate::northbound::v2_pagination::decode_aggregated_offset_cursor;
+use crate::northbound::v2_pagination::encode_aggregated_offset_cursor;
+use crate::northbound::v2_pagination::sort_threads_for_aggregation;
+use crate::northbound::v2_scope::apply_response_scope_policy;
+use crate::northbound::v2_scope::enforce_request_scope;
+use crate::northbound::v2_scope::notification_thread_id;
+use crate::northbound::v2_scope::notification_visible_to;
+use crate::northbound::v2_scope::request_thread_id;
+use crate::northbound::v2_scope::request_thread_path;
+use crate::northbound::v2_scope::response_thread_id;
+use crate::northbound::v2_scope::response_thread_path;
+use crate::northbound::v2_scope::server_request_visible_to;
+pub(crate) use crate::northbound::v2_server_requests::collect_server_request_cleanup_for_worker;
+use crate::northbound::v2_server_requests::log_dropped_duplicate_resolved_server_request;
+use crate::northbound::v2_server_requests::log_duplicate_downstream_server_request;
+use crate::northbound::v2_server_requests::log_rejected_pending_server_requests;
+use crate::northbound::v2_server_requests::log_worker_server_request_cleanup;
+use crate::northbound::v2_server_requests::pending_server_request_log_fields;
+use crate::northbound::v2_server_requests::publish_worker_server_request_cleanup_event;
+use crate::northbound::v2_server_requests::record_client_server_request_cleanup_metrics;
+use crate::northbound::v2_server_requests::record_v2_server_request_lifecycle_method_counts;
+use crate::northbound::v2_server_requests::record_worker_server_request_cleanup_metrics;
+use crate::northbound::v2_server_requests::resolved_server_request_log_fields;
 pub(crate) use crate::northbound::v2_wire::tagged_type_to_notification;
 use crate::northbound::v2_wire::*;
 use crate::observability::GatewayObservability;
@@ -49,7 +91,6 @@ use crate::v2::GatewayV2SessionFactory;
 use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
-use axum::extract::ws::CloseFrame;
 use axum::extract::ws::Message as WebSocketMessage;
 use axum::extract::ws::WebSocket;
 use axum::extract::ws::close_code;
@@ -94,10 +135,8 @@ use codex_app_server_protocol::ModelListResponse;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginMarketplaceEntry;
 use codex_app_server_protocol::PluginSummary;
-use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerRequestResolvedNotification;
 use codex_app_server_protocol::SkillsListEntry;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadListParams;
@@ -107,14 +146,10 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -129,13 +164,8 @@ use tracing::warn;
 const INVALID_REQUEST_CODE: i64 = -32600;
 const INVALID_PARAMS_CODE: i64 = -32602;
 const INTERNAL_ERROR_CODE: i64 = -32603;
-const RATE_LIMITED_ERROR_CODE: i64 = -32001;
 const DOWNSTREAM_SESSION_ENDED_CLOSE_REASON: &str = "downstream app-server session ended";
 const INITIALIZE_TIMEOUT_CLOSE_REASON: &str = "initialize request timed out";
-const DOWNSTREAM_BACKPRESSURE_CLOSE_REASON: &str = "downstream app-server event stream lagged";
-const INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON: &str =
-    "invalid gateway websocket JSON-RPC payload";
-const INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON: &str = "invalid gateway websocket UTF-8 payload";
 const UNEXPECTED_CLIENT_SERVER_REQUEST_RESPONSE_CLOSE_REASON: &str =
     "unexpected gateway websocket server-request response";
 const DUPLICATE_PENDING_CLIENT_REQUEST_CLOSE_REASON: &str = "duplicate pending client request id";
@@ -143,16 +173,10 @@ const DUPLICATE_DOWNSTREAM_SERVER_REQUEST_CLOSE_REASON: &str =
     "duplicate downstream server-request id";
 const STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON: &str =
     "downstream worker disconnected during connection-scoped server request";
-const TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE: &str =
-    "too many pending server requests for websocket connection";
-const TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE: &str =
-    "too many pending client requests for websocket connection";
 const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
     "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
 const MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION: usize = 64;
-const MAX_CLOSE_REASON_BYTES: usize = 123;
-const MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD: usize = 256;
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayV2Timeouts {
     pub initialize: Duration,
@@ -490,6 +514,7 @@ impl GatewayV2DownstreamRouter {
                 {
                     Ok(session) => {
                         if let Err(err) = self.replay_connection_state(&session).await {
+                            let err_message = err.to_string();
                             last_error = Some(err);
                             observability.record_v2_worker_reconnect(worker_id, "replay_failure");
                             warn!(
@@ -499,7 +524,7 @@ impl GatewayV2DownstreamRouter {
                                 initialized_notification_sent = self.initialized_notification_sent,
                                 active_fs_watch_count = self.active_fs_watches.len(),
                                 retry_backoff_seconds = reconnect_state.retry_backoff.as_secs(),
-                                err = %last_error.as_ref().expect("last error set"),
+                                err = %err_message,
                                 "failed to replay connection state to reconnected downstream worker session"
                             );
                             continue;
@@ -735,7 +760,7 @@ impl GatewayV2DownstreamRouter {
             .is_none_or(|state| state.session_factory.worker_is_healthy(worker_id))
     }
 
-    fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) -> bool {
+    pub(crate) fn mark_worker_account_exhausted(&self, worker_id: usize, reason: String) -> bool {
         if let Some(state) = &self.reconnect_state {
             return state
                 .session_factory
@@ -744,7 +769,7 @@ impl GatewayV2DownstreamRouter {
         false
     }
 
-    fn mark_worker_account_available(&self, worker_id: usize) -> bool {
+    pub(crate) fn mark_worker_account_available(&self, worker_id: usize) -> bool {
         if let Some(state) = &self.reconnect_state {
             return state
                 .session_factory
@@ -1256,6 +1281,7 @@ async fn run_websocket_connection(
                         &session_factory,
                         &connection,
                         &mut event_state,
+                        &pending_client_responses.active,
                         event,
                     )
                     .await;
@@ -1681,50 +1707,6 @@ async fn recv_initialize_request(
     })
     .await
     .map_err(|_| io::Error::new(ErrorKind::TimedOut, INITIALIZE_TIMEOUT_CLOSE_REASON))?
-}
-
-fn parse_client_jsonrpc_text(text: &str) -> io::Result<JSONRPCMessage> {
-    serde_json::from_str::<JSONRPCMessage>(text).map_err(|err| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("{INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON}: {err}"),
-        )
-    })
-}
-
-fn parse_client_jsonrpc_binary(bytes: &[u8]) -> io::Result<JSONRPCMessage> {
-    let text = std::str::from_utf8(bytes).map_err(|err| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("{INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON}: {err}"),
-        )
-    })?;
-    parse_client_jsonrpc_text(text)
-}
-
-fn protocol_violation_reason_from_invalid_payload(err: &io::Error) -> &'static str {
-    let message = err.to_string();
-    if message.starts_with(INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON) {
-        "invalid_utf8"
-    } else {
-        "invalid_jsonrpc"
-    }
-}
-
-fn downstream_protocol_violation_reason(message: &str) -> Option<&'static str> {
-    if message.contains("sent invalid JSON-RPC")
-        || message.contains("sent invalid initialize response")
-        || message.contains("sent unexpected JSON-RPC response id")
-        || message.contains("sent unexpected JSON-RPC error id")
-    {
-        Some("invalid_jsonrpc")
-    } else if message.contains("sent non-text JSON-RPC frame")
-        || message.contains("sent non-text initialize frame")
-    {
-        Some("invalid_binary")
-    } else {
-        None
-    }
 }
 
 async fn handle_pre_initialize_message(
@@ -2319,6 +2301,7 @@ async fn handle_app_server_event(
     session_factory: &GatewayV2SessionFactory,
     connection: &GatewayV2ConnectionContext<'_>,
     event_state: &mut GatewayV2EventState,
+    _pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
     downstream_event: DownstreamWorkerEvent,
 ) -> io::Result<Option<GatewayV2ConnectionClose>> {
     let worker_id = downstream_event.worker_id;
@@ -2609,7 +2592,7 @@ async fn handle_app_server_event(
                     reject_pending_server_requests: true,
                 }));
             }
-            if request_visible_to(
+            if server_request_visible_to(
                 connection.scope_registry,
                 connection.request_context,
                 &request,
@@ -2792,21 +2775,21 @@ async fn handle_app_server_event(
                     .await?;
                     return Ok(Some(GatewayV2ConnectionClose {
                         outcome: "stranded_connection_scoped_server_request",
-                reject_pending_server_requests: true,
-            }));
-        }
-        if downstream.reconnect_state.is_some() {
-            downstream
-                .reconnect_missing_workers_after_disconnect(connection.observability)
-                .await;
-        }
-        if downstream.reconnect_state.is_some() && downstream.worker_count() > 0 {
-            return Ok(None);
-        }
-        if downstream.worker_count() > 0 {
-            return Ok(None);
-        }
-    } else if worker_id.is_none() {
+                        reject_pending_server_requests: true,
+                    }));
+                }
+                if downstream.reconnect_state.is_some() {
+                    downstream
+                        .reconnect_missing_workers_after_disconnect(connection.observability)
+                        .await;
+                }
+                if downstream.reconnect_state.is_some() && downstream.worker_count() > 0 {
+                    return Ok(None);
+                }
+                if downstream.worker_count() > 0 {
+                    return Ok(None);
+                }
+            } else if worker_id.is_none() {
                 cleanup = resolve_server_requests_for_worker(
                     socket,
                     connection,
@@ -2968,215 +2951,6 @@ fn record_worker_cleanup_resolution_send_failure(
         %err,
         "failed to deliver synthesized serverRequest/resolved during worker cleanup"
     );
-}
-
-fn record_worker_server_request_cleanup_metrics(
-    observability: &GatewayObservability,
-    cleanup: &WorkerServerRequestCleanup,
-) {
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "worker_cleanup_resolved_thread_scoped",
-        &server_request_method_counts(&cleanup.resolved_thread_scoped_methods),
-    );
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "worker_cleanup_stranded_connection_scoped",
-        &server_request_method_counts(&cleanup.stranded_connection_scoped_methods),
-    );
-}
-
-fn collect_server_request_cleanup_for_worker(
-    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-    worker_id: Option<usize>,
-) -> WorkerServerRequestCleanup {
-    let mut cleanup = WorkerServerRequestCleanup::default();
-
-    pending_server_requests.retain(|gateway_request_id, route| {
-        if route.worker_id != worker_id {
-            return true;
-        }
-        if let Some(thread_id) = route.thread_id.clone() {
-            cleanup
-                .resolved_notifications
-                .push(WorkerCleanupResolvedNotification {
-                    notification: ServerRequestResolvedNotification {
-                        thread_id: thread_id.clone(),
-                        request_id: gateway_request_id.clone(),
-                    },
-                    method: route.method.clone(),
-                });
-            cleanup.resolved_thread_scoped_requests += 1;
-            cleanup
-                .resolved_thread_scoped_request_ids
-                .push(gateway_request_id.clone());
-            cleanup
-                .resolved_thread_scoped_downstream_request_ids
-                .push(route.downstream_request_id.clone());
-            cleanup
-                .resolved_thread_scoped_methods
-                .push(route.method.clone());
-            cleanup.resolved_thread_scoped_thread_ids.push(thread_id);
-        } else {
-            cleanup.stranded_connection_scoped_requests += 1;
-            cleanup
-                .stranded_connection_scoped_request_ids
-                .push(gateway_request_id.clone());
-            cleanup
-                .stranded_connection_scoped_downstream_request_ids
-                .push(route.downstream_request_id.clone());
-            cleanup
-                .stranded_connection_scoped_methods
-                .push(route.method.clone());
-        }
-        false
-    });
-
-    resolved_server_requests.retain(|key, route| {
-        if key.worker_id != worker_id {
-            return true;
-        }
-        if let Some(thread_id) = route.thread_id.clone() {
-            cleanup
-                .resolved_notifications
-                .push(WorkerCleanupResolvedNotification {
-                    notification: ServerRequestResolvedNotification {
-                        thread_id: thread_id.clone(),
-                        request_id: route.gateway_request_id.clone(),
-                    },
-                    method: route.method.clone(),
-                });
-            cleanup.resolved_thread_scoped_requests += 1;
-            cleanup
-                .resolved_thread_scoped_request_ids
-                .push(route.gateway_request_id.clone());
-            cleanup
-                .resolved_thread_scoped_downstream_request_ids
-                .push(key.request_id.clone());
-            cleanup
-                .resolved_thread_scoped_methods
-                .push(route.method.clone());
-            cleanup.resolved_thread_scoped_thread_ids.push(thread_id);
-        } else {
-            cleanup.stranded_connection_scoped_requests += 1;
-            cleanup
-                .stranded_connection_scoped_request_ids
-                .push(route.gateway_request_id.clone());
-            cleanup
-                .stranded_connection_scoped_downstream_request_ids
-                .push(key.request_id.clone());
-            cleanup
-                .stranded_connection_scoped_methods
-                .push(route.method.clone());
-        }
-        false
-    });
-
-    cleanup
-}
-
-fn log_worker_server_request_cleanup(
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    remaining_worker_count: usize,
-    disconnect_message: Option<&str>,
-    cleanup: &WorkerServerRequestCleanup,
-    message: &str,
-) {
-    let mut resolved_thread_scoped_request_ids = cleanup.resolved_thread_scoped_request_ids.clone();
-    resolved_thread_scoped_request_ids.sort();
-    let mut resolved_thread_scoped_downstream_request_ids = cleanup
-        .resolved_thread_scoped_downstream_request_ids
-        .clone();
-    resolved_thread_scoped_downstream_request_ids.sort();
-    let mut resolved_thread_scoped_methods = cleanup.resolved_thread_scoped_methods.clone();
-    resolved_thread_scoped_methods.sort();
-    resolved_thread_scoped_methods.dedup();
-    let mut resolved_thread_scoped_thread_ids = cleanup.resolved_thread_scoped_thread_ids.clone();
-    resolved_thread_scoped_thread_ids.sort();
-    resolved_thread_scoped_thread_ids.dedup();
-    let mut stranded_connection_scoped_request_ids =
-        cleanup.stranded_connection_scoped_request_ids.clone();
-    stranded_connection_scoped_request_ids.sort();
-    let mut stranded_connection_scoped_downstream_request_ids = cleanup
-        .stranded_connection_scoped_downstream_request_ids
-        .clone();
-    stranded_connection_scoped_downstream_request_ids.sort();
-    let mut stranded_connection_scoped_methods = cleanup.stranded_connection_scoped_methods.clone();
-    stranded_connection_scoped_methods.sort();
-    stranded_connection_scoped_methods.dedup();
-
-    warn!(
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        remaining_worker_count,
-        resolved_thread_scoped_server_request_count = cleanup.resolved_thread_scoped_requests,
-        resolved_thread_scoped_server_request_ids = ?resolved_thread_scoped_request_ids,
-        resolved_thread_scoped_downstream_server_request_ids = ?resolved_thread_scoped_downstream_request_ids,
-        resolved_thread_scoped_server_request_methods = ?resolved_thread_scoped_methods,
-        resolved_thread_scoped_thread_ids = ?resolved_thread_scoped_thread_ids,
-        stranded_connection_scoped_server_request_count = cleanup
-            .stranded_connection_scoped_requests,
-        stranded_connection_scoped_server_request_ids = ?stranded_connection_scoped_request_ids,
-        stranded_connection_scoped_downstream_server_request_ids = ?stranded_connection_scoped_downstream_request_ids,
-        stranded_connection_scoped_server_request_methods = ?stranded_connection_scoped_methods,
-        disconnect_message,
-        "{message}"
-    );
-}
-
-fn publish_worker_server_request_cleanup_event(
-    observability: &GatewayObservability,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    remaining_worker_count: usize,
-    disconnect_message: Option<&str>,
-    cleanup: &WorkerServerRequestCleanup,
-) {
-    let mut resolved_thread_scoped_request_ids = cleanup.resolved_thread_scoped_request_ids.clone();
-    resolved_thread_scoped_request_ids.sort();
-    let mut resolved_thread_scoped_downstream_request_ids = cleanup
-        .resolved_thread_scoped_downstream_request_ids
-        .clone();
-    resolved_thread_scoped_downstream_request_ids.sort();
-    let mut resolved_thread_scoped_methods = cleanup.resolved_thread_scoped_methods.clone();
-    resolved_thread_scoped_methods.sort();
-    resolved_thread_scoped_methods.dedup();
-    let mut resolved_thread_scoped_thread_ids = cleanup.resolved_thread_scoped_thread_ids.clone();
-    resolved_thread_scoped_thread_ids.sort();
-    resolved_thread_scoped_thread_ids.dedup();
-    let mut stranded_connection_scoped_request_ids =
-        cleanup.stranded_connection_scoped_request_ids.clone();
-    stranded_connection_scoped_request_ids.sort();
-    let mut stranded_connection_scoped_downstream_request_ids = cleanup
-        .stranded_connection_scoped_downstream_request_ids
-        .clone();
-    stranded_connection_scoped_downstream_request_ids.sort();
-    let mut stranded_connection_scoped_methods = cleanup.stranded_connection_scoped_methods.clone();
-    stranded_connection_scoped_methods.sort();
-    stranded_connection_scoped_methods.dedup();
-
-    observability.publish_operator_event(GatewayEvent {
-        method: "gateway/v2ServerRequestCleanup".to_string(),
-        thread_id: None,
-        data: serde_json::json!({
-            "workerId": worker_id,
-            "workerWebsocketUrl": worker_websocket_url,
-            "remainingWorkerCount": remaining_worker_count,
-            "disconnectMessage": disconnect_message,
-            "resolvedThreadScopedServerRequestCount": cleanup.resolved_thread_scoped_requests,
-            "resolvedThreadScopedServerRequestIds": resolved_thread_scoped_request_ids,
-            "resolvedThreadScopedDownstreamServerRequestIds": resolved_thread_scoped_downstream_request_ids,
-            "resolvedThreadScopedServerRequestMethods": resolved_thread_scoped_methods,
-            "resolvedThreadScopedThreadIds": resolved_thread_scoped_thread_ids,
-            "strandedConnectionScopedServerRequestCount": cleanup
-                .stranded_connection_scoped_requests,
-            "strandedConnectionScopedServerRequestIds": stranded_connection_scoped_request_ids,
-            "strandedConnectionScopedDownstreamServerRequestIds": stranded_connection_scoped_downstream_request_ids,
-            "strandedConnectionScopedServerRequestMethods": stranded_connection_scoped_methods,
-        }),
-    });
 }
 
 fn log_unexpected_client_server_request_response(
@@ -3549,60 +3323,6 @@ fn observe_aborted_pending_client_requests(
     }
 }
 
-fn log_duplicate_downstream_server_request(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    request_id: &RequestId,
-    method: &str,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-) {
-    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        request_id = ?request_id,
-        method,
-        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        pending_thread_ids = ?pending_log_fields.thread_ids,
-        pending_worker_ids = ?pending_log_fields.worker_ids,
-        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
-        "closing gateway v2 connection because a downstream session reused a pending server-request id"
-    );
-}
-
-fn log_dropped_duplicate_resolved_server_request(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    downstream_request_id: &RequestId,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) {
-    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        downstream_request_id = ?downstream_request_id,
-        remaining_resolved_route_count = resolved_log_fields.gateway_request_ids.len(),
-        remaining_resolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        remaining_resolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        remaining_resolved_server_request_methods = ?resolved_log_fields.methods,
-        remaining_resolved_thread_ids = ?resolved_log_fields.thread_ids,
-        remaining_resolved_worker_ids = ?resolved_log_fields.worker_ids,
-        remaining_resolved_worker_websocket_urls = ?resolved_log_fields.worker_websocket_urls,
-        "dropping duplicate downstream serverRequest/resolved replay after request-id translation"
-    );
-}
-
 fn log_suppressed_skills_changed_notification(
     request_context: &GatewayRequestContext,
     worker_id: Option<usize>,
@@ -3956,251 +3676,6 @@ async fn reject_pending_server_requests(
         return Err(err);
     }
     Ok(())
-}
-
-fn record_client_server_request_cleanup_metrics(
-    observability: &GatewayObservability,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) {
-    let mut rejected_thread_scoped_requests = BTreeMap::new();
-    let mut rejected_connection_scoped_requests = BTreeMap::new();
-    for route in pending_server_requests.values() {
-        let counts = if route.thread_id.is_some() {
-            &mut rejected_thread_scoped_requests
-        } else {
-            &mut rejected_connection_scoped_requests
-        };
-        *counts.entry(route.method.clone()).or_insert(0) += 1;
-    }
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "client_cleanup_rejected_thread_scoped",
-        &rejected_thread_scoped_requests,
-    );
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "client_cleanup_rejected_connection_scoped",
-        &rejected_connection_scoped_requests,
-    );
-    let mut answered_but_unresolved_requests = BTreeMap::new();
-    for route in resolved_server_requests.values() {
-        *answered_but_unresolved_requests
-            .entry(route.method.clone())
-            .or_insert(0) += 1;
-    }
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "client_cleanup_answered_but_unresolved",
-        &answered_but_unresolved_requests,
-    );
-}
-
-fn record_v2_server_request_lifecycle_method_counts(
-    observability: &GatewayObservability,
-    event: &str,
-    method_counts: &BTreeMap<String, i64>,
-) {
-    for (method, count) in method_counts {
-        observability.record_v2_server_request_lifecycle_events(event, method, *count);
-    }
-}
-
-fn server_request_method_counts(methods: &[String]) -> BTreeMap<String, i64> {
-    let mut method_counts = BTreeMap::new();
-    for method in methods {
-        *method_counts.entry(method.clone()).or_insert(0) += 1;
-    }
-    method_counts
-}
-
-fn log_rejected_pending_server_requests(
-    request_context: &GatewayRequestContext,
-    connection_outcome: &str,
-    connection_detail: Option<&str>,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-    pending_worker_websocket_urls: &[String],
-) {
-    if pending_server_requests.is_empty() && resolved_server_requests.is_empty() {
-        return;
-    }
-
-    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
-    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
-    let server_request_backlog_count = pending_log_fields
-        .gateway_request_ids
-        .len()
-        .saturating_add(resolved_log_fields.gateway_request_ids.len());
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        connection_outcome,
-        connection_detail,
-        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
-        thread_scoped_pending_server_request_count = pending_log_fields.thread_scoped_request_ids.len(),
-        connection_scoped_pending_server_request_count = pending_log_fields.connection_scoped_request_ids.len(),
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        thread_scoped_pending_server_request_ids = ?pending_log_fields.thread_scoped_request_ids,
-        connection_scoped_pending_server_request_ids = ?pending_log_fields.connection_scoped_request_ids,
-        thread_ids = ?pending_log_fields.thread_ids,
-        worker_ids = ?pending_log_fields.worker_ids,
-        worker_websocket_urls = ?pending_worker_websocket_urls,
-        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
-        server_request_backlog_count,
-        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
-        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
-        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
-        answered_but_unresolved_worker_websocket_urls =
-            ?resolved_log_fields.worker_websocket_urls,
-        "rejecting unresolved downstream server requests because the gateway v2 connection ended"
-    );
-}
-
-#[derive(Debug, Default)]
-struct PendingServerRequestLogFields {
-    gateway_request_ids: Vec<RequestId>,
-    downstream_request_ids: Vec<RequestId>,
-    methods: Vec<String>,
-    thread_scoped_request_ids: Vec<RequestId>,
-    connection_scoped_request_ids: Vec<RequestId>,
-    thread_ids: Vec<String>,
-    worker_ids: Vec<usize>,
-    worker_websocket_urls: Vec<String>,
-}
-
-fn pending_server_request_log_fields(
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-) -> PendingServerRequestLogFields {
-    let mut gateway_request_ids = pending_server_requests.keys().cloned().collect::<Vec<_>>();
-    gateway_request_ids.sort();
-
-    let mut downstream_request_ids = pending_server_requests
-        .values()
-        .map(|route| route.downstream_request_id.clone())
-        .collect::<Vec<_>>();
-    downstream_request_ids.sort();
-
-    let mut methods = pending_server_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect::<Vec<_>>();
-    methods.sort();
-    methods.dedup();
-
-    let mut thread_scoped_request_ids = pending_server_requests
-        .iter()
-        .filter(|(_, route)| route.thread_id.is_some())
-        .map(|(request_id, _)| request_id.clone())
-        .collect::<Vec<_>>();
-    thread_scoped_request_ids.sort();
-
-    let mut connection_scoped_request_ids = pending_server_requests
-        .iter()
-        .filter(|(_, route)| route.thread_id.is_none())
-        .map(|(request_id, _)| request_id.clone())
-        .collect::<Vec<_>>();
-    connection_scoped_request_ids.sort();
-
-    let mut thread_ids = pending_server_requests
-        .values()
-        .filter_map(|route| route.thread_id.clone())
-        .collect::<Vec<_>>();
-    thread_ids.sort();
-    thread_ids.dedup();
-
-    let mut worker_ids = pending_server_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect::<Vec<_>>();
-    worker_ids.sort();
-    worker_ids.dedup();
-
-    let mut worker_websocket_urls = pending_server_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect::<Vec<_>>();
-    worker_websocket_urls.sort();
-    worker_websocket_urls.dedup();
-
-    PendingServerRequestLogFields {
-        gateway_request_ids,
-        downstream_request_ids,
-        methods,
-        thread_scoped_request_ids,
-        connection_scoped_request_ids,
-        thread_ids,
-        worker_ids,
-        worker_websocket_urls,
-    }
-}
-
-#[derive(Debug, Default)]
-struct ResolvedServerRequestLogFields {
-    gateway_request_ids: Vec<RequestId>,
-    downstream_request_ids: Vec<RequestId>,
-    methods: Vec<String>,
-    thread_ids: Vec<String>,
-    worker_ids: Vec<usize>,
-    worker_websocket_urls: Vec<String>,
-}
-
-fn resolved_server_request_log_fields(
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) -> ResolvedServerRequestLogFields {
-    let mut gateway_request_ids = resolved_server_requests
-        .values()
-        .map(|route| route.gateway_request_id.clone())
-        .collect::<Vec<_>>();
-    gateway_request_ids.sort();
-
-    let mut downstream_request_ids = resolved_server_requests
-        .keys()
-        .map(|key| key.request_id.clone())
-        .collect::<Vec<_>>();
-    downstream_request_ids.sort();
-
-    let mut methods = resolved_server_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect::<Vec<_>>();
-    methods.sort();
-    methods.dedup();
-
-    let mut worker_ids = resolved_server_requests
-        .keys()
-        .filter_map(|key| key.worker_id)
-        .collect::<Vec<_>>();
-    worker_ids.sort();
-    worker_ids.dedup();
-
-    let mut thread_ids = resolved_server_requests
-        .values()
-        .filter_map(|route| route.thread_id.clone())
-        .collect::<Vec<_>>();
-    thread_ids.sort();
-    thread_ids.dedup();
-
-    let mut worker_websocket_urls = resolved_server_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect::<Vec<_>>();
-    worker_websocket_urls.sort();
-    worker_websocket_urls.dedup();
-
-    ResolvedServerRequestLogFields {
-        gateway_request_ids,
-        downstream_request_ids,
-        methods,
-        thread_ids,
-        worker_ids,
-        worker_websocket_urls,
-    }
 }
 
 async fn handle_client_request(
@@ -6238,91 +5713,6 @@ async fn aggregate_account_rate_limits_response(
     serde_json::to_value(response).map_err(io::Error::other)
 }
 
-fn sync_worker_account_capacity_from_notification(
-    downstream: &GatewayV2DownstreamRouter,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    worker_id: Option<usize>,
-    notification: &ServerNotification,
-) {
-    let ServerNotification::AccountRateLimitsUpdated(notification) = notification else {
-        return;
-    };
-
-    sync_worker_account_capacity_from_rate_limits(
-        downstream,
-        context,
-        observability,
-        worker_id,
-        [&notification.rate_limits],
-    );
-}
-
-fn sync_worker_account_capacity_from_rate_limits_response(
-    downstream: &GatewayV2DownstreamRouter,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    worker_id: Option<usize>,
-    response: &GetAccountRateLimitsResponse,
-) {
-    let mut snapshots = vec![&response.rate_limits];
-    if let Some(rate_limits_by_limit_id) = &response.rate_limits_by_limit_id {
-        snapshots.extend(rate_limits_by_limit_id.values());
-    }
-    sync_worker_account_capacity_from_rate_limits(
-        downstream,
-        context,
-        observability,
-        worker_id,
-        snapshots,
-    );
-}
-
-fn sync_worker_account_capacity_from_rate_limits<'a>(
-    downstream: &GatewayV2DownstreamRouter,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    worker_id: Option<usize>,
-    snapshots: impl IntoIterator<Item = &'a RateLimitSnapshot>,
-) {
-    let Some(worker_id) = worker_id else {
-        return;
-    };
-
-    if let Some(reason) = account_capacity_exhaustion_reason(snapshots) {
-        if downstream.mark_worker_account_exhausted(worker_id, reason.clone()) {
-            observability.record_v2_account_capacity_event(
-                worker_id,
-                "exhausted",
-                Some(context),
-                Some(reason.as_str()),
-            );
-        }
-    } else if downstream.mark_worker_account_available(worker_id) {
-        observability.record_v2_account_capacity_event(
-            worker_id,
-            "available",
-            Some(context),
-            Some("account/rateLimits reported available capacity"),
-        );
-    }
-}
-
-fn account_capacity_exhaustion_reason<'a>(
-    snapshots: impl IntoIterator<Item = &'a RateLimitSnapshot>,
-) -> Option<String> {
-    snapshots.into_iter().find_map(|snapshot| {
-        snapshot.rate_limit_reached_type.map(|reached_type| {
-            let limit_name = snapshot
-                .limit_name
-                .as_deref()
-                .or(snapshot.limit_id.as_deref())
-                .unwrap_or("account");
-            format!("account/rateLimits reported {limit_name} {reached_type:?}")
-        })
-    })
-}
-
 async fn aggregate_model_list_response_if_supported(
     downstream: &GatewayV2DownstreamRouter,
     request: &JSONRPCRequest,
@@ -6554,7 +5944,6 @@ async fn aggregate_experimental_feature_list_response(
                 cursor: None,
                 limit: None,
                 thread_id: params.thread_id.clone(),
-                ..Default::default()
             })
             .map_err(io::Error::other)?,
         ),
@@ -6657,205 +6046,6 @@ fn merge_plugin_summary(plugins: &mut Vec<PluginSummary>, incoming: PluginSummar
     }
 }
 
-const DEFAULT_AGGREGATED_THREAD_LIST_LIMIT: usize = 20;
-const AGGREGATED_THREAD_CURSOR_PREFIX: &str = "offset:";
-const AGGREGATED_LOADED_THREAD_CURSOR_PREFIX: &str = "loaded-thread-offset:";
-const AGGREGATED_APPS_CURSOR_PREFIX: &str = "apps-offset:";
-const AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX: &str = "mcp-status-offset:";
-const AGGREGATED_MODEL_CURSOR_PREFIX: &str = "model-offset:";
-const AGGREGATED_EXPERIMENTAL_FEATURE_CURSOR_PREFIX: &str = "experimental-feature-offset:";
-
-/// Request params that can be replayed across worker-local paginated responses
-/// while the gateway owns the northbound pagination cursor.
-trait CursorPaginatedParams: Serialize + DeserializeOwned {
-    fn with_cursor_and_limit(self, cursor: Option<String>, limit: Option<u32>) -> Self;
-}
-
-impl CursorPaginatedParams for ThreadListParams {
-    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
-        self.cursor = cursor;
-        self.limit = limit;
-        self
-    }
-}
-
-impl CursorPaginatedParams for codex_app_server_protocol::ThreadLoadedListParams {
-    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
-        self.cursor = cursor;
-        self.limit = limit;
-        self
-    }
-}
-
-impl CursorPaginatedParams for AppsListParams {
-    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
-        self.cursor = cursor;
-        self.limit = limit;
-        self
-    }
-}
-
-impl CursorPaginatedParams for ListMcpServerStatusParams {
-    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
-        self.cursor = cursor;
-        self.limit = limit;
-        self
-    }
-}
-
-impl CursorPaginatedParams for ModelListParams {
-    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
-        self.cursor = cursor;
-        self.limit = limit;
-        self
-    }
-}
-
-impl CursorPaginatedParams for ExperimentalFeatureListParams {
-    fn with_cursor_and_limit(mut self, cursor: Option<String>, limit: Option<u32>) -> Self {
-        self.cursor = cursor;
-        self.limit = limit;
-        self
-    }
-}
-
-async fn collect_worker_paginated_data<P, R, T>(
-    worker: &DownstreamWorkerHandle,
-    request: &JSONRPCRequest,
-    mut extract_page: impl FnMut(R) -> (Vec<T>, Option<String>),
-) -> io::Result<Vec<T>>
-where
-    P: CursorPaginatedParams,
-    R: DeserializeOwned,
-{
-    let mut cursor = None;
-    let mut items = Vec::new();
-    let mut seen_cursors = HashSet::new();
-
-    loop {
-        let response: R = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(
-                paginated_request_with_overrides::<P>(request, cursor.take(), None)?,
-            )?)
-            .await
-            .map_err(io::Error::other)?;
-        let (page_items, next_cursor) = extract_page(response);
-        items.extend(page_items);
-        let Some(next_cursor) = next_cursor else {
-            break;
-        };
-        if !seen_cursors.insert(next_cursor.clone()) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "downstream {} returned repeated pagination cursor: {next_cursor}",
-                    request.method
-                ),
-            ));
-        }
-        cursor = Some(next_cursor);
-    }
-
-    Ok(items)
-}
-
-fn paginated_request_with_overrides<P: CursorPaginatedParams>(
-    request: &JSONRPCRequest,
-    cursor: Option<String>,
-    limit: Option<u32>,
-) -> io::Result<JSONRPCRequest> {
-    let params = request_params::<P>(request)?;
-    Ok(JSONRPCRequest {
-        id: request.id.clone(),
-        method: request.method.clone(),
-        params: Some(
-            serde_json::to_value(params.with_cursor_and_limit(cursor, limit))
-                .map_err(io::Error::other)?,
-        ),
-        trace: request.trace.clone(),
-    })
-}
-
-fn decode_aggregated_offset_cursor(
-    cursor: Option<&str>,
-    prefix: &str,
-    cursor_type: &str,
-) -> io::Result<usize> {
-    let Some(cursor) = cursor else {
-        return Ok(0);
-    };
-    let Some(offset) = cursor.strip_prefix(prefix) else {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("invalid aggregated {cursor_type} cursor: {cursor}"),
-        ));
-    };
-    offset.parse::<usize>().map_err(|_| {
-        io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("invalid aggregated {cursor_type} cursor: {cursor}"),
-        )
-    })
-}
-
-fn encode_aggregated_offset_cursor(prefix: &str, offset: usize) -> String {
-    format!("{prefix}{offset}")
-}
-
-fn aggregated_page_bounds(
-    total_len: usize,
-    offset: usize,
-    limit: usize,
-    cursor_prefix: &str,
-) -> (usize, usize, Option<String>) {
-    let start = offset.min(total_len);
-    let end = start.saturating_add(limit).min(total_len);
-    let next_cursor =
-        (end < total_len).then(|| encode_aggregated_offset_cursor(cursor_prefix, end));
-    (start, end, next_cursor)
-}
-
-fn sort_threads_for_aggregation(
-    threads: &mut [codex_app_server_protocol::Thread],
-    sort_key: Option<codex_app_server_protocol::ThreadSortKey>,
-    sort_direction: Option<codex_app_server_protocol::SortDirection>,
-) {
-    match sort_key.unwrap_or(codex_app_server_protocol::ThreadSortKey::CreatedAt) {
-        codex_app_server_protocol::ThreadSortKey::CreatedAt => {
-            if sort_direction.unwrap_or(codex_app_server_protocol::SortDirection::Desc)
-                == codex_app_server_protocol::SortDirection::Asc
-            {
-                threads.sort_by_key(|thread| (thread.created_at, thread.id.clone()));
-            } else {
-                threads.sort_by_key(|thread| Reverse((thread.created_at, thread.id.clone())));
-            }
-        }
-        codex_app_server_protocol::ThreadSortKey::UpdatedAt => {
-            if sort_direction.unwrap_or(codex_app_server_protocol::SortDirection::Desc)
-                == codex_app_server_protocol::SortDirection::Asc
-            {
-                threads.sort_by_key(|thread| (thread.updated_at, thread.id.clone()));
-            } else {
-                threads.sort_by_key(|thread| Reverse((thread.updated_at, thread.id.clone())));
-            }
-        }
-        codex_app_server_protocol::ThreadSortKey::RecencyAt => {
-            if sort_direction.unwrap_or(codex_app_server_protocol::SortDirection::Desc)
-                == codex_app_server_protocol::SortDirection::Asc
-            {
-                threads.sort_by_key(|thread| {
-                    (thread.recency_at.unwrap_or(thread.updated_at), thread.id.clone())
-                });
-            } else {
-                threads.sort_by_key(|thread| {
-                    Reverse((thread.recency_at.unwrap_or(thread.updated_at), thread.id.clone()))
-                });
-            }
-        }
-    }
-}
-
 fn should_reject_pending_server_requests_after_connection_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -6868,415 +6058,6 @@ fn should_reject_pending_server_requests_after_connection_error(err: &io::Error)
             | ErrorKind::WriteZero
             | ErrorKind::NotConnected
     )
-}
-
-fn enforce_request_scope(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    request: &JSONRPCRequest,
-) -> Result<(), GatewayError> {
-    match request.method.as_str() {
-        "thread/resume" | "thread/fork" | "getConversationSummary" => {
-            if let Some(thread_path) = request_thread_path(request)
-                && !scope_registry.thread_path_visible_to(context, thread_path)
-            {
-                return Err(GatewayError::NotFound(format!(
-                    "thread not found: {thread_path}"
-                )));
-            }
-        }
-        _ => {}
-    }
-
-    if let Some(thread_id) = request_thread_id(request)
-        && !scope_registry.thread_visible_to(context, thread_id)
-    {
-        return Err(GatewayError::NotFound(format!(
-            "thread not found: {thread_id}"
-        )));
-    }
-
-    Ok(())
-}
-
-fn apply_response_scope_policy(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    observability: Option<&GatewayObservability>,
-    method: &str,
-    worker_id: Option<usize>,
-    worker_account_id: Option<String>,
-    mut result: Value,
-) -> io::Result<Value> {
-    let worker_account_id = normalize_remote_account_id(worker_account_id);
-
-    match method {
-        "thread/start"
-        | "thread/resume"
-        | "thread/fork"
-        | "thread/archive"
-        | "thread/decrement_elicitation"
-        | "thread/increment_elicitation"
-        | "thread/inject_items"
-        | "thread/memoryMode/set"
-        | "thread/metadata/update"
-        | "thread/name/set"
-        | "thread/read"
-        | "thread/rollback"
-        | "thread/turns/list"
-        | "thread/unarchive" => {
-            if let Some(thread_id) = response_thread_id(&result) {
-                scope_registry.register_thread_with_worker(
-                    thread_id.to_string(),
-                    context.clone(),
-                    worker_id,
-                );
-            }
-            if method == "thread/start"
-                && let Some(worker_id) = worker_id
-            {
-                scope_registry.register_project_worker(context.clone(), worker_id);
-                if let Some(thread_id) = response_thread_id(&result)
-                    && let Some(project_id) = context.project_id.as_deref()
-                    && let Some(observability) = observability
-                {
-                    observability.record_project_worker_route_selected(
-                        worker_id,
-                        context.tenant_id.as_str(),
-                        project_id,
-                        thread_id,
-                        worker_account_id.as_deref(),
-                    );
-                    observability.publish_operator_event(
-                        GatewayEvent::project_worker_route_selected(
-                            GatewayProjectWorkerRouteSelected {
-                                tenant_id: context.tenant_id.as_str(),
-                                project_id,
-                                thread_id,
-                                worker_id,
-                                account_id: worker_account_id,
-                            },
-                        ),
-                    );
-                }
-            }
-            if let Some(thread_path) = response_thread_path(&result) {
-                scope_registry.register_thread_path_with_worker(
-                    thread_path,
-                    context.clone(),
-                    worker_id,
-                );
-            }
-        }
-        "getConversationSummary" => {
-            if let Some(summary) = result.get("summary") {
-                let thread_id = summary.get("conversationId").and_then(Value::as_str);
-                let thread_path = summary.get("path").and_then(Value::as_str);
-                if let Some(thread_id) = thread_id {
-                    scope_registry.register_thread_with_worker(
-                        thread_id.to_string(),
-                        context.clone(),
-                        worker_id,
-                    );
-                }
-                if let Some(thread_path) = thread_path {
-                    scope_registry.register_thread_path_with_worker(
-                        thread_path,
-                        context.clone(),
-                        worker_id,
-                    );
-                }
-            }
-        }
-        "review/start" => {
-            if let Some(review_thread_id) = result.get("reviewThreadId").and_then(Value::as_str) {
-                scope_registry.register_thread_with_worker(
-                    review_thread_id.to_string(),
-                    context.clone(),
-                    worker_id,
-                );
-            }
-        }
-        "thread/list" => {
-            let data = result
-                .get_mut("data")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        "thread/list response is missing data array",
-                    )
-                })?;
-            data.retain(|thread| {
-                thread
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|thread_id| {
-                        let visible = scope_registry.thread_visible_to(context, thread_id);
-                        if visible && let Some(worker_id) = worker_id {
-                            scope_registry.register_thread_worker_if_visible(
-                                thread_id,
-                                context,
-                                Some(worker_id),
-                            );
-                        }
-                        if visible
-                            && let Some(thread_path) = thread.get("path").and_then(Value::as_str)
-                            && let Some(worker_id) = worker_id
-                        {
-                            scope_registry.register_thread_path_with_worker(
-                                thread_path,
-                                context.clone(),
-                                Some(worker_id),
-                            );
-                        }
-                        visible
-                    })
-            });
-        }
-        "thread/loaded/list" => {
-            let data = result
-                .get_mut("data")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        "thread/loaded/list response is missing data array",
-                    )
-                })?;
-            data.retain(|thread_id| {
-                thread_id.as_str().is_some_and(|thread_id| {
-                    let visible = scope_registry.thread_visible_to(context, thread_id);
-                    if visible && let Some(worker_id) = worker_id {
-                        scope_registry.register_thread_worker_if_visible(
-                            thread_id,
-                            context,
-                            Some(worker_id),
-                        );
-                    }
-                    visible
-                })
-            });
-        }
-        _ => {}
-    }
-
-    Ok(result)
-}
-
-fn pending_server_request_limit_error(
-    pending_server_request_count: usize,
-    max_pending_server_requests: usize,
-) -> Option<JSONRPCErrorError> {
-    if pending_server_request_count < max_pending_server_requests {
-        None
-    } else {
-        Some(JSONRPCErrorError {
-            code: RATE_LIMITED_ERROR_CODE,
-            message: TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE.to_string(),
-            data: None,
-        })
-    }
-}
-
-fn pending_client_request_limit_error(
-    pending_client_request_count: usize,
-    max_pending_client_requests: usize,
-) -> Option<JSONRPCErrorError> {
-    if pending_client_request_count < max_pending_client_requests {
-        None
-    } else {
-        Some(JSONRPCErrorError {
-            code: RATE_LIMITED_ERROR_CODE,
-            message: TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE.to_string(),
-            data: None,
-        })
-    }
-}
-
-fn notification_visible_to(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    notification: &JSONRPCNotification,
-) -> bool {
-    notification
-        .params
-        .as_ref()
-        .and_then(notification_thread_id)
-        .is_none_or(|thread_id| scope_registry.thread_visible_to(context, thread_id))
-}
-
-fn should_deduplicate_connection_notification(notification: &JSONRPCNotification) -> bool {
-    matches!(
-        notification.method.as_str(),
-        "account/updated"
-            | "account/rateLimits/updated"
-            | "account/login/completed"
-            | "app/list/updated"
-            | "mcpServer/oauthLogin/completed"
-            | "warning"
-            | "configWarning"
-            | "deprecationNotice"
-            | "mcpServer/startupStatus/updated"
-            | "externalAgentConfig/import/completed"
-            | "windows/worldWritableWarning"
-            | "windowsSandbox/setupCompleted"
-    )
-}
-
-fn forwarded_connection_notification_duplicate<'a>(
-    forwarded_connection_notifications: &'a HashMap<
-        String,
-        VecDeque<ForwardedConnectionNotification>,
-    >,
-    worker_id: Option<usize>,
-    notification: &JSONRPCNotification,
-) -> Option<&'a ForwardedConnectionNotification> {
-    forwarded_connection_notifications
-        .get(&notification.method)
-        .and_then(|notifications_by_method| {
-            notifications_by_method.iter().find(|forwarded| {
-                forwarded.worker_id != worker_id && forwarded.params == notification.params
-            })
-        })
-}
-
-fn record_forwarded_connection_notification(
-    forwarded_connection_notifications: &mut HashMap<
-        String,
-        VecDeque<ForwardedConnectionNotification>,
-    >,
-    worker_id: Option<usize>,
-    notification: &JSONRPCNotification,
-) {
-    let notifications_by_method = forwarded_connection_notifications
-        .entry(notification.method.clone())
-        .or_default();
-    if let Some(existing_index) = notifications_by_method.iter().position(|forwarded| {
-        forwarded.worker_id == worker_id && forwarded.params == notification.params
-    }) {
-        notifications_by_method.remove(existing_index);
-    }
-    if notifications_by_method.len() >= MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD {
-        notifications_by_method.pop_front();
-    }
-    notifications_by_method.push_back(ForwardedConnectionNotification {
-        worker_id,
-        params: notification.params.clone(),
-    });
-}
-
-fn request_visible_to(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    request: &JSONRPCRequest,
-) -> bool {
-    if let Some(thread_path) = request_thread_path(request) {
-        return scope_registry.thread_path_visible_to(context, thread_path);
-    }
-    request_thread_id(request)
-        .is_none_or(|thread_id| scope_registry.thread_visible_to(context, thread_id))
-}
-
-fn request_thread_id(request: &JSONRPCRequest) -> Option<&str> {
-    if request.method == "thread/resume" && has_non_null_param(request.params.as_ref(), "history") {
-        return None;
-    }
-    if matches!(request.method.as_str(), "thread/resume" | "thread/fork")
-        && has_non_null_param(request.params.as_ref(), "path")
-    {
-        return None;
-    }
-    request.params.as_ref().and_then(param_thread_id)
-}
-
-fn request_thread_path(request: &JSONRPCRequest) -> Option<&str> {
-    match request.method.as_str() {
-        "thread/resume" | "thread/fork" => request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("path"))
-            .and_then(Value::as_str),
-        "getConversationSummary" => request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("rolloutPath"))
-            .and_then(Value::as_str),
-        _ => None,
-    }
-}
-
-fn response_thread_path(result: &Value) -> Option<&str> {
-    result
-        .get("thread")
-        .and_then(|thread| thread.get("path"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("summary")
-                .and_then(|summary| summary.get("path"))
-                .and_then(Value::as_str)
-        })
-}
-
-fn format_lagged_close_reason(skipped: usize) -> String {
-    format!("{DOWNSTREAM_BACKPRESSURE_CLOSE_REASON}: skipped {skipped} events")
-}
-
-fn websocket_close_reason(reason: &str) -> &str {
-    if reason.len() <= MAX_CLOSE_REASON_BYTES {
-        return reason;
-    }
-
-    let mut end = MAX_CLOSE_REASON_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    &reason[..end]
-}
-
-fn param_thread_id(params: &Value) -> Option<&str> {
-    params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("conversationId").and_then(Value::as_str))
-}
-
-fn has_non_null_param(params: Option<&Value>, name: &str) -> bool {
-    params
-        .and_then(|params| params.get(name))
-        .is_some_and(|value| !value.is_null())
-}
-
-fn response_thread_id(result: &Value) -> Option<&str> {
-    result
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("summary")
-                .and_then(|summary| summary.get("conversationId"))
-                .and_then(Value::as_str)
-        })
-}
-
-fn notification_thread_id(params: &Value) -> Option<&str> {
-    params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            params
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            params
-                .get("turn")
-                .and_then(|turn| turn.get("threadId"))
-                .and_then(Value::as_str)
-        })
 }
 
 fn server_notification_to_jsonrpc(
@@ -7322,33 +6103,6 @@ fn server_notification_to_jsonrpc(
     Ok(Some(notification))
 }
 
-async fn send_websocket_message(
-    socket: &mut WebSocket,
-    message: WebSocketMessage,
-    client_send_timeout: Duration,
-) -> io::Result<()> {
-    await_io_with_timeout(
-        async { socket.send(message).await.map_err(io::Error::other) },
-        client_send_timeout,
-        "gateway websocket send timed out",
-    )
-    .await
-}
-
-async fn send_jsonrpc(
-    socket: &mut WebSocket,
-    message: JSONRPCMessage,
-    client_send_timeout: Duration,
-) -> io::Result<()> {
-    let payload = serde_json::to_string(&message).map_err(io::Error::other)?;
-    send_websocket_message(
-        socket,
-        WebSocketMessage::Text(payload.into()),
-        client_send_timeout,
-    )
-    .await
-}
-
 async fn send_client_jsonrpc(
     socket: &mut WebSocket,
     connection: &GatewayV2ConnectionContext<'_>,
@@ -7369,20 +6123,6 @@ async fn send_client_jsonrpc(
                 err,
             );
         })
-}
-
-async fn send_jsonrpc_error(
-    socket: &mut WebSocket,
-    id: RequestId,
-    error: JSONRPCErrorError,
-    client_send_timeout: Duration,
-) -> io::Result<()> {
-    send_jsonrpc(
-        socket,
-        JSONRPCMessage::Error(JSONRPCError { id, error }),
-        client_send_timeout,
-    )
-    .await
 }
 
 async fn send_client_jsonrpc_error(
@@ -7420,23 +6160,6 @@ async fn send_observed_close_frame(
             observability.record_v2_close_frame_send_failure(code, outcome);
             log_close_frame_send_failure(request_context, code, reason, outcome, err);
         })
-}
-
-async fn send_close_frame(
-    socket: &mut WebSocket,
-    code: u16,
-    reason: &str,
-    client_send_timeout: Duration,
-) -> io::Result<()> {
-    send_websocket_message(
-        socket,
-        WebSocketMessage::Close(Some(CloseFrame {
-            code,
-            reason: websocket_close_reason(reason).to_string().into(),
-        })),
-        client_send_timeout,
-    )
-    .await
 }
 
 async fn send_observed_invalid_payload_close(
@@ -7549,8 +6272,6 @@ mod tests {
     use codex_app_server_protocol::PlanDeltaNotification;
     use codex_app_server_protocol::PluginListResponse;
     use codex_app_server_protocol::PluginSummary;
-    use codex_app_server_protocol::RateLimitReachedType;
-    use codex_app_server_protocol::RateLimitSnapshot;
     use codex_app_server_protocol::RawResponseItemCompletedNotification;
     use codex_app_server_protocol::ReasoningSummaryPartAddedNotification;
     use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
@@ -9922,18 +8643,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_server_request_limit_error_allows_counts_below_limit() {
-        assert_eq!(super::pending_server_request_limit_error(0, 1), None);
-        assert_eq!(super::pending_server_request_limit_error(3, 4), None);
-    }
-
-    #[test]
-    fn pending_client_request_limit_error_allows_counts_below_limit() {
-        assert_eq!(super::pending_client_request_limit_error(0, 1), None);
-        assert_eq!(super::pending_client_request_limit_error(3, 4), None);
-    }
-
-    #[test]
     fn pending_client_response_settlement_removes_active_request_before_delivery() {
         let (tx, _rx) = mpsc::channel(1);
         let request_id = RequestId::String("command-exec-1".to_string());
@@ -10514,23 +9223,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_server_request_limit_error_rejects_counts_at_or_above_limit() {
-        let error = super::pending_server_request_limit_error(1, 1).expect("error");
-        assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
-        assert_eq!(
-            error.message,
-            super::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE
-        );
-
-        let error = super::pending_server_request_limit_error(2, 1).expect("error");
-        assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
-        assert_eq!(
-            error.message,
-            super::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE
-        );
-    }
-
-    #[test]
     fn server_request_backlog_worker_counts_groups_pending_and_answered_routes() {
         let pending_server_requests = HashMap::from([
             (
@@ -10733,23 +9425,6 @@ mod tests {
                     server_request_backlog_count: 2,
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn pending_client_request_limit_error_rejects_counts_at_or_above_limit() {
-        let error = super::pending_client_request_limit_error(1, 1).expect("error");
-        assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
-        assert_eq!(
-            error.message,
-            super::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE
-        );
-
-        let error = super::pending_client_request_limit_error(2, 1).expect("error");
-        assert_eq!(error.code, super::RATE_LIMITED_ERROR_CODE);
-        assert_eq!(
-            error.message,
-            super::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE
         );
     }
 
@@ -15999,6 +14674,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: None,
                                 event: Some(AppServerEvent::Lagged { skipped: 3 }),
@@ -16116,6 +14792,7 @@ mod tests {
                                 &session_factory,
                                 &connection,
                                 &mut event_state,
+                                &HashMap::new(),
                                 DownstreamWorkerEvent {
                                     worker_id: None,
                                     event: Some(AppServerEvent::ServerNotification(
@@ -16490,6 +15167,7 @@ mod tests {
                                 &session_factory,
                                 &connection,
                                 &mut event_state,
+                                &HashMap::new(),
                                 DownstreamWorkerEvent {
                                     worker_id: None,
                                     event: Some(AppServerEvent::ServerRequest(request)),
@@ -16692,6 +15370,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(2),
                                 event: Some(AppServerEvent::Lagged { skipped: 3 }),
@@ -24367,14 +23046,14 @@ mod tests {
                 "rateLimitsByLimitId": null,
             }))
             .expect("exhausted rate limits response should parse");
-        super::sync_worker_account_capacity_from_rate_limits_response(
+        crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_rate_limits_response(
             &router,
             &context,
             &observability,
             Some(0),
             &available_response,
         );
-        super::sync_worker_account_capacity_from_rate_limits_response(
+        crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_rate_limits_response(
             &router,
             &context,
             &observability,
@@ -24397,37 +23076,6 @@ mod tests {
                 (0, [("available".to_string(), 1)].into()),
                 (1, [("exhausted".to_string(), 1)].into()),
             ]
-        );
-    }
-
-    #[test]
-    fn account_capacity_exhaustion_reason_uses_first_reached_limit() {
-        let snapshots = [
-            RateLimitSnapshot {
-                limit_id: Some("codex".to_string()),
-                limit_name: None,
-                primary: None,
-                secondary: None,
-                credits: None,
-                plan_type: None,
-                rate_limit_reached_type: None,
-                individual_limit: None,
-            },
-            RateLimitSnapshot {
-                limit_id: Some("credits".to_string()),
-                limit_name: Some("Credits".to_string()),
-                primary: None,
-                secondary: None,
-                credits: None,
-                plan_type: None,
-                rate_limit_reached_type: Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted),
-                individual_limit: None,
-            },
-        ];
-
-        assert_eq!(
-            super::account_capacity_exhaustion_reason(snapshots.iter()).as_deref(),
-            Some("account/rateLimits reported Credits WorkspaceOwnerCreditsDepleted")
         );
     }
 
@@ -43762,7 +42410,11 @@ mod tests {
 
         let logs = capture_logs_async(async move {
             router
-                .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default(), true)
+                .reconnect_missing_workers_at(
+                    Instant::now(),
+                    &GatewayObservability::default(),
+                    true,
+                )
                 .await;
             timeout(Duration::from_secs(2), router.shutdown())
                 .await
@@ -43866,7 +42518,11 @@ mod tests {
 
         let logs = capture_logs_async(async move {
             router
-                .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default(), true)
+                .reconnect_missing_workers_at(
+                    Instant::now(),
+                    &GatewayObservability::default(),
+                    true,
+                )
                 .await;
             timeout(Duration::from_secs(2), router.shutdown())
                 .await
@@ -43960,7 +42616,11 @@ mod tests {
 
         let logs = capture_logs_async(async move {
             router
-                .reconnect_missing_workers_at(Instant::now(), &GatewayObservability::default(), true)
+                .reconnect_missing_workers_at(
+                    Instant::now(),
+                    &GatewayObservability::default(),
+                    true,
+                )
                 .await;
             timeout(Duration::from_secs(2), router.shutdown())
                 .await
@@ -46686,6 +45346,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: Some(AppServerEvent::ServerRequest(
@@ -46829,6 +45490,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: Some(AppServerEvent::ServerRequest(
@@ -47005,6 +45667,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: Some(AppServerEvent::Disconnected {
@@ -47142,6 +45805,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: Some(AppServerEvent::Disconnected {
@@ -47304,6 +45968,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: None,
                                 event: Some(AppServerEvent::Disconnected {
@@ -47423,6 +46088,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: None,
                                 event: None,
@@ -47543,6 +46209,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: None,
                                 event: None,
@@ -47699,6 +46366,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: None,
                                 event: Some(AppServerEvent::Disconnected {
@@ -47827,6 +46495,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: None,
                                 event: None,
@@ -47971,6 +46640,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: Some(AppServerEvent::Disconnected {
@@ -48108,6 +46778,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: Some(AppServerEvent::Disconnected {
@@ -48241,6 +46912,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: None,
@@ -48380,6 +47052,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: None,
@@ -48555,6 +47228,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: None,
@@ -48705,6 +47379,7 @@ mod tests {
                             &session_factory,
                             &connection,
                             &mut event_state,
+                            &HashMap::new(),
                             DownstreamWorkerEvent {
                                 worker_id: Some(0),
                                 event: None,
@@ -50965,789 +49640,6 @@ mod tests {
 
         server_task.abort();
         let _ = server_task.await;
-    }
-
-    #[test]
-    fn enforce_request_scope_allows_thread_resume_history_bypass() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext::default();
-
-        super::enforce_request_scope(
-            &scope_registry,
-            &context,
-            &JSONRPCRequest {
-                id: RequestId::String("thread-resume-history".to_string()),
-                method: "thread/resume".to_string(),
-                params: Some(serde_json::json!({
-                    "threadId": "thread-a",
-                    "history": [{}],
-                })),
-                trace: None,
-            },
-        )
-        .expect("history-based resume should be allowed");
-    }
-
-    #[test]
-    fn enforce_request_scope_allows_thread_resume_visible_path() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext::default();
-        scope_registry.register_thread_path_with_worker(
-            "/tmp/rollout.jsonl",
-            context.clone(),
-            None,
-        );
-
-        super::enforce_request_scope(
-            &scope_registry,
-            &context,
-            &JSONRPCRequest {
-                id: RequestId::String("thread-resume-path".to_string()),
-                method: "thread/resume".to_string(),
-                params: Some(serde_json::json!({
-                    "threadId": "thread-a",
-                    "path": "/tmp/rollout.jsonl",
-                })),
-                trace: None,
-            },
-        )
-        .expect("path-based resume should be allowed when the path is visible");
-    }
-
-    #[test]
-    fn enforce_request_scope_allows_thread_fork_visible_path() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext::default();
-        scope_registry.register_thread_path_with_worker(
-            "/tmp/rollout.jsonl",
-            context.clone(),
-            None,
-        );
-
-        super::enforce_request_scope(
-            &scope_registry,
-            &context,
-            &JSONRPCRequest {
-                id: RequestId::String("thread-fork-path".to_string()),
-                method: "thread/fork".to_string(),
-                params: Some(serde_json::json!({
-                    "threadId": "thread-a",
-                    "path": "/tmp/rollout.jsonl",
-                })),
-                trace: None,
-            },
-        )
-        .expect("path-based fork should be allowed when the path is visible");
-    }
-
-    #[test]
-    fn request_thread_id_ignores_history_based_thread_resume() {
-        let request = JSONRPCRequest {
-            id: RequestId::String("thread-resume-history".to_string()),
-            method: "thread/resume".to_string(),
-            params: Some(serde_json::json!({
-                "threadId": "thread-a",
-                "history": [{}],
-            })),
-            trace: None,
-        };
-        let thread_id = super::request_thread_id(&request);
-
-        assert_eq!(thread_id, None);
-    }
-
-    #[test]
-    fn request_thread_id_ignores_path_based_thread_resume_and_fork() {
-        for method in ["thread/resume", "thread/fork"] {
-            let request = JSONRPCRequest {
-                id: RequestId::String(format!("{method}-path")),
-                method: method.to_string(),
-                params: Some(serde_json::json!({
-                    "threadId": "thread-placeholder",
-                    "path": "/tmp/rollout.jsonl",
-                })),
-                trace: None,
-            };
-
-            assert_eq!(super::request_thread_id(&request), None);
-            assert_eq!(
-                super::request_thread_path(&request),
-                Some("/tmp/rollout.jsonl")
-            );
-        }
-    }
-
-    #[test]
-    fn request_thread_path_uses_rollout_path_for_conversation_summary() {
-        let request = JSONRPCRequest {
-            id: RequestId::String("conversation-summary-path".to_string()),
-            method: "getConversationSummary".to_string(),
-            params: Some(serde_json::json!({
-                "rolloutPath": "/tmp/rollout.jsonl",
-            })),
-            trace: None,
-        };
-
-        assert_eq!(super::request_thread_id(&request), None);
-        assert_eq!(
-            super::request_thread_path(&request),
-            Some("/tmp/rollout.jsonl")
-        );
-    }
-
-    #[test]
-    fn response_thread_path_uses_summary_path_for_conversation_summary() {
-        let response = serde_json::json!({
-            "summary": {
-                "conversationId": "thread-a",
-                "path": "/tmp/rollout.jsonl",
-            },
-        });
-
-        assert_eq!(
-            super::response_thread_path(&response),
-            Some("/tmp/rollout.jsonl")
-        );
-    }
-
-    #[test]
-    fn enforce_request_scope_rejects_conversation_summary_hidden_rollout_path() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let visible_context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let other_context = GatewayRequestContext {
-            tenant_id: "tenant-b".to_string(),
-            project_id: Some("project-b".to_string()),
-        };
-        scope_registry.register_thread_path_with_worker(
-            "/tmp/rollout.jsonl",
-            visible_context,
-            None,
-        );
-
-        let err = super::enforce_request_scope(
-            &scope_registry,
-            &other_context,
-            &JSONRPCRequest {
-                id: RequestId::String("conversation-summary-hidden-path".to_string()),
-                method: "getConversationSummary".to_string(),
-                params: Some(serde_json::json!({
-                    "rolloutPath": "/tmp/rollout.jsonl",
-                })),
-                trace: None,
-            },
-        )
-        .expect_err("hidden rollout summary should be rejected");
-
-        assert!(matches!(
-            err,
-            super::GatewayError::NotFound(message)
-                if message == "thread not found: /tmp/rollout.jsonl"
-        ));
-    }
-
-    #[test]
-    fn request_visible_to_uses_conversation_id_for_legacy_exec_command_approval() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let visible_context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let other_context = GatewayRequestContext {
-            tenant_id: "tenant-b".to_string(),
-            project_id: Some("project-b".to_string()),
-        };
-        scope_registry.register_thread("thread-visible".to_string(), visible_context.clone());
-
-        let request = JSONRPCRequest {
-            id: RequestId::String("legacy-exec-visible".to_string()),
-            method: "execCommandApproval".to_string(),
-            params: Some(serde_json::json!({
-                "conversationId": "thread-visible",
-                "callId": "call-visible",
-                "approvalId": "approval-visible",
-                "command": ["echo", "hello"],
-                "cwd": "/tmp/workspace",
-                "reason": "Need to run a visible command",
-                "parsedCmd": [{
-                    "type": "unknown",
-                    "cmd": "echo hello",
-                }],
-            })),
-            trace: None,
-        };
-
-        assert_eq!(super::request_thread_id(&request), Some("thread-visible"));
-        assert_eq!(
-            super::request_visible_to(&scope_registry, &visible_context, &request),
-            true
-        );
-        assert_eq!(
-            super::request_visible_to(&scope_registry, &other_context, &request),
-            false
-        );
-    }
-
-    #[test]
-    fn request_visible_to_uses_conversation_id_for_legacy_apply_patch_approval() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let visible_context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let other_context = GatewayRequestContext {
-            tenant_id: "tenant-b".to_string(),
-            project_id: Some("project-b".to_string()),
-        };
-        scope_registry.register_thread("thread-visible".to_string(), visible_context.clone());
-
-        let request = JSONRPCRequest {
-            id: RequestId::String("legacy-patch-visible".to_string()),
-            method: "applyPatchApproval".to_string(),
-            params: Some(serde_json::json!({
-                "conversationId": "thread-visible",
-                "callId": "call-visible",
-                "fileChanges": {
-                    "README.md": {
-                        "changeType": "added",
-                        "oldContent": null,
-                        "newContent": "hello\\n",
-                    },
-                },
-                "reason": "Need to write visible changes",
-                "grantRoot": "/tmp/workspace",
-            })),
-            trace: None,
-        };
-
-        assert_eq!(super::request_thread_id(&request), Some("thread-visible"));
-        assert_eq!(
-            super::request_visible_to(&scope_registry, &visible_context, &request),
-            true
-        );
-        assert_eq!(
-            super::request_visible_to(&scope_registry, &other_context, &request),
-            false
-        );
-    }
-
-    #[test]
-    fn apply_response_scope_policy_registers_resume_and_fork_threads_and_filters_loaded_list() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        scope_registry.register_thread(
-            "thread-visible".to_string(),
-            GatewayRequestContext {
-                tenant_id: "tenant-a".to_string(),
-                project_id: Some("project-a".to_string()),
-            },
-        );
-        scope_registry.register_thread(
-            "thread-hidden".to_string(),
-            GatewayRequestContext {
-                tenant_id: "tenant-b".to_string(),
-                project_id: Some("project-a".to_string()),
-            },
-        );
-
-        let resume_result = super::apply_response_scope_policy(
-            &scope_registry,
-            &context,
-            None,
-            "thread/resume",
-            Some(7),
-            None,
-            serde_json::json!({
-                "thread": {
-                    "id": "thread-resumed",
-                }
-            }),
-        )
-        .expect("resume response should be accepted");
-        assert_eq!(resume_result["thread"]["id"], "thread-resumed");
-        assert_eq!(
-            scope_registry.thread_visible_to(&context, "thread-resumed"),
-            true
-        );
-
-        let fork_result = super::apply_response_scope_policy(
-            &scope_registry,
-            &context,
-            None,
-            "thread/fork",
-            Some(8),
-            None,
-            serde_json::json!({
-                "thread": {
-                    "id": "thread-forked",
-                }
-            }),
-        )
-        .expect("fork response should be accepted");
-        assert_eq!(fork_result["thread"]["id"], "thread-forked");
-        assert_eq!(
-            scope_registry.thread_visible_to(&context, "thread-forked"),
-            true
-        );
-
-        let filtered_result = super::apply_response_scope_policy(
-            &scope_registry,
-            &context,
-            None,
-            "thread/loaded/list",
-            None,
-            None,
-            serde_json::json!({
-                "data": ["thread-visible", "thread-hidden", "thread-forked"],
-            }),
-        )
-        .expect("loaded list should be filtered");
-        assert_eq!(
-            filtered_result,
-            serde_json::json!({
-                "data": ["thread-visible", "thread-forked"],
-            })
-        );
-
-        let thread_read_result = super::apply_response_scope_policy(
-            &scope_registry,
-            &context,
-            None,
-            "thread/read",
-            Some(9),
-            None,
-            serde_json::json!({
-                "thread": {
-                    "id": "thread-read",
-                }
-            }),
-        )
-        .expect("thread/read response should be accepted");
-        assert_eq!(thread_read_result["thread"]["id"], "thread-read");
-        assert_eq!(
-            scope_registry.thread_visible_to(&context, "thread-read"),
-            true
-        );
-        assert_eq!(scope_registry.thread_worker_id("thread-read"), Some(9));
-    }
-
-    #[test]
-    fn apply_response_scope_policy_publishes_project_worker_route_selection_for_thread_start() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
-        let observability = GatewayObservability::new(None, true).with_operator_events(event_tx);
-
-        let logs = capture_logs(|| {
-            let result = super::apply_response_scope_policy(
-                &scope_registry,
-                &context,
-                Some(&observability),
-                "thread/start",
-                Some(7),
-                Some("acct-a".to_string()),
-                serde_json::json!({
-                    "thread": {
-                        "id": "thread-started",
-                    }
-                }),
-            )
-            .expect("thread/start response should be accepted");
-
-            assert_eq!(result["thread"]["id"], "thread-started");
-        });
-
-        assert!(logs.contains("codex_gateway.audit"), "{logs}");
-        assert!(
-            logs.contains("gateway project worker route selected"),
-            "{logs}"
-        );
-        assert!(logs.contains("worker_id=7"), "{logs}");
-        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
-        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
-        assert!(logs.contains("thread_id=\"thread-started\""), "{logs}");
-        assert!(logs.contains("account_id=\"acct-a\""), "{logs}");
-
-        assert_eq!(
-            scope_registry.thread_visible_to(&context, "thread-started"),
-            true
-        );
-        let event = event_rx.try_recv().expect("project worker route event");
-        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
-        assert_eq!(event.thread_id.as_deref(), Some("thread-started"));
-        assert_eq!(
-            event.data,
-            serde_json::json!({
-                "tenantId": "tenant-a",
-                "projectId": "project-a",
-                "threadId": "thread-started",
-                "workerId": 7,
-                "accountId": "acct-a",
-            })
-        );
-    }
-
-    #[test]
-    fn apply_response_scope_policy_publishes_project_worker_route_selection_without_account_id() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
-        let observability =
-            GatewayObservability::new(Some(metrics.clone()), true).with_operator_events(event_tx);
-
-        let logs = capture_logs(|| {
-            let result = super::apply_response_scope_policy(
-                &scope_registry,
-                &context,
-                Some(&observability),
-                "thread/start",
-                Some(7),
-                None,
-                serde_json::json!({
-                    "thread": {
-                        "id": "thread-started",
-                    }
-                }),
-            )
-            .expect("thread/start response should be accepted");
-
-            assert_eq!(result["thread"]["id"], "thread-started");
-        });
-
-        assert!(logs.contains("codex_gateway.audit"), "{logs}");
-        assert!(
-            logs.contains("gateway project worker route selected"),
-            "{logs}"
-        );
-        assert!(logs.contains("worker_id=7"), "{logs}");
-        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
-        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
-        assert!(logs.contains("thread_id=\"thread-started\""), "{logs}");
-        assert!(logs.contains("account_id=\"<none>\""), "{logs}");
-
-        assert_eq!(
-            scope_registry.thread_visible_to(&context, "thread-started"),
-            true
-        );
-        let event = event_rx.try_recv().expect("project worker route event");
-        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
-        assert_eq!(event.thread_id.as_deref(), Some("thread-started"));
-        assert_eq!(
-            event.data,
-            serde_json::json!({
-                "tenantId": "tenant-a",
-                "projectId": "project-a",
-                "threadId": "thread-started",
-                "workerId": 7,
-                "accountId": null,
-            })
-        );
-
-        let resource_metrics = metrics.snapshot().expect("snapshot");
-        let mut saw_metric = false;
-        let mut metric_points = Vec::new();
-        for metric in resource_metrics
-            .scope_metrics()
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        {
-            if metric.name() == "gateway_project_worker_route_selections" {
-                saw_metric = true;
-                match metric.data() {
-                    AggregatedMetrics::U64(data) => match data {
-                        MetricData::Sum(sum) => {
-                            metric_points.extend(sum.data_points().map(|point| {
-                                let attributes = point
-                                    .attributes()
-                                    .map(|attribute| {
-                                        (
-                                            attribute.key.as_str().to_string(),
-                                            attribute.value.as_str().to_string(),
-                                        )
-                                    })
-                                    .collect::<BTreeMap<_, _>>();
-                                (point.value(), attributes)
-                            }));
-                        }
-                        _ => panic!("unexpected project worker route metric aggregation"),
-                    },
-                    _ => panic!("unexpected project worker route metric type"),
-                }
-            }
-        }
-
-        metric_points.sort_by(|left, right| left.1.cmp(&right.1));
-        assert!(saw_metric);
-        assert_eq!(
-            metric_points,
-            vec![(
-                1,
-                BTreeMap::from([
-                    ("account_id".to_string(), "none".to_string()),
-                    ("project_id".to_string(), "project-a".to_string()),
-                    ("tenant_id".to_string(), "tenant-a".to_string()),
-                    ("worker_id".to_string(), "7".to_string()),
-                ])
-            )]
-        );
-    }
-
-    #[test]
-    fn apply_response_scope_policy_treats_blank_project_route_account_id_as_missing() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
-        let observability = GatewayObservability::new(None, true).with_operator_events(event_tx);
-
-        let logs = capture_logs(|| {
-            let result = super::apply_response_scope_policy(
-                &scope_registry,
-                &context,
-                Some(&observability),
-                "thread/start",
-                Some(7),
-                Some("   ".to_string()),
-                serde_json::json!({
-                    "thread": {
-                        "id": "thread-started",
-                    }
-                }),
-            )
-            .expect("thread/start response should be accepted");
-
-            assert_eq!(result["thread"]["id"], "thread-started");
-        });
-
-        assert!(logs.contains("codex_gateway.audit"), "{logs}");
-        assert!(logs.contains("account_id=\"<none>\""), "{logs}");
-
-        let health = observability.v2_connection_health().snapshot();
-        assert_eq!(health.project_worker_route_selection_count, 1);
-        assert_eq!(
-            health
-                .last_project_worker_route_selected_account_id
-                .as_deref(),
-            None
-        );
-
-        let event = event_rx.try_recv().expect("project worker route event");
-        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
-        assert_eq!(
-            event.data,
-            serde_json::json!({
-                "tenantId": "tenant-a",
-                "projectId": "project-a",
-                "threadId": "thread-started",
-                "workerId": 7,
-                "accountId": null,
-            })
-        );
-    }
-
-    #[test]
-    fn apply_response_scope_policy_pins_project_worker_route_selection_evidence_chain() {
-        let scope_registry = GatewayScopeRegistry::default();
-        let context = GatewayRequestContext {
-            tenant_id: "tenant-a".to_string(),
-            project_id: Some("project-a".to_string()),
-        };
-        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(1);
-        let metrics = codex_otel::MetricsClient::new(
-            codex_otel::MetricsConfig::in_memory(
-                "test",
-                "codex-gateway",
-                env!("CARGO_PKG_VERSION"),
-                opentelemetry_sdk::metrics::InMemoryMetricExporter::default(),
-            )
-            .with_runtime_reader(),
-        )
-        .expect("metrics");
-        let observability =
-            GatewayObservability::new(Some(metrics.clone()), true).with_operator_events(event_tx);
-
-        let logs = capture_logs(|| {
-            let result = super::apply_response_scope_policy(
-                &scope_registry,
-                &context,
-                Some(&observability),
-                "thread/start",
-                Some(7),
-                Some("acct-a".to_string()),
-                serde_json::json!({
-                    "thread": {
-                        "id": "thread-started",
-                    }
-                }),
-            )
-            .expect("thread/start response should be accepted");
-
-            assert_eq!(result["thread"]["id"], "thread-started");
-        });
-
-        assert!(logs.contains("codex_gateway.audit"), "{logs}");
-        assert!(
-            logs.contains("gateway project worker route selected"),
-            "{logs}"
-        );
-        assert!(logs.contains("worker_id=7"), "{logs}");
-        assert!(logs.contains("tenant_id=\"tenant-a\""), "{logs}");
-        assert!(logs.contains("project_id=\"project-a\""), "{logs}");
-        assert!(logs.contains("thread_id=\"thread-started\""), "{logs}");
-        assert!(logs.contains("account_id=\"acct-a\""), "{logs}");
-
-        assert_eq!(
-            scope_registry.thread_visible_to(&context, "thread-started"),
-            true
-        );
-        assert_eq!(
-            scope_registry.project_worker_routes(
-                |_| true,
-                |worker_id| match worker_id {
-                    7 => Some("acct-a".to_string()),
-                    _ => None,
-                },
-                |_| crate::api::GatewayAccountCapacityStatus::Available,
-            ),
-            vec![crate::api::GatewayProjectWorkerRoute {
-                tenant_id: "tenant-a".to_string(),
-                project_id: "project-a".to_string(),
-                worker_id: 7,
-                account_id: Some("acct-a".to_string()),
-                account_capacity: crate::api::GatewayAccountCapacityStatus::Available,
-                worker_healthy: true,
-                account_routing_eligible: true,
-            }]
-        );
-
-        let event = event_rx.try_recv().expect("project worker route event");
-        assert_eq!(event.method, "gateway/projectWorkerRouteSelected");
-        assert_eq!(event.thread_id.as_deref(), Some("thread-started"));
-        assert_eq!(
-            event.data,
-            serde_json::json!({
-                "tenantId": "tenant-a",
-                "projectId": "project-a",
-                "threadId": "thread-started",
-                "workerId": 7,
-                "accountId": "acct-a",
-            })
-        );
-
-        let health = observability.v2_connection_health().snapshot();
-        assert_eq!(health.project_worker_route_selection_count, 1);
-        assert_eq!(
-            health.project_worker_route_selection_worker_counts,
-            vec![
-                crate::api::GatewayV2ProjectWorkerRouteSelectionWorkerCounts {
-                    worker_id: 7,
-                    project_worker_route_selection_count: 1,
-                }
-            ]
-        );
-        assert_eq!(health.last_project_worker_route_selected_worker_id, Some(7));
-        assert_eq!(
-            health
-                .last_project_worker_route_selected_tenant_id
-                .as_deref(),
-            Some("tenant-a")
-        );
-        assert_eq!(
-            health
-                .last_project_worker_route_selected_project_id
-                .as_deref(),
-            Some("project-a")
-        );
-        assert_eq!(
-            health
-                .last_project_worker_route_selected_thread_id
-                .as_deref(),
-            Some("thread-started")
-        );
-        assert_eq!(
-            health
-                .last_project_worker_route_selected_account_id
-                .as_deref(),
-            Some("acct-a")
-        );
-        assert!(health.last_project_worker_route_selected_at.is_some());
-
-        let resource_metrics = metrics.snapshot().expect("snapshot");
-        let mut saw_metric = false;
-        for metric in resource_metrics
-            .scope_metrics()
-            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        {
-            if metric.name() == "gateway_project_worker_route_selections" {
-                saw_metric = true;
-                match metric.data() {
-                    AggregatedMetrics::U64(data) => match data {
-                        MetricData::Sum(sum) => {
-                            let point = sum.data_points().next().expect("count point");
-                            assert_eq!(point.value(), 1);
-                            let attributes: BTreeMap<String, String> = point
-                                .attributes()
-                                .map(|attribute| {
-                                    (
-                                        attribute.key.as_str().to_string(),
-                                        attribute.value.as_str().to_string(),
-                                    )
-                                })
-                                .collect();
-                            assert_eq!(
-                                attributes,
-                                BTreeMap::from([
-                                    ("account_id".to_string(), "acct-a".to_string()),
-                                    ("project_id".to_string(), "project-a".to_string()),
-                                    ("tenant_id".to_string(), "tenant-a".to_string()),
-                                    ("worker_id".to_string(), "7".to_string()),
-                                ])
-                            );
-                        }
-                        _ => panic!("unexpected project worker route metric aggregation"),
-                    },
-                    _ => panic!("unexpected project worker route metric type"),
-                }
-            }
-        }
-
-        assert!(saw_metric);
-    }
-
-    #[test]
-    fn format_lagged_close_reason_reports_skipped_event_count() {
-        assert_eq!(
-            super::format_lagged_close_reason(3),
-            "downstream app-server event stream lagged: skipped 3 events"
-        );
-    }
-
-    #[test]
-    fn websocket_close_reason_truncates_to_protocol_limit() {
-        let reason = "x".repeat(200);
-        assert_eq!(super::websocket_close_reason(&reason).len(), 123);
     }
 
     #[test]

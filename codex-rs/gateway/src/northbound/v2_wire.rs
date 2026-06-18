@@ -2,9 +2,14 @@ use crate::error::GatewayError;
 use crate::observability::GatewayObservability;
 use crate::scope::GatewayRequestContext;
 use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
+use axum::extract::ws::CloseFrame;
+use axum::extract::ws::Message as WebSocketMessage;
+use axum::extract::ws::WebSocket;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
@@ -18,6 +23,14 @@ use std::io;
 use std::io::ErrorKind;
 use std::time::Duration;
 use tokio::time::timeout;
+
+pub(crate) const DOWNSTREAM_BACKPRESSURE_CLOSE_REASON: &str =
+    "downstream app-server event stream lagged";
+pub(crate) const INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON: &str =
+    "invalid gateway websocket JSON-RPC payload";
+pub(crate) const INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON: &str =
+    "invalid gateway websocket UTF-8 payload";
+pub(crate) const MAX_CLOSE_REASON_BYTES: usize = 123;
 
 pub(crate) fn gateway_error_to_jsonrpc_error(error: GatewayError) -> JSONRPCErrorError {
     match error {
@@ -146,6 +159,50 @@ pub(crate) fn jsonrpc_notification_to_client_notification(
     tagged_message_to_type("notification", notification)
 }
 
+pub(crate) fn parse_client_jsonrpc_text(text: &str) -> io::Result<JSONRPCMessage> {
+    serde_json::from_str::<JSONRPCMessage>(text).map_err(|err| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("{INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON}: {err}"),
+        )
+    })
+}
+
+pub(crate) fn parse_client_jsonrpc_binary(bytes: &[u8]) -> io::Result<JSONRPCMessage> {
+    let text = std::str::from_utf8(bytes).map_err(|err| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("{INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON}: {err}"),
+        )
+    })?;
+    parse_client_jsonrpc_text(text)
+}
+
+pub(crate) fn protocol_violation_reason_from_invalid_payload(err: &io::Error) -> &'static str {
+    let message = err.to_string();
+    if message.starts_with(INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON) {
+        "invalid_utf8"
+    } else {
+        "invalid_jsonrpc"
+    }
+}
+
+pub(crate) fn downstream_protocol_violation_reason(message: &str) -> Option<&'static str> {
+    if message.contains("sent invalid JSON-RPC")
+        || message.contains("sent invalid initialize response")
+        || message.contains("sent unexpected JSON-RPC response id")
+        || message.contains("sent unexpected JSON-RPC error id")
+    {
+        Some("invalid_jsonrpc")
+    } else if message.contains("sent non-text JSON-RPC frame")
+        || message.contains("sent non-text initialize frame")
+    {
+        Some("invalid_binary")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn server_request_to_jsonrpc(
     request: ServerRequest,
     gateway_request_id: RequestId,
@@ -210,6 +267,80 @@ pub(crate) fn tagged_type_to_notification<T: Serialize>(
     Ok(JSONRPCNotification { method, params })
 }
 
+pub(crate) fn format_lagged_close_reason(skipped: usize) -> String {
+    format!("{DOWNSTREAM_BACKPRESSURE_CLOSE_REASON}: skipped {skipped} events")
+}
+
+pub(crate) fn websocket_close_reason(reason: &str) -> &str {
+    if reason.len() <= MAX_CLOSE_REASON_BYTES {
+        return reason;
+    }
+
+    let mut end = MAX_CLOSE_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
+pub(crate) async fn send_websocket_message(
+    socket: &mut WebSocket,
+    message: WebSocketMessage,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    await_io_with_timeout(
+        async { socket.send(message).await.map_err(io::Error::other) },
+        client_send_timeout,
+        "gateway websocket send timed out",
+    )
+    .await
+}
+
+pub(crate) async fn send_jsonrpc(
+    socket: &mut WebSocket,
+    message: JSONRPCMessage,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    let payload = serde_json::to_string(&message).map_err(io::Error::other)?;
+    send_websocket_message(
+        socket,
+        WebSocketMessage::Text(payload.into()),
+        client_send_timeout,
+    )
+    .await
+}
+
+pub(crate) async fn send_jsonrpc_error(
+    socket: &mut WebSocket,
+    id: RequestId,
+    error: JSONRPCErrorError,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    send_jsonrpc(
+        socket,
+        JSONRPCMessage::Error(JSONRPCError { id, error }),
+        client_send_timeout,
+    )
+    .await
+}
+
+pub(crate) async fn send_close_frame(
+    socket: &mut WebSocket,
+    code: u16,
+    reason: &str,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    send_websocket_message(
+        socket,
+        WebSocketMessage::Close(Some(CloseFrame {
+            code,
+            reason: websocket_close_reason(reason).to_string().into(),
+        })),
+        client_send_timeout,
+    )
+    .await
+}
+
 pub(crate) async fn await_io_with_timeout<T>(
     future: impl Future<Output = io::Result<T>>,
     timeout_duration: Duration,
@@ -218,4 +349,23 @@ pub(crate) async fn await_io_with_timeout<T>(
     timeout(timeout_duration, future)
         .await
         .map_err(|_| io::Error::new(ErrorKind::TimedOut, timeout_message))?
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn format_lagged_close_reason_reports_skipped_event_count() {
+        assert_eq!(
+            super::format_lagged_close_reason(3),
+            "downstream app-server event stream lagged: skipped 3 events"
+        );
+    }
+
+    #[test]
+    fn websocket_close_reason_truncates_to_protocol_limit() {
+        let reason = "x".repeat(200);
+        assert_eq!(super::websocket_close_reason(&reason).len(), 123);
+    }
 }

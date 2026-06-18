@@ -1,5 +1,11 @@
 pub mod http;
 pub mod v2;
+pub mod v2_account_capacity;
 pub mod v2_connection;
 pub mod v2_counts;
+pub mod v2_limits;
+pub mod v2_notifications;
+pub mod v2_pagination;
+pub mod v2_scope;
+pub mod v2_server_requests;
 pub mod v2_wire;

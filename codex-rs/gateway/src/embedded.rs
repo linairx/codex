@@ -2580,6 +2580,7 @@ mod tests {
         let mut expected_thread = started.thread.clone();
         expected_thread.created_at = read.thread.created_at;
         expected_thread.updated_at = read.thread.updated_at;
+        expected_thread.recency_at = read.thread.recency_at;
         assert_eq!(read.thread, expected_thread);
 
         let renamed_thread_name = "Gateway Embedded Thread".to_string();
@@ -12460,6 +12461,7 @@ stream_max_retries = 0
         .expect("connection-state notifications should arrive after reconnect");
 
         assert_remote_client_shutdown(v2_client.shutdown().await);
+        drop(events_response);
         server.shutdown().await.expect("shutdown");
     }
 
@@ -12582,6 +12584,7 @@ stream_max_retries = 0
         ));
 
         assert_remote_client_shutdown(v2_client.shutdown().await);
+        drop(events_response);
         server.shutdown().await.expect("shutdown");
     }
 
@@ -13010,6 +13013,7 @@ stream_max_retries = 0
         assert_eq!(first_read.thread.preview, "/tmp/worker-a-2");
 
         assert_remote_client_shutdown(v2_client.shutdown().await);
+        drop(events_response);
         server.shutdown().await.expect("shutdown");
     }
 
@@ -28061,12 +28065,12 @@ stream_max_retries = 0
                                 transport: None,
                                 voice: None,
                                 architecture: None,
-                    client_managed_handoffs: None,
+                                client_managed_handoffs: None,
                                 model: None,
                                 version: None,
                                 codex_responses_as_items: None,
                                 codex_response_item_prefix: None,
-                    codex_response_handoff_prefix: None,
+                                codex_response_handoff_prefix: None,
                                 include_startup_context: None,
                             },
                         }),
@@ -40402,37 +40406,38 @@ stream_max_retries = 0
                                 .await
                                 .expect("close frame should send");
                         }
-                        _ => while let Some(request) =
-                            read_websocket_request_until_close(&mut websocket).await
-                        {
-                            tracing::info!(
-                                method = %request.method,
-                                "realtime reconnect helper received request",
-                            );
-                            match request.method.as_str() {
-                                "thread/start" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread(thread_id, preview),
-                                                "model": "gpt-5",
-                                                "modelProvider": "openai",
-                                                "serviceTier": null,
-                                                "cwd": preview,
-                                                "instructionSources": [],
-                                                "approvalPolicy": "never",
-                                                "approvalsReviewer": "user",
-                                                "sandbox": {
-                                                    "type": "dangerFullAccess"
-                                                },
-                                                "reasoningEffort": null,
+                        _ => {
+                            while let Some(request) =
+                                read_websocket_request_until_close(&mut websocket).await
+                            {
+                                tracing::info!(
+                                    method = %request.method,
+                                    "realtime reconnect helper received request",
+                                );
+                                match request.method.as_str() {
+                                    "thread/start" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread(thread_id, preview),
+                                                    "model": "gpt-5",
+                                                    "modelProvider": "openai",
+                                                    "serviceTier": null,
+                                                    "cwd": preview,
+                                                    "instructionSources": [],
+                                                    "approvalPolicy": "never",
+                                                    "approvalsReviewer": "user",
+                                                    "sandbox": {
+                                                        "type": "dangerFullAccess"
+                                                    },
+                                                    "reasoningEffort": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Request(
                                         codex_app_server_protocol::JSONRPCRequest {
@@ -40464,181 +40469,204 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                    let JSONRPCMessage::Response(response) =
-                                        read_websocket_message(&mut websocket).await
-                                    else {
-                                        panic!("expected server request response");
-                                    };
-                                    assert_eq!(
-                                        response.id,
-                                        RequestId::String(
-                                            "srv-user-input-after-reconnect".to_string()
-                                        )
-                                    );
-                                    assert_eq!(
-                                        response.result,
-                                        serde_json::json!({
-                                            "answers": {
-                                                "mode": {
-                                                    "answers": ["safe"],
+                                        let JSONRPCMessage::Response(response) =
+                                            read_websocket_message(&mut websocket).await
+                                        else {
+                                            panic!("expected server request response");
+                                        };
+                                        assert_eq!(
+                                            response.id,
+                                            RequestId::String(
+                                                "srv-user-input-after-reconnect".to_string()
+                                            )
+                                        );
+                                        assert_eq!(
+                                            response.result,
+                                            serde_json::json!({
+                                                "answers": {
+                                                    "mode": {
+                                                        "answers": ["safe"],
+                                                    },
                                                 },
-                                            },
-                                        })
-                                    );
-                                }
-                                "thread/read" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread(thread_id, preview),
-                                                "turns": [],
+                                            })
+                                        );
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "serverRequest/resolved".to_string(),
+                                                    params: Some(
+                                                        serde_json::to_value(
+                                                            ServerRequestResolvedNotification {
+                                                                thread_id: thread_id.to_string(),
+                                                                request_id: RequestId::String(
+                                                                    "srv-user-input-after-reconnect"
+                                                                        .to_string(),
+                                                                ),
+                                                            },
+                                                        )
+                                                        .expect(
+                                                            "user input serverRequest/resolved should serialize",
+                                                        ),
+                                                    ),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/read" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread(thread_id, preview),
+                                                    "turns": [],
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/list" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "data": [mock_thread(thread_id, preview)],
-                                                "nextCursor": null,
-                                                "backwardsCursor": null,
+                                        )
+                                        .await;
+                                    }
+                                    "thread/list" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "data": [mock_thread(thread_id, preview)],
+                                                    "nextCursor": null,
+                                                    "backwardsCursor": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/loaded/list" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "data": [thread_id],
-                                                "nextCursor": null,
+                                        )
+                                        .await;
+                                    }
+                                    "thread/loaded/list" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "data": [thread_id],
+                                                    "nextCursor": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "configRequirements/read" => {
-                                    assert_eq!(request.params, None);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "requirements": null,
+                                        )
+                                        .await;
+                                    }
+                                    "configRequirements/read" => {
+                                        assert_eq!(request.params, None);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "requirements": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "turn/start" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("turn/start should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    let turn_id = format!("turn-{thread_id}");
+                                        )
+                                        .await;
+                                    }
+                                    "turn/start" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("turn/start should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        let turn_id = format!("turn-{thread_id}");
 
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "turn": mock_turn(&turn_id, "inProgress"),
-                                            }),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/status/changed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "status": {
-                                                        "type": "active",
-                                                        "activeFlags": [],
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "turn/started".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
                                                     "turn": mock_turn(&turn_id, "inProgress"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "hook/started".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "run": {
-                                                        "id": "hook-remote-workflow",
-                                                        "eventName": "userPromptSubmit",
-                                                        "handlerType": "command",
-                                                        "executionMode": "sync",
-                                                        "scope": "turn",
-                                                        "sourcePath": "/tmp/remote-hooks.json",
-                                                        "source": "user",
-                                                        "displayOrder": 0,
-                                                        "status": "running",
-                                                        "statusMessage": "remote hook started",
-                                                        "startedAt": 1,
-                                                        "completedAt": null,
-                                                        "durationMs": null,
-                                                        "entries": [],
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/started".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "item": {
-                                                        "type": "agentMessage",
-                                                        "id": "msg-remote-workflow",
-                                                        "text": "streaming answer in progress",
-                                                        "phase": "commentary",
-                                                        "memoryCitation": null,
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/status/changed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "status": {
+                                                            "type": "active",
+                                                            "activeFlags": [],
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "turn/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turn": mock_turn(&turn_id, "inProgress"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "hook/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "run": {
+                                                            "id": "hook-remote-workflow",
+                                                            "eventName": "userPromptSubmit",
+                                                            "handlerType": "command",
+                                                            "executionMode": "sync",
+                                                            "scope": "turn",
+                                                            "sourcePath": "/tmp/remote-hooks.json",
+                                                            "source": "user",
+                                                            "displayOrder": 0,
+                                                            "status": "running",
+                                                            "statusMessage": "remote hook started",
+                                                            "startedAt": 1,
+                                                            "completedAt": null,
+                                                            "durationMs": null,
+                                                            "entries": [],
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "item": {
+                                                            "type": "agentMessage",
+                                                            "id": "msg-remote-workflow",
+                                                            "text": "streaming answer in progress",
+                                                            "phase": "commentary",
+                                                            "memoryCitation": null,
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
@@ -40667,43 +40695,43 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/started".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "item": {
-                                                        "type": "agentMessage",
-                                                        "id": format!("msg-{thread_id}"),
-                                                        "text": "streaming answer in progress",
-                                                        "phase": "commentary",
-                                                        "memoryCitation": null,
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/agentMessage/delta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("msg-{thread_id}"),
-                                                    "delta": "hello from recovered worker",
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "item": {
+                                                            "type": "agentMessage",
+                                                            "id": format!("msg-{thread_id}"),
+                                                            "text": "streaming answer in progress",
+                                                            "phase": "commentary",
+                                                            "memoryCitation": null,
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/agentMessage/delta".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("msg-{thread_id}"),
+                                                        "delta": "hello from recovered worker",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
@@ -40719,114 +40747,115 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/reasoning/textDelta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("reasoning-{thread_id}"),
-                                                    "delta": format!("reasoning {thread_id}"),
-                                                    "contentIndex": 0,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/commandExecution/outputDelta"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("exec-{thread_id}"),
-                                                    "delta": format!("stdout {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/fileChange/outputDelta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("patch-{thread_id}"),
-                                                    "delta": format!("patch {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/autoApprovalReview/started"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "reviewId": format!("guardian-{thread_id}"),
-                                                    "targetItemId": format!("cmd-{thread_id}"),
-                                                    "review": {
-                                                        "status": "inProgress",
-                                                        "riskLevel": null,
-                                                        "userAuthorization": null,
-                                                        "rationale": null,
-                                                    },
-                                                    "action": {
-                                                        "type": "command",
-                                                        "source": "shell",
-                                                        "command": "cat docs/gateway.md",
-                                                        "cwd": "/tmp",
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/autoApprovalReview/completed"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "completedAtMs": 0,
-                                                    "reviewId": format!("guardian-{thread_id}"),
-                                                    "targetItemId": format!("cmd-{thread_id}"),
-                                                    "decisionSource": "agent",
-                                                    "review": {
-                                                        "status": "approved",
-                                                        "riskLevel": "low",
-                                                        "userAuthorization": "low",
-                                                        "rationale": "Read-only command.",
-                                                    },
-                                                    "action": {
-                                                        "type": "command",
-                                                        "source": "shell",
-                                                        "command": "cat docs/gateway.md",
-                                                        "cwd": "/tmp",
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/reasoning/textDelta".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("reasoning-{thread_id}"),
+                                                        "delta": format!("reasoning {thread_id}"),
+                                                        "contentIndex": 0,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/commandExecution/outputDelta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("exec-{thread_id}"),
+                                                        "delta": format!("stdout {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/fileChange/outputDelta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("patch-{thread_id}"),
+                                                        "delta": format!("patch {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/autoApprovalReview/started"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "reviewId": format!("guardian-{thread_id}"),
+                                                        "targetItemId": format!("cmd-{thread_id}"),
+                                                        "review": {
+                                                            "status": "inProgress",
+                                                            "riskLevel": null,
+                                                            "userAuthorization": null,
+                                                            "rationale": null,
+                                                        },
+                                                        "action": {
+                                                            "type": "command",
+                                                            "source": "shell",
+                                                            "command": "cat docs/gateway.md",
+                                                            "cwd": "/tmp",
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/autoApprovalReview/completed"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "completedAtMs": 0,
+                                                        "reviewId": format!("guardian-{thread_id}"),
+                                                        "targetItemId": format!("cmd-{thread_id}"),
+                                                        "decisionSource": "agent",
+                                                        "review": {
+                                                            "status": "approved",
+                                                            "riskLevel": "low",
+                                                            "userAuthorization": "low",
+                                                            "rationale": "Read-only command.",
+                                                        },
+                                                        "action": {
+                                                            "type": "command",
+                                                            "source": "shell",
+                                                            "command": "cat docs/gateway.md",
+                                                            "cwd": "/tmp",
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                     &mut websocket,
                                     JSONRPCMessage::Notification(
                                         codex_app_server_protocol::JSONRPCNotification {
@@ -40855,44 +40884,45 @@ stream_max_retries = 0
                                     ),
                                 )
                                 .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/completed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "completedAtMs": 0,
-                                                    "item": {
-                                                        "type": "agentMessage",
-                                                        "id": format!("msg-{thread_id}"),
-                                                        "text": "streaming answer completed",
-                                                        "phase": "final_answer",
-                                                        "memoryCitation": null,
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "turn/completed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turn": mock_turn(&turn_id, "completed"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/completed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "completedAtMs": 0,
+                                                        "item": {
+                                                            "type": "agentMessage",
+                                                            "id": format!("msg-{thread_id}"),
+                                                            "text": "streaming answer completed",
+                                                            "phase": "final_answer",
+                                                            "memoryCitation": null,
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "turn/completed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turn": mock_turn(&turn_id, "completed"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    method => panic!("unexpected request method: {method}"),
                                 }
-                                method => panic!("unexpected request method: {method}"),
                             }
-                        },
+                        }
                     }
                 });
             }
@@ -41319,427 +41349,432 @@ stream_max_retries = 0
                 let (stream, _) = listener.accept().await.expect("accept should succeed");
                 let current_connection_index = connection_index;
                 connection_index = connection_index.saturating_add(1);
-                let mut websocket = tokio_tungstenite::accept_async(stream)
-                    .await
-                    .expect("websocket upgrade should succeed");
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket upgrade should succeed");
 
-                expect_remote_initialize(&mut websocket).await;
-                match current_connection_index {
-                    0 | 2 => {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
-                    }
-                    1 => {
-                        websocket
-                            .close(None)
-                            .await
-                            .expect("close frame should send");
-                    }
-                    3 => {
-                        let mut thread_name = None::<String>;
-                        let review_thread_id = format!("{thread_id}-review");
-                        let review_turn_id = format!("turn-review-{thread_id}");
-                        let turn_id = format!("turn-{thread_id}");
-                        let rollout_path = format!("{preview}/rollout.jsonl");
-                        let forked_thread_id = format!("{thread_id}-fork");
-                        let forked_preview = format!("{preview}-fork");
-                        let forked_rollout_path = format!("{forked_preview}/rollout.jsonl");
-                        loop {
-                            let request = read_websocket_request(&mut websocket).await;
-                            match request.method.as_str() {
-                                "configRequirements/read" => {
-                                    assert_eq!(request.params, None);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "requirements": null,
+                    expect_remote_initialize(&mut websocket).await;
+                    match current_connection_index {
+                        0 | 2 => {
+                            websocket
+                                .close(None)
+                                .await
+                                .expect("close frame should send");
+                        }
+                        1 => {
+                            websocket
+                                .close(None)
+                                .await
+                                .expect("close frame should send");
+                        }
+                        _ => {
+                            let mut thread_name = None::<String>;
+                            let review_thread_id = format!("{thread_id}-review");
+                            let review_turn_id = format!("turn-review-{thread_id}");
+                            let turn_id = format!("turn-{thread_id}");
+                            let rollout_path = format!("{preview}/rollout.jsonl");
+                            let forked_thread_id = format!("{thread_id}-fork");
+                            let forked_preview = format!("{preview}-fork");
+                            let forked_rollout_path = format!("{forked_preview}/rollout.jsonl");
+                            loop {
+                                let request = read_websocket_request(&mut websocket).await;
+                                match request.method.as_str() {
+                                    "configRequirements/read" => {
+                                        assert_eq!(request.params, None);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "requirements": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/start" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread_with_name_and_path(
-                                                    thread_id,
-                                                    preview,
-                                                    thread_name.as_deref(),
-                                                    Some(rollout_path.as_str()),
-                                                ),
-                                                "model": "gpt-5",
-                                                "modelProvider": "openai",
-                                                "serviceTier": null,
-                                                "cwd": preview,
-                                                "instructionSources": [],
-                                                "approvalPolicy": "never",
-                                                "approvalsReviewer": "user",
-                                                "sandbox": {
-                                                    "type": "dangerFullAccess"
-                                                },
-                                                "reasoningEffort": null,
-                                            }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/read" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/read should include threadId");
-                                    assert!(
-                                        requested_thread_id == thread_id
-                                            || requested_thread_id == review_thread_id
-                                            || requested_thread_id == forked_thread_id,
-                                        "thread/read should target the recovered thread, its fork, or its review thread",
-                                    );
-                                    let thread = if requested_thread_id == thread_id {
-                                        mock_thread_with_name_and_path(
-                                            thread_id,
-                                            preview,
-                                            thread_name.as_deref(),
-                                            Some(rollout_path.as_str()),
                                         )
-                                    } else if requested_thread_id == forked_thread_id {
-                                        mock_thread_with_path(
-                                            &forked_thread_id,
-                                            &forked_preview,
-                                            Some(forked_rollout_path.as_str()),
-                                        )
-                                    } else {
-                                        mock_thread_with_path(
-                                            &review_thread_id,
-                                            preview,
-                                            Some(rollout_path.as_str()),
-                                        )
-                                    };
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": thread,
-                                                "turns": [],
-                                            }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/resume" => {
-                                    let requested_path = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("path"))
-                                        .and_then(serde_json::Value::as_str);
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/resume should include threadId");
-                                    if let Some(requested_path) = requested_path {
-                                        assert_eq!(
-                                            requested_path, rollout_path,
-                                            "path-based thread/resume should stay on the recovered worker",
-                                        );
-                                    } else {
-                                        assert_eq!(requested_thread_id, thread_id);
+                                        .await;
                                     }
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread_with_name_and_path(
-                                                    thread_id,
-                                                    preview,
-                                                    thread_name.as_deref(),
-                                                    Some(rollout_path.as_str()),
-                                                ),
-                                                "model": "gpt-5",
-                                                "modelProvider": "openai",
-                                                "serviceTier": null,
-                                                "cwd": preview,
-                                                "instructionSources": [],
-                                                "approvalPolicy": "never",
-                                                "approvalsReviewer": "user",
-                                                "sandbox": {
-                                                    "type": "dangerFullAccess"
-                                                },
-                                                "reasoningEffort": null,
-                                            }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/fork" => {
-                                    let requested_path = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("path"))
-                                        .and_then(serde_json::Value::as_str);
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/fork should include threadId");
-                                    if let Some(requested_path) = requested_path {
-                                        assert_eq!(
-                                            requested_path, rollout_path,
-                                            "path-based thread/fork should stay on the recovered worker",
-                                        );
-                                    } else {
-                                        assert_eq!(requested_thread_id, thread_id);
-                                    }
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": {
-                                                    "id": forked_thread_id.as_str(),
-                                                    "sessionId": forked_thread_id.as_str(),
-                                                    "forkedFromId": thread_id,
-                                                    "preview": forked_preview.as_str(),
-                                                    "ephemeral": true,
+                                    "thread/start" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread_with_name_and_path(
+                                                        thread_id,
+                                                        preview,
+                                                        thread_name.as_deref(),
+                                                        Some(rollout_path.as_str()),
+                                                    ),
+                                                    "model": "gpt-5",
                                                     "modelProvider": "openai",
-                                                    "createdAt": 1,
-                                                    "updatedAt": 1,
-                                                    "status": {
-                                                        "type": "idle"
+                                                    "serviceTier": null,
+                                                    "cwd": preview,
+                                                    "instructionSources": [],
+                                                    "approvalPolicy": "never",
+                                                    "approvalsReviewer": "user",
+                                                    "sandbox": {
+                                                        "type": "dangerFullAccess"
                                                     },
-                                                    "path": forked_rollout_path.as_str(),
-                                                    "cwd": forked_preview.as_str(),
-                                                    "cliVersion": "0.0.0-test",
-                                                    "source": "vscode",
-                                                    "agentNickname": null,
-                                                    "agentRole": null,
-                                                    "gitInfo": null,
-                                                    "name": null,
+                                                    "reasoningEffort": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/read" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/read should include threadId");
+                                        assert!(
+                                            requested_thread_id == thread_id
+                                                || requested_thread_id == review_thread_id
+                                                || requested_thread_id == forked_thread_id,
+                                            "thread/read should target the recovered thread, its fork, or its review thread",
+                                        );
+                                        let thread = if requested_thread_id == thread_id {
+                                            mock_thread_with_name_and_path(
+                                                thread_id,
+                                                preview,
+                                                thread_name.as_deref(),
+                                                Some(rollout_path.as_str()),
+                                            )
+                                        } else if requested_thread_id == forked_thread_id {
+                                            mock_thread_with_path(
+                                                &forked_thread_id,
+                                                &forked_preview,
+                                                Some(forked_rollout_path.as_str()),
+                                            )
+                                        } else {
+                                            mock_thread_with_path(
+                                                &review_thread_id,
+                                                preview,
+                                                Some(rollout_path.as_str()),
+                                            )
+                                        };
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": thread,
                                                     "turns": [],
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/resume" => {
+                                        let requested_path = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("path"))
+                                            .and_then(serde_json::Value::as_str);
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/resume should include threadId");
+                                        if let Some(requested_path) = requested_path {
+                                            assert_eq!(
+                                                requested_path, rollout_path,
+                                                "path-based thread/resume should stay on the recovered worker",
+                                            );
+                                        } else {
+                                            assert_eq!(requested_thread_id, thread_id);
+                                        }
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread_with_name_and_path(
+                                                        thread_id,
+                                                        preview,
+                                                        thread_name.as_deref(),
+                                                        Some(rollout_path.as_str()),
+                                                    ),
+                                                    "model": "gpt-5",
+                                                    "modelProvider": "openai",
+                                                    "serviceTier": null,
+                                                    "cwd": preview,
+                                                    "instructionSources": [],
+                                                    "approvalPolicy": "never",
+                                                    "approvalsReviewer": "user",
+                                                    "sandbox": {
+                                                        "type": "dangerFullAccess"
+                                                    },
+                                                    "reasoningEffort": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/fork" => {
+                                        let requested_path = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("path"))
+                                            .and_then(serde_json::Value::as_str);
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/fork should include threadId");
+                                        if let Some(requested_path) = requested_path {
+                                            assert_eq!(
+                                                requested_path, rollout_path,
+                                                "path-based thread/fork should stay on the recovered worker",
+                                            );
+                                        } else {
+                                            assert_eq!(requested_thread_id, thread_id);
+                                        }
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": {
+                                                        "id": forked_thread_id.as_str(),
+                                                        "sessionId": forked_thread_id.as_str(),
+                                                        "forkedFromId": thread_id,
+                                                        "preview": forked_preview.as_str(),
+                                                        "ephemeral": true,
+                                                        "modelProvider": "openai",
+                                                        "createdAt": 1,
+                                                        "updatedAt": 1,
+                                                        "status": {
+                                                            "type": "idle"
+                                                        },
+                                                        "path": forked_rollout_path.as_str(),
+                                                        "cwd": forked_preview.as_str(),
+                                                        "cliVersion": "0.0.0-test",
+                                                        "source": "vscode",
+                                                        "agentNickname": null,
+                                                        "agentRole": null,
+                                                        "gitInfo": null,
+                                                        "name": null,
+                                                        "turns": [],
+                                                    },
+                                                    "model": "gpt-5",
+                                                    "modelProvider": "openai",
+                                                    "serviceTier": null,
+                                                    "cwd": forked_preview,
+                                                    "instructionSources": [],
+                                                    "approvalPolicy": "never",
+                                                    "approvalsReviewer": "user",
+                                                    "sandbox": {
+                                                        "type": "dangerFullAccess"
+                                                    },
+                                                    "reasoningEffort": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/name/set" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/name/set should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        let name = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("name"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/name/set should include name");
+                                        thread_name = Some(name.to_string());
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/name/updated".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "threadName": name,
+                                                    })),
                                                 },
-                                                "model": "gpt-5",
-                                                "modelProvider": "openai",
-                                                "serviceTier": null,
-                                                "cwd": forked_preview,
-                                                "instructionSources": [],
-                                                "approvalPolicy": "never",
-                                                "approvalsReviewer": "user",
-                                                "sandbox": {
-                                                    "type": "dangerFullAccess"
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/memoryMode/set" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect(
+                                                "thread/memoryMode/set should include threadId",
+                                            );
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/unsubscribe" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/unsubscribe should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "status": "unsubscribed",
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/closed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                    })),
                                                 },
-                                                "reasoningEffort": null,
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/archive" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/archive should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/name/set" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/name/set should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    let name = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("name"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/name/set should include name");
-                                    thread_name = Some(name.to_string());
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/name/updated".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "threadName": name,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/memoryMode/set" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/memoryMode/set should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/unsubscribe" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/unsubscribe should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "status": "unsubscribed",
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/archived".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/unarchive" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/unarchive should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread_with_name(
+                                                        thread_id,
+                                                        preview,
+                                                        thread_name.as_deref(),
+                                                    ),
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/closed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/archive" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/archive should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/archived".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/unarchive" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/unarchive should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread_with_name(
-                                                    thread_id,
-                                                    preview,
-                                                    thread_name.as_deref(),
-                                                ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/unarchived".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/metadata/update" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect(
+                                                "thread/metadata/update should include threadId",
+                                            );
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread_with_name(
+                                                        thread_id,
+                                                        preview,
+                                                        thread_name.as_deref(),
+                                                    ),
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/unarchived".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/metadata/update" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/metadata/update should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread_with_name(
-                                                    thread_id,
-                                                    preview,
-                                                    thread_name.as_deref(),
-                                                ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/turns/list" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/turns/list should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "data": [mock_turn(&turn_id, "completed")],
+                                                    "nextCursor": null,
+                                                    "backwardsCursor": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/turns/list" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/turns/list should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "data": [mock_turn(&turn_id, "completed")],
-                                                "nextCursor": null,
-                                                "backwardsCursor": null,
-                                            }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/increment_elicitation" => {
-                                    let requested_thread_id = request
+                                        )
+                                        .await;
+                                    }
+                                    "thread/increment_elicitation" => {
+                                        let requested_thread_id = request
                                         .params
                                         .as_ref()
                                         .and_then(|params| params.get("threadId"))
@@ -41747,21 +41782,21 @@ stream_max_retries = 0
                                         .expect(
                                             "thread/increment_elicitation should include threadId",
                                         );
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "count": 1,
-                                                "paused": true,
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "count": 1,
+                                                    "paused": true,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/decrement_elicitation" => {
-                                    let requested_thread_id = request
+                                        )
+                                        .await;
+                                    }
+                                    "thread/decrement_elicitation" => {
+                                        let requested_thread_id = request
                                         .params
                                         .as_ref()
                                         .and_then(|params| params.get("threadId"))
@@ -41769,72 +41804,72 @@ stream_max_retries = 0
                                         .expect(
                                             "thread/decrement_elicitation should include threadId",
                                         );
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "count": 0,
-                                                "paused": false,
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "count": 0,
+                                                    "paused": false,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/inject_items" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/inject_items should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/compact/start" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/compact/start should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/shellCommand" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/shellCommand should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/backgroundTerminals/clean" => {
-                                    let requested_thread_id = request
+                                        )
+                                        .await;
+                                    }
+                                    "thread/inject_items" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/inject_items should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/compact/start" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/compact/start should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/shellCommand" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/shellCommand should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/backgroundTerminals/clean" => {
+                                        let requested_thread_id = request
                                         .params
                                         .as_ref()
                                         .and_then(|params| params.get("threadId"))
@@ -41842,48 +41877,48 @@ stream_max_retries = 0
                                         .expect(
                                             "thread/backgroundTerminals/clean should include threadId",
                                         );
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/rollback" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/rollback should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "thread": mock_thread_with_name(
-                                                    thread_id,
-                                                    preview,
-                                                    thread_name.as_deref(),
-                                                ),
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "app/list" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("app/list should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
+                                        )
+                                        .await;
+                                    }
+                                    "thread/rollback" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/rollback should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "thread": mock_thread_with_name(
+                                                        thread_id,
+                                                        preview,
+                                                        thread_name.as_deref(),
+                                                    ),
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "app/list" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("app/list should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Response(JSONRPCResponse {
                                             id: request.id,
@@ -41908,22 +41943,24 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
-                                }
-                                "mcpServer/resource/read" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("mcpServer/resource/read should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    let uri = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("uri"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("mcpServer/resource/read should include uri");
-                                    write_websocket_message(
+                                    }
+                                    "mcpServer/resource/read" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect(
+                                                "mcpServer/resource/read should include threadId",
+                                            );
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        let uri = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("uri"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("mcpServer/resource/read should include uri");
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Response(JSONRPCResponse {
                                             id: request.id,
@@ -41937,23 +41974,23 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
-                                }
-                                "mcpServer/tool/call" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("mcpServer/tool/call should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    let tool = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("tool"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("mcpServer/tool/call should include tool");
-                                    assert_eq!(tool, "lookup");
-                                    write_websocket_message(
+                                    }
+                                    "mcpServer/tool/call" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("mcpServer/tool/call should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        let tool = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("tool"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("mcpServer/tool/call should include tool");
+                                        assert_eq!(tool, "lookup");
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Response(JSONRPCResponse {
                                             id: request.id,
@@ -41970,16 +42007,16 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
-                                }
-                                "review/start" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("review/start should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
+                                    }
+                                    "review/start" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("review/start should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Response(JSONRPCResponse {
                                             id: request.id,
@@ -41990,55 +42027,55 @@ stream_max_retries = 0
                                         }),
                                     )
                                     .await;
-                                }
-                                "turn/start" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("turn/start should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "turn": mock_turn(&turn_id, "inProgress"),
-                                            }),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/status/changed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "status": {
-                                                        "type": "active",
-                                                        "activeFlags": [],
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "turn/started".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
+                                    }
+                                    "turn/start" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("turn/start should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
                                                     "turn": mock_turn(&turn_id, "inProgress"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/status/changed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "status": {
+                                                            "type": "active",
+                                                            "activeFlags": [],
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "turn/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turn": mock_turn(&turn_id, "inProgress"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42067,58 +42104,58 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/started".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "item": {
-                                                        "type": "agentMessage",
-                                                        "id": format!("msg-{thread_id}"),
-                                                        "text": "streaming answer in progress",
-                                                        "phase": "commentary",
-                                                        "memoryCitation": null,
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/agentMessage/delta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("msg-{thread_id}"),
-                                                    "delta": "hello from recovered worker",
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/plan/delta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("plan-{thread_id}"),
-                                                    "delta": format!("plan {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/started".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "item": {
+                                                            "type": "agentMessage",
+                                                            "id": format!("msg-{thread_id}"),
+                                                            "text": "streaming answer in progress",
+                                                            "phase": "commentary",
+                                                            "memoryCitation": null,
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/agentMessage/delta".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("msg-{thread_id}"),
+                                                        "delta": "hello from recovered worker",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/plan/delta".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("plan-{thread_id}"),
+                                                        "delta": format!("plan {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42134,7 +42171,7 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42150,133 +42187,135 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/reasoning/textDelta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("reasoning-{thread_id}"),
-                                                    "delta": format!("reasoning {thread_id}"),
-                                                    "contentIndex": 0,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/commandExecution/terminalInteraction"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("terminal-{thread_id}"),
-                                                    "processId": format!("proc-{thread_id}"),
-                                                    "stdin": "y\n",
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/commandExecution/outputDelta"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("exec-{thread_id}"),
-                                                    "delta": format!("stdout {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/fileChange/outputDelta".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "itemId": format!("patch-{thread_id}"),
-                                                    "delta": format!("patch {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "turn/diff/updated".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "diff": format!("diff {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "turn/plan/updated".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "explanation": "gateway multi-worker plan",
-                                                    "plan": [{
-                                                        "step": format!("plan {thread_id}"),
-                                                        "status": "completed",
-                                                    }],
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/tokenUsage/updated".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "tokenUsage": {
-                                                        "total": {
-                                                            "totalTokens": 42,
-                                                            "inputTokens": 20,
-                                                            "cachedInputTokens": 3,
-                                                            "outputTokens": 22,
-                                                            "reasoningOutputTokens": 7,
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/reasoning/textDelta".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("reasoning-{thread_id}"),
+                                                        "delta": format!("reasoning {thread_id}"),
+                                                        "contentIndex": 0,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method:
+                                                        "item/commandExecution/terminalInteraction"
+                                                            .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("terminal-{thread_id}"),
+                                                        "processId": format!("proc-{thread_id}"),
+                                                        "stdin": "y\n",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/commandExecution/outputDelta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("exec-{thread_id}"),
+                                                        "delta": format!("stdout {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/fileChange/outputDelta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": format!("patch-{thread_id}"),
+                                                        "delta": format!("patch {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "turn/diff/updated".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "diff": format!("diff {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "turn/plan/updated".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "explanation": "gateway multi-worker plan",
+                                                        "plan": [{
+                                                            "step": format!("plan {thread_id}"),
+                                                            "status": "completed",
+                                                        }],
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/tokenUsage/updated".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "tokenUsage": {
+                                                            "total": {
+                                                                "totalTokens": 42,
+                                                                "inputTokens": 20,
+                                                                "cachedInputTokens": 3,
+                                                                "outputTokens": 22,
+                                                                "reasoningOutputTokens": 7,
+                                                            },
+                                                            "last": {
+                                                                "totalTokens": 10,
+                                                                "inputTokens": 4,
+                                                                "cachedInputTokens": 1,
+                                                                "outputTokens": 6,
+                                                                "reasoningOutputTokens": 2,
+                                                            },
+                                                            "modelContextWindow": 200000,
                                                         },
-                                                        "last": {
-                                                            "totalTokens": 10,
-                                                            "inputTokens": 4,
-                                                            "cachedInputTokens": 1,
-                                                            "outputTokens": 6,
-                                                            "reasoningOutputTokens": 2,
-                                                        },
-                                                        "modelContextWindow": 200000,
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42291,52 +42330,52 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/compacted".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "model/rerouted".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "fromModel": "gpt-5",
-                                                    "toModel": "gpt-5-codex",
-                                                    "reason": "highRiskCyberActivity",
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "rawResponseItem/completed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "item": {
-                                                        "type": "other",
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/compacted".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "model/rerouted".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "fromModel": "gpt-5",
+                                                        "toModel": "gpt-5-codex",
+                                                        "reason": "highRiskCyberActivity",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "rawResponseItem/completed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "item": {
+                                                            "type": "other",
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42355,67 +42394,67 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/autoApprovalReview/started"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "reviewId": format!("guardian-{thread_id}"),
-                                                    "targetItemId": format!("cmd-{thread_id}"),
-                                                    "review": {
-                                                        "status": "inProgress",
-                                                        "riskLevel": null,
-                                                        "userAuthorization": null,
-                                                        "rationale": null,
-                                                    },
-                                                    "action": {
-                                                        "type": "command",
-                                                        "source": "shell",
-                                                        "command": "cat docs/gateway.md",
-                                                        "cwd": "/tmp",
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/autoApprovalReview/completed"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": 0,
-                                                    "completedAtMs": 0,
-                                                    "reviewId": format!("guardian-{thread_id}"),
-                                                    "targetItemId": format!("cmd-{thread_id}"),
-                                                    "decisionSource": "agent",
-                                                    "review": {
-                                                        "status": "approved",
-                                                        "riskLevel": "low",
-                                                        "userAuthorization": "low",
-                                                        "rationale": "Read-only command.",
-                                                    },
-                                                    "action": {
-                                                        "type": "command",
-                                                        "source": "shell",
-                                                        "command": "cat docs/gateway.md",
-                                                        "cwd": "/tmp",
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/autoApprovalReview/started"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "reviewId": format!("guardian-{thread_id}"),
+                                                        "targetItemId": format!("cmd-{thread_id}"),
+                                                        "review": {
+                                                            "status": "inProgress",
+                                                            "riskLevel": null,
+                                                            "userAuthorization": null,
+                                                            "rationale": null,
+                                                        },
+                                                        "action": {
+                                                            "type": "command",
+                                                            "source": "shell",
+                                                            "command": "cat docs/gateway.md",
+                                                            "cwd": "/tmp",
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/autoApprovalReview/completed"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": 0,
+                                                        "completedAtMs": 0,
+                                                        "reviewId": format!("guardian-{thread_id}"),
+                                                        "targetItemId": format!("cmd-{thread_id}"),
+                                                        "decisionSource": "agent",
+                                                        "review": {
+                                                            "status": "approved",
+                                                            "riskLevel": "low",
+                                                            "userAuthorization": "low",
+                                                            "rationale": "Read-only command.",
+                                                        },
+                                                        "action": {
+                                                            "type": "command",
+                                                            "source": "shell",
+                                                            "command": "cat docs/gateway.md",
+                                                            "cwd": "/tmp",
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42444,108 +42483,110 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "item/completed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "completedAtMs": 0,
-                                                "item": {
-                                                    "type": "agentMessage",
-                                                    "id": format!("msg-{thread_id}"),
-                                                    "text": "streaming answer completed",
-                                                    "phase": "final_answer",
-                                                        "memoryCitation": null,
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "turn/completed".to_string(),
-                                                params: Some(serde_json::json!({
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "item/completed".to_string(),
+                                                    params: Some(serde_json::json!({
                                                     "threadId": thread_id,
-                                                    "turn": mock_turn(&turn_id, "completed"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "turn/steer" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("turn/steer should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    let expected_turn_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("expectedTurnId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("turn/steer should include expectedTurnId");
-                                    assert_eq!(expected_turn_id, turn_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "turnId": turn_id,
+                                                    "turnId": turn_id,
+                                                    "completedAtMs": 0,
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": format!("msg-{thread_id}"),
+                                                        "text": "streaming answer completed",
+                                                        "phase": "final_answer",
+                                                            "memoryCitation": null,
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "turn/completed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turn": mock_turn(&turn_id, "completed"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "turn/steer" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("turn/steer should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        let expected_turn_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("expectedTurnId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("turn/steer should include expectedTurnId");
+                                        assert_eq!(expected_turn_id, turn_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "turnId": turn_id,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "turn/interrupt" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("turn/interrupt should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    let requested_turn_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("turnId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("turn/interrupt should include turnId");
-                                    assert_eq!(requested_turn_id, turn_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/realtime/start" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/realtime/start should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        )
+                                        .await;
+                                    }
+                                    "turn/interrupt" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("turn/interrupt should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        let requested_turn_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("turnId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("turn/interrupt should include turnId");
+                                        assert_eq!(requested_turn_id, turn_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/start" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect(
+                                                "thread/realtime/start should include threadId",
+                                            );
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42559,25 +42600,25 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/realtime/itemAdded".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "item": {
-                                                        "type": "message",
-                                                        "id": format!("item-{thread_id}"),
-                                                    },
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/realtime/appendText" => {
-                                    let requested_thread_id = request
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/itemAdded".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "item": {
+                                                            "type": "message",
+                                                            "id": format!("item-{thread_id}"),
+                                                        },
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/appendText" => {
+                                        let requested_thread_id = request
                                         .params
                                         .as_ref()
                                         .and_then(|params| params.get("threadId"))
@@ -42585,48 +42626,48 @@ stream_max_retries = 0
                                         .expect(
                                             "thread/realtime/appendText should include threadId",
                                         );
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/realtime/transcript/delta"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "role": "assistant",
-                                                    "delta": format!("delta {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/realtime/transcript/done"
-                                                    .to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "role": "assistant",
-                                                    "text": format!("done {thread_id}"),
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/realtime/appendAudio" => {
-                                    let requested_thread_id = request
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/transcript/delta"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "role": "assistant",
+                                                        "delta": format!("delta {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/transcript/done"
+                                                        .to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "role": "assistant",
+                                                        "text": format!("done {thread_id}"),
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/appendAudio" => {
+                                        let requested_thread_id = request
                                         .params
                                         .as_ref()
                                         .and_then(|params| params.get("threadId"))
@@ -42634,16 +42675,16 @@ stream_max_retries = 0
                                         .expect(
                                             "thread/realtime/appendAudio should include threadId",
                                         );
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
+                                            }),
+                                        )
+                                        .await;
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42674,7 +42715,7 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
+                                        write_websocket_message(
                                         &mut websocket,
                                         JSONRPCMessage::Notification(
                                             codex_app_server_protocol::JSONRPCNotification {
@@ -42687,87 +42728,87 @@ stream_max_retries = 0
                                         ),
                                     )
                                     .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/realtime/error".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "message": "realtime transport warning",
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/realtime/stop" => {
-                                    let requested_thread_id = request
-                                        .params
-                                        .as_ref()
-                                        .and_then(|params| params.get("threadId"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("thread/realtime/stop should include threadId");
-                                    assert_eq!(requested_thread_id, thread_id);
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({}),
-                                        }),
-                                    )
-                                    .await;
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Notification(
-                                            codex_app_server_protocol::JSONRPCNotification {
-                                                method: "thread/realtime/closed".to_string(),
-                                                params: Some(serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "reason": "client requested stop",
-                                                })),
-                                            },
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                "thread/list" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "data": [mock_thread_with_name(
-                                                    thread_id,
-                                                    preview,
-                                                    thread_name.as_deref(),
-                                                )],
-                                                "nextCursor": null,
-                                                "backwardsCursor": null,
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/error".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "message": "realtime transport warning",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/realtime/stop" => {
+                                        let requested_thread_id = request
+                                            .params
+                                            .as_ref()
+                                            .and_then(|params| params.get("threadId"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .expect("thread/realtime/stop should include threadId");
+                                        assert_eq!(requested_thread_id, thread_id);
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({}),
                                             }),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                "thread/loaded/list" => {
-                                    write_websocket_message(
-                                        &mut websocket,
-                                        JSONRPCMessage::Response(JSONRPCResponse {
-                                            id: request.id,
-                                            result: serde_json::json!({
-                                                "data": [thread_id],
-                                                "nextCursor": null,
+                                        )
+                                        .await;
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Notification(
+                                                codex_app_server_protocol::JSONRPCNotification {
+                                                    method: "thread/realtime/closed".to_string(),
+                                                    params: Some(serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "reason": "client requested stop",
+                                                    })),
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    "thread/list" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "data": [mock_thread_with_name(
+                                                        thread_id,
+                                                        preview,
+                                                        thread_name.as_deref(),
+                                                    )],
+                                                    "nextCursor": null,
+                                                    "backwardsCursor": null,
+                                                }),
                                             }),
-                                        }),
-                                    )
-                                    .await;
+                                        )
+                                        .await;
+                                    }
+                                    "thread/loaded/list" => {
+                                        write_websocket_message(
+                                            &mut websocket,
+                                            JSONRPCMessage::Response(JSONRPCResponse {
+                                                id: request.id,
+                                                result: serde_json::json!({
+                                                    "data": [thread_id],
+                                                    "nextCursor": null,
+                                                }),
+                                            }),
+                                        )
+                                        .await;
+                                    }
+                                    method => panic!("unexpected request method: {method}"),
                                 }
-                                method => panic!("unexpected request method: {method}"),
                             }
                         }
                     }
-                    _ => unreachable!("unexpected connection index"),
-                }
+                });
             }
         });
         format!("ws://{addr}")
@@ -54369,7 +54410,7 @@ stream_max_retries = 0
                         .expect("pong should send");
                     continue;
                 }
-                Message::Close(_) => panic!("unexpected close frame"),
+                Message::Close(frame) => panic!("unexpected close frame: {frame:?}"),
             }
         }
     }
@@ -54783,6 +54824,7 @@ data: {}\n\n",
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
+        let metadata_base = format!("http://{addr}");
 
         let mcp_service = StreamableHttpService::new(
             move || Ok(EmbeddedElicitationAppsMcpServer),
@@ -54791,6 +54833,23 @@ data: {}\n\n",
         );
 
         let router = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server/mcp",
+                get({
+                    move || {
+                        let metadata_base = metadata_base.clone();
+                        async move {
+                            Json(serde_json::json!({
+                                "authorization_endpoint": format!(
+                                    "{metadata_base}/oauth/authorize"
+                                ),
+                                "token_endpoint": format!("{metadata_base}/oauth/token"),
+                                "scopes_supported": [""],
+                            }))
+                        }
+                    }
+                }),
+            )
             .route(
                 "/connectors/directory/list",
                 get(list_embedded_directory_connectors),
@@ -54801,7 +54860,11 @@ data: {}\n\n",
             )
             .route("/api/codex/usage", get(read_embedded_rate_limits))
             .with_state(state)
-            .nest_service("/api/codex/apps", mcp_service);
+            .nest_service("/api/codex/ps/mcp", mcp_service)
+            .fallback(|method: axum::http::Method, uri: Uri| async move {
+                tracing::error!(%method, %uri, "embedded apps mock unmatched request");
+                StatusCode::NOT_FOUND
+            });
 
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;

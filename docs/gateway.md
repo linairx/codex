@@ -55,6 +55,52 @@ Keep business execution in the existing stack:
 
 `codex-gateway -> codex-app-server -> codex-core`
 
+## Responsibility Boundary
+
+The gateway owns northbound policy and coordination. It should decide whether a
+request is authorized, scoped, admitted, audited, observable, and which
+downstream app-server session should receive it. It should not duplicate app
+server business logic or expose `codex-core` concepts directly.
+
+Layer ownership:
+
+- `codex-gateway` owns northbound HTTP/WebSocket/SSE framing, gateway auth and
+  scope checks, request admission, audit logs, metrics, worker selection,
+  thread/project/account affinity, fail-closed routing decisions, and operator
+  health summaries.
+- `codex-gateway` may translate at the protocol boundary when compatibility
+  requires it, such as preserving app-server v2 JSON-RPC wire semantics,
+  mapping gateway-visible request IDs for multi-worker server requests, and
+  hiding worker-local topology from clients.
+- `codex-app-server-client` owns remote app-server session establishment,
+  initialize response validation, request/response correlation, downstream
+  event delivery, shutdown, and transport-level disconnect reporting for one
+  app-server session.
+- `codex-app-server` owns app-server protocol behavior and maps validated v2
+  requests to runtime services.
+- `codex-core` owns thread lifecycle, turn execution, tool execution, approvals,
+  and model/runtime state behind app-server.
+
+Gateway v2 modules should stay aligned with that split:
+
+- `northbound/v2.rs` is the northbound connection orchestrator and routing
+  policy owner.
+- `northbound/v2_account_capacity.rs` owns v2 account-capacity synchronization
+  from downstream account rate-limit snapshots and notifications.
+- `northbound/v2_wire.rs` owns JSON-RPC/WebSocket wire helpers, close-reason
+  handling, and app-server protocol type conversion.
+- `northbound/v2_connection.rs` owns connection-local state shapes, pending
+  request bookkeeping, and downstream worker handles.
+- `northbound/v2_counts.rs` owns bounded health and backlog count derivation.
+- `northbound/v2_limits.rs` owns v2 WebSocket pending request admission
+  limits and stable rate-limit error messages.
+- `northbound/v2_notifications.rs` owns connection-scoped notification
+  deduplication and bounded forwarded-notification payload tracking.
+- `northbound/v2_pagination.rs` owns gateway-generated aggregation cursors,
+  downstream paginated collection, page slicing, and stable aggregate sorting.
+- `northbound/v2_scope.rs` owns gateway v2 request visibility, response scope
+  registration, and thread id/path extraction rules.
+
 ## Initial Crate Shape
 
 ```text
