@@ -467,6 +467,7 @@ mod tests {
             client_name: "codex-gateway".to_string(),
             client_version: "0.0.0".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 4,
         }
@@ -493,6 +494,7 @@ mod tests {
                 capabilities: Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Some(vec!["thread/started".to_string()]),
                 }),
             },

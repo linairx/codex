@@ -173,6 +173,7 @@ pub async fn start_gateway_server(
                 client_name: gateway_config.client_name.clone(),
                 client_version: gateway_config.client_version.clone(),
                 experimental_api: gateway_config.experimental_api,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: gateway_config.channel_capacity,
             };
@@ -273,6 +274,7 @@ fn remote_connect_args(
         client_name: gateway_config.client_name.clone(),
         client_version: gateway_config.client_version.clone(),
         experimental_api: gateway_config.experimental_api,
+        mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: gateway_config.channel_capacity,
     }
@@ -2475,6 +2477,7 @@ mod tests {
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -2696,6 +2699,7 @@ mod tests {
                             client_name: "codex-gateway-test".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: true,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 8,
                         })
@@ -2776,6 +2780,7 @@ mod tests {
                             client_name: "codex-gateway-test".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: true,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 8,
                         })
@@ -2959,6 +2964,7 @@ mod tests {
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -3786,6 +3792,7 @@ mod tests {
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -3888,6 +3895,7 @@ mod tests {
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -4016,6 +4024,7 @@ mod tests {
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -4164,6 +4173,7 @@ requires_openai_auth = true
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -4289,6 +4299,7 @@ requires_openai_auth = true
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -4544,6 +4555,7 @@ request_permissions_tool = true
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -4772,6 +4784,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -5039,6 +5052,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -5261,6 +5275,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -5475,6 +5490,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -5730,6 +5746,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -5900,6 +5917,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -6068,6 +6086,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -6225,6 +6244,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -6581,6 +6601,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -6775,6 +6796,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -6819,7 +6841,6 @@ stream_max_retries = 0
                         sdp: "v=offer\r\n".to_string(),
                     }),
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -6927,7 +6948,7 @@ stream_max_retries = 0
         );
         assert_eq!(
             append_requests[0]["item"]["content"][0]["text"],
-            serde_json::json!("[USER] hello realtime")
+            serde_json::json!("hello realtime")
         );
         assert_eq!(
             append_requests[1]["type"],
@@ -7147,6 +7168,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -7291,6 +7313,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -7502,6 +7525,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -7622,6 +7646,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -8117,6 +8142,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -8146,6 +8172,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -8226,6 +8253,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -8283,7 +8311,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -8486,6 +8513,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -8688,6 +8716,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -8961,6 +8990,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -9991,6 +10021,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10126,6 +10157,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -10294,6 +10326,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10359,6 +10392,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10427,6 +10461,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10495,6 +10530,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10561,6 +10597,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10639,6 +10676,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -10752,6 +10790,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -11174,6 +11213,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -11693,6 +11733,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -12031,6 +12072,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -12089,7 +12131,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -12332,6 +12373,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -12545,6 +12587,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -12703,6 +12746,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -13084,6 +13128,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -14196,6 +14241,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -14291,7 +14337,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -14315,7 +14360,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -14665,6 +14709,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -14887,6 +14932,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -14977,6 +15023,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -17121,6 +17168,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -17433,6 +17481,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -17717,6 +17766,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             },
@@ -17765,6 +17815,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             },
@@ -17839,6 +17890,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             },
@@ -17958,6 +18010,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             },
@@ -18084,6 +18137,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             },
@@ -18134,6 +18188,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             },
@@ -18239,6 +18294,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -18414,6 +18470,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -19312,7 +19369,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -19600,6 +19656,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -20117,6 +20174,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -20468,6 +20526,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -20593,6 +20652,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -20828,6 +20888,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -21473,6 +21534,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -22116,6 +22178,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -22277,6 +22340,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -22488,6 +22552,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -22664,6 +22729,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -22821,6 +22887,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -23095,6 +23162,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -23192,6 +23260,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -23415,6 +23484,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -23801,6 +23871,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -23939,6 +24010,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -24122,6 +24194,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -24312,6 +24385,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -24527,6 +24601,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -24736,6 +24811,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -24959,6 +25035,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -25187,6 +25264,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -25426,6 +25504,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -25657,6 +25736,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -25887,6 +25967,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -26116,6 +26197,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -26344,6 +26426,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -26569,6 +26652,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -26795,6 +26879,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             })
@@ -27132,6 +27217,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             })
@@ -27464,6 +27550,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -27680,6 +27767,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             })
@@ -27936,6 +28024,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             })
@@ -28064,7 +28153,6 @@ stream_max_retries = 0
                                 realtime_session_id: None,
                                 transport: None,
                                 voice: None,
-                                architecture: None,
                                 client_managed_handoffs: None,
                                 model: None,
                                 version: None,
@@ -28235,6 +28323,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             })
@@ -28477,6 +28566,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -28721,6 +28811,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -28970,6 +29061,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -29537,6 +29629,7 @@ stream_max_retries = 0
                 client_name: "codex-gateway-test".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 8,
             })
@@ -29813,6 +29906,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -30750,6 +30844,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -31191,6 +31286,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -31312,6 +31408,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -31464,6 +31561,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -31750,6 +31848,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -31914,6 +32013,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -32052,6 +32152,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -32358,6 +32459,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -32549,6 +32651,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -32672,6 +32775,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -32809,6 +32913,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -32916,6 +33021,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,
         })
@@ -33130,6 +33236,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -33316,6 +33423,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -33913,6 +34021,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -34275,6 +34384,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -34859,6 +34969,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -34952,6 +35063,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 64,
         })
@@ -35022,7 +35134,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -35046,7 +35157,6 @@ stream_max_retries = 0
                     realtime_session_id: None,
                     transport: None,
                     voice: None,
-                    architecture: None,
                     client_managed_handoffs: None,
                     model: None,
                     version: None,
@@ -35386,6 +35496,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -35874,6 +35985,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -36507,6 +36619,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -37266,6 +37379,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -37389,6 +37503,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-a".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -37440,6 +37555,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-b".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -37507,6 +37623,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-c".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -37860,6 +37977,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -37974,6 +38092,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-a".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -38030,6 +38149,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-b".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -38097,6 +38217,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-c".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -38233,6 +38354,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -38367,6 +38489,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-a".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -38423,6 +38546,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-b".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -38490,6 +38614,7 @@ stream_max_retries = 0
             client_name: "codex-gateway-test-c".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })

@@ -2,13 +2,9 @@ use crate::admission::GatewayAdmissionController;
 use crate::auth::GatewayAuth;
 use crate::auth::GatewayAuthError;
 use crate::event::GatewayAccountActiveThreadHandoffFailed;
-use crate::event::GatewayAccountPathHandoffFailed;
-use crate::event::GatewayAccountPathHandoffSucceeded;
-use crate::event::GatewayAccountThreadHandoffFailed;
-use crate::event::GatewayAccountThreadHandoffSucceeded;
 use crate::event::GatewayEvent;
 use crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_notification;
-use crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_rate_limits_response;
+use crate::northbound::v2_aggregation::*;
 use crate::northbound::v2_connection::ClientServerRequestAnswer;
 use crate::northbound::v2_connection::DownstreamServerRequestKey;
 use crate::northbound::v2_connection::DownstreamWorkerEvent;
@@ -27,12 +23,22 @@ use crate::northbound::v2_connection::PendingClientResponses;
 use crate::northbound::v2_connection::PendingServerRequestRoute;
 use crate::northbound::v2_connection::ResolvedServerRequestRoute;
 use crate::northbound::v2_connection::UnavailableWorkerRouteDiagnostics;
-use crate::northbound::v2_connection::WorkerCleanupResolvedNotification;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_connection::WorkerCleanupResolvedNotification;
 use crate::northbound::v2_connection::WorkerServerRequestCleanup;
 use crate::northbound::v2_connection::WorkerServerRequestCleanupReport;
-use crate::northbound::v2_connection::log_degraded_multi_worker_thread_discovery;
 use crate::northbound::v2_connection::log_fail_closed_multi_worker_request;
 use crate::northbound::v2_connection::update_active_v2_connection_pending_counts;
+use crate::northbound::v2_connection_lifecycle::log_aborted_pending_client_requests;
+use crate::northbound::v2_connection_lifecycle::log_client_send_timeout;
+use crate::northbound::v2_connection_lifecycle::log_downstream_backpressure_close;
+use crate::northbound::v2_connection_lifecycle::log_downstream_shutdown_failure;
+use crate::northbound::v2_connection_lifecycle::log_duplicate_pending_client_request;
+use crate::northbound::v2_connection_lifecycle::log_rejected_hidden_downstream_server_request;
+use crate::northbound::v2_connection_lifecycle::log_rejected_saturated_client_request;
+use crate::northbound::v2_connection_lifecycle::log_rejected_saturated_server_request;
+use crate::northbound::v2_connection_lifecycle::log_unexpected_client_server_request_response;
+use crate::northbound::v2_connection_lifecycle::observe_aborted_pending_client_requests;
 use crate::northbound::v2_counts::answered_but_unresolved_server_request_count;
 use crate::northbound::v2_counts::pending_client_request_method_counts;
 use crate::northbound::v2_counts::pending_client_request_worker_counts;
@@ -55,42 +61,52 @@ pub(crate) use crate::northbound::v2_notifications::log_suppressed_opted_out_not
 pub(crate) use crate::northbound::v2_notifications::log_suppressed_skills_changed_notification;
 use crate::northbound::v2_notifications::record_forwarded_connection_notification;
 use crate::northbound::v2_notifications::should_deduplicate_connection_notification;
-use crate::northbound::v2_pagination::AGGREGATED_APPS_CURSOR_PREFIX;
-use crate::northbound::v2_pagination::AGGREGATED_EXPERIMENTAL_FEATURE_CURSOR_PREFIX;
-use crate::northbound::v2_pagination::AGGREGATED_LOADED_THREAD_CURSOR_PREFIX;
-use crate::northbound::v2_pagination::AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX;
-use crate::northbound::v2_pagination::AGGREGATED_MODEL_CURSOR_PREFIX;
-use crate::northbound::v2_pagination::AGGREGATED_THREAD_CURSOR_PREFIX;
-use crate::northbound::v2_pagination::DEFAULT_AGGREGATED_THREAD_LIST_LIMIT;
-use crate::northbound::v2_pagination::aggregated_page_bounds;
-use crate::northbound::v2_pagination::collect_worker_paginated_data;
-use crate::northbound::v2_pagination::decode_aggregated_offset_cursor;
-use crate::northbound::v2_pagination::encode_aggregated_offset_cursor;
-use crate::northbound::v2_pagination::sort_threads_for_aggregation;
-use crate::northbound::v2_scope::DeduplicatedThreadListEntryLog;
+use crate::northbound::v2_request_routing::fanout_connection_notification;
+use crate::northbound::v2_request_routing::fanout_fs_unwatch_request;
+use crate::northbound::v2_request_routing::fanout_fs_watch_request;
+use crate::northbound::v2_request_routing::fanout_mutating_connection_request;
+use crate::northbound::v2_request_routing::first_successful_connection_request;
+use crate::northbound::v2_request_routing::first_successful_scoped_path_thread_request;
+use crate::northbound::v2_request_routing::first_successful_visible_thread_read_request;
+use crate::northbound::v2_request_routing::is_multi_worker_fanout_login_request;
+use crate::northbound::v2_request_routing::recover_visible_thread_worker_route as recover_visible_thread_worker_route_impl;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_request_routing::recover_visible_thread_worker_route;
+use crate::northbound::v2_request_routing::route_config_read_request_if_supported;
+use crate::northbound::v2_request_routing::route_thread_id_request_with_account_handoff;
+use crate::northbound::v2_request_routing::route_thread_start_request_with_account_capacity_failover;
+use crate::northbound::v2_request_routing::thread_id_account_handoff_metrics;
+use crate::northbound::v2_routing::requires_primary_worker_route;
+use crate::northbound::v2_routing::worker_for_notification;
+use crate::northbound::v2_routing::worker_for_request;
+use crate::northbound::v2_routing::worker_for_server_request;
 use crate::northbound::v2_scope::apply_response_scope_policy;
 use crate::northbound::v2_scope::enforce_request_scope;
-use crate::northbound::v2_scope::log_deduplicated_thread_list_entry;
-use crate::northbound::v2_scope::log_failed_visible_thread_worker_route_recovery;
-use crate::northbound::v2_scope::log_recovered_visible_thread_worker_route;
-use crate::northbound::v2_scope::notification_thread_id;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_scope::log_failed_visible_thread_worker_route_recovery;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_scope::log_recovered_visible_thread_worker_route;
 use crate::northbound::v2_scope::notification_visible_to;
 use crate::northbound::v2_scope::request_thread_id;
 use crate::northbound::v2_scope::request_thread_path;
-use crate::northbound::v2_scope::response_thread_id;
-use crate::northbound::v2_scope::response_thread_path;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_scope::response_thread_id;
 use crate::northbound::v2_scope::server_request_visible_to;
+pub(crate) use crate::northbound::v2_server_request_cleanup::record_worker_cleanup_resolution_send_failure;
+pub(crate) use crate::northbound::v2_server_request_cleanup::reject_pending_server_requests;
+pub(crate) use crate::northbound::v2_server_request_cleanup::report_worker_server_request_cleanup;
+pub(crate) use crate::northbound::v2_server_request_cleanup::should_reject_pending_server_requests_after_connection_error;
 pub(crate) use crate::northbound::v2_server_requests::collect_server_request_cleanup_for_worker;
-use crate::northbound::v2_server_requests::log_dropped_duplicate_resolved_server_request;
 use crate::northbound::v2_server_requests::log_duplicate_downstream_server_request;
-use crate::northbound::v2_server_requests::log_rejected_pending_server_requests;
-use crate::northbound::v2_server_requests::log_worker_server_request_cleanup;
-use crate::northbound::v2_server_requests::pending_server_request_log_fields;
-use crate::northbound::v2_server_requests::publish_worker_server_request_cleanup_event;
-use crate::northbound::v2_server_requests::record_client_server_request_cleanup_metrics;
-use crate::northbound::v2_server_requests::record_v2_server_request_lifecycle_method_counts;
-use crate::northbound::v2_server_requests::record_worker_server_request_cleanup_metrics;
-use crate::northbound::v2_server_requests::resolved_server_request_log_fields;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_server_requests::log_worker_server_request_cleanup;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_server_requests::publish_worker_server_request_cleanup_event;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_server_requests::record_client_server_request_cleanup_metrics;
+pub(crate) use crate::northbound::v2_server_requests::record_worker_server_request_cleanup_metrics;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_server_requests_logging::log_rejected_pending_server_requests;
 use crate::northbound::v2_wire::log_downstream_connect_protocol_violation;
 use crate::northbound::v2_wire::log_downstream_protocol_violation;
 use crate::northbound::v2_wire::log_downstream_reconnect_protocol_violation;
@@ -113,59 +129,21 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::header::ORIGIN;
 use axum::response::IntoResponse;
 use codex_app_server_client::AppServerEvent;
-use codex_app_server_protocol::AppInfo;
-use codex_app_server_protocol::AppsListParams;
-use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::CollaborationModeListResponse;
-use codex_app_server_protocol::CollaborationModeMask;
-use codex_app_server_protocol::ConfigReadParams;
-use codex_app_server_protocol::ExperimentalFeature;
-use codex_app_server_protocol::ExperimentalFeatureListParams;
-use codex_app_server_protocol::ExperimentalFeatureListResponse;
-use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
-use codex_app_server_protocol::FsUnwatchParams;
 use codex_app_server_protocol::FsWatchParams;
 use codex_app_server_protocol::FsWatchResponse;
-use codex_app_server_protocol::FuzzyFileSearchResponse;
-use codex_app_server_protocol::FuzzyFileSearchResult;
-use codex_app_server_protocol::GetAccountRateLimitsResponse;
-use codex_app_server_protocol::GetAccountResponse;
-use codex_app_server_protocol::GetAuthStatusResponse;
 use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::ListMcpServerStatusParams;
-use codex_app_server_protocol::ListMcpServerStatusResponse;
-use codex_app_server_protocol::McpServerStatus;
-use codex_app_server_protocol::ModelListParams;
-use codex_app_server_protocol::ModelListResponse;
-use codex_app_server_protocol::PluginListResponse;
-use codex_app_server_protocol::PluginMarketplaceEntry;
-use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::SkillsListEntry;
-use codex_app_server_protocol::SkillsListResponse;
-use codex_app_server_protocol::ThreadListParams;
-use codex_app_server_protocol::ThreadListResponse;
-use codex_app_server_protocol::ThreadLoadedListResponse;
-use codex_app_server_protocol::ThreadReadParams;
-use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
-use codex_protocol::protocol::RealtimeVoice;
-use codex_protocol::protocol::RealtimeVoicesList;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -175,8 +153,8 @@ use tracing::info;
 use tracing::warn;
 
 const INVALID_REQUEST_CODE: i64 = -32600;
-const INVALID_PARAMS_CODE: i64 = -32602;
-const INTERNAL_ERROR_CODE: i64 = -32603;
+pub(crate) const INVALID_PARAMS_CODE: i64 = -32602;
+pub(crate) const INTERNAL_ERROR_CODE: i64 = -32603;
 const DOWNSTREAM_SESSION_ENDED_CLOSE_REASON: &str = "downstream app-server session ended";
 const INITIALIZE_TIMEOUT_CLOSE_REASON: &str = "initialize request timed out";
 const UNEXPECTED_CLIENT_SERVER_REQUEST_RESPONSE_CLOSE_REASON: &str =
@@ -186,7 +164,7 @@ const DUPLICATE_DOWNSTREAM_SERVER_REQUEST_CLOSE_REASON: &str =
     "duplicate downstream server-request id";
 const STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON: &str =
     "downstream worker disconnected during connection-scoped server request";
-const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
+pub(crate) const PENDING_SERVER_REQUEST_ABORTED_MESSAGE: &str =
     "gateway websocket connection ended before server request was resolved";
 const MAX_PENDING_SERVER_REQUESTS_PER_CONNECTION: usize = 64;
 const MAX_PENDING_CLIENT_REQUESTS_PER_CONNECTION: usize = 64;
@@ -302,7 +280,10 @@ impl GatewayV2DownstreamRouter {
         self.workers.len() == 1
     }
 
-    fn latest_worker_with_id(&self, worker_id: Option<usize>) -> Option<&DownstreamWorkerHandle> {
+    pub(crate) fn latest_worker_with_id(
+        &self,
+        worker_id: Option<usize>,
+    ) -> Option<&DownstreamWorkerHandle> {
         self.workers
             .iter()
             .rev()
@@ -316,7 +297,7 @@ impl GatewayV2DownstreamRouter {
             || self.workers.len() > 1
     }
 
-    fn primary_worker(&self) -> io::Result<&DownstreamWorkerHandle> {
+    pub(crate) fn primary_worker(&self) -> io::Result<&DownstreamWorkerHandle> {
         if self.multi_worker_topology() {
             return self.latest_worker_with_id(Some(0)).ok_or_else(|| {
                 io::Error::other("gateway v2 connection has no downstream app-server sessions")
@@ -363,7 +344,7 @@ impl GatewayV2DownstreamRouter {
             })
     }
 
-    fn next_thread_start_worker_for_project(
+    pub(crate) fn next_thread_start_worker_for_project(
         &mut self,
         scope_registry: &GatewayScopeRegistry,
         context: &GatewayRequestContext,
@@ -388,7 +369,7 @@ impl GatewayV2DownstreamRouter {
         self.next_thread_start_worker()
     }
 
-    fn worker_for_thread(
+    pub(crate) fn worker_for_thread(
         &self,
         scope_registry: &GatewayScopeRegistry,
         thread_id: &str,
@@ -627,12 +608,12 @@ impl GatewayV2DownstreamRouter {
         self.initialized_notification_sent = true;
     }
 
-    fn record_fs_watch(&mut self, params: FsWatchParams) {
+    pub(crate) fn record_fs_watch(&mut self, params: FsWatchParams) {
         self.active_fs_watches
             .insert(params.watch_id.clone(), params);
     }
 
-    fn clear_fs_watch(&mut self, watch_id: &str) {
+    pub(crate) fn clear_fs_watch(&mut self, watch_id: &str) {
         self.active_fs_watches.remove(watch_id);
     }
 
@@ -670,7 +651,7 @@ impl GatewayV2DownstreamRouter {
         self.reconnect_retry_after.remove(&worker_id);
     }
 
-    fn ensure_all_configured_workers_present_for(&self, label: &str) -> io::Result<()> {
+    pub(crate) fn ensure_all_configured_workers_present_for(&self, label: &str) -> io::Result<()> {
         let Some(reconnect_state) = &self.reconnect_state else {
             return Ok(());
         };
@@ -692,7 +673,7 @@ impl GatewayV2DownstreamRouter {
         }))
     }
 
-    fn ensure_primary_worker_present_for(&self, label: &str) -> io::Result<()> {
+    pub(crate) fn ensure_primary_worker_present_for(&self, label: &str) -> io::Result<()> {
         if self.has_worker(Some(0)) {
             return Ok(());
         }
@@ -735,7 +716,7 @@ impl GatewayV2DownstreamRouter {
             .collect()
     }
 
-    fn websocket_url_for_worker_id(&self, worker_id: Option<usize>) -> &str {
+    pub(crate) fn websocket_url_for_worker_id(&self, worker_id: Option<usize>) -> &str {
         if let Some(worker_websocket_url) = self
             .workers
             .iter()
@@ -755,19 +736,19 @@ impl GatewayV2DownstreamRouter {
             .map_or("<unknown>", String::as_str)
     }
 
-    fn worker_account_id(&self, worker_id: usize) -> Option<String> {
+    pub(crate) fn worker_account_id(&self, worker_id: usize) -> Option<String> {
         self.reconnect_state
             .as_ref()
             .and_then(|state| state.session_factory.worker_account_id(worker_id))
     }
 
-    fn worker_account_has_capacity(&self, worker_id: usize) -> bool {
+    pub(crate) fn worker_account_has_capacity(&self, worker_id: usize) -> bool {
         self.reconnect_state
             .as_ref()
             .is_none_or(|state| state.session_factory.worker_account_has_capacity(worker_id))
     }
 
-    fn worker_is_healthy(&self, worker_id: usize) -> bool {
+    pub(crate) fn worker_is_healthy(&self, worker_id: usize) -> bool {
         self.reconnect_state
             .as_ref()
             .is_none_or(|state| state.session_factory.worker_is_healthy(worker_id))
@@ -2914,634 +2895,6 @@ async fn resolve_server_requests_for_worker(
     Ok(cleanup)
 }
 
-fn report_worker_server_request_cleanup(
-    observability: &GatewayObservability,
-    worker_id: Option<usize>,
-    report: &WorkerServerRequestCleanupReport<'_>,
-    cleanup: &WorkerServerRequestCleanup,
-) {
-    log_worker_server_request_cleanup(
-        worker_id,
-        report.worker_websocket_url,
-        report.remaining_worker_count,
-        report.disconnect_message,
-        cleanup,
-        report.message,
-    );
-    publish_worker_server_request_cleanup_event(
-        observability,
-        worker_id,
-        report.worker_websocket_url,
-        report.remaining_worker_count,
-        report.disconnect_message,
-        cleanup,
-    );
-}
-
-fn record_worker_cleanup_resolution_send_failure(
-    observability: &GatewayObservability,
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    resolved_notification: &WorkerCleanupResolvedNotification,
-    err: &io::Error,
-) {
-    let outcome = classify_v2_connection_error(err);
-    let notification = &resolved_notification.notification;
-    let method = resolved_notification.method.as_str();
-    observability.record_v2_notification_send_failure("serverRequest/resolved", outcome);
-    observability
-        .record_v2_server_request_lifecycle_event("worker_cleanup_resolution_send_failed", method);
-    warn!(
-        tenant_id = %request_context.tenant_id,
-        project_id = ?request_context.project_id,
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        thread_id = notification.thread_id.as_str(),
-        gateway_request_id = ?notification.request_id,
-        method,
-        outcome,
-        %err,
-        "failed to deliver synthesized serverRequest/resolved during worker cleanup"
-    );
-}
-
-fn log_unexpected_client_server_request_response(
-    request_context: &GatewayRequestContext,
-    response_kind: &str,
-    unexpected_request_id: &RequestId,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) {
-    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
-    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
-    let server_request_backlog_count = pending_log_fields
-        .gateway_request_ids
-        .len()
-        .saturating_add(resolved_log_fields.gateway_request_ids.len());
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        response_kind,
-        unexpected_request_id = ?unexpected_request_id,
-        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        pending_thread_ids = ?pending_log_fields.thread_ids,
-        pending_worker_ids = ?pending_log_fields.worker_ids,
-        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
-        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
-        server_request_backlog_count,
-        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
-        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
-        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
-        answered_but_unresolved_worker_websocket_urls =
-            ?resolved_log_fields.worker_websocket_urls,
-        "gateway v2 client replied to a server request that is no longer pending"
-    );
-}
-
-fn log_rejected_saturated_server_request(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    request_id: &RequestId,
-    method: &str,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-    limit: usize,
-) {
-    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        pending_server_request_count = pending_server_requests.len(),
-        limit,
-        request_id = ?request_id,
-        method,
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        pending_thread_ids = ?pending_log_fields.thread_ids,
-        pending_worker_ids = ?pending_log_fields.worker_ids,
-        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
-        "rejecting downstream server request because the gateway websocket connection is saturated"
-    );
-}
-
-fn log_rejected_saturated_client_request(
-    request_context: &GatewayRequestContext,
-    request_id: &RequestId,
-    method: &str,
-    pending_client_request_count: usize,
-    limit: usize,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        request_id = ?request_id,
-        method,
-        pending_client_request_count,
-        limit,
-        "rejecting client request because the gateway websocket connection is saturated"
-    );
-}
-
-fn log_rejected_hidden_downstream_server_request(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    request_id: &RequestId,
-    method: &str,
-    thread_id: Option<&str>,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        request_id = ?request_id,
-        method,
-        thread_id,
-        "rejecting downstream server request for a thread outside the gateway request scope"
-    );
-}
-
-fn log_downstream_backpressure_close(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    skipped: usize,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) {
-    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
-    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
-    let server_request_backlog_count = pending_log_fields
-        .gateway_request_ids
-        .len()
-        .saturating_add(resolved_log_fields.gateway_request_ids.len());
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        skipped_event_count = skipped,
-        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        pending_thread_ids = ?pending_log_fields.thread_ids,
-        pending_worker_ids = ?pending_log_fields.worker_ids,
-        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
-        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
-        server_request_backlog_count,
-        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
-        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
-        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
-        answered_but_unresolved_worker_websocket_urls =
-            ?resolved_log_fields.worker_websocket_urls,
-        "closing gateway v2 connection because the downstream app-server event stream lagged"
-    );
-}
-
-fn log_client_send_timeout(
-    request_context: &GatewayRequestContext,
-    detail: &str,
-    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
-    pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
-    let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
-    let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
-    let server_request_backlog_count = pending_log_fields
-        .gateway_request_ids
-        .len()
-        .saturating_add(resolved_log_fields.gateway_request_ids.len());
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        connection_detail = detail,
-        pending_client_request_count = pending_client_request_ids.len(),
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
-        pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
-        pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
-        pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
-        pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
-        pending_server_request_methods = ?pending_log_fields.methods,
-        pending_thread_ids = ?pending_log_fields.thread_ids,
-        pending_worker_ids = ?pending_log_fields.worker_ids,
-        pending_worker_websocket_urls = ?pending_log_fields.worker_websocket_urls,
-        answered_but_unresolved_server_request_count = resolved_log_fields.gateway_request_ids.len(),
-        server_request_backlog_count,
-        answered_but_unresolved_gateway_request_ids = ?resolved_log_fields.gateway_request_ids,
-        answered_but_unresolved_downstream_request_ids = ?resolved_log_fields.downstream_request_ids,
-        answered_but_unresolved_server_request_methods = ?resolved_log_fields.methods,
-        answered_but_unresolved_thread_ids = ?resolved_log_fields.thread_ids,
-        answered_but_unresolved_worker_ids = ?resolved_log_fields.worker_ids,
-        answered_but_unresolved_worker_websocket_urls =
-            ?resolved_log_fields.worker_websocket_urls,
-        "closing gateway v2 connection because sending to the northbound client timed out"
-    );
-}
-
-fn log_downstream_shutdown_failure(
-    request_context: &GatewayRequestContext,
-    connection_outcome: &str,
-    connection_detail: Option<&str>,
-    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
-    pending_counts: &GatewayV2ConnectionPendingCounts,
-    err: &io::Error,
-) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
-    let pending_client_request_worker_counts = &pending_counts.pending_client_request_worker_counts;
-    let pending_client_request_method_counts = &pending_counts.pending_client_request_method_counts;
-    let server_request_backlog_count = pending_counts
-        .pending_server_request_count
-        .saturating_add(pending_counts.answered_but_unresolved_server_request_count);
-    let server_request_backlog_worker_counts = &pending_counts.server_request_backlog_worker_counts;
-    let server_request_backlog_method_counts = &pending_counts.server_request_backlog_method_counts;
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        connection_outcome,
-        connection_detail,
-        pending_client_request_count = pending_counts.pending_client_request_count,
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
-        pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
-        pending_client_request_worker_counts = ?pending_client_request_worker_counts,
-        pending_client_request_method_counts = ?pending_client_request_method_counts,
-        pending_server_request_count = pending_counts.pending_server_request_count,
-        answered_but_unresolved_server_request_count =
-            pending_counts.answered_but_unresolved_server_request_count,
-        server_request_backlog_count,
-        server_request_backlog_worker_counts = ?server_request_backlog_worker_counts,
-        server_request_backlog_method_counts = ?server_request_backlog_method_counts,
-        shutdown_error = %err,
-        "gateway v2 websocket downstream shutdown also failed after connection error"
-    );
-}
-
-fn log_aborted_pending_client_requests(
-    request_context: &GatewayRequestContext,
-    outcome: &str,
-    detail: Option<&str>,
-    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
-) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
-    let pending_client_request_worker_counts =
-        pending_client_request_worker_counts(pending_client_requests);
-    let pending_client_request_method_counts =
-        pending_client_request_method_counts(pending_client_requests);
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        outcome,
-        detail,
-        pending_client_request_count = pending_client_request_ids.len(),
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
-        pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
-        pending_client_request_worker_counts = ?pending_client_request_worker_counts,
-        pending_client_request_method_counts = ?pending_client_request_method_counts,
-        "aborting pending gateway v2 client requests because the northbound connection ended"
-    );
-}
-
-fn log_duplicate_pending_client_request(
-    request_context: &GatewayRequestContext,
-    request_id: &RequestId,
-    method: &str,
-    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
-) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
-
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        request_id = ?request_id,
-        method,
-        pending_client_request_count = pending_client_request_ids.len(),
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
-        pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
-        "closing gateway v2 connection because the northbound client reused a pending request id"
-    );
-}
-
-fn observe_aborted_pending_client_requests(
-    observability: &GatewayObservability,
-    outcome: &str,
-    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
-) {
-    for route in pending_client_requests.values() {
-        observe_v2_request(
-            observability,
-            &route.request_context,
-            &route.method,
-            outcome,
-            route.started_at.elapsed(),
-        );
-    }
-}
-
-fn log_notification_send_failure(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    method: &str,
-    outcome: &str,
-    err: &io::Error,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        method,
-        outcome,
-        error = %err,
-        "failed to deliver downstream notification to northbound v2 client"
-    );
-}
-
-fn log_downstream_server_request_forward_failure(
-    request_context: &GatewayRequestContext,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    method: &str,
-    outcome: &str,
-    err: &io::Error,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        method,
-        outcome,
-        error = %err,
-        "failed to deliver downstream server request to northbound v2 client"
-    );
-}
-
-fn observe_client_response_send_failure(
-    observability: &GatewayObservability,
-    request_context: &GatewayRequestContext,
-    request_id: &RequestId,
-    method: &str,
-    outcome: &str,
-    err: &io::Error,
-) {
-    observability.record_v2_client_response_send_failure(method, outcome);
-    log_client_response_send_failure(request_context, request_id, method, outcome, err);
-}
-
-fn log_client_response_send_failure(
-    request_context: &GatewayRequestContext,
-    request_id: &RequestId,
-    method: &str,
-    outcome: &str,
-    err: &io::Error,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        request_id = ?request_id,
-        method,
-        outcome,
-        error = %err,
-        "failed to deliver gateway v2 client request response to northbound client"
-    );
-}
-
-fn log_close_frame_send_failure(
-    request_context: &GatewayRequestContext,
-    code: u16,
-    reason: &str,
-    outcome: &str,
-    err: &io::Error,
-) {
-    warn!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        code,
-        reason = websocket_close_reason(reason),
-        outcome,
-        error = %err,
-        "failed to deliver gateway v2 close frame to northbound client"
-    );
-}
-
-async fn reject_pending_server_requests(
-    downstream: &GatewayV2DownstreamRouter,
-    observability: &GatewayObservability,
-    request_context: &GatewayRequestContext,
-    connection_outcome: &str,
-    connection_detail: Option<&str>,
-    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
-    resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) -> io::Result<()> {
-    let mut pending_worker_websocket_urls = pending_server_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect::<Vec<_>>();
-    pending_worker_websocket_urls.sort();
-    pending_worker_websocket_urls.dedup();
-    log_rejected_pending_server_requests(
-        request_context,
-        connection_outcome,
-        connection_detail,
-        pending_server_requests,
-        resolved_server_requests,
-        &pending_worker_websocket_urls,
-    );
-    record_client_server_request_cleanup_metrics(
-        observability,
-        pending_server_requests,
-        resolved_server_requests,
-    );
-
-    let mut first_rejection_error = None;
-    let mut skipped_unavailable_worker_rejections = BTreeMap::new();
-    let mut failed_rejections = BTreeMap::new();
-    let mut delivered_rejections = BTreeMap::new();
-    for (gateway_request_id, route) in pending_server_requests.drain() {
-        let Ok(worker) = worker_for_server_request(downstream, route.worker_id) else {
-            *skipped_unavailable_worker_rejections
-                .entry(route.method.clone())
-                .or_insert(0) += 1;
-            observability
-                .record_v2_server_request_rejection_delivery_failure(route.method.as_str());
-            warn!(
-                tenant_id = request_context.tenant_id.as_str(),
-                project_id = request_context.project_id.as_deref(),
-                worker_id = ?route.worker_id,
-                worker_websocket_url = route.worker_websocket_url.as_str(),
-                gateway_request_id = ?gateway_request_id,
-                downstream_request_id = ?route.downstream_request_id,
-                method = route.method.as_str(),
-                "skipping pending server-request rejection because the downstream worker route is unavailable"
-            );
-            continue;
-        };
-        let worker_websocket_url = worker
-            .worker_websocket_url
-            .as_deref()
-            .unwrap_or("<unknown>");
-
-        match worker
-            .request_handle
-            .reject_server_request(
-                route.downstream_request_id.clone(),
-                JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: PENDING_SERVER_REQUEST_ABORTED_MESSAGE.to_string(),
-                    data: None,
-                },
-            )
-            .await
-        {
-            Ok(()) => {
-                *delivered_rejections
-                    .entry(route.method.clone())
-                    .or_insert(0) += 1;
-            }
-            Err(err) => {
-                observability
-                    .record_v2_server_request_rejection_delivery_failure(route.method.as_str());
-                *failed_rejections.entry(route.method.clone()).or_insert(0) += 1;
-                warn!(
-                    tenant_id = request_context.tenant_id.as_str(),
-                    project_id = request_context.project_id.as_deref(),
-                    worker_id = ?route.worker_id,
-                    worker_websocket_url,
-                    gateway_request_id = ?gateway_request_id,
-                    downstream_request_id = ?route.downstream_request_id,
-                    method = route.method.as_str(),
-                    %err,
-                    "failed to reject pending downstream server request during gateway v2 connection cleanup"
-                );
-                if first_rejection_error.is_none() {
-                    first_rejection_error = Some(err);
-                }
-            }
-        }
-    }
-
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "client_cleanup_rejection_delivered",
-        &delivered_rejections,
-    );
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "client_cleanup_rejection_skipped_unavailable_worker",
-        &skipped_unavailable_worker_rejections,
-    );
-    record_v2_server_request_lifecycle_method_counts(
-        observability,
-        "client_cleanup_rejection_failed",
-        &failed_rejections,
-    );
-
-    if let Some(err) = first_rejection_error {
-        return Err(err);
-    }
-    Ok(())
-}
-
 async fn handle_client_request(
     downstream: &mut GatewayV2DownstreamRouter,
     connection: &GatewayV2ConnectionContext<'_>,
@@ -3567,7 +2920,7 @@ async fn handle_client_request(
                 .is_none()
         {
             downstream.ensure_all_configured_workers_present_for(&request.method)?;
-            recover_visible_thread_worker_route(
+            recover_visible_thread_worker_route_impl(
                 downstream,
                 connection.scope_registry,
                 connection.request_context,
@@ -3855,1959 +3208,6 @@ fn fail_closed_active_thread_request_if_account_exhausted(
     }))
 }
 
-async fn route_thread_start_request_with_account_capacity_failover(
-    downstream: &mut GatewayV2DownstreamRouter,
-    connection: &GatewayV2ConnectionContext<'_>,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    let max_attempts = downstream.workers.len().max(1);
-    let mut first_capacity_error = None;
-    let mut exhausted_worker_ids = Vec::new();
-
-    for _ in 0..max_attempts {
-        let worker = worker_for_request(
-            downstream,
-            connection.scope_registry,
-            connection.request_context,
-            &request,
-        )?
-        .clone();
-        let worker_account_id = worker
-            .worker_id
-            .and_then(|worker_id| downstream.worker_account_id(worker_id));
-        let method = request.method.clone();
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-
-        match response {
-            Ok(result) => {
-                if let Some(worker_id) = worker.worker_id {
-                    downstream.mark_worker_account_available(worker_id);
-                    if !exhausted_worker_ids.is_empty() {
-                        connection.observability.publish_operator_event(
-                            GatewayEvent::account_failover_succeeded(
-                                connection.request_context.tenant_id.as_str(),
-                                connection.request_context.project_id.as_deref(),
-                                worker_id,
-                                downstream.worker_account_id(worker_id),
-                                exhausted_worker_ids.clone(),
-                            ),
-                        );
-                        connection.observability.record_v2_account_capacity_event(
-                            worker_id,
-                            "thread_start_failover_success",
-                            Some(connection.request_context),
-                            Some("thread/start restored on a replacement account-backed worker"),
-                        );
-                        info!(
-                            method = method.as_str(),
-                            tenant_id = connection.request_context.tenant_id.as_str(),
-                            project_id = connection.request_context.project_id.as_deref(),
-                            replacement_worker_id = worker_id,
-                            replacement_account_id = downstream.worker_account_id(worker_id),
-                            exhausted_worker_ids = ?exhausted_worker_ids,
-                            "gateway v2 thread/start retried on another account-backed worker after account capacity exhaustion"
-                        );
-                    }
-                }
-                return Ok(Ok(apply_response_scope_policy(
-                    connection.scope_registry,
-                    connection.request_context,
-                    Some(connection.observability),
-                    &method,
-                    worker.worker_id,
-                    worker_account_id,
-                    result,
-                )?));
-            }
-            Err(error) if is_account_capacity_error(&error) => {
-                if let Some(worker_id) = worker.worker_id {
-                    connection.observability.record_v2_account_capacity_event(
-                        worker_id,
-                        "exhausted",
-                        Some(connection.request_context),
-                        Some(error.message.as_str()),
-                    );
-                    warn!(
-                        method = method.as_str(),
-                        tenant_id = connection.request_context.tenant_id.as_str(),
-                        project_id = connection.request_context.project_id.as_deref(),
-                        exhausted_worker_id = worker_id,
-                        exhausted_account_id = downstream.worker_account_id(worker_id),
-                        reason = error.message.as_str(),
-                        "gateway v2 marked account-backed worker exhausted after downstream thread/start failure"
-                    );
-                    connection.observability.publish_operator_event(
-                        GatewayEvent::account_capacity_exhausted(
-                            connection.request_context.tenant_id.as_str(),
-                            connection.request_context.project_id.as_deref(),
-                            worker_id,
-                            downstream.worker_account_id(worker_id),
-                            error.message.as_str(),
-                        ),
-                    );
-                    downstream.mark_worker_account_exhausted(worker_id, error.message.clone());
-                    exhausted_worker_ids.push(worker_id);
-                }
-                if first_capacity_error.is_none() {
-                    first_capacity_error = Some(error);
-                }
-            }
-            Err(error) => return Ok(Err(error)),
-        }
-    }
-
-    first_capacity_error.map(Err).ok_or_else(|| {
-        io::Error::other(
-            "gateway v2 connection has no downstream app-server sessions with available account capacity",
-        )
-    })
-}
-
-async fn route_thread_id_request_with_account_handoff(
-    downstream: &mut GatewayV2DownstreamRouter,
-    connection: &GatewayV2ConnectionContext<'_>,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    let method = request.method.clone();
-    let Some((success_metric, failure_metric)) = thread_id_account_handoff_metrics(method.as_str())
-    else {
-        return Err(io::Error::other(format!(
-            "gateway v2 {method} handoff is not supported"
-        )));
-    };
-    let Some(thread_id) = request_thread_id(&request).map(str::to_string) else {
-        return Err(io::Error::other(format!(
-            "gateway v2 {method} handoff requires a thread id"
-        )));
-    };
-    let Some(exhausted_worker_id) = connection.scope_registry.thread_worker_id(&thread_id) else {
-        let worker = worker_for_request(
-            downstream,
-            connection.scope_registry,
-            connection.request_context,
-            &request,
-        )?
-        .clone();
-        let worker_account_id = worker
-            .worker_id
-            .and_then(|worker_id| downstream.worker_account_id(worker_id));
-        return send_thread_request_to_worker(
-            &worker,
-            connection.scope_registry,
-            connection.request_context,
-            Some(connection.observability),
-            worker_account_id,
-            request,
-        )
-        .await;
-    };
-
-    if downstream.worker_account_has_capacity(exhausted_worker_id) {
-        let worker = worker_for_request(
-            downstream,
-            connection.scope_registry,
-            connection.request_context,
-            &request,
-        )?
-        .clone();
-        let worker_account_id = worker
-            .worker_id
-            .and_then(|worker_id| downstream.worker_account_id(worker_id));
-        return send_thread_request_to_worker(
-            &worker,
-            connection.scope_registry,
-            connection.request_context,
-            Some(connection.observability),
-            worker_account_id,
-            request,
-        )
-        .await;
-    }
-
-    let mut first_error = None;
-    for worker in &downstream.workers {
-        let Some(replacement_worker_id) = worker.worker_id else {
-            continue;
-        };
-        if replacement_worker_id == exhausted_worker_id
-            || !downstream.worker_is_healthy(replacement_worker_id)
-            || !downstream.worker_account_has_capacity(replacement_worker_id)
-        {
-            continue;
-        }
-
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => {
-                if matches!(
-                    method.as_str(),
-                    "getConversationSummary"
-                        | "thread/metadata/update"
-                        | "thread/read"
-                        | "thread/resume"
-                        | "thread/rollback"
-                        | "thread/unarchive"
-                ) && response_thread_id(&result) != Some(thread_id.as_str())
-                {
-                    if first_error.is_none() {
-                        first_error = Some(JSONRPCErrorError {
-                            code: INVALID_PARAMS_CODE,
-                            message: format!(
-                                "replacement worker returned a different thread while restoring {thread_id}"
-                            ),
-                            data: None,
-                        });
-                    }
-                    continue;
-                }
-                connection.observability.record_v2_account_capacity_event(
-                    replacement_worker_id,
-                    success_metric,
-                    Some(connection.request_context),
-                    Some("thread id request restored on a replacement account-backed worker"),
-                );
-                connection.observability.publish_operator_event(
-                    GatewayEvent::account_thread_handoff_succeeded(
-                        GatewayAccountThreadHandoffSucceeded {
-                            tenant_id: connection.request_context.tenant_id.as_str(),
-                            project_id: connection.request_context.project_id.as_deref(),
-                            method: method.as_str(),
-                            thread_id: thread_id.as_str(),
-                            exhausted_worker_id,
-                            exhausted_account_id: downstream.worker_account_id(exhausted_worker_id),
-                            replacement_worker_id,
-                            replacement_account_id: downstream
-                                .worker_account_id(replacement_worker_id),
-                        },
-                    ),
-                );
-                if matches!(
-                    method.as_str(),
-                    "thread/archive"
-                        | "thread/compact/start"
-                        | "thread/decrement_elicitation"
-                        | "thread/increment_elicitation"
-                        | "thread/inject_items"
-                        | "thread/memoryMode/set"
-                        | "thread/name/set"
-                        | "thread/rollback"
-                        | "thread/turns/list"
-                        | "thread/unsubscribe"
-                ) {
-                    connection.scope_registry.register_thread_with_worker(
-                        thread_id.clone(),
-                        connection.request_context.clone(),
-                        worker.worker_id,
-                    );
-                }
-                info!(
-                    method = method.as_str(),
-                    tenant_id = connection.request_context.tenant_id.as_str(),
-                    project_id = connection.request_context.project_id.as_deref(),
-                    thread_id,
-                    exhausted_worker_id,
-                    exhausted_account_id = downstream.worker_account_id(exhausted_worker_id),
-                    replacement_worker_id,
-                    replacement_account_id = downstream.worker_account_id(replacement_worker_id),
-                    "gateway v2 restored thread id request on another account-backed worker after account capacity exhaustion"
-                );
-                return Ok(Ok(apply_response_scope_policy(
-                    connection.scope_registry,
-                    connection.request_context,
-                    Some(connection.observability),
-                    method.as_str(),
-                    worker.worker_id,
-                    worker
-                        .worker_id
-                        .and_then(|worker_id| downstream.worker_account_id(worker_id)),
-                    result,
-                )?));
-            }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-
-    let message = format!(
-        "thread {thread_id} is pinned to worker {exhausted_worker_id} with exhausted account capacity for {method}, and no replacement worker restored the context"
-    );
-    connection.observability.record_v2_account_capacity_event(
-        exhausted_worker_id,
-        failure_metric,
-        Some(connection.request_context),
-        Some(message.as_str()),
-    );
-    connection
-        .observability
-        .publish_operator_event(GatewayEvent::account_thread_handoff_failed(
-            GatewayAccountThreadHandoffFailed {
-                tenant_id: connection.request_context.tenant_id.as_str(),
-                project_id: connection.request_context.project_id.as_deref(),
-                method: method.as_str(),
-                thread_id: thread_id.as_str(),
-                exhausted_worker_id,
-                exhausted_account_id: downstream.worker_account_id(exhausted_worker_id),
-                reason: message.as_str(),
-            },
-        ));
-    warn!(
-        method = method.as_str(),
-        account_capacity_event = failure_metric,
-        tenant_id = connection.request_context.tenant_id.as_str(),
-        project_id = connection.request_context.project_id.as_deref(),
-        thread_id,
-        exhausted_worker_id,
-        exhausted_account_id = downstream.worker_account_id(exhausted_worker_id),
-        first_error = ?first_error,
-        "gateway v2 failed to restore thread id request on another account-backed worker after account capacity exhaustion"
-    );
-    Err(io::Error::other(FailClosedMultiWorkerRouteError {
-        message,
-    }))
-}
-
-fn thread_id_account_handoff_metrics(method: &str) -> Option<(&'static str, &'static str)> {
-    match method {
-        "getConversationSummary" => Some((
-            "conversation_summary_handoff_success",
-            "conversation_summary_handoff_failure",
-        )),
-        "thread/archive" => Some((
-            "thread_archive_handoff_success",
-            "thread_archive_handoff_failure",
-        )),
-        "thread/decrement_elicitation" => Some((
-            "thread_decrement_elicitation_handoff_success",
-            "thread_decrement_elicitation_handoff_failure",
-        )),
-        "thread/fork" => Some(("thread_fork_handoff_success", "thread_fork_handoff_failure")),
-        "thread/increment_elicitation" => Some((
-            "thread_increment_elicitation_handoff_success",
-            "thread_increment_elicitation_handoff_failure",
-        )),
-        "thread/inject_items" => Some((
-            "thread_inject_items_handoff_success",
-            "thread_inject_items_handoff_failure",
-        )),
-        "thread/memoryMode/set" => Some((
-            "thread_memory_mode_set_handoff_success",
-            "thread_memory_mode_set_handoff_failure",
-        )),
-        "thread/metadata/update" => Some((
-            "thread_metadata_update_handoff_success",
-            "thread_metadata_update_handoff_failure",
-        )),
-        "thread/name/set" => Some((
-            "thread_name_set_handoff_success",
-            "thread_name_set_handoff_failure",
-        )),
-        "thread/read" => Some(("thread_read_handoff_success", "thread_read_handoff_failure")),
-        "thread/resume" => Some((
-            "thread_resume_handoff_success",
-            "thread_resume_handoff_failure",
-        )),
-        "thread/rollback" => Some((
-            "thread_rollback_handoff_success",
-            "thread_rollback_handoff_failure",
-        )),
-        "thread/compact/start" => Some((
-            "thread_compact_start_handoff_success",
-            "thread_compact_start_handoff_failure",
-        )),
-        "thread/turns/list" => Some((
-            "thread_turns_list_handoff_success",
-            "thread_turns_list_handoff_failure",
-        )),
-        "thread/unsubscribe" => Some((
-            "thread_unsubscribe_handoff_success",
-            "thread_unsubscribe_handoff_failure",
-        )),
-        "thread/unarchive" => Some((
-            "thread_unarchive_handoff_success",
-            "thread_unarchive_handoff_failure",
-        )),
-        _ => None,
-    }
-}
-
-async fn send_thread_request_to_worker(
-    worker: &DownstreamWorkerHandle,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    observability: Option<&GatewayObservability>,
-    worker_account_id: Option<String>,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    let method = request.method.clone();
-    let response = worker
-        .request_handle
-        .request(jsonrpc_request_to_client_request(request)?)
-        .await?;
-    Ok(match response {
-        Ok(result) => Ok(apply_response_scope_policy(
-            scope_registry,
-            context,
-            observability,
-            &method,
-            worker.worker_id,
-            worker_account_id,
-            result,
-        )?),
-        Err(error) => Err(error),
-    })
-}
-
-fn is_account_capacity_error(error: &JSONRPCErrorError) -> bool {
-    if error.code == 429 {
-        return true;
-    }
-
-    let message = error.message.to_ascii_lowercase();
-    [
-        "rate limit",
-        "rate_limit",
-        "usage limit",
-        "usage_limit",
-        "credits depleted",
-        "billing",
-        "quota",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
-fn is_multi_worker_fanout_login_request(request: &JSONRPCRequest) -> bool {
-    request.method == "account/login/start"
-        && request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|login_type| matches!(login_type, "apiKey" | "chatgptAuthTokens"))
-}
-
-async fn recover_visible_thread_worker_route(
-    downstream: &GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    thread_id: &str,
-) -> io::Result<()> {
-    let attempted_worker_ids = downstream
-        .workers
-        .iter()
-        .map(|worker| worker.worker_id)
-        .collect::<Vec<_>>();
-    let attempted_worker_websocket_urls = downstream
-        .workers
-        .iter()
-        .map(|worker| downstream.websocket_url_for_worker_id(worker.worker_id))
-        .collect::<Vec<_>>();
-    for worker in &downstream.workers {
-        let response = worker
-            .request_handle
-            .request(ClientRequest::ThreadRead {
-                request_id: RequestId::String(format!("gateway-thread-route-probe:{thread_id}")),
-                params: ThreadReadParams {
-                    thread_id: thread_id.to_string(),
-                    include_turns: false,
-                },
-            })
-            .await?;
-        if let Ok(result) = response
-            && response_thread_id(&result) == Some(thread_id)
-        {
-            scope_registry.register_thread_with_worker(
-                thread_id.to_string(),
-                context.clone(),
-                worker.worker_id,
-            );
-            log_recovered_visible_thread_worker_route(
-                context,
-                thread_id,
-                worker.worker_id,
-                downstream.websocket_url_for_worker_id(worker.worker_id),
-            );
-            observability.record_v2_thread_route_recovery("success");
-            break;
-        }
-    }
-
-    if scope_registry.thread_worker_id(thread_id).is_none() {
-        log_failed_visible_thread_worker_route_recovery(
-            context,
-            thread_id,
-            &attempted_worker_ids,
-            &attempted_worker_websocket_urls,
-        );
-        observability.record_v2_thread_route_recovery("miss");
-    }
-
-    Ok(())
-}
-
-async fn fanout_mutating_connection_request(
-    downstream: &GatewayV2DownstreamRouter,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-    let mut primary_result = None;
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => {
-                if index == 0 {
-                    primary_result = Some(result);
-                }
-            }
-            Err(error) => return Ok(Err(error)),
-        }
-    }
-
-    primary_result.map(Ok).ok_or_else(|| {
-        io::Error::other("gateway v2 connection has no downstream app-server sessions")
-    })
-}
-
-async fn fanout_fs_watch_request(
-    downstream: &mut GatewayV2DownstreamRouter,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-    let params = request_params::<FsWatchParams>(&request)?;
-    let mut primary_result = None;
-    let mut watched_workers = Vec::new();
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => {
-                watched_workers.push(worker.worker_id);
-                if index == 0 {
-                    primary_result = Some(result);
-                }
-            }
-            Err(error) => {
-                rollback_fs_watch_registrations(downstream, &params.watch_id, &watched_workers)
-                    .await;
-                return Ok(Err(error));
-            }
-        }
-    }
-
-    let Some(primary_result) = primary_result else {
-        return Err(io::Error::other(
-            "gateway v2 connection has no downstream app-server sessions",
-        ));
-    };
-
-    downstream.record_fs_watch(params);
-    Ok(Ok(primary_result))
-}
-
-async fn fanout_fs_unwatch_request(
-    downstream: &mut GatewayV2DownstreamRouter,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    let params = request_params::<FsUnwatchParams>(&request)?;
-    let result = fanout_mutating_connection_request(downstream, request).await?;
-    if result.is_ok() {
-        downstream.clear_fs_watch(&params.watch_id);
-    }
-    Ok(result)
-}
-
-async fn rollback_fs_watch_registrations(
-    downstream: &GatewayV2DownstreamRouter,
-    watch_id: &str,
-    worker_ids: &[Option<usize>],
-) {
-    for worker_id in worker_ids {
-        let Some(worker) = downstream.latest_worker_with_id(*worker_id) else {
-            continue;
-        };
-        let _ = worker
-            .request_handle
-            .request(ClientRequest::FsUnwatch {
-                request_id: RequestId::String(format!("gateway-rollback-fs-watch:{watch_id}")),
-                params: FsUnwatchParams {
-                    watch_id: watch_id.to_string(),
-                },
-            })
-            .await;
-    }
-}
-
-async fn route_config_read_request_if_supported(
-    downstream: &GatewayV2DownstreamRouter,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    let params = request_params::<ConfigReadParams>(&request)?;
-    let Some(cwd) = params.cwd.as_ref() else {
-        if downstream.multi_worker_topology() {
-            downstream.ensure_primary_worker_present_for("config/read")?;
-        }
-        let worker = downstream.primary_worker()?;
-        return worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request)?)
-            .await;
-    };
-    downstream.ensure_all_configured_workers_present_for("config/read")?;
-    let request_cwd = Path::new(cwd);
-    let mut primary_result = None;
-    let mut first_result = None;
-    let mut first_error = None;
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => {
-                if config_read_response_matches_cwd(&result, request_cwd) {
-                    return Ok(Ok(result));
-                }
-                if index == 0 {
-                    primary_result = Some(result.clone());
-                }
-                if first_result.is_none() {
-                    first_result = Some(result);
-                }
-            }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-
-    if let Some(result) = primary_result.or(first_result) {
-        return Ok(Ok(result));
-    }
-
-    match first_error {
-        Some(error) => Ok(Err(error)),
-        None => Err(io::Error::other(
-            "gateway v2 connection has no downstream app-server sessions",
-        )),
-    }
-}
-
-async fn first_successful_connection_request(
-    downstream: &GatewayV2DownstreamRouter,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-    let mut first_error = None;
-
-    for worker in &downstream.workers {
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => return Ok(Ok(result)),
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-
-    match first_error {
-        Some(error) => Ok(Err(error)),
-        None => Err(io::Error::other(
-            "gateway v2 connection has no downstream app-server sessions",
-        )),
-    }
-}
-
-async fn fanout_connection_notification(
-    downstream: &GatewayV2DownstreamRouter,
-    notification: ClientNotification,
-) -> io::Result<()> {
-    for worker in &downstream.workers {
-        worker.request_handle.notify(notification.clone()).await?;
-    }
-    Ok(())
-}
-
-async fn first_successful_visible_thread_read_request(
-    downstream: &GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut first_error = None;
-
-    for worker in &downstream.workers {
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => {
-                return Ok(Ok(apply_response_scope_policy(
-                    scope_registry,
-                    context,
-                    None,
-                    &request.method,
-                    worker.worker_id,
-                    worker
-                        .worker_id
-                        .and_then(|worker_id| downstream.worker_account_id(worker_id)),
-                    result,
-                )?));
-            }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-
-    match first_error {
-        Some(error) => Ok(Err(error)),
-        None => Err(io::Error::other(
-            "gateway v2 connection has no downstream app-server sessions",
-        )),
-    }
-}
-
-async fn first_successful_scoped_path_thread_request(
-    downstream: &GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    request: JSONRPCRequest,
-) -> io::Result<Result<Value, JSONRPCErrorError>> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-    let mut exhausted_route_worker_id = None;
-    if let Some(thread_path) = request_thread_path(&request)
-        && let Some(worker_id) = scope_registry.thread_path_worker_id(thread_path)
-    {
-        if !downstream.worker_account_has_capacity(worker_id) {
-            exhausted_route_worker_id = Some(worker_id);
-        } else {
-            let response = worker_for_server_request(downstream, Some(worker_id))?
-                .request_handle
-                .request(jsonrpc_request_to_client_request(request.clone())?)
-                .await?;
-            return match response {
-                Ok(result) => Ok(Ok(apply_response_scope_policy(
-                    scope_registry,
-                    context,
-                    Some(observability),
-                    &request.method,
-                    Some(worker_id),
-                    downstream.worker_account_id(worker_id),
-                    result,
-                )?)),
-                Err(error) => Ok(Err(error)),
-            };
-        }
-    }
-
-    let mut first_error = None;
-
-    for worker in &downstream.workers {
-        if worker.worker_id.is_some_and(|worker_id| {
-            !downstream.worker_is_healthy(worker_id)
-                || !downstream.worker_account_has_capacity(worker_id)
-        }) {
-            continue;
-        }
-        let response = worker
-            .request_handle
-            .request(jsonrpc_request_to_client_request(request.clone())?)
-            .await?;
-        match response {
-            Ok(result) => {
-                if let Some(thread_path) = request_thread_path(&request)
-                    && path_handoff_response_must_match_request(&request)
-                    && response_thread_path(&result) != Some(thread_path)
-                {
-                    if first_error.is_none() {
-                        first_error = Some(JSONRPCErrorError {
-                            code: INVALID_PARAMS_CODE,
-                            message: format!(
-                                "replacement worker returned a different rollout path while restoring {thread_path}"
-                            ),
-                            data: None,
-                        });
-                    }
-                    continue;
-                }
-                if let (Some(exhausted_worker_id), Some(replacement_worker_id)) =
-                    (exhausted_route_worker_id, worker.worker_id)
-                {
-                    observability.record_v2_account_capacity_event(
-                        replacement_worker_id,
-                        "path_thread_handoff_success",
-                        Some(context),
-                        Some("path-based thread request restored on a replacement account-backed worker"),
-                    );
-                    if let Some(thread_path) = request_thread_path(&request) {
-                        observability.publish_operator_event(
-                            GatewayEvent::account_path_handoff_succeeded(
-                                GatewayAccountPathHandoffSucceeded {
-                                    tenant_id: context.tenant_id.as_str(),
-                                    project_id: context.project_id.as_deref(),
-                                    method: request.method.as_str(),
-                                    thread_path,
-                                    exhausted_worker_id,
-                                    exhausted_account_id: downstream
-                                        .worker_account_id(exhausted_worker_id),
-                                    replacement_worker_id,
-                                    replacement_account_id: downstream
-                                        .worker_account_id(replacement_worker_id),
-                                },
-                            ),
-                        );
-                    }
-                    info!(
-                        method = request.method.as_str(),
-                        tenant_id = context.tenant_id.as_str(),
-                        project_id = context.project_id.as_deref(),
-                        exhausted_worker_id,
-                        exhausted_account_id = downstream.worker_account_id(exhausted_worker_id),
-                        replacement_worker_id,
-                        replacement_account_id =
-                            downstream.worker_account_id(replacement_worker_id),
-                        thread_path = request_thread_path(&request),
-                        "gateway v2 restored a path-based thread request on another account-backed worker after account capacity exhaustion"
-                    );
-                }
-                return Ok(Ok(apply_response_scope_policy(
-                    scope_registry,
-                    context,
-                    Some(observability),
-                    &request.method,
-                    worker.worker_id,
-                    worker
-                        .worker_id
-                        .and_then(|worker_id| downstream.worker_account_id(worker_id)),
-                    result,
-                )?));
-            }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-
-    if let Some(worker_id) = exhausted_route_worker_id
-        && let Some(thread_path) = request_thread_path(&request)
-    {
-        let message = format!(
-            "thread path {thread_path} is pinned to worker {worker_id} with exhausted account capacity for {}, and no replacement worker restored the context",
-            request.method
-        );
-        observability.record_v2_account_capacity_event(
-            worker_id,
-            "path_thread_handoff_failure",
-            Some(context),
-            Some(message.as_str()),
-        );
-        observability.publish_operator_event(GatewayEvent::account_path_handoff_failed(
-            GatewayAccountPathHandoffFailed {
-                tenant_id: context.tenant_id.as_str(),
-                project_id: context.project_id.as_deref(),
-                method: request.method.as_str(),
-                thread_path,
-                exhausted_worker_id: worker_id,
-                exhausted_account_id: downstream.worker_account_id(worker_id),
-                reason: message.as_str(),
-            },
-        ));
-        warn!(
-            method = request.method.as_str(),
-            account_capacity_event = "path_thread_handoff_failure",
-            tenant_id = context.tenant_id.as_str(),
-            project_id = context.project_id.as_deref(),
-            exhausted_worker_id = worker_id,
-            exhausted_account_id = downstream.worker_account_id(worker_id),
-            thread_path,
-            "gateway v2 failed to restore a path-based thread request on another account-backed worker after account capacity exhaustion"
-        );
-        return Err(io::Error::other(FailClosedMultiWorkerRouteError {
-            message,
-        }));
-    }
-
-    match first_error {
-        Some(error) => Ok(Err(error)),
-        None => Err(io::Error::other(
-            "gateway v2 connection has no downstream app-server sessions",
-        )),
-    }
-}
-
-fn path_handoff_response_must_match_request(request: &JSONRPCRequest) -> bool {
-    matches!(
-        request.method.as_str(),
-        "getConversationSummary" | "thread/resume"
-    )
-}
-
-fn worker_for_request<'a>(
-    downstream: &'a mut GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    request: &JSONRPCRequest,
-) -> io::Result<&'a DownstreamWorkerHandle> {
-    if !downstream.multi_worker_topology() {
-        return downstream.primary_worker();
-    }
-
-    if request.method == "thread/start" {
-        return downstream.next_thread_start_worker_for_project(scope_registry, context);
-    }
-
-    if requires_primary_worker_route(request) {
-        downstream.ensure_primary_worker_present_for(&request.method)?;
-        return downstream.primary_worker();
-    }
-
-    if let Some(thread_id) = request_thread_id(request) {
-        if let Ok(worker) = downstream.worker_for_thread(scope_registry, thread_id) {
-            if let Some(worker_id) = worker.worker_id
-                && !downstream.worker_account_has_capacity(worker_id)
-            {
-                return Err(io::Error::other(FailClosedMultiWorkerRouteError {
-                    message: format!(
-                        "thread {thread_id} is pinned to worker {worker_id} with exhausted account capacity for {}",
-                        request.method
-                    ),
-                }));
-            }
-            return Ok(worker);
-        }
-        if scope_registry.thread_context(thread_id).is_some() {
-            return Err(io::Error::other(format!(
-                "thread {thread_id} is missing a downstream worker route"
-            )));
-        }
-    }
-
-    downstream.primary_worker()
-}
-
-fn worker_for_notification<'a>(
-    downstream: &'a mut GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    notification: &JSONRPCNotification,
-) -> io::Result<&'a DownstreamWorkerHandle> {
-    if !downstream.multi_worker_topology() {
-        return downstream.primary_worker();
-    }
-
-    if let Some(thread_id) = notification
-        .params
-        .as_ref()
-        .and_then(notification_thread_id)
-    {
-        if let Ok(worker) = downstream.worker_for_thread(scope_registry, thread_id) {
-            return Ok(worker);
-        }
-        if scope_registry.thread_context(thread_id).is_some() {
-            return Err(io::Error::other(format!(
-                "thread {thread_id} is missing a downstream worker route"
-            )));
-        }
-    }
-
-    downstream.primary_worker()
-}
-
-fn worker_for_server_request(
-    downstream: &GatewayV2DownstreamRouter,
-    worker_id: Option<usize>,
-) -> io::Result<&DownstreamWorkerHandle> {
-    downstream.latest_worker_with_id(worker_id).ok_or_else(|| {
-        io::Error::other(format!(
-            "gateway v2 connection has no downstream server-request route for worker {worker_id:?}"
-        ))
-    })
-}
-
-fn requires_primary_worker_route(request: &JSONRPCRequest) -> bool {
-    matches!(
-        request.method.as_str(),
-        "configRequirements/read"
-            | "account/login/cancel"
-            | "account/sendAddCreditsNudgeEmail"
-            | "feedback/upload"
-            | "command/exec"
-            | "command/exec/write"
-            | "command/exec/resize"
-            | "command/exec/terminate"
-            | "fs/readFile"
-            | "fs/writeFile"
-            | "fs/createDirectory"
-            | "fs/getMetadata"
-            | "fs/readDirectory"
-            | "fs/remove"
-            | "fs/copy"
-            | "fuzzyFileSearch/sessionStart"
-            | "fuzzyFileSearch/sessionUpdate"
-            | "fuzzyFileSearch/sessionStop"
-            | "windowsSandbox/setupStart"
-    ) || (request.method == "account/login/start" && !is_multi_worker_fanout_login_request(request))
-}
-
-fn config_read_response_matches_cwd(result: &Value, cwd: &Path) -> bool {
-    result
-        .get("layers")
-        .and_then(Value::as_array)
-        .is_some_and(|layers| {
-            layers.iter().any(|layer| {
-                layer.get("name").is_some_and(|name| {
-                    name.get("dotCodexFolder")
-                        .and_then(Value::as_str)
-                        .map(Path::new)
-                        .is_some_and(|config_dir| cwd.starts_with(config_dir))
-                        || name
-                            .get("file")
-                            .and_then(Value::as_str)
-                            .and_then(|file| Path::new(file).parent())
-                            .is_some_and(|config_dir| cwd.starts_with(config_dir))
-                })
-            })
-        })
-}
-
-async fn aggregate_thread_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    log_degraded_multi_worker_thread_discovery(downstream, context, observability, &request.method);
-
-    let params = request_params::<ThreadListParams>(request)?;
-    let offset = decode_aggregated_offset_cursor(
-        params.cursor.as_deref(),
-        AGGREGATED_THREAD_CURSOR_PREFIX,
-        "thread",
-    )?;
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_AGGREGATED_THREAD_LIST_LIMIT as u32) as usize;
-    let mut threads_by_id =
-        HashMap::<String, (codex_app_server_protocol::Thread, Option<usize>)>::new();
-
-    for worker in &downstream.workers {
-        let pages = collect_worker_paginated_data::<ThreadListParams, ThreadListResponse, _>(
-            worker,
-            request,
-            |response| (response.data, response.next_cursor),
-        )
-        .await?;
-        for thread in pages.into_iter().filter(|thread| {
-            if !scope_registry.thread_visible_to(context, &thread.id) {
-                return false;
-            }
-            true
-        }) {
-            match threads_by_id.entry(thread.id.clone()) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert((thread, worker.worker_id));
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let (
-                        replace_existing,
-                        selected_worker_id,
-                        discarded_worker_id,
-                        selected_updated_at,
-                        discarded_updated_at,
-                        selected_created_at,
-                        discarded_created_at,
-                    ) = {
-                        let (existing, existing_worker_id) = entry.get();
-                        if (thread.updated_at, thread.created_at)
-                            > (existing.updated_at, existing.created_at)
-                        {
-                            (
-                                true,
-                                worker.worker_id,
-                                *existing_worker_id,
-                                thread.updated_at,
-                                existing.updated_at,
-                                thread.created_at,
-                                existing.created_at,
-                            )
-                        } else {
-                            (
-                                false,
-                                *existing_worker_id,
-                                worker.worker_id,
-                                existing.updated_at,
-                                thread.updated_at,
-                                existing.created_at,
-                                thread.created_at,
-                            )
-                        }
-                    };
-                    log_deduplicated_thread_list_entry(
-                        context,
-                        DeduplicatedThreadListEntryLog {
-                            thread_id: thread.id.as_str(),
-                            selected_worker_id,
-                            selected_worker_websocket_url: downstream
-                                .websocket_url_for_worker_id(selected_worker_id),
-                            discarded_worker_id,
-                            discarded_worker_websocket_url: downstream
-                                .websocket_url_for_worker_id(discarded_worker_id),
-                            selected_updated_at,
-                            discarded_updated_at,
-                            selected_created_at,
-                            discarded_created_at,
-                        },
-                    );
-                    observability.record_v2_thread_list_deduplication(selected_worker_id);
-                    if replace_existing {
-                        entry.insert((thread, worker.worker_id));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut threads = threads_by_id
-        .into_values()
-        .map(|(thread, worker_id)| {
-            scope_registry.register_thread_worker_if_visible(&thread.id, context, worker_id);
-            thread
-        })
-        .collect::<Vec<_>>();
-
-    sort_threads_for_aggregation(&mut threads, params.sort_key, params.sort_direction);
-    let page: Vec<_> = threads.iter().skip(offset).take(limit).cloned().collect();
-    let next_cursor = (offset + page.len() < threads.len()).then(|| {
-        encode_aggregated_offset_cursor(AGGREGATED_THREAD_CURSOR_PREFIX, offset + page.len())
-    });
-    let backwards_cursor = (offset > 0).then(|| {
-        encode_aggregated_offset_cursor(
-            AGGREGATED_THREAD_CURSOR_PREFIX,
-            offset.saturating_sub(limit),
-        )
-    });
-
-    serde_json::to_value(ThreadListResponse {
-        data: page,
-        next_cursor,
-        backwards_cursor,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_loaded_thread_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    log_degraded_multi_worker_thread_discovery(downstream, context, observability, &request.method);
-
-    let params = request_params::<codex_app_server_protocol::ThreadLoadedListParams>(request)?;
-    let offset = decode_aggregated_offset_cursor(
-        params.cursor.as_deref(),
-        AGGREGATED_LOADED_THREAD_CURSOR_PREFIX,
-        "loaded thread",
-    )?;
-    let mut thread_ids = Vec::new();
-    let mut seen = HashSet::new();
-
-    for worker in &downstream.workers {
-        let loaded_ids = collect_worker_paginated_data::<
-            codex_app_server_protocol::ThreadLoadedListParams,
-            ThreadLoadedListResponse,
-            _,
-        >(worker, request, |response| {
-            (response.data, response.next_cursor)
-        })
-        .await?;
-        for thread_id in loaded_ids {
-            if scope_registry.thread_visible_to(context, &thread_id) {
-                scope_registry.register_thread_worker_if_visible(
-                    &thread_id,
-                    context,
-                    worker.worker_id,
-                );
-            }
-            if scope_registry.thread_visible_to(context, &thread_id)
-                && seen.insert(thread_id.clone())
-            {
-                thread_ids.push(thread_id);
-            }
-        }
-    }
-
-    let limit = params.limit.unwrap_or(thread_ids.len() as u32).max(1) as usize;
-    let (start, end, next_cursor) = aggregated_page_bounds(
-        thread_ids.len(),
-        offset,
-        limit,
-        AGGREGATED_LOADED_THREAD_CURSOR_PREFIX,
-    );
-
-    serde_json::to_value(ThreadLoadedListResponse {
-        data: thread_ids[start..end].to_vec(),
-        next_cursor,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_apps_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let params = request_params::<AppsListParams>(request)?;
-    let offset = decode_aggregated_offset_cursor(
-        params.cursor.as_deref(),
-        AGGREGATED_APPS_CURSOR_PREFIX,
-        "apps",
-    )?;
-    let fanout_request = JSONRPCRequest {
-        id: request.id.clone(),
-        method: request.method.clone(),
-        params: Some(
-            serde_json::to_value(AppsListParams {
-                cursor: None,
-                limit: None,
-                thread_id: None,
-                force_refetch: params.force_refetch,
-            })
-            .map_err(io::Error::other)?,
-        ),
-        trace: request.trace.clone(),
-    };
-
-    let mut apps = Vec::<AppInfo>::new();
-    let mut seen_ids = HashSet::new();
-
-    for worker in &downstream.workers {
-        let worker_apps = collect_worker_paginated_data::<AppsListParams, AppsListResponse, _>(
-            worker,
-            &fanout_request,
-            |response| (response.data, response.next_cursor),
-        )
-        .await?;
-        for app in worker_apps {
-            if seen_ids.insert(app.id.clone()) {
-                apps.push(app);
-            }
-        }
-    }
-
-    let limit = params.limit.unwrap_or(apps.len() as u32).max(1) as usize;
-    let (start, end, next_cursor) =
-        aggregated_page_bounds(apps.len(), offset, limit, AGGREGATED_APPS_CURSOR_PREFIX);
-
-    serde_json::to_value(AppsListResponse {
-        data: apps[start..end].to_vec(),
-        next_cursor,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_mcp_server_status_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let params = request_params::<ListMcpServerStatusParams>(request)?;
-    let offset = decode_aggregated_offset_cursor(
-        params.cursor.as_deref(),
-        AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX,
-        "mcp server status",
-    )?;
-    let fanout_request = JSONRPCRequest {
-        id: request.id.clone(),
-        method: request.method.clone(),
-        params: Some(
-            serde_json::to_value(ListMcpServerStatusParams {
-                cursor: None,
-                limit: None,
-                detail: params.detail,
-                thread_id: params.thread_id.clone(),
-            })
-            .map_err(io::Error::other)?,
-        ),
-        trace: request.trace.clone(),
-    };
-
-    let mut statuses = Vec::<McpServerStatus>::new();
-    let mut seen_names = HashSet::new();
-
-    for worker in &downstream.workers {
-        let worker_statuses = collect_worker_paginated_data::<
-            ListMcpServerStatusParams,
-            ListMcpServerStatusResponse,
-            _,
-        >(worker, &fanout_request, |response| {
-            (response.data, response.next_cursor)
-        })
-        .await?;
-        for status in worker_statuses {
-            if seen_names.insert(status.name.clone()) {
-                statuses.push(status);
-            }
-        }
-    }
-
-    let limit = params.limit.unwrap_or(statuses.len() as u32).max(1) as usize;
-    let (start, end, next_cursor) = aggregated_page_bounds(
-        statuses.len(),
-        offset,
-        limit,
-        AGGREGATED_MCP_SERVER_STATUS_CURSOR_PREFIX,
-    );
-
-    serde_json::to_value(ListMcpServerStatusResponse {
-        data: statuses[start..end].to_vec(),
-        next_cursor,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_external_agent_config_detect_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut items = Vec::new();
-
-    for worker in &downstream.workers {
-        let response: ExternalAgentConfigDetectResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        for item in response.items {
-            if !items.contains(&item) {
-                items.push(item);
-            }
-        }
-    }
-
-    serde_json::to_value(ExternalAgentConfigDetectResponse { items }).map_err(io::Error::other)
-}
-
-async fn aggregate_account_read_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut primary_response = None;
-    let mut requires_openai_auth = false;
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response: GetAccountResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        requires_openai_auth |= response.requires_openai_auth;
-        if index == 0 {
-            primary_response = Some(response);
-        }
-    }
-
-    let mut response = primary_response.ok_or_else(|| {
-        io::Error::other("gateway v2 connection has no downstream app-server sessions")
-    })?;
-    response.requires_openai_auth = requires_openai_auth;
-    serde_json::to_value(response).map_err(io::Error::other)
-}
-
-async fn aggregate_get_auth_status_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut primary_response = None;
-    let mut requires_openai_auth = None;
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response: GetAuthStatusResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        if let Some(requires_openai_auth_value) = response.requires_openai_auth {
-            requires_openai_auth =
-                Some(requires_openai_auth.unwrap_or(false) || requires_openai_auth_value);
-        }
-        if index == 0 {
-            primary_response = Some(response);
-        }
-    }
-
-    let mut response = primary_response.ok_or_else(|| {
-        io::Error::other("gateway v2 connection has no downstream app-server sessions")
-    })?;
-    response.requires_openai_auth = requires_openai_auth;
-    serde_json::to_value(response).map_err(io::Error::other)
-}
-
-async fn aggregate_account_rate_limits_response(
-    downstream: &GatewayV2DownstreamRouter,
-    context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut primary_response = None;
-    let mut aggregated_rate_limits_by_limit_id = HashMap::new();
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response: GetAccountRateLimitsResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        sync_worker_account_capacity_from_rate_limits_response(
-            downstream,
-            context,
-            observability,
-            worker.worker_id,
-            &response,
-        );
-        if let Some(rate_limits_by_limit_id) = &response.rate_limits_by_limit_id {
-            for (limit_id, snapshot) in rate_limits_by_limit_id {
-                aggregated_rate_limits_by_limit_id
-                    .entry(limit_id.clone())
-                    .or_insert_with(|| snapshot.clone());
-            }
-        }
-        if index == 0 {
-            primary_response = Some(response);
-        }
-    }
-
-    let mut response = primary_response.ok_or_else(|| {
-        io::Error::other("gateway v2 connection has no downstream app-server sessions")
-    })?;
-    response.rate_limits_by_limit_id = (!aggregated_rate_limits_by_limit_id.is_empty())
-        .then_some(aggregated_rate_limits_by_limit_id);
-    serde_json::to_value(response).map_err(io::Error::other)
-}
-
-async fn aggregate_model_list_response_if_supported(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let params = request_params::<ModelListParams>(request)?;
-    let offset = decode_aggregated_offset_cursor(
-        params.cursor.as_deref(),
-        AGGREGATED_MODEL_CURSOR_PREFIX,
-        "model",
-    )?;
-    let fanout_request = JSONRPCRequest {
-        id: request.id.clone(),
-        method: request.method.clone(),
-        params: Some(
-            serde_json::to_value(ModelListParams {
-                cursor: None,
-                limit: None,
-                include_hidden: params.include_hidden,
-            })
-            .map_err(io::Error::other)?,
-        ),
-        trace: request.trace.clone(),
-    };
-
-    let mut models = Vec::new();
-    let mut seen_ids = HashSet::new();
-
-    for worker in &downstream.workers {
-        let worker_models = collect_worker_paginated_data::<ModelListParams, ModelListResponse, _>(
-            worker,
-            &fanout_request,
-            |response| (response.data, response.next_cursor),
-        )
-        .await?;
-        for model in worker_models {
-            if seen_ids.insert(model.id.clone()) {
-                models.push(model);
-            }
-        }
-    }
-
-    let limit = params.limit.unwrap_or(models.len() as u32).max(1) as usize;
-    let (start, end, next_cursor) =
-        aggregated_page_bounds(models.len(), offset, limit, AGGREGATED_MODEL_CURSOR_PREFIX);
-
-    serde_json::to_value(ModelListResponse {
-        data: models[start..end].to_vec(),
-        next_cursor,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_skills_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut entries = Vec::<SkillsListEntry>::new();
-
-    for worker in &downstream.workers {
-        let response: SkillsListResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        for mut incoming in response.data {
-            if let Some(existing) = entries.iter_mut().find(|entry| entry.cwd == incoming.cwd) {
-                for skill in incoming.skills.drain(..) {
-                    if !existing.skills.contains(&skill) {
-                        existing.skills.push(skill);
-                    }
-                }
-                for error in incoming.errors.drain(..) {
-                    if !existing.errors.contains(&error) {
-                        existing.errors.push(error);
-                    }
-                }
-            } else {
-                entries.push(incoming);
-            }
-        }
-    }
-
-    serde_json::to_value(SkillsListResponse { data: entries }).map_err(io::Error::other)
-}
-
-async fn aggregate_plugin_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut marketplaces = Vec::<PluginMarketplaceEntry>::new();
-    let mut featured_plugin_ids = Vec::<String>::new();
-    let mut marketplace_load_errors = Vec::new();
-
-    for worker in &downstream.workers {
-        let response: PluginListResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        for marketplace in response.marketplaces {
-            merge_plugin_marketplace(&mut marketplaces, marketplace);
-        }
-        for plugin_id in response.featured_plugin_ids {
-            if !featured_plugin_ids.contains(&plugin_id) {
-                featured_plugin_ids.push(plugin_id);
-            }
-        }
-        for load_error in response.marketplace_load_errors {
-            if !marketplace_load_errors.contains(&load_error) {
-                marketplace_load_errors.push(load_error);
-            }
-        }
-    }
-
-    serde_json::to_value(PluginListResponse {
-        marketplaces,
-        marketplace_load_errors,
-        featured_plugin_ids,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_realtime_list_voices_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut primary_response = None;
-    let mut merged_v1 = Vec::<RealtimeVoice>::new();
-    let mut merged_v2 = Vec::<RealtimeVoice>::new();
-
-    for (index, worker) in downstream.workers.iter().enumerate() {
-        let response: ThreadRealtimeListVoicesResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        merge_realtime_voices(&mut merged_v1, &response.voices.v1);
-        merge_realtime_voices(&mut merged_v2, &response.voices.v2);
-        if index == 0 {
-            primary_response = Some(response);
-        }
-    }
-
-    let mut response = primary_response.ok_or_else(|| {
-        io::Error::other("gateway v2 connection has no downstream app-server sessions")
-    })?;
-    response.voices = RealtimeVoicesList {
-        v1: merged_v1,
-        v2: merged_v2,
-        default_v1: response.voices.default_v1,
-        default_v2: response.voices.default_v2,
-    };
-    serde_json::to_value(response).map_err(io::Error::other)
-}
-
-async fn aggregate_fuzzy_file_search_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut files = Vec::<FuzzyFileSearchResult>::new();
-
-    for worker in &downstream.workers {
-        let response: FuzzyFileSearchResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        for incoming in response.files {
-            if let Some(existing) = files.iter_mut().find(|file| {
-                file.root == incoming.root
-                    && file.path == incoming.path
-                    && file.match_type == incoming.match_type
-            }) {
-                if incoming.score > existing.score {
-                    *existing = incoming;
-                }
-            } else {
-                files.push(incoming);
-            }
-        }
-    }
-
-    files.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.root.cmp(&b.root))
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.file_name.cmp(&b.file_name))
-    });
-
-    serde_json::to_value(FuzzyFileSearchResponse { files }).map_err(io::Error::other)
-}
-
-fn merge_realtime_voices(target: &mut Vec<RealtimeVoice>, incoming: &[RealtimeVoice]) {
-    for voice in incoming {
-        if !target.contains(voice) {
-            target.push(*voice);
-        }
-    }
-}
-
-async fn aggregate_experimental_feature_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let params = request_params::<ExperimentalFeatureListParams>(request)?;
-    let offset = decode_aggregated_offset_cursor(
-        params.cursor.as_deref(),
-        AGGREGATED_EXPERIMENTAL_FEATURE_CURSOR_PREFIX,
-        "experimental feature",
-    )?;
-    let fanout_request = JSONRPCRequest {
-        id: request.id.clone(),
-        method: request.method.clone(),
-        params: Some(
-            serde_json::to_value(ExperimentalFeatureListParams {
-                cursor: None,
-                limit: None,
-                thread_id: params.thread_id.clone(),
-            })
-            .map_err(io::Error::other)?,
-        ),
-        trace: request.trace.clone(),
-    };
-
-    let mut features = Vec::<ExperimentalFeature>::new();
-
-    for worker in &downstream.workers {
-        let worker_features = collect_worker_paginated_data::<
-            ExperimentalFeatureListParams,
-            ExperimentalFeatureListResponse,
-            _,
-        >(worker, &fanout_request, |response| {
-            (response.data, response.next_cursor)
-        })
-        .await?;
-        for incoming in worker_features {
-            if let Some(existing) = features
-                .iter_mut()
-                .find(|feature| feature.name == incoming.name)
-            {
-                existing.enabled |= incoming.enabled;
-                existing.default_enabled |= incoming.default_enabled;
-            } else {
-                features.push(incoming);
-            }
-        }
-    }
-
-    features.sort_by(|a, b| a.name.cmp(&b.name));
-    let limit = params.limit.unwrap_or(features.len() as u32).max(1) as usize;
-    let (start, end, next_cursor) = aggregated_page_bounds(
-        features.len(),
-        offset,
-        limit,
-        AGGREGATED_EXPERIMENTAL_FEATURE_CURSOR_PREFIX,
-    );
-
-    serde_json::to_value(ExperimentalFeatureListResponse {
-        data: features[start..end].to_vec(),
-        next_cursor,
-    })
-    .map_err(io::Error::other)
-}
-
-async fn aggregate_collaboration_mode_list_response(
-    downstream: &GatewayV2DownstreamRouter,
-    request: &JSONRPCRequest,
-) -> io::Result<Value> {
-    downstream.ensure_all_configured_workers_present_for(&request.method)?;
-
-    let mut modes = Vec::<CollaborationModeMask>::new();
-
-    for worker in &downstream.workers {
-        let response: CollaborationModeListResponse = worker
-            .request_handle
-            .request_typed(jsonrpc_request_to_client_request(request.clone())?)
-            .await
-            .map_err(io::Error::other)?;
-        for incoming in response.data {
-            if !modes.iter().any(|mode| mode.name == incoming.name) {
-                modes.push(incoming);
-            }
-        }
-    }
-
-    modes.sort_by(|a, b| a.name.cmp(&b.name));
-
-    serde_json::to_value(CollaborationModeListResponse { data: modes }).map_err(io::Error::other)
-}
-
-fn merge_plugin_marketplace(
-    marketplaces: &mut Vec<PluginMarketplaceEntry>,
-    mut incoming: PluginMarketplaceEntry,
-) {
-    if let Some(existing) = marketplaces
-        .iter_mut()
-        .find(|entry| entry.name == incoming.name && entry.path == incoming.path)
-    {
-        for plugin in incoming.plugins.drain(..) {
-            merge_plugin_summary(&mut existing.plugins, plugin);
-        }
-    } else {
-        marketplaces.push(incoming);
-    }
-}
-
-fn merge_plugin_summary(plugins: &mut Vec<PluginSummary>, incoming: PluginSummary) {
-    if let Some(existing) = plugins.iter_mut().find(|entry| entry.id == incoming.id) {
-        let was_installed = existing.installed;
-        if incoming.installed && !was_installed {
-            *existing = incoming;
-        } else {
-            existing.installed |= incoming.installed;
-            existing.enabled |= incoming.enabled;
-        }
-    } else {
-        plugins.push(incoming);
-    }
-}
-
-fn should_reject_pending_server_requests_after_connection_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        ErrorKind::InvalidData
-            | ErrorKind::TimedOut
-            | ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::ConnectionReset
-            | ErrorKind::UnexpectedEof
-            | ErrorKind::WriteZero
-            | ErrorKind::NotConnected
-    )
-}
-
-fn server_notification_to_jsonrpc(
-    notification: ServerNotification,
-    request_context: &GatewayRequestContext,
-    observability: &GatewayObservability,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
-) -> io::Result<Option<JSONRPCNotification>> {
-    let mut notification = tagged_type_to_notification(notification)?;
-    if notification.method == "serverRequest/resolved"
-        && let Some(params) = notification.params.as_mut()
-        && let Some(request_id_value) = params.get("requestId").cloned()
-    {
-        let downstream_request_id =
-            serde_json::from_value::<RequestId>(request_id_value).map_err(io::Error::other)?;
-        if let Some(route) = resolved_server_requests.remove(&DownstreamServerRequestKey {
-            worker_id,
-            request_id: downstream_request_id.clone(),
-        }) {
-            params["requestId"] =
-                serde_json::to_value(route.gateway_request_id).map_err(io::Error::other)?;
-            observability.record_v2_server_request_lifecycle_event(
-                "downstream_server_request_resolved",
-                "serverRequest/resolved",
-            );
-        } else if worker_id.is_some() {
-            log_dropped_duplicate_resolved_server_request(
-                request_context,
-                worker_id,
-                worker_websocket_url,
-                &downstream_request_id,
-                resolved_server_requests,
-            );
-            observability.record_v2_server_request_lifecycle_event(
-                "duplicate_resolved_replay",
-                "serverRequest/resolved",
-            );
-            return Ok(None);
-        }
-    }
-    Ok(Some(notification))
-}
-
-async fn send_client_jsonrpc(
-    socket: &mut WebSocket,
-    connection: &GatewayV2ConnectionContext<'_>,
-    request_id: &RequestId,
-    method: &str,
-    message: JSONRPCMessage,
-) -> io::Result<()> {
-    send_jsonrpc(socket, message, connection.client_send_timeout)
-        .await
-        .inspect_err(|err| {
-            let outcome = classify_v2_connection_error(err);
-            observe_client_response_send_failure(
-                connection.observability,
-                connection.request_context,
-                request_id,
-                method,
-                outcome,
-                err,
-            );
-        })
-}
-
-async fn send_client_jsonrpc_error(
-    socket: &mut WebSocket,
-    connection: &GatewayV2ConnectionContext<'_>,
-    request_id: &RequestId,
-    method: &str,
-    error: JSONRPCErrorError,
-) -> io::Result<()> {
-    send_client_jsonrpc(
-        socket,
-        connection,
-        request_id,
-        method,
-        JSONRPCMessage::Error(JSONRPCError {
-            id: request_id.clone(),
-            error,
-        }),
-    )
-    .await
-}
-
-async fn send_observed_close_frame(
-    socket: &mut WebSocket,
-    observability: &GatewayObservability,
-    request_context: &GatewayRequestContext,
-    code: u16,
-    reason: &str,
-    client_send_timeout: Duration,
-) -> io::Result<()> {
-    send_close_frame(socket, code, reason, client_send_timeout)
-        .await
-        .inspect_err(|err| {
-            let outcome = classify_v2_connection_error(err);
-            observability.record_v2_close_frame_send_failure(code, outcome);
-            log_close_frame_send_failure(request_context, code, reason, outcome, err);
-        })
-}
-
-async fn send_observed_invalid_payload_close(
-    socket: &mut WebSocket,
-    observability: &GatewayObservability,
-    request_context: &GatewayRequestContext,
-    err: &io::Error,
-    client_send_timeout: Duration,
-) -> io::Result<()> {
-    if err.kind() == ErrorKind::InvalidData {
-        let code = if err
-            .to_string()
-            .starts_with(INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
-        {
-            close_code::INVALID
-        } else {
-            close_code::PROTOCOL
-        };
-        send_observed_close_frame(
-            socket,
-            observability,
-            request_context,
-            code,
-            &err.to_string(),
-            client_send_timeout,
-        )
-        .await
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::DownstreamServerRequestKey;
@@ -5827,6 +3227,11 @@ mod tests {
     use crate::admission::GatewayAdmissionConfig;
     use crate::admission::GatewayAdmissionController;
     use crate::auth::GatewayAuth;
+    use crate::northbound::v2_connection::log_degraded_multi_worker_thread_discovery;
+    use crate::northbound::v2_pagination::aggregated_page_bounds;
+    use crate::northbound::v2_scope::DeduplicatedThreadListEntryLog;
+    use crate::northbound::v2_scope::log_deduplicated_thread_list_entry;
+    use crate::northbound::v2_server_requests::log_dropped_duplicate_resolved_server_request;
     use crate::observability::GatewayObservability;
     use crate::remote_health::RemoteWorkerHealthRegistry;
     use crate::scope::GatewayRequestContext;
@@ -6060,6 +3465,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6148,6 +3554,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -6200,6 +3607,7 @@ mod tests {
             Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -6230,6 +3638,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 8,
                     },
@@ -6285,6 +3694,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -6321,6 +3731,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6426,6 +3837,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6514,6 +3926,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6566,6 +3979,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6656,6 +4070,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6777,6 +4192,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6868,6 +4284,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -6961,6 +4378,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 8,
                     },
@@ -6972,6 +4390,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 8,
                     },
@@ -6991,6 +4410,7 @@ mod tests {
             Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Some(vec![
                     "thread/started".to_string(),
                     "item/agentMessage/delta".to_string(),
@@ -7008,6 +4428,7 @@ mod tests {
             capabilities: Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Some(vec![
                     "thread/started".to_string(),
                     "item/agentMessage/delta".to_string(),
@@ -7052,6 +4473,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7101,6 +4523,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7174,6 +4597,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7251,6 +4675,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7344,6 +4769,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7431,6 +4857,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7525,6 +4952,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7615,6 +5043,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7699,6 +5128,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -7784,6 +5214,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -7795,6 +5226,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -7860,6 +5292,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -7871,6 +5304,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -7966,6 +5400,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -7977,6 +5412,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -8051,6 +5487,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -8117,6 +5554,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -8207,6 +5645,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -8424,6 +5863,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -8435,6 +5875,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -9514,6 +6955,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -9525,6 +6967,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -9675,7 +7118,7 @@ mod tests {
     #[test]
     fn aggregated_page_bounds_returns_requested_window_when_offset_is_in_range() {
         assert_eq!(
-            super::aggregated_page_bounds(5, 1, 2, "apps-offset:"),
+            aggregated_page_bounds(5, 1, 2, "apps-offset:"),
             (1, 3, Some("apps-offset:3".to_string()))
         );
     }
@@ -9683,7 +7126,7 @@ mod tests {
     #[test]
     fn aggregated_page_bounds_returns_empty_page_when_offset_is_past_end() {
         assert_eq!(
-            super::aggregated_page_bounds(2, 5, 3, "apps-offset:"),
+            aggregated_page_bounds(2, 5, 3, "apps-offset:"),
             (2, 2, None)
         );
     }
@@ -12583,6 +10026,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -12770,6 +10214,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -12913,6 +10358,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13023,6 +10469,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13072,6 +10519,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13148,6 +10596,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13230,6 +10679,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13404,6 +10854,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13597,6 +11048,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13720,6 +11172,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13775,6 +11228,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13871,6 +11325,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -13964,6 +11419,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -14041,6 +11497,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -14115,6 +11572,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -14273,6 +11731,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -14385,6 +11844,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -14744,6 +12204,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -14954,6 +12415,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -15135,6 +12597,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -15352,6 +12815,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -15523,6 +12987,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -15655,6 +13120,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -15825,6 +13291,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -16048,6 +13515,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 8,
                     },
@@ -16250,6 +13718,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 8,
                     },
@@ -16390,6 +13859,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -16520,6 +13990,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -16659,6 +14130,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -16833,6 +14305,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17022,6 +14495,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17164,6 +14638,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17337,6 +14812,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17539,6 +15015,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17700,6 +15177,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17864,6 +15342,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -17968,6 +15447,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -18073,6 +15553,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -18285,6 +15766,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -18451,6 +15933,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -18729,6 +16212,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -18831,6 +16315,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -18944,6 +16429,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -19087,6 +16573,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -19164,6 +16651,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -19290,6 +16778,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -19413,6 +16902,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -19501,6 +16991,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -19632,6 +17123,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -20106,6 +17598,7 @@ mod tests {
             Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -20148,6 +17641,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -20261,6 +17755,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -20346,6 +17841,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -20436,6 +17932,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -20447,6 +17944,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -20517,6 +18015,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -20528,6 +18027,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -20678,6 +18178,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 8,
                     },
@@ -21072,6 +18573,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21199,6 +18701,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21210,6 +18713,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21371,6 +18875,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -21382,6 +18887,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -21519,6 +19025,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21530,6 +19037,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21675,6 +19183,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21686,6 +19195,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21890,6 +19400,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -21901,6 +19412,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22019,6 +19531,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22030,6 +19543,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22152,6 +19666,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22163,6 +19678,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22274,6 +19790,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22285,6 +19802,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22416,6 +19934,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22427,6 +19946,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22544,6 +20064,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22555,6 +20076,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22749,6 +20271,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22760,6 +20283,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22846,6 +20370,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22857,6 +20382,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -22998,6 +20524,7 @@ mod tests {
                 client_name: "codex-gateway".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: false,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 4,
             }],
@@ -23094,6 +20621,7 @@ mod tests {
                 client_name: "codex-gateway".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: false,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 4,
             }],
@@ -23186,6 +20714,7 @@ mod tests {
                 client_name: "codex-gateway".to_string(),
                 client_version: "0.0.0-test".to_string(),
                 experimental_api: false,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Vec::new(),
                 channel_capacity: 4,
             }],
@@ -23275,6 +20804,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -23286,6 +20816,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -23399,6 +20930,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23410,6 +20942,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23520,6 +21053,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -23531,6 +21065,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -23617,6 +21152,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23628,6 +21164,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23754,6 +21291,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23765,6 +21303,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23946,6 +21485,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -23957,6 +21497,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24129,6 +21670,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24140,6 +21682,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24151,6 +21694,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24315,6 +21859,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24326,6 +21871,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24482,6 +22028,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24493,6 +22040,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24624,6 +22172,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24635,6 +22184,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24771,6 +22321,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24782,6 +22333,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24918,6 +22470,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -24929,6 +22482,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25058,6 +22612,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25069,6 +22624,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25201,6 +22757,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25212,6 +22769,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25332,6 +22890,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25343,6 +22902,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25469,6 +23029,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25480,6 +23041,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25616,6 +23178,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25627,6 +23190,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25756,6 +23320,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25767,6 +23332,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25892,6 +23458,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -25903,6 +23470,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26030,6 +23598,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26041,6 +23610,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26233,6 +23803,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -26244,6 +23815,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -26460,6 +24032,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -26471,6 +24044,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -26637,6 +24211,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26648,6 +24223,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26801,6 +24377,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26812,6 +24389,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -26994,6 +24572,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27005,6 +24584,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27184,6 +24764,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27195,6 +24776,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27345,6 +24927,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27356,6 +24939,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27367,6 +24951,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27556,6 +25141,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27567,6 +25153,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27745,6 +25332,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27756,6 +25344,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27944,6 +25533,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -27955,6 +25545,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28094,6 +25685,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28105,6 +25697,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28232,6 +25825,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28243,6 +25837,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28353,6 +25948,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28364,6 +25960,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28497,6 +26094,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28508,6 +26106,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28645,6 +26244,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28656,6 +26256,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28784,6 +26385,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28795,6 +26397,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28979,6 +26582,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -28990,6 +26594,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29151,6 +26756,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29162,6 +26768,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29314,6 +26921,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29325,6 +26933,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29431,6 +27040,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -29442,6 +27052,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -29682,6 +27293,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -29693,6 +27305,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -29775,6 +27388,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29786,6 +27400,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29925,6 +27540,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -29936,6 +27552,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30063,6 +27680,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30074,6 +27692,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30185,6 +27804,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30196,6 +27816,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30303,6 +27924,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30314,6 +27936,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30404,6 +28027,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30415,6 +28039,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30588,6 +28213,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30599,6 +28225,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30718,6 +28345,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30729,6 +28357,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30880,6 +28509,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30891,6 +28521,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -30993,6 +28624,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31004,6 +28636,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31127,6 +28760,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31138,6 +28772,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31264,6 +28899,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31275,6 +28911,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31370,6 +29007,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31381,6 +29019,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31506,6 +29145,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31517,6 +29157,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31624,6 +29265,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31635,6 +29277,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31738,6 +29381,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31749,6 +29393,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31881,6 +29526,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -31892,6 +29538,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32023,6 +29670,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32034,6 +29682,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32140,6 +29789,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32151,6 +29801,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32255,6 +29906,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32266,6 +29918,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32440,6 +30093,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -32451,6 +30105,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -32543,6 +30198,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32554,6 +30210,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32739,6 +30396,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -32750,6 +30408,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -32827,6 +30486,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -32838,6 +30498,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -33113,6 +30774,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33124,6 +30786,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33228,6 +30891,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -33239,6 +30903,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -33552,6 +31217,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33563,6 +31229,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33703,6 +31370,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33714,6 +31382,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33905,6 +31574,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -33916,6 +31586,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -34136,6 +31807,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -34147,6 +31819,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -34266,6 +31939,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -34277,6 +31951,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -34383,6 +32058,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34394,6 +32070,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34517,6 +32194,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34528,6 +32206,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34676,6 +32355,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34687,6 +32367,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34881,6 +32562,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -34892,6 +32574,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -34982,6 +32665,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -34993,6 +32677,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -35141,6 +32826,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -35152,6 +32838,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -35217,6 +32904,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35228,6 +32916,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35296,6 +32985,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35307,6 +32997,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35370,6 +33061,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35381,6 +33073,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35449,6 +33142,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35460,6 +33154,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35555,6 +33250,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35566,6 +33262,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35660,6 +33357,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35671,6 +33369,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35763,6 +33462,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35774,6 +33474,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35865,6 +33566,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -35876,6 +33578,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36023,6 +33726,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36034,6 +33738,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36145,6 +33850,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36156,6 +33862,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36245,6 +33952,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36256,6 +33964,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36363,6 +34072,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36374,6 +34084,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36623,6 +34334,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36634,6 +34346,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -36705,6 +34418,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36716,6 +34430,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36779,6 +34494,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36790,6 +34506,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36853,6 +34570,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36864,6 +34582,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36931,6 +34650,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -36942,6 +34662,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -37075,6 +34796,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -37086,6 +34808,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -37165,6 +34888,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -37176,6 +34900,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -37411,6 +35136,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -37422,6 +35148,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -37441,6 +35168,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -37550,6 +35278,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 8,
                 },
@@ -37686,6 +35415,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -37806,6 +35536,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -37974,6 +35705,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -37985,6 +35717,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -38203,6 +35936,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38214,6 +35948,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38412,6 +36147,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38423,6 +36159,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38526,6 +36263,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38537,6 +36275,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38631,6 +36370,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38642,6 +36382,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38833,6 +36574,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -38844,6 +36586,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -38863,6 +36606,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -38964,6 +36708,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -38975,6 +36720,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -39105,6 +36851,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -39116,6 +36863,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -39320,6 +37068,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -39331,6 +37080,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40058,6 +37808,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40069,6 +37820,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40262,6 +38014,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40273,6 +38026,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40426,6 +38180,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40437,6 +38192,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40685,6 +38441,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40696,6 +38453,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40776,6 +38534,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -40787,6 +38546,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -40982,6 +38742,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -40993,6 +38754,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -41085,6 +38847,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -41096,6 +38859,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -41344,6 +39108,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -41355,6 +39120,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -41374,6 +39140,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -41507,6 +39274,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -41518,6 +39286,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -41588,6 +39357,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -41599,6 +39369,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -41723,6 +39494,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -41734,6 +39506,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -41834,6 +39607,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -41845,6 +39619,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -41909,6 +39684,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -41920,6 +39696,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -41994,6 +39771,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42005,6 +39783,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42102,6 +39881,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42113,6 +39893,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42200,6 +39981,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42211,6 +39993,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42301,6 +40084,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42312,6 +40096,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42361,6 +40146,7 @@ mod tests {
             capabilities: Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Some(vec![
                     "thread/started".to_string(),
                     "item/agentMessage/delta".to_string(),
@@ -42394,6 +40180,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42405,6 +40192,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42479,6 +40267,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42490,6 +40279,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42568,6 +40358,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42579,6 +40370,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42751,6 +40543,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42762,6 +40555,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42880,6 +40674,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42891,6 +40686,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -42951,6 +40747,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -42962,6 +40759,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43044,6 +40842,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43055,6 +40854,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43161,6 +40961,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43172,6 +40973,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43504,6 +41306,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43515,6 +41318,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -43795,6 +41599,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -43806,6 +41611,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -43817,6 +41623,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -43930,6 +41737,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -43941,6 +41749,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -43952,6 +41761,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44060,6 +41870,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44071,6 +41882,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44177,6 +41989,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44188,6 +42001,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44291,6 +42105,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44302,6 +42117,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44409,6 +42225,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44420,6 +42237,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -44552,6 +42370,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -44563,6 +42382,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -44734,6 +42554,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -44745,6 +42566,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -44823,6 +42645,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -44834,6 +42657,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -44935,6 +42759,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -45079,6 +42904,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -45228,6 +43054,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -45239,6 +43066,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -45366,6 +43194,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -45377,6 +43206,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -45541,6 +43371,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -45661,6 +43492,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -45782,6 +43614,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -45939,6 +43772,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -46068,6 +43902,7 @@ mod tests {
                                 client_name: "codex-gateway".to_string(),
                                 client_version: "0.0.0-test".to_string(),
                                 experimental_api: false,
+                                mcp_server_openai_form_elicitation: false,
                                 opt_out_notification_methods: Vec::new(),
                                 channel_capacity: 4,
                             },
@@ -46197,6 +44032,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46208,6 +44044,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46335,6 +44172,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46346,6 +44184,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46469,6 +44308,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46480,6 +44320,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46609,6 +44450,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46620,6 +44462,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46789,6 +44632,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46800,6 +44644,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46936,6 +44781,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -46947,6 +44793,7 @@ mod tests {
                                     client_name: "codex-gateway".to_string(),
                                     client_version: "0.0.0-test".to_string(),
                                     experimental_api: false,
+mcp_server_openai_form_elicitation: false,
                                     opt_out_notification_methods: Vec::new(),
                                     channel_capacity: 4,
                                 },
@@ -47169,6 +45016,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -47180,6 +45028,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -47345,6 +45194,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -47441,6 +45291,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -47534,6 +45385,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -47606,6 +45458,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -47932,6 +45785,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -47981,6 +45835,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -48050,6 +45905,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -48119,6 +45975,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -48194,6 +46051,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -48259,6 +46117,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -48277,6 +46136,7 @@ mod tests {
             Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -48386,6 +46246,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -48404,6 +46265,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: true,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
             )
@@ -48517,6 +46379,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -48528,6 +46391,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -48547,6 +46411,7 @@ mod tests {
             Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -48746,6 +46611,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -48796,6 +46662,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -48826,6 +46693,7 @@ mod tests {
                 Some(InitializeCapabilities {
                     request_attestation: false,
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Some(vec!["warning".to_string()]),
                 }),
             )
@@ -48892,6 +46760,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -48903,6 +46772,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -48922,6 +46792,7 @@ mod tests {
             Some(InitializeCapabilities {
                 request_attestation: false,
                 experimental_api: false,
+                mcp_server_openai_form_elicitation: false,
                 opt_out_notification_methods: Some(vec!["warning".to_string()]),
             }),
         )
@@ -48964,6 +46835,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },
@@ -49033,6 +46905,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -49103,6 +46976,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -49114,6 +46988,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -49203,6 +47078,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -49214,6 +47090,7 @@ mod tests {
                         client_name: "codex-gateway".to_string(),
                         client_version: "0.0.0-test".to_string(),
                         experimental_api: false,
+                        mcp_server_openai_form_elicitation: false,
                         opt_out_notification_methods: Vec::new(),
                         channel_capacity: 4,
                     },
@@ -49687,6 +47564,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -49698,6 +47576,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -49745,7 +47624,7 @@ mod tests {
             project_id: Some("project-a".to_string()),
         };
         let logs = capture_logs(|| {
-            super::log_degraded_multi_worker_thread_discovery(
+            log_degraded_multi_worker_thread_discovery(
                 &router,
                 &request_context,
                 &observability,
@@ -49807,6 +47686,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -49818,6 +47698,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -49927,6 +47808,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -49938,6 +47820,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -50098,6 +47981,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -50109,6 +47993,7 @@ mod tests {
                             client_name: "codex-gateway".to_string(),
                             client_version: "0.0.0-test".to_string(),
                             experimental_api: false,
+                            mcp_server_openai_form_elicitation: false,
                             opt_out_notification_methods: Vec::new(),
                             channel_capacity: 4,
                         },
@@ -51591,7 +49476,7 @@ mod tests {
     #[test]
     fn log_dropped_duplicate_resolved_server_request_includes_scope_worker_and_routes() {
         let logs = capture_logs(|| {
-            super::log_dropped_duplicate_resolved_server_request(
+            log_dropped_duplicate_resolved_server_request(
                 &GatewayRequestContext {
                     tenant_id: "tenant-visible".to_string(),
                     project_id: Some("project-visible".to_string()),
@@ -51888,12 +49773,12 @@ mod tests {
     #[test]
     fn log_deduplicated_thread_list_entry_includes_selected_and_discarded_workers() {
         let logs = capture_logs(|| {
-            super::log_deduplicated_thread_list_entry(
+            log_deduplicated_thread_list_entry(
                 &GatewayRequestContext {
                     tenant_id: "tenant-visible".to_string(),
                     project_id: Some("project-visible".to_string()),
                 },
-                super::DeduplicatedThreadListEntryLog {
+                DeduplicatedThreadListEntryLog {
                     thread_id: "thread-visible",
                     selected_worker_id: Some(2),
                     selected_worker_websocket_url: "ws://worker-c.invalid",
@@ -52116,6 +50001,7 @@ mod tests {
             client_name: "codex-gateway-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 4,
         })
@@ -54967,6 +52853,7 @@ mod tests {
                     client_name: "codex-gateway".to_string(),
                     client_version: "0.0.0-test".to_string(),
                     experimental_api: false,
+                    mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: Vec::new(),
                     channel_capacity: 4,
                 },

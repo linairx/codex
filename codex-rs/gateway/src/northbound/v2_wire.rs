@@ -1,5 +1,15 @@
+//! Wire-level helpers for northbound v2 transport handling.
+//!
+//! This module owns JSON-RPC conversion, close-reason handling, and transport
+//! send-failure logging so `v2.rs` can stay focused on routing and session
+//! orchestration.
+
 use crate::error::GatewayError;
+use crate::northbound::v2_connection::DownstreamServerRequestKey;
+use crate::northbound::v2_connection::GatewayV2ConnectionContext;
 use crate::northbound::v2_connection::GatewayV2EventState;
+use crate::northbound::v2_connection::ResolvedServerRequestRoute;
+use crate::northbound::v2_server_requests::log_dropped_duplicate_resolved_server_request;
 use crate::northbound::v2_server_requests::pending_server_request_log_fields;
 use crate::northbound::v2_server_requests::resolved_server_request_log_fields;
 use crate::observability::GatewayObservability;
@@ -8,6 +18,7 @@ use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 use axum::extract::ws::CloseFrame;
 use axum::extract::ws::Message as WebSocketMessage;
 use axum::extract::ws::WebSocket;
+use axum::extract::ws::close_code;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCError;
@@ -16,6 +27,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -280,6 +292,94 @@ pub(crate) fn log_downstream_protocol_violation(
     );
 }
 
+pub(crate) fn log_notification_send_failure(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method,
+        outcome,
+        error = %err,
+        "failed to deliver downstream notification to northbound v2 client"
+    );
+}
+
+pub(crate) fn log_downstream_server_request_forward_failure(
+    request_context: &GatewayRequestContext,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        worker_id = ?worker_id,
+        worker_websocket_url,
+        method,
+        outcome,
+        error = %err,
+        "failed to deliver downstream server request to northbound v2 client"
+    );
+}
+
+pub(crate) fn log_client_response_send_failure(
+    request_context: &GatewayRequestContext,
+    request_id: &RequestId,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        request_id = ?request_id,
+        method,
+        outcome,
+        error = %err,
+        "failed to deliver gateway v2 client request response to northbound client"
+    );
+}
+
+pub(crate) fn log_close_frame_send_failure(
+    request_context: &GatewayRequestContext,
+    code: u16,
+    reason: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    warn!(
+        tenant_id = request_context.tenant_id.as_str(),
+        project_id = request_context.project_id.as_deref(),
+        code,
+        reason = websocket_close_reason(reason),
+        outcome,
+        error = %err,
+        "failed to deliver gateway v2 close frame to northbound client"
+    );
+}
+
+pub(crate) fn observe_client_response_send_failure(
+    observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
+    request_id: &RequestId,
+    method: &str,
+    outcome: &str,
+    err: &io::Error,
+) {
+    observability.record_v2_client_response_send_failure(method, outcome);
+    log_client_response_send_failure(request_context, request_id, method, outcome, err);
+}
+
 pub(crate) fn server_request_to_jsonrpc(
     request: ServerRequest,
     gateway_request_id: RequestId,
@@ -342,6 +442,52 @@ pub(crate) fn tagged_type_to_notification<T: Serialize>(
         .to_string();
     let params = value.get("params").cloned();
     Ok(JSONRPCNotification { method, params })
+}
+
+pub(crate) fn server_notification_to_jsonrpc(
+    notification: ServerNotification,
+    request_context: &GatewayRequestContext,
+    observability: &GatewayObservability,
+    worker_id: Option<usize>,
+    worker_websocket_url: &str,
+    resolved_server_requests: &mut std::collections::HashMap<
+        DownstreamServerRequestKey,
+        ResolvedServerRequestRoute,
+    >,
+) -> io::Result<Option<JSONRPCNotification>> {
+    let mut notification = tagged_type_to_notification(notification)?;
+    if notification.method == "serverRequest/resolved"
+        && let Some(params) = notification.params.as_mut()
+        && let Some(request_id_value) = params.get("requestId").cloned()
+    {
+        let downstream_request_id =
+            serde_json::from_value::<RequestId>(request_id_value).map_err(io::Error::other)?;
+        if let Some(route) = resolved_server_requests.remove(&DownstreamServerRequestKey {
+            worker_id,
+            request_id: downstream_request_id.clone(),
+        }) {
+            params["requestId"] =
+                serde_json::to_value(route.gateway_request_id).map_err(io::Error::other)?;
+            observability.record_v2_server_request_lifecycle_event(
+                "downstream_server_request_resolved",
+                "serverRequest/resolved",
+            );
+        } else if worker_id.is_some() {
+            log_dropped_duplicate_resolved_server_request(
+                request_context,
+                worker_id,
+                worker_websocket_url,
+                &downstream_request_id,
+                resolved_server_requests,
+            );
+            observability.record_v2_server_request_lifecycle_event(
+                "duplicate_resolved_replay",
+                "serverRequest/resolved",
+            );
+            return Ok(None);
+        }
+    }
+    Ok(Some(notification))
 }
 
 pub(crate) fn format_lagged_close_reason(skipped: usize) -> String {
@@ -416,6 +562,95 @@ pub(crate) async fn send_close_frame(
         client_send_timeout,
     )
     .await
+}
+
+pub(crate) async fn send_client_jsonrpc(
+    socket: &mut WebSocket,
+    connection: &GatewayV2ConnectionContext<'_>,
+    request_id: &RequestId,
+    method: &str,
+    message: JSONRPCMessage,
+) -> io::Result<()> {
+    send_jsonrpc(socket, message, connection.client_send_timeout)
+        .await
+        .inspect_err(|err| {
+            let outcome = classify_v2_connection_error(err);
+            observe_client_response_send_failure(
+                connection.observability,
+                connection.request_context,
+                request_id,
+                method,
+                outcome,
+                err,
+            );
+        })
+}
+
+pub(crate) async fn send_client_jsonrpc_error(
+    socket: &mut WebSocket,
+    connection: &GatewayV2ConnectionContext<'_>,
+    request_id: &RequestId,
+    method: &str,
+    error: JSONRPCErrorError,
+) -> io::Result<()> {
+    send_client_jsonrpc(
+        socket,
+        connection,
+        request_id,
+        method,
+        JSONRPCMessage::Error(JSONRPCError {
+            id: request_id.clone(),
+            error,
+        }),
+    )
+    .await
+}
+
+pub(crate) async fn send_observed_close_frame(
+    socket: &mut WebSocket,
+    observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
+    code: u16,
+    reason: &str,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    send_close_frame(socket, code, reason, client_send_timeout)
+        .await
+        .inspect_err(|err| {
+            let outcome = classify_v2_connection_error(err);
+            observability.record_v2_close_frame_send_failure(code, outcome);
+            log_close_frame_send_failure(request_context, code, reason, outcome, err);
+        })
+}
+
+pub(crate) async fn send_observed_invalid_payload_close(
+    socket: &mut WebSocket,
+    observability: &GatewayObservability,
+    request_context: &GatewayRequestContext,
+    err: &io::Error,
+    client_send_timeout: Duration,
+) -> io::Result<()> {
+    if err.kind() == ErrorKind::InvalidData {
+        let code = if err
+            .to_string()
+            .starts_with(INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON)
+        {
+            close_code::INVALID
+        } else {
+            close_code::PROTOCOL
+        };
+        send_observed_close_frame(
+            socket,
+            observability,
+            request_context,
+            code,
+            &err.to_string(),
+            client_send_timeout,
+        )
+        .await
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) async fn await_io_with_timeout<T>(

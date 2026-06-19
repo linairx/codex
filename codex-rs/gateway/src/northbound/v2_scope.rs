@@ -2,16 +2,26 @@ use crate::config::normalize_remote_account_id;
 use crate::error::GatewayError;
 use crate::event::GatewayEvent;
 use crate::event::GatewayProjectWorkerRouteSelected;
+pub(crate) use crate::northbound::v2_scope_logging::DeduplicatedThreadListEntryLog;
+pub(crate) use crate::northbound::v2_scope_logging::log_deduplicated_thread_list_entry;
+pub(crate) use crate::northbound::v2_scope_logging::log_failed_visible_thread_worker_route_recovery;
+pub(crate) use crate::northbound::v2_scope_logging::log_recovered_visible_thread_worker_route;
+pub(crate) use crate::northbound::v2_scope_thread::notification_thread_id;
+pub(crate) use crate::northbound::v2_scope_thread::notification_visible_to;
+pub(crate) use crate::northbound::v2_scope_thread::request_thread_id;
+pub(crate) use crate::northbound::v2_scope_thread::request_thread_path;
+#[cfg(test)]
+pub(crate) use crate::northbound::v2_scope_thread::request_visible_to;
+pub(crate) use crate::northbound::v2_scope_thread::response_thread_id;
+pub(crate) use crate::northbound::v2_scope_thread::response_thread_path;
+pub(crate) use crate::northbound::v2_scope_thread::server_request_visible_to;
 use crate::observability::GatewayObservability;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use serde_json::Value;
 use std::io;
 use std::io::ErrorKind;
-use tracing::info;
-use tracing::warn;
 
 pub(crate) fn enforce_request_scope(
     scope_registry: &GatewayScopeRegistry,
@@ -205,191 +215,6 @@ pub(crate) fn apply_response_scope_policy(
     }
 
     Ok(result)
-}
-
-pub(crate) fn notification_visible_to(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    notification: &JSONRPCNotification,
-) -> bool {
-    notification
-        .params
-        .as_ref()
-        .and_then(notification_thread_id)
-        .is_none_or(|thread_id| scope_registry.thread_visible_to(context, thread_id))
-}
-
-pub(crate) fn request_visible_to(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    request: &JSONRPCRequest,
-) -> bool {
-    if let Some(thread_path) = request_thread_path(request) {
-        return scope_registry.thread_path_visible_to(context, thread_path);
-    }
-    request_thread_id(request)
-        .is_none_or(|thread_id| scope_registry.thread_visible_to(context, thread_id))
-}
-
-pub(crate) fn server_request_visible_to(
-    scope_registry: &GatewayScopeRegistry,
-    context: &GatewayRequestContext,
-    request: &JSONRPCRequest,
-) -> bool {
-    if request_thread_id(request).is_some() || request_thread_path(request).is_some() {
-        return request_visible_to(scope_registry, context, request);
-    }
-
-    true
-}
-
-pub(crate) fn request_thread_id(request: &JSONRPCRequest) -> Option<&str> {
-    if request.method == "thread/resume" && has_non_null_param(request.params.as_ref(), "history") {
-        return None;
-    }
-    if matches!(request.method.as_str(), "thread/resume" | "thread/fork")
-        && has_non_null_param(request.params.as_ref(), "path")
-    {
-        return None;
-    }
-    request.params.as_ref().and_then(param_thread_id)
-}
-
-pub(crate) fn request_thread_path(request: &JSONRPCRequest) -> Option<&str> {
-    match request.method.as_str() {
-        "thread/resume" | "thread/fork" => request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("path"))
-            .and_then(Value::as_str),
-        "getConversationSummary" => request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("rolloutPath"))
-            .and_then(Value::as_str),
-        _ => None,
-    }
-}
-
-pub(crate) fn response_thread_path(result: &Value) -> Option<&str> {
-    result
-        .get("thread")
-        .and_then(|thread| thread.get("path"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("summary")
-                .and_then(|summary| summary.get("path"))
-                .and_then(Value::as_str)
-        })
-}
-
-fn param_thread_id(params: &Value) -> Option<&str> {
-    params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("conversationId").and_then(Value::as_str))
-}
-
-fn has_non_null_param(params: Option<&Value>, name: &str) -> bool {
-    params
-        .and_then(|params| params.get(name))
-        .is_some_and(|value| !value.is_null())
-}
-
-pub(crate) fn response_thread_id(result: &Value) -> Option<&str> {
-    result
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("summary")
-                .and_then(|summary| summary.get("conversationId"))
-                .and_then(Value::as_str)
-        })
-}
-
-pub(crate) fn notification_thread_id(params: &Value) -> Option<&str> {
-    params
-        .get("threadId")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            params
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            params
-                .get("turn")
-                .and_then(|turn| turn.get("threadId"))
-                .and_then(Value::as_str)
-        })
-}
-
-pub(crate) fn log_recovered_visible_thread_worker_route(
-    context: &GatewayRequestContext,
-    thread_id: &str,
-    worker_id: Option<usize>,
-    worker_websocket_url: &str,
-) {
-    info!(
-        tenant_id = context.tenant_id.as_str(),
-        project_id = context.project_id.as_deref(),
-        thread_id,
-        worker_id = ?worker_id,
-        worker_websocket_url,
-        "recovered missing visible thread route via downstream thread/read probe"
-    );
-}
-
-pub(crate) fn log_failed_visible_thread_worker_route_recovery(
-    context: &GatewayRequestContext,
-    thread_id: &str,
-    attempted_worker_ids: &[Option<usize>],
-    attempted_worker_websocket_urls: &[&str],
-) {
-    warn!(
-        tenant_id = context.tenant_id.as_str(),
-        project_id = context.project_id.as_deref(),
-        thread_id,
-        attempted_worker_ids = ?attempted_worker_ids,
-        attempted_worker_websocket_urls = ?attempted_worker_websocket_urls,
-        "failed to recover visible thread route via downstream thread/read probe"
-    );
-}
-
-pub(crate) struct DeduplicatedThreadListEntryLog<'a> {
-    pub(crate) thread_id: &'a str,
-    pub(crate) selected_worker_id: Option<usize>,
-    pub(crate) selected_worker_websocket_url: &'a str,
-    pub(crate) discarded_worker_id: Option<usize>,
-    pub(crate) discarded_worker_websocket_url: &'a str,
-    pub(crate) selected_updated_at: i64,
-    pub(crate) discarded_updated_at: i64,
-    pub(crate) selected_created_at: i64,
-    pub(crate) discarded_created_at: i64,
-}
-
-pub(crate) fn log_deduplicated_thread_list_entry(
-    request_context: &GatewayRequestContext,
-    entry: DeduplicatedThreadListEntryLog<'_>,
-) {
-    info!(
-        tenant_id = request_context.tenant_id.as_str(),
-        project_id = request_context.project_id.as_deref(),
-        thread_id = entry.thread_id,
-        selected_worker_id = ?entry.selected_worker_id,
-        selected_worker_websocket_url = entry.selected_worker_websocket_url,
-        discarded_worker_id = ?entry.discarded_worker_id,
-        discarded_worker_websocket_url = entry.discarded_worker_websocket_url,
-        selected_updated_at = entry.selected_updated_at,
-        discarded_updated_at = entry.discarded_updated_at,
-        selected_created_at = entry.selected_created_at,
-        discarded_created_at = entry.discarded_created_at,
-        "deduplicating repeated thread/list entry across downstream workers"
-    );
 }
 
 #[cfg(test)]

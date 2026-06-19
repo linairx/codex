@@ -382,6 +382,11 @@ Recent progress:
 
 - the Stage A required-method matrix is now documented in
   [docs/gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md)
+- the northbound v2 cleanup path has been split again so worker teardown
+  reporting, synthesized resolution delivery failures, pending-request
+  rejection, and connection-error rejection policy now live in
+  `northbound/v2_server_request_cleanup.rs`, keeping `v2.rs` thinner while
+  preserving the same cleanup behavior
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
@@ -978,7 +983,37 @@ Recent progress:
   `command/exec` baseline, covering `command/exec` plus
   `command/exec/outputDelta` through the in-process gateway transport while
   dedicated passthrough coverage continues to own the lower-level control-plane
+- northbound v2 wire helpers that only handle JSON-RPC conversion, close
+  reasons, and transport send-failure logging now live in
+  `northbound/v2_wire.rs`, keeping that wire-specific policy separate from
+  the main v2 routing and session orchestration loop
+- the connection cleanup, saturation, and shutdown diagnostics that only
+  shape northbound v2 lifecycle logging now live in
+  `northbound/v2_connection_lifecycle.rs`, keeping teardown telemetry apart
+  from the main request-routing loop
+- northbound v2 websocket send helpers that wrap JSON-RPC and close-frame
+  delivery now live in `northbound/v2_wire.rs`, keeping transport send
+  telemetry together with the wire conversion helpers
+- the `serverRequest/resolved` notification remapping and duplicate replay
+  handling also live in `northbound/v2_wire.rs`, so the wire layer now owns the
+  full notification translation path
+- northbound v2 scope helpers for thread/path visibility now live in
+  `northbound/v2_scope_thread.rs`, keeping request and response thread
+  extraction separate from the main scope policy file
+- northbound v2 scope logging for visible-thread recovery and deduplicated
+  thread/list entries now lives in `northbound/v2_scope_logging.rs`, keeping
+  recovery telemetry separate from the thread visibility predicates
+- northbound v2 server-request cleanup diagnostics now live in
+  `northbound/v2_server_requests_logging.rs`, keeping duplicate-request and
+  rejected-pending logging separate from cleanup collection and metrics
   requests
+- northbound v2 cleanup teardown and pending-request rejection helpers now
+  live in `northbound/v2_server_request_cleanup.rs`, keeping the worker
+  cleanup path and connection-error policy separate from the main router
+- northbound v2 worker-selection predicates and route-shape checks now live in
+  `northbound/v2_routing.rs`, keeping the request-routing helpers, config-read
+  response matching, and path-handoff validation separate from the main
+  connection loop
 - the real embedded harness now also exercises a plan-mode turn through
   `RemoteAppServerClient`, verifying proposed-plan `item/started` /
   `item/completed` lifecycle delivery through the in-process gateway transport
