@@ -99,7 +99,7 @@ project id: project-a
 worker id: worker-0
 account id: acct-a
 capture time: 2026-06-11T10:00:00Z
-{"ok":true}
+{"ok":true,"projectWorkerRoutes":[{"tenantId":"tenant-a","projectId":"project-a","workerId":0,"accountId":"acct-a","workerHealthy":true,"accountRoutingEligible":true}]}
 EOF
 cat > "$bundle_path/events/01-baseline.sse" <<'EOF'
 gateway build: gw-test
@@ -119,7 +119,7 @@ project id: project-a
 worker id: worker-0
 account id: acct-a
 capture time: 2026-06-11T10:00:00Z
-{"metric":"sample"}
+{"metric":"gateway_project_worker_route_selections","labels":{"tenant_id":"tenant-a","project_id":"project-a","worker_id":"0","account_id":"acct-a"},"value":1}
 EOF
 cat > "$bundle_path/logs/01-baseline.log" <<'EOF'
 gateway build: gw-test
@@ -129,11 +129,37 @@ project id: project-a
 worker id: worker-0
 account id: acct-a
 capture time: 2026-06-11T10:00:00Z
-sample log line
+codex_gateway.audit gateway project worker route selected worker_id=0 tenant_id="tenant-a" project_id="project-a" thread_id="thread-started" account_id="acct-a"
 EOF
 
 "$repo_root/scripts/check-gateway-promotion-bundle.sh" "$bundle_path" >/dev/null
 just gateway-promotion-bundle-check -- "$bundle_path" >/dev/null
+
+perl -0pi -e 's#accountRoutingEligible#routeEligibility#g' "$bundle_path/healthz/01-baseline.json"
+if "$repo_root/scripts/check-gateway-promotion-bundle.sh" "$bundle_path" >/dev/null 2>&1; then
+  echo "expected project route selection health evidence to require accountRoutingEligible" >&2
+  exit 1
+fi
+perl -0pi -e 's#routeEligibility#accountRoutingEligible#g' "$bundle_path/healthz/01-baseline.json"
+
+sed -i \
+  -e 's#^- Method matrix route classes covered: bootstrap discovery, project-aware account routing$#- Method matrix route classes covered: bootstrap discovery, worker discovery#' \
+  -e 's#^- Method families included: bootstrap discovery, project-aware account routing$#- Method families included: bootstrap discovery, worker discovery#' \
+  "$WORKSHEET_MD"
+sed -i \
+  -e 's#^- Method families included: bootstrap discovery, project-aware account routing$#- Method families included: bootstrap discovery, worker discovery#' \
+  "$DECISION_MD"
+if "$repo_root/scripts/check-gateway-promotion-bundle.sh" "$bundle_path" >/dev/null 2>&1; then
+  echo "expected missing project-aware account routing coverage to fail" >&2
+  exit 1
+fi
+sed -i \
+  -e 's#^- Method matrix route classes covered: bootstrap discovery, worker discovery$#- Method matrix route classes covered: bootstrap discovery, project-aware account routing#' \
+  -e 's#^- Method families included: bootstrap discovery, worker discovery$#- Method families included: bootstrap discovery, project-aware account routing#' \
+  "$WORKSHEET_MD"
+sed -i \
+  -e 's#^- Method families included: bootstrap discovery, worker discovery$#- Method families included: bootstrap discovery, project-aware account routing#' \
+  "$DECISION_MD"
 
 for path in \
   "$bundle_path/transcripts/01-baseline.txt" \

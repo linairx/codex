@@ -8,6 +8,7 @@ use crate::northbound::v2_connection::DownstreamServerRequestKey;
 use crate::northbound::v2_connection::PendingClientRequestRoute;
 use crate::northbound::v2_connection::PendingServerRequestRoute;
 use crate::northbound::v2_connection::ResolvedServerRequestRoute;
+use crate::northbound::v2_connection::UnavailableWorkerRouteDiagnostics;
 use crate::northbound::v2_counts::pending_client_request_method_counts;
 use crate::northbound::v2_counts::pending_client_request_worker_counts;
 use crate::northbound::v2_server_requests::pending_server_request_log_fields;
@@ -20,6 +21,44 @@ use codex_app_server_protocol::RequestId;
 use std::collections::HashMap;
 use std::io;
 use tracing::warn;
+
+struct PendingClientRequestLogFields {
+    count: usize,
+    ids: Vec<RequestId>,
+    methods: Vec<String>,
+    worker_ids: Vec<usize>,
+    worker_websocket_urls: Vec<String>,
+}
+
+fn pending_client_request_log_fields(
+    pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
+) -> PendingClientRequestLogFields {
+    let mut ids: Vec<RequestId> = pending_client_requests.keys().cloned().collect();
+    ids.sort();
+    let mut methods: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.method.clone())
+        .collect();
+    methods.sort();
+    let mut worker_ids: Vec<usize> = pending_client_requests
+        .values()
+        .filter_map(|route| route.worker_id)
+        .collect();
+    worker_ids.sort_unstable();
+    let mut worker_websocket_urls: Vec<String> = pending_client_requests
+        .values()
+        .map(|route| route.worker_websocket_url.clone())
+        .collect();
+    worker_websocket_urls.sort();
+
+    PendingClientRequestLogFields {
+        count: ids.len(),
+        ids,
+        methods,
+        worker_ids,
+        worker_websocket_urls,
+    }
+}
 
 pub(crate) fn log_unexpected_client_server_request_response(
     request_context: &GatewayRequestContext,
@@ -176,24 +215,7 @@ pub(crate) fn log_client_send_timeout(
     pending_server_requests: &HashMap<RequestId, PendingServerRequestRoute>,
     resolved_server_requests: &HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
 ) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
+    let pending_client_log_fields = pending_client_request_log_fields(pending_client_requests);
     let pending_log_fields = pending_server_request_log_fields(pending_server_requests);
     let resolved_log_fields = resolved_server_request_log_fields(resolved_server_requests);
     let server_request_backlog_count = pending_log_fields
@@ -205,12 +227,12 @@ pub(crate) fn log_client_send_timeout(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         connection_detail = detail,
-        pending_client_request_count = pending_client_request_ids.len(),
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_count = pending_client_log_fields.count,
+        pending_client_request_ids = ?pending_client_log_fields.ids,
+        pending_client_request_methods = ?pending_client_log_fields.methods,
+        pending_client_request_worker_ids = ?pending_client_log_fields.worker_ids,
         pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
+            ?pending_client_log_fields.worker_websocket_urls,
         pending_server_request_count = pending_log_fields.gateway_request_ids.len(),
         pending_server_request_ids = ?pending_log_fields.gateway_request_ids,
         pending_downstream_server_request_ids = ?pending_log_fields.downstream_request_ids,
@@ -239,24 +261,7 @@ pub(crate) fn log_downstream_shutdown_failure(
     pending_counts: &GatewayV2ConnectionPendingCounts,
     err: &io::Error,
 ) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
+    let pending_client_log_fields = pending_client_request_log_fields(pending_client_requests);
     let pending_client_request_worker_counts = &pending_counts.pending_client_request_worker_counts;
     let pending_client_request_method_counts = &pending_counts.pending_client_request_method_counts;
     let server_request_backlog_count = pending_counts
@@ -271,11 +276,11 @@ pub(crate) fn log_downstream_shutdown_failure(
         connection_outcome,
         connection_detail,
         pending_client_request_count = pending_counts.pending_client_request_count,
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_ids = ?pending_client_log_fields.ids,
+        pending_client_request_methods = ?pending_client_log_fields.methods,
+        pending_client_request_worker_ids = ?pending_client_log_fields.worker_ids,
         pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
+            ?pending_client_log_fields.worker_websocket_urls,
         pending_client_request_worker_counts = ?pending_client_request_worker_counts,
         pending_client_request_method_counts = ?pending_client_request_method_counts,
         pending_server_request_count = pending_counts.pending_server_request_count,
@@ -295,24 +300,7 @@ pub(crate) fn log_aborted_pending_client_requests(
     detail: Option<&str>,
     pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
 ) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
+    let pending_client_log_fields = pending_client_request_log_fields(pending_client_requests);
     let pending_client_request_worker_counts =
         pending_client_request_worker_counts(pending_client_requests);
     let pending_client_request_method_counts =
@@ -323,12 +311,12 @@ pub(crate) fn log_aborted_pending_client_requests(
         project_id = request_context.project_id.as_deref(),
         outcome,
         detail,
-        pending_client_request_count = pending_client_request_ids.len(),
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_count = pending_client_log_fields.count,
+        pending_client_request_ids = ?pending_client_log_fields.ids,
+        pending_client_request_methods = ?pending_client_log_fields.methods,
+        pending_client_request_worker_ids = ?pending_client_log_fields.worker_ids,
         pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
+            ?pending_client_log_fields.worker_websocket_urls,
         pending_client_request_worker_counts = ?pending_client_request_worker_counts,
         pending_client_request_method_counts = ?pending_client_request_method_counts,
         "aborting pending gateway v2 client requests because the northbound connection ended"
@@ -341,36 +329,19 @@ pub(crate) fn log_duplicate_pending_client_request(
     method: &str,
     pending_client_requests: &HashMap<RequestId, PendingClientRequestRoute>,
 ) {
-    let mut pending_client_request_ids: Vec<RequestId> =
-        pending_client_requests.keys().cloned().collect();
-    pending_client_request_ids.sort();
-    let mut pending_client_request_methods: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.method.clone())
-        .collect();
-    pending_client_request_methods.sort();
-    let mut pending_client_request_worker_ids: Vec<usize> = pending_client_requests
-        .values()
-        .filter_map(|route| route.worker_id)
-        .collect();
-    pending_client_request_worker_ids.sort_unstable();
-    let mut pending_client_request_worker_websocket_urls: Vec<String> = pending_client_requests
-        .values()
-        .map(|route| route.worker_websocket_url.clone())
-        .collect();
-    pending_client_request_worker_websocket_urls.sort();
+    let pending_client_log_fields = pending_client_request_log_fields(pending_client_requests);
 
     warn!(
         tenant_id = request_context.tenant_id.as_str(),
         project_id = request_context.project_id.as_deref(),
         request_id = ?request_id,
         method,
-        pending_client_request_count = pending_client_request_ids.len(),
-        pending_client_request_ids = ?pending_client_request_ids,
-        pending_client_request_methods = ?pending_client_request_methods,
-        pending_client_request_worker_ids = ?pending_client_request_worker_ids,
+        pending_client_request_count = pending_client_log_fields.count,
+        pending_client_request_ids = ?pending_client_log_fields.ids,
+        pending_client_request_methods = ?pending_client_log_fields.methods,
+        pending_client_request_worker_ids = ?pending_client_log_fields.worker_ids,
         pending_client_request_worker_websocket_urls =
-            ?pending_client_request_worker_websocket_urls,
+            ?pending_client_log_fields.worker_websocket_urls,
         "closing gateway v2 connection because the northbound client reused a pending request id"
     );
 }
@@ -389,4 +360,32 @@ pub(crate) fn observe_aborted_pending_client_requests(
             route.started_at.elapsed(),
         );
     }
+}
+
+pub(crate) fn is_fail_closed_multi_worker_route_error(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|source| {
+            source
+                .downcast_ref::<crate::northbound::v2_connection::FailClosedMultiWorkerRouteError>()
+        })
+        .is_some()
+}
+
+pub(crate) fn reconnect_backoff_worker_routes(
+    unavailable_workers: &[UnavailableWorkerRouteDiagnostics],
+) -> Vec<(usize, &str, u64)> {
+    unavailable_workers
+        .iter()
+        .filter_map(|worker| {
+            worker
+                .reconnect_backoff_remaining_seconds
+                .map(|remaining_seconds| {
+                    (
+                        worker.worker_id,
+                        worker.websocket_url.as_str(),
+                        remaining_seconds,
+                    )
+                })
+        })
+        .collect()
 }

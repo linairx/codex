@@ -417,6 +417,14 @@ if [ "$worksheet_route_classes" != "$decision_method_families_included" ]; then
   echo "method family coverage values do not match between worksheet and decision files in $bundle" >&2
   exit 1
 fi
+if ! comma_list_contains "$worksheet_route_classes" "project-aware account routing"; then
+  echo "project-aware account routing must be included in worksheet route-class coverage in $bundle" >&2
+  exit 1
+fi
+if ! comma_list_contains "$decision_method_families_included" "project-aware account routing"; then
+  echo "project-aware account routing must be included in decision method coverage in $bundle" >&2
+  exit 1
+fi
 
 worksheet_route_selection_summary=$(scope_value "$bundle/worksheet.md" '- Route-selection identities agree across health, events, metrics, and audit:')
 decision_route_selection_summary=$(scope_value "$bundle/decision.md" '- Route-selection evidence:')
@@ -647,8 +655,38 @@ require_runtime_config() {
   require_populated_field "$bundle/README.md" '- v2 max pending client requests:'
 }
 
+require_bundle_evidence() {
+  path=$1
+  pattern=$2
+  label=$3
+
+  if ! grep -R -Fq -- "$pattern" "$path"; then
+    echo "missing required $label evidence in $path: $pattern" >&2
+    exit 1
+  fi
+}
+
+require_project_route_selection_evidence() {
+  health=$1
+  events=$2
+  metrics=$3
+  logs=$4
+
+  require_bundle_evidence "$health" 'projectWorkerRoutes' 'project route selection health'
+  require_bundle_evidence "$health" 'accountRoutingEligible' 'project route selection health'
+  require_bundle_evidence "$events" 'gateway/projectWorkerRouteSelected' 'project route selection event'
+  require_bundle_evidence "$metrics" 'gateway_project_worker_route_selections' 'project route selection metric'
+  require_bundle_evidence "$logs" 'codex_gateway.audit' 'project route selection audit log'
+  require_bundle_evidence "$logs" 'gateway project worker route selected' 'project route selection audit log'
+}
+
 require_topology_rows
 require_runtime_config
+require_bundle_evidence "$bundle/healthz" 'projectWorkerRoutes' 'project route health'
+require_bundle_evidence "$bundle/events" 'gateway/projectWorkerRouteSelected' 'project route selection event'
+require_bundle_evidence "$bundle/metrics" 'gateway_project_worker_route_selections' 'project route selection metric'
+require_bundle_evidence "$bundle/logs" 'codex_gateway.audit' 'project route selection audit log'
+require_bundle_evidence "$bundle/logs" 'gateway project worker route selected' 'project route selection audit log'
 
 require_unique_scenario() {
   path=$1
@@ -683,11 +721,12 @@ capture_metadata_value() {
 }
 
 require_matching_capture_metadata() {
-  transcript=$1
-  health=$2
-  events=$3
-  metrics=$4
-  logs=$5
+  scenario=$1
+  transcript=$2
+  health=$3
+  events=$4
+  metrics=$5
+  logs=$6
 
   expected_gateway_build=$(capture_metadata_value "$transcript" 'gateway build:')
   expected_worker_build=$(capture_metadata_value "$transcript" 'worker build:')
@@ -735,6 +774,10 @@ require_matching_capture_metadata() {
     exit 1
   fi
 
+  if [ "$scenario" = "Project route selection" ]; then
+    require_project_route_selection_evidence "$health" "$events" "$metrics" "$logs"
+  fi
+
   for path in "$health" "$events" "$metrics" "$logs"; do
     gateway_build=$(capture_metadata_value "$path" 'gateway build:')
     worker_build=$(capture_metadata_value "$path" 'worker build:')
@@ -762,6 +805,7 @@ require_matching_capture_metadata() {
       exit 1
     fi
   done
+
 }
 
 evidence_index_row_number=0
@@ -933,7 +977,7 @@ while IFS='|' read -r _ scenario transcript health events metrics logs worksheet
     require_capture_metadata "$bundle/$events"
     require_capture_metadata "$bundle/$metrics"
     require_capture_metadata "$bundle/$logs"
-    require_matching_capture_metadata "$bundle/$transcript" "$bundle/$health" "$bundle/$events" "$bundle/$metrics" "$bundle/$logs"
+    require_matching_capture_metadata "$scenario" "$bundle/$transcript" "$bundle/$health" "$bundle/$events" "$bundle/$metrics" "$bundle/$logs"
   fi
 done < <(awk '/^## Evidence Index$/ { in_index = 1; next } in_index && /^## / { exit } in_index && /^\|/ { print }' "$bundle/README.md")
 
@@ -976,7 +1020,7 @@ while IFS='|' read -r _ scenario transcript health events metrics logs result _;
     require_capture_metadata "$bundle/$events"
     require_capture_metadata "$bundle/$metrics"
     require_capture_metadata "$bundle/$logs"
-    require_matching_capture_metadata "$bundle/$transcript" "$bundle/$health" "$bundle/$events" "$bundle/$metrics" "$bundle/$logs"
+    require_matching_capture_metadata "$scenario" "$bundle/$transcript" "$bundle/$health" "$bundle/$events" "$bundle/$metrics" "$bundle/$logs"
   fi
 done < <(awk '/^## Captures$/ { in_captures = 1; next } in_captures && /^## / { exit } in_captures && /^\|/ { print }' "$bundle/worksheet.md")
 

@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
@@ -19,6 +20,16 @@ pub enum GatewayAuth {
 impl GatewayAuth {
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::Disabled)
+    }
+}
+
+pub(crate) fn is_authorized(auth: &GatewayAuth, headers: &HeaderMap) -> bool {
+    match auth {
+        GatewayAuth::Disabled => true,
+        GatewayAuth::BearerToken { token } => headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == format!("Bearer {token}")),
     }
 }
 
@@ -43,22 +54,10 @@ pub async fn require_auth(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, GatewayAuthError> {
-    match auth {
-        GatewayAuth::Disabled => Ok(next.run(request).await),
-        GatewayAuth::BearerToken { token } => {
-            let expected = format!("Bearer {token}");
-            let authorized = request
-                .headers()
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value == expected);
-
-            if authorized {
-                Ok(next.run(request).await)
-            } else {
-                Err(GatewayAuthError)
-            }
-        }
+    if is_authorized(&auth, request.headers()) {
+        Ok(next.run(request).await)
+    } else {
+        Err(GatewayAuthError)
     }
 }
 

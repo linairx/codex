@@ -85,10 +85,37 @@ Gateway v2 modules should stay aligned with that split:
 
 - `northbound/v2.rs` is the northbound connection orchestrator and routing
   policy owner.
+- `northbound/v2_handshake.rs` owns the initialize handshake and pre-init
+  frame handling.
+- `northbound/v2_client_message.rs` owns post-initialize client frame
+  dispatch.
+- `northbound/v2_client_response.rs` owns pending client response delivery
+  back to the northbound socket and the associated outcome accounting.
+- `northbound/v2_connection_disconnect.rs` owns downstream disconnect
+  handling and the cleanup triggers that follow a broken worker link.
+- `northbound/v2_connection_post_initialize.rs` owns the post-initialize
+  session setup that runs after the handshake succeeds.
+- `northbound/v2_connection_loop.rs` owns the shared websocket read loop,
+  downstream event fan-in, and reconnect ticking.
+- `northbound/v2_connection_event.rs` owns downstream app-server event
+  classification, fan-in, notification suppression, and server-request
+  forwarding.
+- `northbound/v2_connection_finalize.rs` owns connection teardown, pending
+  request drainage, and shutdown bookkeeping.
+- `northbound/v2_connection_server_request.rs` owns downstream server-request
+  fan-in and the request/response bookkeeping that sits around it.
+- `northbound/v2_request_dispatch.rs` owns protocol-level request routing
+  across aggregation, fanout, sticky routing, and fail-closed policy checks.
+- `northbound/v2_request_routing_handoff.rs` owns account-handoff and
+  visible-thread restoration routing.
+- `northbound/v2_request_routing_path_handoff.rs` owns path-based handoff
+  routing.
 - `northbound/v2_account_capacity.rs` owns v2 account-capacity synchronization
   from downstream account rate-limit snapshots and notifications.
 - `northbound/v2_wire.rs` owns JSON-RPC/WebSocket wire helpers, close-reason
   handling, and app-server protocol type conversion.
+- `northbound/v2_wire_send.rs` owns websocket send helpers, close-frame
+  transmission, and timeout-aware delivery.
 - `northbound/v2_connection.rs` owns connection-local state shapes, pending
   request bookkeeping, and downstream worker handles.
 - `northbound/v2_counts.rs` owns bounded health and backlog count derivation.
@@ -100,6 +127,16 @@ Gateway v2 modules should stay aligned with that split:
   downstream paginated collection, page slicing, and stable aggregate sorting.
 - `northbound/v2_scope.rs` owns gateway v2 request visibility, response scope
   registration, and thread id/path extraction rules.
+- `northbound/v2_scope_tests.rs` carries the `v2_scope.rs` regression tests,
+  keeping the visibility and scope-policy implementation separate from its
+  audit coverage.
+- `northbound/v2_connection_runtime.rs` owns the multi-worker runtime helpers
+  that sit on top of the connection-local state shapes and worker handles.
+- `northbound/v2_connection_router.rs` owns the downstream worker-session
+  lifecycle, reconnect, and per-connection routing helpers.
+- `northbound/v2_connection_router_state.rs` owns the reconnect support
+  helpers, worker diagnostics, and worker-account/session replay helpers that
+  sit underneath the router lifecycle.
 
 ## Initial Crate Shape
 
@@ -387,6 +424,70 @@ Recent progress:
   rejection, and connection-error rejection policy now live in
   `northbound/v2_server_request_cleanup.rs`, keeping `v2.rs` thinner while
   preserving the same cleanup behavior
+- the northbound v2 websocket lifecycle is now split into dedicated
+  handshake, client-message, client-response, connection-loop,
+  connection-finalize, and request-dispatch modules, and downstream event
+  handling now lives in its own owner-specific module too, with disconnect,
+  post-initialize, and server-request handling separated further so the shared
+  loop, teardown path, event fan-in, and request routing policy are easier to
+  review independently of the old monolithic `v2.rs` entrypoint
+- that split now leaves `v2.rs` as a thin orchestration-and-test shell while
+  the lifecycle, routing, disconnect, and server-request flows live in their
+  own owner-specific modules, keeping the high-churn transport logic bounded
+  and easier to validate in isolation
+- the remaining test-only `handle_client_request` shim has been removed from
+  `v2.rs` in favor of a direct test-time re-export of the request-dispatch
+  implementation, trimming one more layer from the northbound entrypoint
+- the northbound request-routing helpers are now split again so
+  account-handoff and visible-thread restoration live in
+  `northbound/v2_request_routing_handoff.rs`, path-based handoff lives in
+  `northbound/v2_request_routing_path_handoff.rs`, and fanout plus connection
+  discovery remain in `northbound/v2_request_routing.rs`; that keeps each
+  routing owner under the module-size target and makes the handoff paths
+  easier to review separately from the fanout paths
+- the connection-local state helpers now have a separate
+  `northbound/v2_connection_runtime.rs` module for the multi-worker runtime
+  logging and downstream delivery helpers, leaving `northbound/v2_connection.rs`
+  focused on the state and bookkeeping types that back those flows
+- the downstream worker-session lifecycle and reconnect helpers now live in
+  `northbound/v2_connection_router.rs`, leaving `v2.rs` free of the router
+  implementation and keeping the connection state and runtime layers narrower
+- the connection pending-count updater and connection run-result shape now
+  also live in `northbound/v2_connection_runtime.rs`, so the connection state
+  module is left with the durable shapes while the runtime module owns the
+  active accounting and orchestration helpers that sit on top of them
+- the router support helpers for worker diagnostics, reconnect backoff, and
+  replaying session state after reconnect now live in
+  `northbound/v2_connection_router_state.rs`, keeping the router file under
+  the module-size target while preserving the same reconnect behavior
+- the downstream worker-session injection path now lives back in
+  `northbound/v2_connection_router.rs`, leaving `v2_connection_router_state.rs`
+  focused on reconnect support and replay helpers instead of session
+  installation
+- the connection runtime helpers now live directly behind
+  `northbound/v2_connection_runtime.rs` instead of being relayed through
+  `v2_connection.rs`, so the state module is now limited to durable shapes and
+  bookkeeping while the runtime module owns the active delivery helpers and
+  run-result plumbing
+- the wire-level send, close-frame, and timeout helpers now live in
+  `northbound/v2_wire_send.rs`, leaving `northbound/v2_wire.rs` focused on
+  JSON-RPC conversion and protocol logging while preserving the same transport
+  behavior
+- the response aggregation helpers are now split again so the thread,
+  app, and account aggregation paths stay in `v2_aggregation.rs` while the
+  catalog-style model, skills, plugin, realtime, fuzzy-search, experimental,
+  and collaboration aggregation helpers live in
+  `northbound/v2_aggregation_catalog.rs`, keeping the remaining owner module
+  under the implementation-size target without changing the fan-out behavior
+- the HTTP northbound router now keeps its implementation in
+  `northbound/http.rs` and its large test suite in
+  `northbound/http_tests.rs`, so the runtime route handlers stay easy to scan
+  without carrying the full regression harness in the same file
+- the v2 northbound entrypoint now keeps its implementation shell in
+  `northbound/v2.rs` and its regression harness in `northbound/v2_tests.rs`,
+  with the bulk of the cases split into `northbound/v2_tests_cases.rs`, which
+  leaves the shared v2 wiring easier to read without dragging the entire test
+  matrix through the top-level module
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment

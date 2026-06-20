@@ -802,6 +802,7 @@ impl GatewayServerRequest {
 impl TryFrom<ServerRequest> for GatewayServerRequest {
     type Error = ServerRequest;
 
+    #[allow(clippy::redundant_closure_for_method_calls)]
     fn try_from(value: ServerRequest) -> Result<Self, Self::Error> {
         match value {
             ServerRequest::CommandExecutionRequestApproval { params, .. } => {

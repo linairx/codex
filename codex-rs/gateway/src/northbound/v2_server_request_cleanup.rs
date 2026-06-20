@@ -6,22 +6,30 @@
 use crate::northbound::v2::INTERNAL_ERROR_CODE;
 use crate::northbound::v2::PENDING_SERVER_REQUEST_ABORTED_MESSAGE;
 use crate::northbound::v2_connection::DownstreamServerRequestKey;
+use crate::northbound::v2_connection::GatewayV2ConnectionContext;
 use crate::northbound::v2_connection::PendingServerRequestRoute;
 use crate::northbound::v2_connection::ResolvedServerRequestRoute;
 use crate::northbound::v2_connection::WorkerCleanupResolvedNotification;
 use crate::northbound::v2_connection::WorkerServerRequestCleanup;
 use crate::northbound::v2_connection::WorkerServerRequestCleanupReport;
 use crate::northbound::v2_routing::worker_for_server_request;
+use crate::northbound::v2_server_requests::collect_server_request_cleanup_for_worker;
 use crate::northbound::v2_server_requests::log_worker_server_request_cleanup;
 use crate::northbound::v2_server_requests::publish_worker_server_request_cleanup_event;
 use crate::northbound::v2_server_requests::record_client_server_request_cleanup_metrics;
 use crate::northbound::v2_server_requests::record_v2_server_request_lifecycle_method_counts;
+use crate::northbound::v2_server_requests::record_worker_server_request_cleanup_metrics;
 use crate::northbound::v2_server_requests_logging::log_rejected_pending_server_requests;
 use crate::northbound::v2_wire::classify_v2_connection_error;
+use crate::northbound::v2_wire::tagged_type_to_notification;
+use crate::northbound::v2_wire_send::send_jsonrpc;
 use crate::observability::GatewayObservability;
 use crate::scope::GatewayRequestContext;
+use axum::extract::ws::WebSocket;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io;
@@ -78,6 +86,64 @@ pub(crate) fn record_worker_cleanup_resolution_send_failure(
         %err,
         "failed to deliver synthesized serverRequest/resolved during worker cleanup"
     );
+}
+
+pub(crate) async fn resolve_server_requests_for_worker(
+    socket: &mut WebSocket,
+    connection: &GatewayV2ConnectionContext<'_>,
+    pending_server_requests: &mut HashMap<RequestId, PendingServerRequestRoute>,
+    resolved_server_requests: &mut HashMap<DownstreamServerRequestKey, ResolvedServerRequestRoute>,
+    worker_id: Option<usize>,
+    report: WorkerServerRequestCleanupReport<'_>,
+) -> io::Result<WorkerServerRequestCleanup> {
+    let cleanup = collect_server_request_cleanup_for_worker(
+        pending_server_requests,
+        resolved_server_requests,
+        worker_id,
+    );
+
+    record_worker_server_request_cleanup_metrics(connection.observability, &cleanup);
+    if cleanup.has_cleaned_up_requests() {
+        report_worker_server_request_cleanup(
+            connection.observability,
+            worker_id,
+            &report,
+            &cleanup,
+        );
+    }
+
+    for resolved_notification in &cleanup.resolved_notifications {
+        let method = resolved_notification.method.as_str();
+        if let Err(err) = send_jsonrpc(
+            socket,
+            JSONRPCMessage::Notification(tagged_type_to_notification(
+                ServerNotification::ServerRequestResolved(
+                    resolved_notification.notification.clone(),
+                ),
+            )?),
+            connection.client_send_timeout,
+        )
+        .await
+        {
+            record_worker_cleanup_resolution_send_failure(
+                connection.observability,
+                connection.request_context,
+                worker_id,
+                report.worker_websocket_url,
+                resolved_notification,
+                &err,
+            );
+            return Err(err);
+        }
+        connection
+            .observability
+            .record_v2_server_request_lifecycle_event(
+                "worker_cleanup_resolution_delivered",
+                method,
+            );
+    }
+
+    Ok(cleanup)
 }
 
 pub(crate) async fn reject_pending_server_requests(
