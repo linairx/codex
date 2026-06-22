@@ -692,6 +692,10 @@ Recent progress:
   `v2_tests_cases_0.rs` through `v2_tests_cases_4.rs`,
   `v2_tests_cases_late.rs`, and `v2_tests_cases_support.rs`, leaving the
   top-level case module as a thin dispatcher instead of a monolithic test file
+- the northbound v2 case matrix now keeps the realtime and notification tail
+  in `v2_tests_cases_4_notifications.rs`, leaving
+  `v2_tests_cases_4.rs` focused on the routing, reconnect, and server-request
+  coverage while the notification-heavy tail stays isolated
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
