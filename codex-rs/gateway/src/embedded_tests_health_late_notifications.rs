@@ -3,7 +3,7 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn remote_multi_worker_deduplicates_external_agent_import_completed_notifications_after_worker_reconnect()
-{
+ {
     let (worker_a, _worker_a_requests) =
         start_reconnecting_v2_multi_connection_session_mutation_server("worker-a").await;
     let (worker_b, _worker_b_requests) =

@@ -3,7 +3,7 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn remote_multi_worker_resolves_pending_thread_scoped_server_requests_when_worker_disconnects()
-{
+ {
     let worker_a =
         start_mock_remote_multi_connection_disconnect_after_server_request_server().await;
     let worker_b =

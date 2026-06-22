@@ -4,6 +4,343 @@ pub(crate) async fn start_mock_remote_workflow_server() -> String {
     start_mock_remote_workflow_server_with_thread_id("thread-remote-workflow").await
 }
 
+pub(crate) async fn start_mock_remote_server_for_server_request_roundtrip() -> String {
+    start_mock_remote_server_for_server_requests(/*multiple*/ false).await
+}
+
+pub(crate) async fn start_mock_remote_server_for_multiple_server_request_roundtrips() -> String {
+    start_mock_remote_server_for_server_requests(/*multiple*/ true).await
+}
+
+async fn start_mock_remote_server_for_server_requests(multiple: bool) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener address");
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            tokio::spawn(async move {
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket upgrade should succeed");
+                expect_remote_initialize(&mut websocket).await;
+
+                loop {
+                    let request = read_websocket_request(&mut websocket).await;
+                    match request.method.as_str() {
+                        "thread/start" => {
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id.clone(),
+                                    result: serde_json::json!({
+                                        "thread": mock_thread(
+                                            "thread-remote-workflow",
+                                            "/tmp/remote-project"
+                                        ),
+                                        "model": "gpt-5",
+                                        "modelProvider": "openai",
+                                        "serviceTier": null,
+                                        "cwd": "/tmp/remote-project",
+                                        "instructionSources": [],
+                                        "approvalPolicy": "never",
+                                        "approvalsReviewer": "user",
+                                        "sandbox": {
+                                            "type": "dangerFullAccess"
+                                        },
+                                        "reasoningEffort": null,
+                                    }),
+                                }),
+                            )
+                            .await;
+                            if multiple {
+                                write_additional_server_requests(&mut websocket).await;
+                            } else {
+                                write_user_input_server_request(&mut websocket, 1).await;
+                            }
+                        }
+                        _ => {
+                            write_websocket_message(
+                                &mut websocket,
+                                JSONRPCMessage::Response(JSONRPCResponse {
+                                    id: request.id,
+                                    result: serde_json::json!({}),
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    format!("ws://{addr}")
+}
+
+async fn write_user_input_server_request<S>(
+    websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    id: i64,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: if id == 1 {
+                RequestId::String("srv-user-input".to_string())
+            } else {
+                RequestId::Integer(id)
+            },
+            method: "item/tool/requestUserInput".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "itemId": "tool-call-remote-workflow",
+                "questions": [{
+                    "id": "mode",
+                    "header": "Mode",
+                    "question": "Pick a mode",
+                    "options": [{
+                        "label": "safe",
+                        "description": "Use safe mode.",
+                    }],
+                }],
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+}
+
+async fn write_additional_server_requests<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: RequestId::Integer(1),
+            method: "item/commandExecution/requestApproval".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "itemId": "cmd-remote-workflow",
+                "startedAtMs": 0,
+                "command": "echo remote",
+                "cwd": "/tmp/remote-project",
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: RequestId::Integer(2),
+            method: "item/fileChange/requestApproval".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "itemId": "file-remote-workflow",
+                "startedAtMs": 0,
+                "reason": "Need to write changes",
+                "grantRoot": null,
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: RequestId::Integer(3),
+            method: "mcpServer/elicitation/request".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "serverName": "mock-mcp",
+                "mode": "form",
+                "_meta": null,
+                "message": "Allow mock action?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "confirmed": {
+                            "type": "boolean",
+                        },
+                    },
+                    "required": ["confirmed"],
+                },
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+    write_dynamic_tool_started(websocket).await;
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: RequestId::Integer(4),
+            method: "item/tool/call".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "callId": "tool-call-remote-workflow",
+                "tool": "image-edit",
+                "arguments": {
+                    "prompt": "Sharpen this image",
+                    "strength": 0.5,
+                },
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: RequestId::Integer(5),
+            method: "item/permissions/requestApproval".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "itemId": "perm-remote-workflow",
+                "startedAtMs": 0,
+                "cwd": "/tmp/remote-project",
+                "reason": "Need wider permissions",
+                "permissions": {
+                    "fileSystem": null,
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest {
+            id: RequestId::Integer(6),
+            method: "account/chatgptAuthTokens/refresh".to_string(),
+            params: Some(serde_json::json!({
+                "reason": "unauthorized",
+                "previousAccountId": "acct-123",
+            })),
+            trace: None,
+        }),
+    )
+    .await;
+    for request_id in 1..=6 {
+        eprintln!("waiting for additional server request response {request_id}");
+        let message = read_websocket_message(websocket).await;
+        eprintln!("got additional server request response {request_id}: {message:?}");
+        write_server_request_resolved(websocket, RequestId::Integer(request_id)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_dynamic_tool_completed(websocket).await;
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+            method: "turn/completed".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turn": mock_turn("turn-remote-workflow", "completed"),
+            })),
+        }),
+    )
+    .await;
+}
+
+async fn write_server_request_resolved<S>(
+    websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    request_id: RequestId,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+            method: "serverRequest/resolved".to_string(),
+            params: Some(
+                serde_json::to_value(ServerRequestResolvedNotification {
+                    thread_id: "thread-remote-workflow".to_string(),
+                    request_id,
+                })
+                .expect("serverRequest/resolved should serialize"),
+            ),
+        }),
+    )
+    .await;
+}
+
+async fn write_dynamic_tool_started<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+            method: "item/started".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "startedAtMs": 0,
+                "item": {
+                    "type": "dynamicToolCall",
+                    "id": "tool-call-remote-workflow",
+                    "tool": "image-edit",
+                    "arguments": {
+                        "prompt": "Sharpen this image",
+                        "strength": 0.5,
+                    },
+                    "status": "inProgress",
+                    "contentItems": null,
+                    "success": null,
+                    "durationMs": null,
+                },
+            })),
+        }),
+    )
+    .await;
+}
+
+async fn write_dynamic_tool_completed<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_websocket_message(
+        websocket,
+        JSONRPCMessage::Notification(codex_app_server_protocol::JSONRPCNotification {
+            method: "item/completed".to_string(),
+            params: Some(serde_json::json!({
+                "threadId": "thread-remote-workflow",
+                "turnId": "turn-remote-workflow",
+                "completedAtMs": 7,
+                "item": {
+                    "type": "dynamicToolCall",
+                    "id": "tool-call-remote-workflow",
+                    "tool": "image-edit",
+                    "arguments": {
+                        "prompt": "Sharpen this image",
+                        "strength": 0.5,
+                    },
+                    "status": "completed",
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "tool output",
+                    }],
+                    "success": true,
+                    "durationMs": 7,
+                },
+            })),
+        }),
+    )
+    .await;
+}
+
 pub(crate) async fn start_mock_remote_workflow_server_with_thread_id(
     thread_id: &'static str,
 ) -> String {

@@ -4,7 +4,6 @@ use pretty_assertions::assert_eq;
 #[path = "embedded_tests_v2_late_aggregation.rs"]
 mod embedded_tests_v2_late_aggregation;
 
-
 #[tokio::test]
 async fn remote_multi_worker_supports_drop_in_v2_client_bootstrap_setup_workflow() {
     let worker_a = start_mock_remote_multi_connection_bootstrap_setup_server(

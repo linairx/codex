@@ -317,7 +317,10 @@ async fn remote_runtime_round_robins_threads_across_workers() {
     assert_eq!(second_thread.thread.id, "thread-worker-b");
 
     let list_response = client
-        .get(format!("http://{}/v1/threads?limit=10", server.local_addr()))
+        .get(format!(
+            "http://{}/v1/threads?limit=10",
+            server.local_addr()
+        ))
         .send()
         .await
         .expect("list response");

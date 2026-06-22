@@ -2994,6 +2994,5 @@ async fn remote_multi_worker_v2_session_readds_recovered_worker_for_setup_mutati
     server.shutdown().await.expect("shutdown");
 }
 
-
 #[path = "embedded_tests_health_late.rs"]
 mod embedded_tests_health_late;

@@ -4,12 +4,12 @@ use pretty_assertions::assert_eq;
 #[path = "embedded_tests_health_late_notifications.rs"]
 mod embedded_tests_health_late_notifications;
 
-#[path = "embedded_tests_health_late_setup.rs"]
-mod embedded_tests_health_late_setup;
 #[path = "embedded_tests_health_late_bootstrap.rs"]
 mod embedded_tests_health_late_bootstrap;
 #[path = "embedded_tests_health_late_mutation.rs"]
 mod embedded_tests_health_late_mutation;
+#[path = "embedded_tests_health_late_setup.rs"]
+mod embedded_tests_health_late_setup;
 
 #[tokio::test]
 async fn remote_multi_worker_routes_filesystem_operations_to_primary_worker_over_v2() {

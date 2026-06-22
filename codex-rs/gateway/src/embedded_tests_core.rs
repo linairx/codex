@@ -366,18 +366,18 @@ fn capture_logs(f: impl FnOnce()) -> String {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TurnStreamingCoverage {
-    saw_thread_active: bool,
-    saw_turn_started: bool,
-    saw_hook_started: bool,
-    saw_item_started: bool,
-    saw_agent_delta: bool,
-    saw_reasoning_summary_delta: bool,
-    saw_reasoning_text_delta: bool,
-    saw_command_output_delta: bool,
-    saw_file_change_delta: bool,
-    saw_hook_completed: bool,
-    saw_item_completed: bool,
-    saw_turn_completed: bool,
+    pub(crate) saw_thread_active: bool,
+    pub(crate) saw_turn_started: bool,
+    pub(crate) saw_hook_started: bool,
+    pub(crate) saw_item_started: bool,
+    pub(crate) saw_agent_delta: bool,
+    pub(crate) saw_reasoning_summary_delta: bool,
+    pub(crate) saw_reasoning_text_delta: bool,
+    pub(crate) saw_command_output_delta: bool,
+    pub(crate) saw_file_change_delta: bool,
+    pub(crate) saw_hook_completed: bool,
+    pub(crate) saw_item_completed: bool,
+    pub(crate) saw_turn_completed: bool,
 }
 
 pub(crate) fn expected_turn_streaming_coverage() -> TurnStreamingCoverage {
@@ -417,23 +417,23 @@ pub(crate) fn expected_extended_turn_notifications() -> HashSet<&'static str> {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RealtimeStreamingCoverage {
-    saw_started: bool,
-    saw_item_added: bool,
-    saw_output_audio_delta: bool,
-    saw_transcript_delta: bool,
-    saw_transcript_done: bool,
-    saw_sdp: bool,
-    saw_error: bool,
-    saw_closed: bool,
+    pub(crate) saw_started: bool,
+    pub(crate) saw_item_added: bool,
+    pub(crate) saw_output_audio_delta: bool,
+    pub(crate) saw_transcript_delta: bool,
+    pub(crate) saw_transcript_done: bool,
+    pub(crate) saw_sdp: bool,
+    pub(crate) saw_error: bool,
+    pub(crate) saw_closed: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TurnControlCoverage {
-    saw_thread_active: bool,
-    saw_turn_started: bool,
-    saw_agent_delta: bool,
-    saw_turn_completed: bool,
-    saw_thread_idle: bool,
+    pub(crate) saw_thread_active: bool,
+    pub(crate) saw_turn_started: bool,
+    pub(crate) saw_agent_delta: bool,
+    pub(crate) saw_turn_completed: bool,
+    pub(crate) saw_thread_idle: bool,
 }
 
 #[derive(Clone)]

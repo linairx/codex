@@ -168,6 +168,55 @@ data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-1\",\"usage
     )
 }
 
+pub(crate) fn create_exec_command_sse_response(call_id: &str) -> serde_json::Result<String> {
+    let args = serde_json::json!({
+        "cmd": "touch command-approval.txt",
+    });
+    create_function_call_sse_response(call_id, "exec_command", &args)
+}
+
+pub(crate) fn create_apply_patch_sse_response(
+    patch: &str,
+    call_id: &str,
+) -> serde_json::Result<String> {
+    let args = serde_json::json!({
+        "cmd": format!("apply_patch <<'EOF'\n{patch}\nEOF\n"),
+    });
+    create_function_call_sse_response(call_id, "exec_command", &args)
+}
+
+pub(crate) fn create_shell_command_sse_response(
+    command: Vec<String>,
+    cwd: Option<&std::path::Path>,
+    timeout_ms: Option<u64>,
+    call_id: &str,
+) -> serde_json::Result<String> {
+    let command = command.join(" ");
+    let mut args = serde_json::json!({
+        "command": command,
+    });
+    if let Some(cwd) = cwd {
+        args["cwd"] = serde_json::Value::String(cwd.display().to_string());
+    }
+    if let Some(timeout_ms) = timeout_ms {
+        args["timeout_ms"] = serde_json::Value::Number(timeout_ms.into());
+    }
+    create_function_call_sse_response(call_id, "shell_command", &args)
+}
+
+fn create_function_call_sse_response(
+    call_id: &str,
+    name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Result<String> {
+    let arguments = serde_json::to_string(args)?;
+    Ok(responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call(call_id, name, &arguments),
+        responses::ev_completed("resp-1"),
+    ]))
+}
+
 pub(crate) fn mock_responses_request_user_input_sse_body(call_id: &str) -> String {
     format!(
         "event: response.created\n\

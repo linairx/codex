@@ -7,6 +7,7 @@ const EMBEDDED_TOOL_CALL_ID: &str = "call-calendar-confirm";
 
 #[tokio::test]
 async fn embedded_server_supports_command_and_file_approval_roundtrips_over_v2() {
+    let codex_linux_sandbox_exe = core_test_support::codex_linux_sandbox_exe_or_skip!();
     let codex_home = tempdir().expect("tempdir");
     let workspace = codex_home.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace should be created");
@@ -58,7 +59,10 @@ stream_max_retries = 0
             session_source: SessionSource::Cli,
             ..GatewayConfig::default()
         },
-        Arg0DispatchPaths::default(),
+        Arg0DispatchPaths {
+            codex_linux_sandbox_exe,
+            ..Arg0DispatchPaths::default()
+        },
         config,
         Vec::new(),
         LoaderOverrides::default(),
@@ -5264,7 +5268,6 @@ async fn remote_single_worker_supports_drop_in_v2_client_bootstrap_setup_methods
     assert_remote_client_shutdown(client.shutdown().await);
     server.shutdown().await.expect("shutdown");
 }
-
 
 #[path = "embedded_tests_remote_late.rs"]
 mod embedded_tests_remote_late;

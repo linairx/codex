@@ -322,4 +322,3 @@ async fn remote_multi_worker_supports_drop_in_v2_client_setup_mutation_workflow(
         .expect("server shutdown should finish in time")
         .expect("shutdown");
 }
-

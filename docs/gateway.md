@@ -701,6 +701,21 @@ Recent progress:
   `v2_tests_cases_4.rs` and `v2_tests_cases_4_notifications.rs` focused on
   the broader routing and notification coverage while the realtime request
   path stays isolated
+- the northbound v2 case matrix now keeps the user-visible and opt-out
+  notification coverage in `v2_tests_cases_4_notifications.rs`, alongside the
+  filesystem and fuzzy-search notification tests, leaving
+  `v2_tests_cases_4.rs` focused on the routing and reconnect cases while the
+  notification scenarios stay grouped together
+- the remaining visible-thread item, turn, and realtime notification
+  coverage now lives in `v2_tests_cases_4_thread_notifications.rs` and
+  `v2_tests_cases_4_realtime_notifications.rs`, keeping the main
+  `v2_tests_cases_4.rs` matrix focused on routing, reconnect, and server-
+  request behavior while notification fan-in stays grouped by scenario family
+- the embedded multi-worker regression suite now keeps the basic single-worker
+  v2 server-request roundtrip in
+  `embedded_tests_multi_worker_server_requests.rs`, leaving
+  `embedded_tests_multi_worker.rs` focused on reconnect, additional
+  server-request matrix, realtime, and notification recovery coverage
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
