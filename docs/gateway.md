@@ -431,6 +431,85 @@ Recent progress:
   post-initialize, and server-request handling separated further so the shared
   loop, teardown path, event fan-in, and request routing policy are easier to
   review independently of the old monolithic `v2.rs` entrypoint
+- the embedded test support block was split again so the multi-worker bootstrap
+  and routing helpers now live in `embedded_test_support_multi_worker.rs`,
+  keeping the shared embedded test harness smaller while preserving the same
+  end-to-end coverage
+- the multi-worker bootstrap/setup helpers were split again so the shared
+  pagination and mock bootstrap logic now lives in
+  `embedded_test_support_multi_worker_bootstrap.rs`, keeping the remaining
+  multi-worker harness focused on the reconnect, workflow, realtime, and
+  server-request scenarios
+- the multi-worker pagination result helpers for app, MCP server status, and
+  experimental feature listings were moved into
+  `embedded_test_support_multi_worker_bootstrap.rs`, keeping the worker-local
+  harness smaller while leaving the shared paginated mock bounds and result
+  shaping next to the bootstrap helpers that reuse them
+- the multi-worker server-request session driver now lives in
+  `embedded_test_support_multi_worker_server_requests_session.rs`, leaving the
+  outer server-request harness focused on the listener setup, session
+  selection, and worker-specific test entrypoints
+- the concurrent multi-worker server-request harness now lives in
+  `embedded_test_support_multi_worker_server_requests_concurrent.rs`, keeping
+  the shared server-request module centered on the reconnect and mutation
+  scenarios while the concurrent-barrier flow stays isolated
+- the warning, config-warning, and deprecation-notice notification harnesses
+  now live in `embedded_test_support_multi_worker_notifications_warnings.rs`,
+  leaving `embedded_test_support_multi_worker_notifications.rs` focused on the
+  skills, state, and reconnect notification flows
+- the multi-worker filesystem-operations harness now lives in
+  `embedded_test_support_multi_worker_filesystem.rs`, keeping the main
+  `embedded_test_support_multi_worker.rs` file focused on bootstrap and the
+  remaining harness wiring
+- the multi-worker bootstrap setup server now lives in
+  `embedded_test_support_multi_worker_bootstrap_server.rs`, leaving
+  `embedded_test_support_multi_worker_bootstrap.rs` focused on the shared
+  pagination helpers and bootstrap-shaped mock payload builders
+- the reconnecting multi-worker bootstrap setup server now lives in
+  `embedded_test_support_multi_worker_reconnect_bootstrap.rs`, leaving
+  `embedded_test_support_multi_worker.rs` focused on the smaller list-server
+  wrappers and legacy approval enum
+- the multi-worker workflow, realtime, turn-control, and plugin helpers were
+  split again so those scenario groups now live in
+  `embedded_test_support_multi_worker_sessions.rs`, leaving the remaining
+  harness centered on server-request handling and the approval-replay paths
+- the reconnect v2 skills-change helpers were split again so the multi-worker
+  and single-worker skills notification harness now lives in
+  `embedded_test_support_reconnect_v2_skills.rs`, leaving the larger reconnect
+  refresh path isolated at the tail of `embedded_test_support_reconnect_v2.rs`
+- the reconnect v2 bootstrap refresh flow was split again so the recovered
+  single-worker reconnect scenario now lives in
+  `embedded_test_support_reconnect_v2_refresh.rs`, leaving
+  `embedded_test_support_reconnect_v2.rs` focused on the remaining reconnect
+  orchestration shell
+- the reconnect v2 single-worker thread-control flow was split again so the
+  single-worker reconnect and thread-management scenario now lives in
+  `embedded_test_support_reconnect_v2_thread_control.rs`, leaving
+  `embedded_test_support_reconnect_v2.rs` with the broader reconnect mock,
+  shared thread-server, and same-session recovery helpers
+- the reconnect v2 realtime helper flow was split again so the shared
+  multi-connection realtime scenario now lives in
+  `embedded_test_support_reconnect_v2_realtime.rs`, leaving
+  `embedded_test_support_reconnect_v2.rs` focused on the remaining
+  same-session recovery, session-mutation, and state-notification helpers
+- the reconnect v2 session-mutation and state-notification helpers were split
+  again so those tail scenarios now live in
+  `embedded_test_support_reconnect_v2_session_mutation.rs` and
+  `embedded_test_support_reconnect_v2_state_notification.rs`, leaving
+  `embedded_test_support_reconnect_v2.rs` centered on same-session recovery
+- the reconnect v2 same-session recovery helper was split again so the
+  recovered thread, fork, review, realtime, and approval replay scenario now
+  lives in `embedded_test_support_reconnect_v2_same_session_recovery.rs`,
+  leaving `embedded_test_support_reconnect_v2.rs` as a thin reconnect module
+- the reconnect v2 thread-server scenario was split again so the large
+  multi-connection thread recovery helper now lives in
+  `embedded_test_support_reconnect_v2_thread_server.rs`, leaving
+  `embedded_test_support_reconnect_v2.rs` focused on the reconnect mock
+- the reconnect test support path was split again so the shared bootstrap
+  responder lives in `embedded_test_support_reconnect_common.rs`, the legacy
+  mock-server helpers stay in `embedded_test_support_reconnect.rs`, and the
+  larger v2 reconnect harness now lives in
+  `embedded_test_support_reconnect_v2.rs`
 - that split now leaves `v2.rs` as a thin orchestration-and-test shell while
   the lifecycle, routing, disconnect, and server-request flows live in their
   own owner-specific modules, keeping the high-churn transport logic bounded
@@ -488,6 +567,120 @@ Recent progress:
   with the bulk of the cases split into `northbound/v2_tests_cases.rs`, which
   leaves the shared v2 wiring easier to read without dragging the entire test
   matrix through the top-level module
+- the embedded gateway regression harness has now been split again so the
+  high-churn test coverage lives in `embedded_tests_core.rs`,
+  `embedded_tests_remote.rs`, `embedded_tests_multi_worker.rs`,
+  `embedded_tests_health.rs`, `embedded_tests_v2.rs`, and
+  `embedded_tests_misc.rs`, while the shared test support helpers stay in
+  `embedded_test_support.rs`; that keeps the embedded compatibility suite
+  reviewable without changing any of the exercised scenarios
+- the late multi-worker regression suite was split again so the thread-routing
+  cases now live in `embedded_tests_multi_worker_late_thread_routing.rs`,
+  leaving `embedded_tests_multi_worker_late.rs` focused on the remaining
+  health, routing, notification, and recovery scenarios
+- the late health regression suite was split again so the notification and
+  plugin-recovery cases now live in
+  `embedded_tests_health_late_notifications.rs`, leaving
+  `embedded_tests_health_late.rs` focused on the remaining setup, bootstrap,
+  filesystem, and legacy recovery scenarios
+- the late health regression suite was split again so the setup-flow case now
+  lives in `embedded_tests_health_late_setup.rs`, leaving
+  `embedded_tests_health_late.rs` focused on the remaining bootstrap,
+  filesystem, server-request, and account-exhaustion recovery scenarios
+- the late health regression suite was split again so the bootstrap and
+  discovery refresh case now lives in
+  `embedded_tests_health_late_bootstrap.rs`, leaving
+  `embedded_tests_health_late.rs` focused on the remaining server-request,
+  filesystem, and account-exhaustion recovery scenarios
+- the late health regression suite was split again so the setup mutation case
+  now lives in `embedded_tests_health_late_mutation.rs`, leaving
+  `embedded_tests_health_late.rs` focused on the remaining server-request,
+  filesystem, and account-exhaustion recovery scenarios
+- the embedded test core module now keeps its early rollout-guardrail tests in
+  `embedded_tests_core.rs` and moves the later single-worker remote,
+  bootstrap, auth, and server-request regressions into
+  `embedded_tests_core_late.rs`, which keeps the shared helper definitions in
+  the original file while trimming the tail of the embedded regression bundle
+- the embedded remote regression suite now keeps the early command/file,
+  elicitation, turn, plan, and bootstrap coverage in `embedded_tests_remote.rs`
+  and moves the external auth onboarding, notification forwarding, and tail
+  recovery coverage into `embedded_tests_remote_late.rs`, which keeps the
+  shared remote harness easy to scan without changing the exercised scenarios
+- the embedded multi-worker health and recovery suite now keeps the early
+  resume/fork, scope, disconnect, and session-recovery coverage in
+  `embedded_tests_health.rs` and moves the later notification deduplication,
+  plugin management, setup-flow, bootstrap-refresh, server-request recovery,
+  filesystem, legacy, and exhaustion-recovery coverage into
+  `embedded_tests_health_late.rs`, which keeps the shared multi-worker harness
+  smaller without changing the exercised scenarios
+- the embedded multi-worker regression suite now keeps the early
+  server-request, reconnect, and notification-deduplication coverage in
+  `embedded_tests_multi_worker.rs` and moves the later unmaterialized
+  thread-error, runtime routing, health, fallback, and legacy compatibility
+  coverage into `embedded_tests_multi_worker_late.rs`, which keeps the shared
+  multi-worker harness easier to scan without changing the exercised scenarios
+- the embedded multi-worker v2 suite now keeps the early account-exhaustion
+  recovery and fail-closed coverage in `embedded_tests_v2.rs` and moves the
+  later aggregation, setup, onboarding, account-rate-limit, and API fanout
+  coverage into `embedded_tests_v2_late.rs`, which keeps the shared v2 harness
+  easier to scan without changing the exercised scenarios
+- the shared embedded websocket and mock-server helpers now live in
+  `embedded_test_support_websocket.rs`, which keeps the websocket test
+  primitives and mock-thread fixtures separate from the larger embedded test
+  support harness while preserving the same helper API for the regression
+  modules that depend on them
+- the embedded gateway runtime path now keeps the remote bootstrap and event
+  loop split into `embedded_remote.rs` and `embedded_remote_loop.rs`, while
+  the remote connection lifecycle and health helpers sit behind
+  `remote_runtime_requests.rs`, `remote_runtime_server_request.rs`, and
+  `remote_runtime_views.rs`; that keeps the worker reconnect and routing
+  plumbing separate from the gateway startup shell
+- the remote reconnect regression trio was split again so the recovery and
+  SSE reconnect coverage now lives in `embedded_tests_misc_reconnect.rs`,
+  leaving `embedded_tests_misc.rs` focused on the remaining workflow, routing,
+  and health coverage
+- the embedded runtime healthz exec-server smoke test was split again so that
+  coverage now lives in `embedded_tests_misc_healthz.rs`, leaving
+  `embedded_tests_misc.rs` focused on the remaining multi-worker workflow,
+  reconnect, and health scenarios
+- the gateway observability metrics now live in `observability_metrics.rs`,
+  leaving `observability.rs` focused on the shared observability surface,
+  audit logging, and HTTP tracing entrypoints instead of carrying every metric
+  recording helper in one file
+- the v2 connection health regression suite now lives in
+  `v2_connection_health_tests.rs`, leaving `v2_connection_health.rs` focused
+  on the registry state and mutation helpers while the large snapshot and
+  coverage matrix stays isolated in its own test module
+- the v2 connection health snapshot builder now lives in
+  `v2_connection_health_snapshot.rs`, leaving `v2_connection_health.rs`
+  focused on the registry state and mutation helpers while the large
+  read-only snapshot conversion stays in its own module
+- the v2 connection health state and count shapes now live in
+  `v2_connection_health_state.rs`, leaving `v2_connection_health.rs`
+  focused on the registry facade and active bookkeeping methods while the
+  shared count and state shapes sit in their own module
+- the remaining large inline observability test matrix is still the next
+  obvious cleanup candidate, because `observability.rs` now carries only the
+  shared logging and metric surface while the test body is still embedded in
+  the same file
+- the large inline observability test matrix now lives in
+  `observability_tests.rs`, leaving `observability.rs` focused on the shared
+  logging and metric surface while the assertions and fixture setup sit in a
+  separate test module
+- the remote runtime regression harness now keeps the core routing and
+  server-request cases in `remote_runtime_tests.rs` and moves the health
+  coverage into `remote_runtime_tests_health.rs`, keeping the runtime shell
+  smaller while the health snapshot assertions stay isolated
+- the shared embedded test-support shell now keeps the large mock remote
+  workflow server in `embedded_test_support_remote_workflow.rs`, which trims
+  the root `embedded_test_support.rs` module down to the plugin fixture and
+  module wiring while keeping the mock workflow surface available to the
+  embedded regression suite
+- the northbound v2 regression harness now keeps the test entrypoint in
+  `v2_tests.rs` and splits the large case matrix across
+  `v2_tests_cases_0.rs` through `v2_tests_cases_4.rs`,
+  `v2_tests_cases_late.rs`, and `v2_tests_cases_support.rs`, leaving the
+  top-level case module as a thin dispatcher instead of a monolithic test file
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
@@ -3847,6 +4040,26 @@ Phase 6 includes the following validated transport and rollout properties:
   `README.md` and worksheet now record the topology id, tenant/project scope,
   and runtime shape
   explicitly too
+- the multi-connection disconnect reconnect helper now lives in
+  `embedded_test_support_multi_connection_disconnect_reconnect.rs`, keeping
+  the larger disconnect harness a little narrower while preserving the same
+  reconnect-after-thread-start regression behavior
+- the multi-connection disconnect server-request fixtures now live in
+  `embedded_test_support_multi_connection_disconnect_server_requests.rs`,
+  keeping the larger disconnect harness narrower while preserving the same
+  reconnect and pending-request regression coverage
+- the multi-connection wrong-thread-read fixture now lives in
+  `embedded_test_support_multi_connection_disconnect_wrong_thread_read.rs`,
+  keeping the disconnect harness a little smaller while preserving the same
+  wrong-thread regression coverage
+- the multi-worker notification fixtures now live in
+  `embedded_test_support_multi_worker_notifications.rs`, keeping the shared
+  multi-worker harness smaller while preserving the same skills, state, and
+  warning notification coverage
+- the multi-worker server-request, reconnect-request, and mutation fixtures now
+  live in `embedded_test_support_multi_worker_server_requests.rs`, keeping the
+  shared harness smaller while preserving the same approval, tool-call, and
+  turn-mutation coverage
 - `scripts/test-create-gateway-promotion-bundle.sh` and
   `just gateway-promotion-bundle-test` now smoke-test the bundle template and
   its worker/build/account topology rows, README capture metadata, worksheet
