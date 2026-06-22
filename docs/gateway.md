@@ -696,6 +696,11 @@ Recent progress:
   in `v2_tests_cases_4_notifications.rs`, leaving
   `v2_tests_cases_4.rs` focused on the routing, reconnect, and server-request
   coverage while the notification-heavy tail stays isolated
+- the northbound v2 case matrix now keeps the realtime request smoke tests in
+  `v2_tests_cases_4_realtime.rs`, leaving
+  `v2_tests_cases_4.rs` and `v2_tests_cases_4_notifications.rs` focused on
+  the broader routing and notification coverage while the realtime request
+  path stays isolated
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
