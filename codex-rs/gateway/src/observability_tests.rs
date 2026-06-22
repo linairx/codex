@@ -1,4 +1,3 @@
-
 use super::ACCOUNT_CAPACITY_EVENT_COUNT_METRIC;
 use super::GatewayObservability;
 use super::REMOTE_ACCOUNT_LABEL_EVENT_COUNT_METRIC;

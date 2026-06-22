@@ -671,6 +671,17 @@ Recent progress:
   server-request cases in `remote_runtime_tests.rs` and moves the health
   coverage into `remote_runtime_tests_health.rs`, keeping the runtime shell
   smaller while the health snapshot assertions stay isolated
+- the embedded miscellaneous regression harness now keeps the workflow,
+  routing, realtime, and server-request coverage in `embedded_tests_misc.rs`
+  and moves the healthz and runtime-health coverage into
+  `embedded_tests_misc_health.rs`, keeping the remaining tail focused on the
+  non-health scenarios
+- the embedded v2 regression harness now keeps the path recovery coverage in
+  `embedded_tests_v2.rs`, moves the restoration-heavy account-exhaustion
+  cases into `embedded_tests_v2_restore.rs`, and splits the remaining
+  fail-closed coverage into `embedded_tests_v2_restore_fail_closed.rs`, so the
+  v2 shell stays narrow while the restoration and fail-closed cases are easier
+  to reason about separately
 - the shared embedded test-support shell now keeps the large mock remote
   workflow server in `embedded_test_support_remote_workflow.rs`, which trims
   the root `embedded_test_support.rs` module down to the plugin fixture and
