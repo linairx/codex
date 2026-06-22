@@ -725,6 +725,10 @@ Recent progress:
   `embedded_tests_remote_tool_requests.rs`, leaving
   `embedded_tests_remote.rs` focused on the drop-in turn, plan, realtime,
   thread-control, and operational workflows
+- the embedded client plan-item coverage now lives in
+  `embedded_tests_remote_plan.rs`, leaving `embedded_tests_remote.rs`
+  focused on the drop-in turn, realtime, thread-control, and operational
+  workflows
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
