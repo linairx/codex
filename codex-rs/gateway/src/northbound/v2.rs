@@ -81,12 +81,6 @@ use crate::northbound::v2_counts::server_request_backlog_method_counts;
 #[cfg(test)]
 use crate::northbound::v2_counts::server_request_backlog_worker_counts;
 #[cfg(test)]
-pub(crate) use crate::northbound::v2_limits::RATE_LIMITED_ERROR_CODE;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_limits::TOO_MANY_PENDING_CLIENT_REQUESTS_MESSAGE;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_limits::TOO_MANY_PENDING_SERVER_REQUESTS_MESSAGE;
-#[cfg(test)]
 use crate::northbound::v2_notifications::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_notifications::forwarded_connection_notification_duplicate;

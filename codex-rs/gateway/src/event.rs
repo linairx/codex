@@ -362,6 +362,7 @@ mod tests {
     fn builds_gateway_event_from_notification() {
         let thread = Thread {
             id: "thread-123".to_string(),
+            extra: None,
             session_id: "session-123".to_string(),
             forked_from_id: None,
             parent_thread_id: None,

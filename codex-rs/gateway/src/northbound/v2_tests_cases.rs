@@ -10,7 +10,10 @@ mod v2_tests_cases_late;
 
 pub(crate) use self::v2_tests_cases_late::*;
 
-pub(crate) use self::v2_tests_cases_0::*;
+#[path = "v2_tests_cases_0_late.rs"]
+mod v2_tests_cases_0_late;
+
+pub(crate) use self::v2_tests_cases_0_late::*;
 
 #[path = "v2_tests_cases_0.rs"]
 mod v2_tests_cases_0;

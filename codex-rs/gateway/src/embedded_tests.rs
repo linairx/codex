@@ -256,7 +256,6 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::result::Result;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tempfile::tempdir;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -275,7 +274,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
 use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
-use tracing_subscriber::layer::SubscriberExt;
 
 const EMBEDDED_CONNECTOR_ID: &str = "calendar";
 const EMBEDDED_CONNECTOR_NAME: &str = "Calendar";

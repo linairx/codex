@@ -707,6 +707,18 @@ Recent progress:
   `v2_tests_cases_0.rs` through `v2_tests_cases_4.rs`,
   `v2_tests_cases_late.rs`, and `v2_tests_cases_support.rs`, leaving the
   top-level case module as a thin dispatcher instead of a monolithic test file
+- the northbound v2 case matrix now keeps the initialize, pre-initialize, and
+  downstream initialize failure coverage in `v2_tests_cases_0_initialize.rs`,
+  leaving `v2_tests_cases_0.rs` focused on the remaining cleanup, routing, and
+  metrics coverage
+- the northbound v2 case matrix now keeps the websocket upgrade, scope, quota,
+  and connection-metrics tail in `v2_tests_cases_0_websocket.rs`, leaving
+  `v2_tests_cases_0.rs` focused on the earlier cleanup, routing, and shared
+  metric helpers
+- the northbound v2 case matrix now keeps the shared websocket, bootstrap,
+  log-capture, and mock-server helpers in `v2_tests_cases_support.rs`, leaving
+  `v2_tests_cases_late.rs` focused more narrowly on the remaining case matrix
+  and domain-specific helpers
 - the northbound v2 case matrix now keeps the realtime and notification tail
   in `v2_tests_cases_4_notifications.rs`, leaving
   `v2_tests_cases_4.rs` focused on the routing, reconnect, and server-request
@@ -4272,6 +4284,194 @@ Phase 6 includes the following validated transport and rollout properties:
   least one artifact file, so a reviewed bundle is populated with real
   transcripts, health snapshots, events, metrics, and logs rather than only
   empty folder placeholders
+- the split multi-worker notification reconnect regression suite now restores
+  the after-reconnect connection-state and skills-changed notification
+  deduplication cases in
+  `embedded_tests_multi_worker_notifications_reconnect.rs`, so the module
+  split preserves the notification suppression coverage that existed before
+  the test harness was broken into smaller files while keeping
+  `embedded_tests_multi_worker_reconnect.rs` focused on core reconnect flows
+- the late multi-worker regression suite now keeps its degraded-worker,
+  v2-compatibility healthz, and websocket-upgrade smoke tests in
+  `embedded_tests_multi_worker_late_health.rs`, leaving
+  `embedded_tests_multi_worker_late.rs` focused on project routing, account
+  capacity, handoff, and remaining thread aggregation scenarios
+- the late multi-worker v2 thread routing and aggregation workflow now lives
+  in `embedded_tests_multi_worker_late_aggregation.rs`, keeping the
+  project-route and account-capacity handoff tests separate from the
+  thread/list, loaded-thread, app-list, and MCP sticky-routing coverage
+- the late multi-worker regression suite now keeps its account-capacity and
+  account-handoff scenarios in
+  `embedded_tests_multi_worker_late_account_capacity.rs` and
+  `embedded_tests_multi_worker_late_handoff.rs`, leaving
+  `embedded_tests_multi_worker_late.rs` focused on project routing and the
+  remaining thread aggregation coverage
+- the late multi-worker project-route scenarios now live in
+  `embedded_tests_multi_worker_late_project_routes.rs`, keeping
+  `embedded_tests_multi_worker_late.rs` as a small owner list that only wires
+  together the late multi-worker scenario modules
+- the single-worker reconnect notification coverage now lives in
+  `embedded_tests_multi_worker_notifications_reconnect.rs`, leaving
+  `embedded_tests_multi_worker_notifications.rs` focused on the steady-state
+  notification flows
+- the multi-worker skills-change reconnect coverage now lives in
+  `embedded_tests_multi_worker_notifications_reconnect_skills.rs`, keeping
+  `embedded_tests_multi_worker_notifications_reconnect.rs` focused on the
+  connection-state reconnect coverage
+- the multi-worker server-request roundtrip expansion now lives in
+  `embedded_tests_multi_worker_server_requests_roundtrips.rs`, keeping
+  `embedded_tests_multi_worker_server_requests.rs` focused on the base
+  server-request roundtrip coverage
+- the single-worker reconnect thread-control and realtime workflows now live
+  in `embedded_tests_multi_worker_single_worker_reconnect_thread_control.rs`
+  and `embedded_tests_multi_worker_single_worker_reconnect_realtime.rs`,
+  leaving `embedded_tests_multi_worker_single_worker_reconnect.rs` focused on
+  the main reconnect recovery flow
+- the reconnect v2 thread-server turn/start workflow now lives in
+  `embedded_test_support_reconnect_v2_thread_server_turn_start.rs`, leaving
+  `embedded_test_support_reconnect_v2_thread_server.rs` focused on the
+  smaller thread request handlers and accept-loop orchestration
+- the reconnect v2 same-session recovery turn and realtime workflows now live
+  in `embedded_test_support_reconnect_v2_same_session_recovery_turn_and_realtime.rs`,
+  leaving `embedded_test_support_reconnect_v2_same_session_recovery.rs`
+  focused on the remaining thread, app, MCP, and review recovery handlers
+- the reconnect v2 same-session recovery helper was split again so thread
+  route restoration now lives in
+  `embedded_test_support_reconnect_v2_same_session_recovery_thread_routes.rs`,
+  bootstrap and discovery handling now lives in
+  `embedded_test_support_reconnect_v2_same_session_recovery_discovery.rs`,
+  and the remaining thread-control recovery handlers now live in
+  `embedded_test_support_reconnect_v2_same_session_recovery_thread_controls.rs`,
+  which keeps the long recovery dispatcher back under the module-size target
+  without changing the exercised reconnect scenarios
+- the reconnect v2 same-session recovery turn-and-realtime helper was split
+  again so turn lifecycle handling now lives in
+  `embedded_test_support_reconnect_v2_same_session_recovery_turn.rs` and the
+  realtime workflow now lives in
+  `embedded_test_support_reconnect_v2_same_session_recovery_realtime.rs`,
+  leaving `embedded_test_support_reconnect_v2_same_session_recovery_turn_and_realtime.rs`
+  as a thin dispatcher that only routes between those two request families
+- the gateway observability test matrix was split again so the lifecycle,
+  protocol-violation, downstream backpressure, client timeout, thread route
+  recovery, degraded discovery, and connection-log coverage now lives in
+  `observability_tests_tail.rs`, leaving `observability_tests.rs` focused on
+  the remaining request and connection-metric coverage
+- the gateway observability test matrix was split again so the remote account
+  label, server-request lifecycle and delivery-failure, account-capacity,
+  fail-closed, and upstream-failure coverage now lives in
+  `observability_tests_metrics.rs`, leaving `observability_tests.rs` focused
+  on the remaining request, notification, and connection-log coverage
+- the gateway observability connection-metric coverage now lives in
+  `observability_tests_connection.rs`, leaving `observability_tests.rs`
+  focused on request metrics and the smaller rejection/reconnect/account
+  capacity cases
+- the multi-worker health reconnect regression coverage was split so the
+  basic disconnect survival case now lives in
+  `embedded_tests_health_reconnect.rs`, recovered server-request fan-in lives
+  in `embedded_tests_health_reconnect_server_requests.rs`, and recovered setup
+  mutation fanout lives in `embedded_tests_health_reconnect_setup.rs`, leaving
+  `embedded_tests_health.rs` focused on the remaining resume, scope, hidden
+  request, and same-session recovery coverage
+- the remaining same-session recovery coverage now lives in
+  `embedded_tests_health_reconnect_same_session.rs`, leaving
+  `embedded_tests_health.rs` focused on the shorter resume, scope, and hidden
+  request coverage
+- the account-exhaustion restore and fail-closed v2 regression suite was split
+  into restore-turn, restore-mutation, restore-no-response, fail-no-response,
+  fail-review/MCP, and fail-realtime/cleanup scenario modules under
+  `embedded_tests_v2_restore_fail_closed_*.rs`, leaving
+  `embedded_tests_v2_restore_fail_closed.rs` as a small owner list for the
+  account-handoff restoration matrix
+- the embedded core account-label and startup-validation smoke tests now live
+  in `embedded_tests_core_labels.rs`, leaving `embedded_tests_core.rs`
+  focused on the embedded workflow, bootstrap, and later v2 coverage
+- the embedded core environment-manager, startup-constraint, and bootstrap
+  workflow tests now live in `embedded_tests_core_bootstrap.rs`, leaving
+  `embedded_tests_core.rs` focused on the later embedded workflow and v2
+  session coverage
+- the later embedded core workflow and v2 session coverage was split again so
+  MCP OAuth, external-auth onboarding, account-rate-limit reads, and the
+  server-request roundtrip coverage now live in dedicated
+  `embedded_tests_core_late_*.rs` modules, leaving
+  `embedded_tests_core_late.rs` as a thin owner list for the remaining v2
+  parity scenarios
+- the multi-worker health regression coverage was split again so resume/fork
+  routing, scope filtering, and hidden server-request rejection now live in
+  dedicated `embedded_tests_health_*.rs` modules, leaving
+  `embedded_tests_health.rs` as a thin owner list for the remaining
+  reconnect-focused coverage
+- the gateway observability request-metric coverage and shared log-capture
+  helper now live in dedicated `observability_tests_request_metrics.rs` and
+  `observability_tests_support.rs` modules, leaving
+  `observability_tests.rs` focused on the remaining rejection, reconnect, and
+  account-capacity coverage
+- the northbound `v2_tests_cases_0` tail coverage was split again so the
+  pending-response settlement, server-request cleanup, connection-health, and
+  request-metric helper coverage now live in
+  `northbound/v2_tests_cases_0_late.rs`, leaving
+  `northbound/v2_tests_cases_0.rs` focused on the earlier websocket and
+  initialize coverage
+- the northbound `v2_tests_cases_1` command-exec coverage was split again so
+  the output-notification, pending-limit, duplicate-request-id, and fail-closed
+  command-exec cases now live in `northbound/v2_tests_cases_1_command_exec.rs`,
+  leaving `northbound/v2_tests_cases_1.rs` focused on the later turn-control,
+  thread-list, and aggregation coverage
+- the northbound `v2_tests_cases_1` turn-control coverage was split again so the
+  `turn/interrupt`, `turn/steer`, and `review/start` cases now live in
+  `northbound/v2_tests_cases_1_turn_control.rs`, leaving
+  `northbound/v2_tests_cases_1.rs` focused on thread-list and aggregation
+  coverage
+- the northbound `v2_tests_cases_1` thread-list coverage was split again so the
+  scope-filtering, backfill, and deduplication cases now live in
+  `northbound/v2_tests_cases_1_thread_list.rs`, leaving
+  `northbound/v2_tests_cases_1.rs` focused on the remaining aggregation
+  coverage
+- the northbound `v2_tests_cases_1` plugin-list coverage was split again so the
+  marketplace merge and plugin-summary repeat cases now live in
+  `northbound/v2_tests_cases_1_plugin_list.rs`, leaving
+  `northbound/v2_tests_cases_1.rs` focused on realtime, fuzzy-search, and auth
+  aggregation coverage
+- the northbound `v2_tests_cases_1` realtime aggregation coverage was split
+  again so the multi-worker realtime voice merge case now lives in
+  `northbound/v2_tests_cases_1_realtime.rs`, leaving
+  `northbound/v2_tests_cases_1.rs` focused on fuzzy-search and auth aggregation
+  coverage
+- the northbound `v2_tests_cases_1` fuzzy-search aggregation coverage was split
+  again so the multi-worker fuzzy-file-search merge case now lives in
+  `northbound/v2_tests_cases_1_fuzzy_search.rs`, and the auth aggregation
+  coverage now lives in `northbound/v2_tests_cases_1_auth.rs`, leaving
+  `northbound/v2_tests_cases_1.rs` focused on the remaining non-aggregation
+  websocket regression coverage
+- the remaining `v2_tests_cases_1` tail was split again so the low-frequency
+  passthrough, slow-client timeout, and experimental-feature aggregation cases
+  now live in dedicated `northbound/v2_tests_cases_1_late_*.rs` modules,
+  leaving `northbound/v2_tests_cases_1.rs` smaller and keeping the request
+  regression, timeout, and aggregation concerns isolated from one another
+- the northbound `v2_tests_cases_2` tail was split again so the route-recovery,
+  sticky-thread mutation, aggregation reconnect, and collaboration-mode cases
+  now live in `northbound/v2_tests_cases_2_late.rs`, leaving the parent file
+  focused on the earlier account-capacity and thread-list aggregation
+  scenarios
+- that `v2_tests_cases_2_late` tail was split again so the route-recovery and
+  sticky-thread tests now live in `northbound/v2_tests_cases_2_late_routes.rs`
+  while the aggregation reconnect tests now live in
+  `northbound/v2_tests_cases_2_late_aggregation.rs`, keeping route-recovery
+  and aggregation concerns separate as the file grows
+- the northbound `v2_tests_cases_4` tail was split again so the
+  reconnectable-router, server-request cleanup, and scope-heavy cases now
+  live in `northbound/v2_tests_cases_4_late.rs`, leaving
+  `northbound/v2_tests_cases_4.rs` focused on the earlier reconnect and
+  notification coverage
+- the northbound `v2_tests_cases_3` tail was split again so the
+  websocket-deduplication, reconnecting server-request, and sticky-routing
+  cases now live in `northbound/v2_tests_cases_3_late.rs`, leaving
+  `northbound/v2_tests_cases_3.rs` focused on the earlier reconnect and
+  discovery coverage
+- the northbound `v2_tests_cases_2` account-rate-limit and collaboration-mode
+  aggregation smoke tests now live in
+  `northbound/v2_tests_cases_2_account_and_collaboration.rs`, leaving the
+  parent case file focused on thread-list pagination, route recovery, and
+  handoff coverage
 
 Phase 6 now consists of:
 
