@@ -643,6 +643,21 @@ Recent progress:
   coverage now lives in `embedded_tests_misc_healthz.rs`, leaving
   `embedded_tests_misc.rs` focused on the remaining multi-worker workflow,
   reconnect, and health scenarios
+- the embedded miscellaneous regression harness now also keeps the initial
+  notification and plugin-discovery coverage in
+  `embedded_tests_misc_notifications.rs` and
+  `embedded_tests_misc_plugins.rs`, leaving `embedded_tests_misc.rs` focused
+  on the remaining turn, realtime, server-request, reconnect, and health
+  coverage
+- the embedded miscellaneous regression harness now also keeps the turn
+  routing and notification fan-in coverage in
+  `embedded_tests_misc_turns.rs`, leaving `embedded_tests_misc.rs` focused on
+  the remaining turn-control, thread-control, realtime, server-request,
+  reconnect, and health coverage
+- the embedded miscellaneous regression harness now also keeps the realtime
+  voice aggregation, routing, and notification fan-in coverage in
+  `embedded_tests_misc_realtime.rs`, leaving `embedded_tests_misc.rs` as the
+  scenario module dispatcher for the remaining misc regression groups
 - the gateway observability metrics now live in `observability_metrics.rs`,
   leaving `observability.rs` focused on the shared observability surface,
   audit logging, and HTTP tracing entrypoints instead of carrying every metric
@@ -716,6 +731,31 @@ Recent progress:
   `embedded_tests_multi_worker_server_requests.rs`, leaving
   `embedded_tests_multi_worker.rs` focused on reconnect, additional
   server-request matrix, realtime, and notification recovery coverage
+- the embedded multi-worker regression suite now keeps the additional
+  single-worker server-request matrix in
+  `embedded_tests_multi_worker_server_requests.rs` too, leaving
+  `embedded_tests_multi_worker.rs` focused on reconnect, realtime, and
+  notification recovery coverage
+- the embedded multi-worker regression suite now keeps single-worker
+  notification recovery coverage in
+  `embedded_tests_multi_worker_notifications.rs`, leaving
+  `embedded_tests_multi_worker.rs` focused on reconnect, thread-control,
+  realtime, bootstrap refresh, and the remaining multi-worker notification
+  recovery coverage
+- the embedded multi-worker regression suite now keeps single-worker
+  reconnect workflow coverage in
+  `embedded_tests_multi_worker_single_worker_reconnect.rs`, leaving
+  `embedded_tests_multi_worker.rs` focused on the remaining multi-worker
+  reconnect and realtime recovery cases
+- the remaining multi-worker reconnect and realtime recovery cases now live in
+  `embedded_tests_multi_worker_reconnect.rs` and
+  `embedded_tests_multi_worker_realtime.rs`, leaving
+  `embedded_tests_multi_worker.rs` as the scenario module dispatcher
+- the single-worker reconnect suite now keeps the broad bootstrap refresh
+  request matrix in
+  `embedded_tests_multi_worker_single_worker_bootstrap.rs`, leaving
+  `embedded_tests_multi_worker_single_worker_reconnect.rs` focused on the
+  turn, thread-control/review, and realtime reconnect workflows
 - the remote embedded-client regression suite now keeps the command/file
   approval server-request coverage in
   `embedded_tests_remote_server_requests.rs`, leaving
@@ -729,6 +769,38 @@ Recent progress:
   `embedded_tests_remote_plan.rs`, leaving `embedded_tests_remote.rs`
   focused on the drop-in turn, realtime, thread-control, and operational
   workflows
+- the embedded realtime coverage now lives in
+  `embedded_tests_remote_realtime_embedded.rs` and
+  `embedded_tests_remote_realtime_request.rs`, leaving
+  `embedded_tests_remote_realtime.rs` focused on the remote single-worker
+  realtime workflow while `embedded_tests_remote.rs` keeps the drop-in turn,
+  thread-control, and operational workflows
+- the embedded client operational coverage now lives in
+  `embedded_tests_remote_operational.rs`, leaving `embedded_tests_remote.rs`
+  focused on the drop-in turn, realtime, thread-control, and bootstrap/
+  turn-workflow coverage
+- the embedded and single-worker control coverage now lives in
+  `embedded_tests_remote_control.rs`, leaving `embedded_tests_remote.rs`
+  focused on the drop-in turn, realtime, operational, and bootstrap
+  workflows
+- the embedded bootstrap coverage now stays in
+  `embedded_tests_remote_bootstrap.rs`, while the thread-resume/fork error and
+  later-client-session reentry coverage now lives in
+  `embedded_tests_remote_thread_lifecycle.rs` and
+  `embedded_tests_remote_thread_reentry.rs`, leaving
+  `embedded_tests_remote.rs` focused on the drop-in turn, realtime,
+  operational, and control workflows
+- the remote embedded-client regression suite now removes the remaining
+  duplicate remote realtime and remote thread-control/review workflows from
+  `embedded_tests_remote.rs`, leaving those cases only in
+  `embedded_tests_remote_realtime.rs` and `embedded_tests_remote_control.rs`
+  while the parent file focuses on the embedded turn and embedded
+  thread-control workflows plus scenario module wiring
+- the remaining embedded drop-in turn and thread-control workflows now live in
+  `embedded_tests_remote_embedded_turn.rs` and
+  `embedded_tests_remote_embedded_thread_control.rs`, leaving
+  `embedded_tests_remote.rs` as the scenario module dispatcher plus the shared
+  embedded tool request constants
 - the compatibility plan now separates the completed northbound v2 hardening
   workstream from the multi-worker rollout gate, and the project-
   aware promotion checklist is written down in one place for deployment
@@ -3894,8 +3966,19 @@ Phase 6 includes the following validated transport and rollout properties:
   commands, compact start, unsubscribe, and background-terminal cleanup, so the
   fail-closed policy is not represented only by one sample method; `review/start`
   and thread-scoped MCP now each have explicit no-replacement regressions in
-  the same multi-worker harness; turn control, realtime control methods, and
-  shell commands plus background-terminal cleanup now also have explicit
+  the same multi-worker harness; thread control and review routing now also
+  live in `embedded_tests_misc_thread_control.rs`, keeping the same
+  multi-worker harness focused on the remaining realtime control, turn
+  control, and server-request cases; server-request routing and overlapping
+  request-id coverage now also live in `embedded_tests_misc_server_requests.rs`,
+  thread mutations now live in `embedded_tests_misc_thread_mutations.rs`,
+  realtime aggregation and fan-in coverage now lives in
+  `embedded_tests_misc_realtime.rs`, and the reconnect SSE regression stays
+  consolidated in
+  `embedded_tests_misc_reconnect.rs`, keeping the remaining misc harness
+  focused on module dispatch; turn control now also lives in
+  `embedded_tests_misc_turn_control.rs`; realtime control methods, and shell
+  commands plus background-terminal cleanup now also have explicit
   no-replacement regressions there, and the exported
   `gateway_v2_account_capacity_events` counts are also covered beyond the
   health mirror
