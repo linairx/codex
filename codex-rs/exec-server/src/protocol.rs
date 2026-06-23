@@ -72,6 +72,9 @@ pub struct InitializeResponse {
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentInfo {
     pub shell: ShellInfo,
+    /// Working directory inherited by the exec-server process.
+    #[serde(default)]
+    pub cwd: Option<PathUri>,
 }
 
 /// Shell detected for an execution/filesystem environment.
@@ -511,10 +514,12 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
+    use super::EnvironmentInfo;
     use super::ExecParams;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
     use super::ProcessId;
+    use super::ShellInfo;
     use codex_file_system::FileSystemSandboxContext;
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_protocol::models::PermissionProfile;
@@ -567,38 +572,52 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_protocol_accepts_legacy_absolute_paths_and_serializes_path_uris() {
-        let legacy_path = std::env::current_dir()
-            .expect("current directory")
-            .join("legacy-file.txt");
-        let legacy_cwd = std::env::current_dir().expect("current directory");
-        let native_sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
-            PermissionProfile::default(),
-            PathUri::from_host_native_path(&legacy_cwd).expect("cwd URI"),
-        );
-        let mut legacy_sandbox =
-            serde_json::to_value(&native_sandbox).expect("sandbox should serialize");
-        legacy_sandbox["cwd"] = serde_json::json!(legacy_cwd.to_string_lossy());
-        let params: FsReadFileParams = serde_json::from_value(serde_json::json!({
-            "path": legacy_path.to_string_lossy(),
-            "sandbox": legacy_sandbox,
+    fn environment_info_accepts_legacy_response_without_cwd() {
+        let info: EnvironmentInfo = serde_json::from_value(serde_json::json!({
+            "shell": { "name": "zsh", "path": "/bin/zsh" }
         }))
-        .expect("legacy absolute path should deserialize");
-        let expected_sandbox = native_sandbox;
-        let expected = FsReadFileParams {
-            path: PathUri::from_host_native_path(legacy_path).expect("path URI"),
-            sandbox: Some(expected_sandbox.clone()),
-        };
+        .expect("legacy environment info should deserialize");
 
-        assert_eq!(params, expected);
         assert_eq!(
-            serde_json::to_value(params).expect("params should serialize"),
-            serde_json::json!({
-                "path": expected.path.to_string(),
-                "sandbox": serde_json::to_value(expected_sandbox)
-                    .expect("sandbox should serialize"),
-            })
+            info,
+            EnvironmentInfo {
+                shell: ShellInfo {
+                    name: "zsh".to_string(),
+                    path: "/bin/zsh".to_string(),
+                },
+                cwd: None,
+            }
         );
+    }
+
+    #[test]
+    fn filesystem_protocol_rejects_native_absolute_paths() {
+        let native_path = std::env::current_dir()
+            .expect("current directory")
+            .join("native-file.txt");
+        let native_cwd = std::env::current_dir().expect("current directory");
+
+        serde_json::from_value::<FsReadFileParams>(serde_json::json!({
+            "path": native_path.to_string_lossy(),
+            "sandbox": null,
+        }))
+        .expect_err("native absolute path should not deserialize as a URI");
+
+        let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+            PermissionProfile::default(),
+            PathUri::from_host_native_path(&native_cwd).expect("cwd URI"),
+        );
+        let mut native_path_sandbox =
+            serde_json::to_value(sandbox).expect("sandbox should serialize");
+        native_path_sandbox["cwd"] = serde_json::json!(native_cwd.to_string_lossy());
+
+        serde_json::from_value::<FsReadFileParams>(serde_json::json!({
+            "path": PathUri::from_host_native_path(native_path)
+                .expect("path URI")
+                .to_string(),
+            "sandbox": native_path_sandbox,
+        }))
+        .expect_err("native absolute sandbox cwd should not deserialize as a URI");
     }
 
     #[test]
