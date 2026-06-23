@@ -142,7 +142,7 @@ async fn remote_multi_worker_supports_v2_resume_and_fork_routing() {
                 thread_id: "thread-history-placeholder".to_string(),
                 history: Some(vec![ResponseItem::Message {
                     id: None,
-                    metadata: None,
+                    internal_chat_message_metadata_passthrough: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
                         text: "resume from explicit history".to_string(),

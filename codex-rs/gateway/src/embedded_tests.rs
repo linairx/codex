@@ -31,7 +31,6 @@ pub(crate) use self::embedded_tests_core::TurnStreamingCoverage;
 pub(crate) use self::embedded_tests_core::bootstrap_setup_plugin_list_json;
 pub(crate) use self::embedded_tests_core::bootstrap_setup_realtime_voices;
 pub(crate) use self::embedded_tests_core::expected_extended_turn_notifications;
-pub(crate) use self::embedded_tests_core::expected_turn_streaming_coverage;
 
 use crate::api::CreateThreadRequest;
 use crate::api::GatewayExecutionMode;

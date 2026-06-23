@@ -1089,7 +1089,7 @@ async fn remote_multi_worker_supports_fanout_external_auth_onboarding_over_v2() 
     assert_eq!(
         account.account,
         Some(codex_app_server_protocol::Account::Chatgpt {
-            email: "worker-a@example.com".to_string(),
+            email: Some("worker-a@example.com".to_string()),
             plan_type: AccountPlanType::Pro,
         })
     );

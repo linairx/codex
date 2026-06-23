@@ -380,23 +380,6 @@ pub(crate) struct TurnStreamingCoverage {
     pub(crate) saw_turn_completed: bool,
 }
 
-pub(crate) fn expected_turn_streaming_coverage() -> TurnStreamingCoverage {
-    TurnStreamingCoverage {
-        saw_thread_active: true,
-        saw_turn_started: true,
-        saw_hook_started: true,
-        saw_item_started: true,
-        saw_agent_delta: true,
-        saw_reasoning_summary_delta: true,
-        saw_reasoning_text_delta: true,
-        saw_command_output_delta: true,
-        saw_file_change_delta: true,
-        saw_hook_completed: true,
-        saw_item_completed: true,
-        saw_turn_completed: true,
-    }
-}
-
 pub(crate) fn expected_extended_turn_notifications() -> HashSet<&'static str> {
     HashSet::from([
         "context_compacted",
