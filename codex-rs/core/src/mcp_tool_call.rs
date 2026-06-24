@@ -26,11 +26,11 @@ use crate::turn_metadata::McpTurnMetadataContext;
 use codex_analytics::AppInvocation;
 use codex_analytics::InvocationType;
 use codex_analytics::build_track_events_context;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::McpElicitationObjectType;
 use codex_app_server_protocol::McpElicitationSchema;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
+use codex_config::ConfigLayerSource;
 use codex_config::types::AppToolApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_connectors::AppToolPolicy;
@@ -971,6 +971,7 @@ async fn maybe_track_codex_app_used(
         turn_context.model_info.slug.clone(),
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
+        turn_context.originator.clone(),
     );
     sess.services.analytics_events_client.track_app_used(
         tracking,

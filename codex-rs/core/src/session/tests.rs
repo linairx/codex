@@ -66,6 +66,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_path_uri::PathUri;
 use tracing::Span;
 
+use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
 use crate::state::TaskKind;
@@ -83,7 +84,6 @@ use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::router::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
-use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::McpElicitationSchema;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ProjectConfig;
@@ -210,7 +210,7 @@ fn user_message(text: &str) -> ResponseItem {
 }
 
 #[test]
-fn assign_missing_response_item_ids_skips_agent_messages() {
+fn assign_missing_response_item_ids_assigns_agent_message_ids() {
     let items = Cow::Owned(vec![
         ResponseItem::AgentMessage {
             id: None,
@@ -226,7 +226,7 @@ fn assign_missing_response_item_ids_skips_agent_messages() {
 
     let items = Session::assign_missing_response_item_ids(items);
 
-    assert_eq!(items[0].id(), None);
+    assert!(items[0].id().is_some_and(|id| id.starts_with("amsg_")));
     assert!(items[1].id().is_some_and(|id| id.starts_with("msg_")));
 }
 
@@ -479,6 +479,7 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         thread_id,
         ModelProviderInfo::create_openai_provider(/* base_url */ /*base_url*/ None),
         codex_protocol::protocol::SessionSource::Exec,
+        "test_originator".to_string(),
         /*model_verbosity*/ None,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
@@ -1777,6 +1778,75 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
 }
 
 #[tokio::test]
+async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resume() {
+    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            let _ = config.features.enable(Feature::ItemIds);
+        },
+    )
+    .await;
+    let rollout_path =
+        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::root().join("worker").expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "child done".to_string(),
+        /*trigger_turn*/ false,
+    );
+
+    session
+        .record_inter_agent_communication(&turn_context, communication)
+        .await;
+
+    let live_history = session.clone_history().await;
+    let [live_item] = live_history.raw_items() else {
+        panic!("expected exactly one live history item");
+    };
+    let live_item_id = live_item
+        .id()
+        .expect("live agent message should have an item id")
+        .to_string();
+    assert!(live_item_id.starts_with("amsg_"));
+
+    session.flush_rollout().await.expect("rollout should flush");
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let persisted_communication = resumed.history.iter().find_map(|item| match item {
+        RolloutItem::InterAgentCommunication(communication) => Some(communication),
+        _ => None,
+    });
+    assert_eq!(
+        persisted_communication.and_then(|communication| communication.id.as_deref()),
+        Some(live_item_id.as_str())
+    );
+
+    let (resumed_session, _resumed_turn_context, _rx) =
+        make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            |config| {
+                let _ = config.features.enable(Feature::ItemIds);
+            },
+        )
+        .await;
+    resumed_session
+        .record_initial_history(InitialHistory::Resumed(resumed))
+        .await;
+    let resumed_history = resumed_session.clone_history().await;
+    let [resumed_item] = resumed_history.raw_items() else {
+        panic!("expected exactly one resumed history item");
+    };
+    assert_eq!(resumed_item.id(), Some(live_item_id.as_str()));
+}
+
+#[tokio::test]
 async fn prepares_image_failures_before_history_insertion() {
     let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),
@@ -2614,6 +2684,110 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test]
+async fn start_new_context_window_assigns_and_persists_item_ids() {
+    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            let _ = config.features.enable(Feature::ItemIds);
+        },
+    )
+    .await;
+    let rollout_path =
+        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let world_state = Arc::new(
+        build_world_state_from_turn_context(session.as_ref(), turn_context.as_ref()).await,
+    );
+
+    session
+        .start_new_context_window(turn_context.as_ref(), world_state)
+        .await;
+
+    let live_history = session.clone_history().await;
+    assert!(!live_history.raw_items().is_empty());
+    assert!(
+        live_history
+            .raw_items()
+            .iter()
+            .all(|item| item.id().is_some())
+    );
+
+    session.flush_rollout().await.expect("rollout should flush");
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let persisted_replacement_history = resumed.history.iter().rev().find_map(|item| match item {
+        RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::EventMsg(_) => None,
+    });
+    assert_eq!(
+        persisted_replacement_history.map(Vec::as_slice),
+        Some(live_history.raw_items())
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_assigns_and_persists_id_for_forked_response_item() {
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            let _ = config.features.enable(Feature::ItemIds);
+        },
+    )
+    .await;
+    let rollout_path =
+        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let response_item = crate::context_manager::updates::build_developer_update_item(vec![
+        "Subagent guidance.".to_string(),
+    ])
+    .expect("developer message");
+    let mut expected_item = response_item.clone();
+
+    session
+        .record_initial_history(InitialHistory::Forked(vec![RolloutItem::ResponseItem(
+            response_item,
+        )]))
+        .await;
+
+    let live_history = session.clone_history().await;
+    let [live_item] = live_history.raw_items() else {
+        panic!("expected one forked response item");
+    };
+    let live_item_id = live_item
+        .id()
+        .expect("forked response item should have an id")
+        .to_string();
+    assert!(live_item_id.starts_with("msg_"));
+    expected_item.set_id(Some(live_item_id.clone()));
+    assert_eq!(live_history.raw_items(), &[expected_item]);
+
+    session.flush_rollout().await.expect("rollout should flush");
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let persisted_item_id = resumed.history.iter().find_map(|item| match item {
+        RolloutItem::ResponseItem(response_item) => response_item.id(),
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::EventMsg(_) => None,
+    });
+    assert_eq!(persisted_item_id, Some(live_item_id.as_str()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3485,6 +3659,7 @@ async fn set_rate_limits_retains_previous_credits() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     };
@@ -3592,6 +3767,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     };
@@ -3841,6 +4017,7 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
+            originator: "test_originator".to_string(),
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             multi_agent_version: None,
@@ -4122,13 +4299,14 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     }
 }
 
 #[tokio::test]
-async fn emit_subagent_session_started_includes_fork_lineage_from_session_configuration() {
+async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
@@ -4203,6 +4381,10 @@ async fn emit_subagent_session_started_includes_fork_lineage_from_session_config
     assert_eq!(
         event["event_params"]["forked_from_thread_id"],
         forked_from_thread_id.to_string()
+    );
+    assert_eq!(
+        event["event_params"]["app_server_client"]["product_client_id"],
+        "test_originator"
     );
 }
 
@@ -4989,6 +5171,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     };
@@ -5118,6 +5301,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     };
@@ -5220,6 +5404,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             thread_id,
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
+            session_configuration.originator.clone(),
             config.model_verbosity,
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
@@ -5364,6 +5549,7 @@ async fn make_session_with_config_and_rx(
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     };
@@ -5471,6 +5657,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
     };
@@ -6713,6 +6900,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
+            originator: "test_originator".to_string(),
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             multi_agent_version: None,
@@ -7194,6 +7382,7 @@ where
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        originator: "test_originator".to_string(),
         dynamic_tools,
         user_shell_override: None,
     };
@@ -7295,6 +7484,7 @@ where
             thread_id,
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
+            session_configuration.originator.clone(),
             config.model_verbosity,
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),

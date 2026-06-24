@@ -73,7 +73,6 @@ use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
-use codex_login::default_client::originator;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpRuntimeContext;
@@ -211,6 +210,7 @@ use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
 mod config_lock;
+pub(crate) mod context_window;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -432,6 +432,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) originator: String,
     pub(crate) agent_control: AgentControl,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     pub(crate) metrics_service_name: Option<String>,
@@ -521,6 +522,7 @@ impl Codex {
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
+            originator,
             agent_control,
             dynamic_tools,
             metrics_service_name,
@@ -653,6 +655,7 @@ impl Codex {
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
+            originator,
             dynamic_tools,
             user_shell_override,
         };
@@ -1334,8 +1337,15 @@ impl Session {
                     let _ = self.flush_rollout().await;
                 }
             }
-            InitialHistory::Forked(rollout_items) => {
+            InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
+                if turn_context.config.features.enabled(Feature::ItemIds) {
+                    for rollout_item in &mut rollout_items {
+                        if let RolloutItem::ResponseItem(response_item) = rollout_item {
+                            Self::assign_missing_response_item_id(response_item);
+                        }
+                    }
+                }
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
 
@@ -2720,30 +2730,33 @@ impl Session {
         }
         let mut items = items;
         for item in items.to_mut() {
-            if item.id().is_some() {
-                continue;
-            }
-            let prefix = match item {
-                ResponseItem::AdditionalTools { .. } => "at",
-                ResponseItem::Message { .. } => "msg",
-                ResponseItem::Reasoning { .. } => "rs",
-                ResponseItem::LocalShellCall { .. } => "lsh",
-                ResponseItem::FunctionCall { .. } => "fc",
-                ResponseItem::ToolSearchCall { .. } => "tsc",
-                ResponseItem::FunctionCallOutput { .. } => "fco",
-                ResponseItem::CustomToolCall { .. } => "ctc",
-                ResponseItem::CustomToolCallOutput { .. } => "ctco",
-                ResponseItem::ToolSearchOutput { .. } => "tso",
-                ResponseItem::WebSearchCall { .. } => "ws",
-                ResponseItem::ImageGenerationCall { .. } => "ig",
-                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => "cmp",
-                ResponseItem::AgentMessage { .. }
-                | ResponseItem::CompactionTrigger { .. }
-                | ResponseItem::Other => continue,
-            };
-            item.set_id(Some(format!("{prefix}_{}", Uuid::now_v7())));
+            Self::assign_missing_response_item_id(item);
         }
         items
+    }
+
+    fn assign_missing_response_item_id(item: &mut ResponseItem) {
+        if item.id().is_some() {
+            return;
+        }
+        let prefix = match item {
+            ResponseItem::AdditionalTools { .. } => "at",
+            ResponseItem::Message { .. } => "msg",
+            ResponseItem::Reasoning { .. } => "rs",
+            ResponseItem::LocalShellCall { .. } => "lsh",
+            ResponseItem::FunctionCall { .. } => "fc",
+            ResponseItem::ToolSearchCall { .. } => "tsc",
+            ResponseItem::FunctionCallOutput { .. } => "fco",
+            ResponseItem::CustomToolCall { .. } => "ctc",
+            ResponseItem::CustomToolCallOutput { .. } => "ctco",
+            ResponseItem::ToolSearchOutput { .. } => "tso",
+            ResponseItem::WebSearchCall { .. } => "ws",
+            ResponseItem::ImageGenerationCall { .. } => "ig",
+            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => "cmp",
+            ResponseItem::AgentMessage { .. } => "amsg",
+            ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => return,
+        };
+        item.set_id(Some(format!("{prefix}_{}", Uuid::now_v7())));
     }
 
     pub(crate) fn response_item_from_user_input(&self, input: Vec<UserInput>) -> ResponseItem {
@@ -2828,6 +2841,7 @@ impl Session {
             std::slice::from_ref(&response_item),
         );
         let items = items.as_ref();
+        communication.id = items.first().and_then(ResponseItem::id).map(str::to_string);
         {
             let mut state = self.state.lock().await;
             state.record_items(
@@ -3424,44 +3438,42 @@ impl Session {
         state.request_new_context_window();
     }
 
-    pub(crate) async fn maybe_start_new_context_window(
+    pub(crate) async fn take_new_context_window_request(&self) -> bool {
+        let mut state = self.state.lock().await;
+        state.take_new_context_window_request()
+    }
+
+    pub(crate) async fn start_new_context_window(
         &self,
         turn_context: &TurnContext,
         world_state: Arc<WorldState>,
-    ) -> Option<u64> {
+    ) -> u64 {
         let window = {
             let mut state = self.state.lock().await;
-            state.start_new_context_window_if_requested()
+            state.start_new_context_window()
         };
-        let (window_number, window_ids) = window?;
+        let (window_number, window_ids) = window;
         let context_items = self
             .build_initial_context_with_world_state(turn_context, world_state.as_ref())
             .await;
         let turn_context_item = turn_context.to_turn_context_item();
-        let replacement_history = context_items;
-        {
-            let mut state = self.state.lock().await;
-            state.replace_history(replacement_history.clone(), Some(turn_context_item.clone()));
-            state.history.set_world_state_baseline(world_state);
-        };
-        self.persist_rollout_items(&[
-            RolloutItem::Compacted(CompactedItem {
+        self.replace_compacted_history(
+            turn_context,
+            context_items,
+            Some(turn_context_item),
+            Some(world_state),
+            CompactedItem {
                 message: String::new(),
-                replacement_history: Some(replacement_history),
+                replacement_history: None,
                 window_number: Some(window_number),
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
                 window_id: Some(window_ids.window_id.to_string()),
-            }),
-            RolloutItem::TurnContext(turn_context_item),
-        ])
+            },
+        )
         .await;
-        {
-            let mut state = self.state.lock().await;
-            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-        }
         self.recompute_token_usage(turn_context).await;
-        Some(window_number)
+        window_number
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -3907,7 +3919,7 @@ pub(crate) fn emit_subagent_session_started(
         forked_from_thread_id: thread_config
             .forked_from_thread_id
             .map(|thread_id| thread_id.to_string()),
-        product_client_id: client_name.clone(),
+        product_client_id: thread_config.originator.clone(),
         client_name,
         client_version,
         model: thread_config.model,
