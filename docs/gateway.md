@@ -417,6 +417,71 @@ Detailed plan:
 
 Recent progress:
 
+- the `v2_tests_cases_4.rs` thread-start and account-capacity tail has been
+  split again so the active-thread exhaustion case and the registered-worker,
+  load-balancing, unlabeled-fallback, and affinity-skipping thread-start cases
+  now live in `v2_tests_cases_4_thread_start_tail.rs`, keeping the parent
+  module focused on reconnect, fs-watch, and router lifecycle coverage
+- the active-thread exhaustion handoff case now lives in
+  `v2_tests_cases_4_thread_start_tail_account_capacity.rs`, leaving
+  `v2_tests_cases_4_thread_start_tail.rs` focused on the thread-start
+  worker-selection matrix
+- the `v2_tests_cases_1_forwarding_account_setup.rs` tail now keeps only the
+  account read, rate-limit read, bootstrap discovery, plugin/setup mutation,
+  and core thread workflow coverage, while the account-login and feedback
+  forwarding cases now live in
+  `v2_tests_cases_1_forwarding_account_login.rs`
+- the server-request forwarding coverage now lives in
+  `v2_tests_cases_1_forwarding_server_requests.rs`, keeping the parent
+  `v2_tests_cases_1.rs` module focused on the remaining websocket lifecycle
+  and request-forwarding cases
+- the reconnect-backoff plugin-management and MCP OAuth login cases now live
+  in `v2_tests_cases_3_reconnect_backoff.rs`, keeping the parent
+  `v2_tests_cases_3.rs` module focused on the remaining reconnect,
+  discovery-backoff, and late-routing coverage
+- the `v2_tests_cases_0_late.rs` connection-log observation case now lives in
+  `v2_tests_cases_0_late_connection_log.rs`, keeping the parent late module
+  focused on the request and metrics helper coverage that follows
+- the account read and rate-limit read coverage now lives in
+  `v2_tests_cases_1_forwarding_account_setup_read.rs`, leaving
+  `v2_tests_cases_1_forwarding_account_setup.rs` focused on bootstrap
+  discovery, plugin/setup mutation, and core thread workflow forwarding
+- the `v2_tests_cases_4_late.rs` connection-cleanup block has been split again
+  so the reconnect, pending-request cleanup, worker disconnect, worker session
+  end, and resolved cleanup coverage now lives in
+  `v2_tests_cases_4_late_cleanup_tail.rs`, keeping the parent late module
+  focused on duplicate resolved notifications and scope filtering
+- the `v2_tests_cases_3_late.rs` notification-deduplication block has been
+  split again so the exact-duplicate and interleaved multi-worker connection
+  notification cases now live in `v2_tests_cases_3_late_notifications.rs`,
+  keeping the parent late module focused on skills refresh and plugin routing
+- the `v2_tests_cases_3_late.rs` server-request tail has been split again so
+  the chatgpt auth token refresh, exec-command approval, apply-patch approval,
+  and exhausted-account failure cases now live in
+  `v2_tests_cases_3_late_server_requests.rs`, keeping the parent late module
+  focused on notification deduplication, skills refresh, and plugin routing
+- the `v2_tests_cases_3_late_reconnect.rs` config-read tail has been split
+  again so the matching-cwd and threadless config reconnect cases now live in
+  `v2_tests_cases_3_late_reconnect_config.rs`, keeping the parent reconnect
+  module focused on the earlier server-request, login, OAuth, MCP status, and
+  plugin-management paths
+- the `v2_tests_cases_3_late_reconnect.rs` route-heavy tail has been split again
+  so the aggregated-capability, bootstrap, thread, sticky-thread, realtime,
+  turn-start, and primary-worker reconnect cases now live in
+  `v2_tests_cases_3_late_reconnect_routes.rs`, keeping the parent reconnect
+  module centered on the earlier server-request and config-reconnect coverage
+- the `v2_tests_cases_2.rs` aggregation block has been split again so the
+  loaded-thread, thread-list, and MCP-status aggregation cases now live in
+  `v2_tests_cases_2_aggregation.rs`, keeping the parent module centered on
+  the remaining account-capacity and path-handoff coverage
+- the `v2_tests_cases_4_late.rs` worker-disconnect cleanup path has been
+  split again so the pending connection-server-request disconnect cases now
+  live in `v2_tests_cases_4_late_connection_cleanup.rs`, keeping the parent
+  late module focused on the remaining recovery and visibility tests
+- the `v2_tests_cases_4.rs` project-selection tail has been split again so
+  the no-capacity, account-retry, and final capacity-error thread-start cases
+  now live in `v2_tests_cases_4_thread_start.rs`, keeping the reconnect and
+  fail-closed routing coverage in the parent module easier to scan
 - the Stage A required-method matrix is now documented in
   [docs/gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md)
 - the northbound v2 cleanup path has been split again so worker teardown
@@ -431,6 +496,31 @@ Recent progress:
   post-initialize, and server-request handling separated further so the shared
   loop, teardown path, event fan-in, and request routing policy are easier to
   review independently of the old monolithic `v2.rs` entrypoint
+- the remaining `v2_tests_cases_1.rs` forwarding coverage was split again so
+  the fuzzy search, filesystem, config write, model list, MCP status/OAuth,
+  and additional thread-control passthrough cases now live in
+  `v2_tests_cases_1_forwarding_requests.rs`, keeping the server-request
+  lifecycle coverage separate from the broader request-forwarding matrix
+- the websocket lifecycle coverage was split again so the invalid-payload and
+  client-send-timeout cases now live in
+  `v2_tests_cases_1_websocket_lifecycle_invalid_payload.rs` and
+  `v2_tests_cases_1_websocket_lifecycle_timeout.rs`, keeping the remaining
+  lifecycle and unknown-server-request cases easier to review independently
+- the websocket lifecycle disconnect coverage now lives in
+  `v2_tests_cases_1_websocket_lifecycle_disconnect.rs`, keeping the remaining
+  lifecycle owner focused on the downstream-lag and unknown-server-request
+  groups
+- the downstream protocol-violation and invalid-payload websocket cases are
+  now split into `northbound/v2_tests_cases_1_downstream_protocol.rs`, keeping
+  the remaining `v2_tests_cases_1.rs` coverage focused on lifecycle, routing,
+  and request-forwarding behavior
+- the multi-worker visible-thread route recovery coverage now lives in
+  `northbound/v2_tests_cases_2_thread_route_recovery.rs`, keeping the parent
+  `v2_tests_cases_2.rs` module focused on aggregation, account/collaboration,
+  and the rest of the multi-worker routing matrix
+- the leading `v2_tests_cases_3` reconnect and route-selection coverage now
+  lives in `northbound/v2_tests_cases_3_reconnect.rs`, keeping the parent file
+  focused on the remaining reconnect, fallback, and discovery cases
 - the embedded test support block was split again so the multi-worker bootstrap
   and routing helpers now live in `embedded_test_support_multi_worker.rs`,
   keeping the shared embedded test harness smaller while preserving the same
@@ -4472,6 +4562,50 @@ Phase 6 includes the following validated transport and rollout properties:
   `northbound/v2_tests_cases_2_account_and_collaboration.rs`, leaving the
   parent case file focused on thread-list pagination, route recovery, and
   handoff coverage
+- the northbound `v2_tests_cases_1` downstream protocol coverage now lives in
+  `northbound/v2_tests_cases_1_downstream_protocol.rs`, including malformed
+  frames, unexpected downstream response IDs, and downstream close-reason
+  truncation; client invalid-payload close-reason truncation now lives there
+  too, leaving the parent case file a little more focused on the remaining
+  websocket request and server-request lifecycle regressions
+- the remaining `v2_tests_cases_1` websocket request and server-request
+  lifecycle regressions now live in
+  `northbound/v2_tests_cases_1_websocket_lifecycle.rs`, leaving
+  `northbound/v2_tests_cases_1.rs` focused on the forwarding request matrix
+  and keeping the lifecycle/pending-request coverage in its own module
+- the `v2_tests_cases_1` account, setup, and core-thread forwarding coverage
+  now lives in `northbound/v2_tests_cases_1_forwarding_account_setup.rs`,
+  leaving `northbound/v2_tests_cases_1.rs` focused on the remaining
+  forwarding coverage for feedback, fuzzy-search, filesystem, config, model,
+  MCP, and thread-control requests
+- the remaining `v2_tests_cases_1` websocket lifecycle coverage was split
+  again so the invalid-payload and client-send-timeout cases now live in
+  `northbound/v2_tests_cases_1_websocket_lifecycle_invalid_payload.rs` and
+  `northbound/v2_tests_cases_1_websocket_lifecycle_timeout.rs`, leaving
+  `northbound/v2_tests_cases_1_websocket_lifecycle.rs` focused on the
+  disconnect and unknown-server-request lifecycle cases
+- the websocket lifecycle disconnect coverage now lives in
+  `northbound/v2_tests_cases_1_websocket_lifecycle_disconnect.rs`, leaving
+  `northbound/v2_tests_cases_1_websocket_lifecycle.rs` focused on the
+  downstream-lag case while the unknown-server-request coverage stays in its
+  dedicated module
+- the `v2_tests_cases_3_late_reconnect.rs` config-read tail has been split
+  again so the matching-cwd and threadless config reconnect cases now live in
+  `northbound/v2_tests_cases_3_late_reconnect_config.rs`, keeping the parent
+  reconnect module focused on the earlier server-request, login, OAuth, MCP
+  status, and plugin-management paths
+- the `v2_tests_cases_3_late.rs` server-request tail has been split again so
+  the chatgpt auth token refresh, exec-command approval, apply-patch approval,
+  and exhausted-account failure cases now live in
+  `northbound/v2_tests_cases_3_late_server_requests.rs`, keeping the parent
+  late module focused on notification deduplication, skills refresh, and
+  plugin routing
+- the `v2_tests_cases_3_late_reconnect.rs` route-heavy tail has been split
+  again so the aggregated-capability, bootstrap, thread, sticky-thread,
+  realtime, turn-start, and primary-worker reconnect cases now live in
+  `northbound/v2_tests_cases_3_late_reconnect_routes.rs`, keeping the parent
+  reconnect module centered on the earlier server-request and
+  config-reconnect coverage
 
 Phase 6 now consists of:
 

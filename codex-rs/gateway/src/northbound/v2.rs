@@ -97,8 +97,6 @@ use crate::northbound::v2_notifications::record_forwarded_connection_notificatio
 #[cfg(test)]
 use crate::northbound::v2_notifications::should_deduplicate_connection_notification;
 #[cfg(test)]
-pub(crate) use crate::northbound::v2_request_routing_handoff::recover_visible_thread_worker_route;
-#[cfg(test)]
 use crate::northbound::v2_routing::worker_for_notification;
 #[cfg(test)]
 use crate::northbound::v2_routing::worker_for_request;
@@ -166,8 +164,6 @@ pub(crate) use crate::northbound::v2_wire_send::send_client_jsonrpc;
 pub(crate) use crate::northbound::v2_wire_send::send_client_jsonrpc_error;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_wire_send::send_observed_close_frame;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_wire_send::send_observed_invalid_payload_close;
 #[cfg(test)]
 pub(crate) use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 

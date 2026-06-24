@@ -2015,46 +2015,8 @@ fn record_project_worker_route_selected_tracks_missing_account_id_in_v2_connecti
     );
 }
 
-#[test]
-fn observe_v2_connection_emits_terminal_detail_in_connection_log() {
-    let observability = GatewayObservability::new(None, false);
-    let context = GatewayRequestContext {
-        tenant_id: "tenant-a".to_string(),
-        project_id: Some("project-a".to_string()),
-    };
-    let connection_id = observability
-        .v2_connection_health()
-        .mark_connection_started();
-
-    let logs = capture_logs(|| {
-        super::super::super::observe_v2_connection(
-            &observability,
-            connection_id,
-            &context,
-            "protocol_violation",
-            Some("unexpected gateway websocket server-request response"),
-            super::super::super::GatewayV2ConnectionPendingCounts {
-                pending_client_request_count: 0,
-                pending_client_request_worker_counts: Vec::new(),
-                pending_client_request_method_counts: Vec::new(),
-                pending_server_request_count: 1,
-                answered_but_unresolved_server_request_count: 2,
-                server_request_backlog_worker_counts: Vec::new(),
-                server_request_backlog_method_counts: Vec::new(),
-            },
-            Duration::from_millis(13),
-        );
-    });
-
-    assert!(logs.contains("gateway v2 connection completed"));
-    assert!(logs.contains("protocol_violation"));
-    assert!(logs.contains("unexpected gateway websocket server-request response"));
-    assert!(logs.contains("tenant-a"));
-    assert!(logs.contains("project-a"));
-    assert!(logs.contains("13"));
-    assert!(logs.contains("pending_server_request_count=1"));
-    assert!(logs.contains("answered_but_unresolved_server_request_count=2"));
-}
+#[path = "v2_tests_cases_0_late_connection_log.rs"]
+mod v2_tests_cases_0_late_connection_log;
 
 pub(crate) fn assert_v2_server_request_rejection_and_lifecycle_metrics(
     metrics: &codex_otel::MetricsClient,
