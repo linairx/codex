@@ -269,6 +269,7 @@ async fn remote_multi_worker_routes_thread_mutations_to_owning_workers() {
             request_id: RequestId::Integer(9),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),

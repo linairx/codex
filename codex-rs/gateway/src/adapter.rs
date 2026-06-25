@@ -38,6 +38,7 @@ pub fn thread_list_request(request_id: RequestId, request: ListThreadsRequest) -
         request_id,
         params: ThreadListParams {
             parent_thread_id: None,
+            ancestor_thread_id: None,
             cursor: request.cursor,
             limit: request.limit,
             sort_key: request.sort_key.map(Into::into),
@@ -179,6 +180,7 @@ mod tests {
                 request_id: RequestId::Integer(3),
                 params: ThreadListParams {
                     parent_thread_id: None,
+                    ancestor_thread_id: None,
                     cursor: Some("cursor-1".to_string()),
                     limit: Some(20),
                     sort_key: Some(ThreadSortKey::UpdatedAt),

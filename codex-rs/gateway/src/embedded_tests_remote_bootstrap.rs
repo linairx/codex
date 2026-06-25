@@ -107,6 +107,7 @@ async fn remote_single_worker_supports_drop_in_v2_client_bootstrap_and_thread_wo
             request_id: RequestId::Integer(4),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),

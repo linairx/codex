@@ -385,6 +385,7 @@ async fn remote_multi_worker_v2_clients_recover_after_worker_reconnect() {
             request_id: RequestId::Integer(4),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),

@@ -116,6 +116,7 @@ async fn remote_multi_worker_v2_scope_filters_threads_across_tenants_and_project
             request_id: RequestId::Integer(3),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),
@@ -219,6 +220,7 @@ async fn remote_multi_worker_v2_scope_filters_threads_across_tenants_and_project
             request_id: RequestId::Integer(7),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),
@@ -309,6 +311,7 @@ async fn remote_multi_worker_v2_scope_filters_threads_across_tenants_and_project
             request_id: RequestId::Integer(10),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),

@@ -79,6 +79,7 @@ async fn remote_single_worker_supports_v2_thread_reentry_from_later_client_sessi
             request_id: RequestId::Integer(2),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),

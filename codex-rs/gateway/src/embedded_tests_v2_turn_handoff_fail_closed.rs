@@ -1,6 +1,6 @@
 use super::*;
 
-macro_rules! path_restore_test_setup {
+macro_rules! turn_handoff_fail_closed_test_setup {
     () => {{
         let worker_a = start_mock_remote_multi_connection_legacy_account_handoff_server(
             "worker-a",
@@ -24,13 +24,11 @@ macro_rules! path_restore_test_setup {
                     workers: vec![
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_a,
-
                             auth_token: None,
                             account_id: Some("acct-a".to_string()),
                         },
                         GatewayRemoteWorkerConfig {
                             websocket_url: worker_b,
-
                             auth_token: None,
                             account_id: Some("acct-b".to_string()),
                         },
@@ -120,17 +118,43 @@ macro_rules! path_restore_test_setup {
         .await
         .expect("second thread/start should finish in time")
         .expect("second thread/start should register worker B scope");
-        let worker_b_rollout_path = worker_b_thread
-            .thread
-            .path
-            .clone()
-            .expect("worker B thread should expose rollout path");
+
+        let turn_start_response: TurnStartResponse = timeout(
+            Duration::from_secs(5),
+            client.request_typed(ClientRequest::TurnStart {
+                request_id: RequestId::Integer(3),
+                params: TurnStartParams {
+                    thread_id: worker_b_thread.thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "seed active turn before exhaustion".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    responsesapi_client_metadata: None,
+                    cwd: None,
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_policy: None,
+                    model: None,
+                    service_tier: None,
+                    effort: None,
+                    summary: None,
+                    personality: None,
+                    output_schema: None,
+                    collaboration_mode: None,
+                    ..TurnStartParams::default()
+                },
+            }),
+        )
+        .await
+        .expect("turn/start should finish in time before exhaustion")
+        .expect("turn/start should succeed before exhaustion");
+        let turn_id = turn_start_response.turn.id.clone();
 
         timeout(
             Duration::from_secs(5),
             client.request_typed::<GetAccountRateLimitsResponse>(
                 ClientRequest::GetAccountRateLimits {
-                    request_id: RequestId::Integer(3),
+                    request_id: RequestId::Integer(4),
                     params: None,
                 },
             ),
@@ -139,12 +163,12 @@ macro_rules! path_restore_test_setup {
         .expect("account/rateLimits/read should finish in time")
         .expect("account/rateLimits/read should mark worker B exhausted");
 
-        (server, client, worker_b_thread, worker_b_rollout_path)
+        (server, client, worker_b_thread, turn_id)
     }};
 }
 
-#[path = "embedded_tests_v2_restore_path_resume.rs"]
-mod embedded_tests_v2_restore_path_resume;
+#[path = "embedded_tests_v2_turn_handoff_fail_closed_steer.rs"]
+mod embedded_tests_v2_turn_handoff_fail_closed_steer;
 
-#[path = "embedded_tests_v2_restore_path_fork.rs"]
-mod embedded_tests_v2_restore_path_fork;
+#[path = "embedded_tests_v2_turn_handoff_fail_closed_interrupt.rs"]
+mod embedded_tests_v2_turn_handoff_fail_closed_interrupt;

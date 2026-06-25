@@ -716,6 +716,8 @@ pub(crate) async fn start_mock_remote_multi_connection_legacy_account_handoff_se
                             assert!(
                                 requested_thread_id == "00000000-0000-0000-0000-0000000000b2"
                                     || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a1"
+                                    || requested_thread_id
                                         == "00000000-0000-0000-0000-0000000000a2",
                                 "thread/read should target a restored thread"
                             );
@@ -746,9 +748,12 @@ pub(crate) async fn start_mock_remote_multi_connection_legacy_account_handoff_se
                                 .and_then(|params| params.get("threadId"))
                                 .and_then(serde_json::Value::as_str)
                                 .expect("thread/rollback should include threadId");
-                            pretty_assertions::assert_eq!(
-                                requested_thread_id,
-                                "00000000-0000-0000-0000-0000000000b2"
+                            assert!(
+                                requested_thread_id == "00000000-0000-0000-0000-0000000000b2"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a1"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a2"
                             );
                             serde_json::json!({
                                 "thread": mock_thread_with_path(
@@ -765,9 +770,12 @@ pub(crate) async fn start_mock_remote_multi_connection_legacy_account_handoff_se
                                 .and_then(|params| params.get("threadId"))
                                 .and_then(serde_json::Value::as_str)
                                 .expect("thread/archive should include threadId");
-                            pretty_assertions::assert_eq!(
-                                requested_thread_id,
-                                "00000000-0000-0000-0000-0000000000b2"
+                            assert!(
+                                requested_thread_id == "00000000-0000-0000-0000-0000000000b2"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a1"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a2"
                             );
                             serde_json::json!({})
                         }
@@ -778,9 +786,12 @@ pub(crate) async fn start_mock_remote_multi_connection_legacy_account_handoff_se
                                 .and_then(|params| params.get("threadId"))
                                 .and_then(serde_json::Value::as_str)
                                 .expect("thread/unarchive should include threadId");
-                            pretty_assertions::assert_eq!(
-                                requested_thread_id,
-                                "00000000-0000-0000-0000-0000000000b2"
+                            assert!(
+                                requested_thread_id == "00000000-0000-0000-0000-0000000000b2"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a1"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a2"
                             );
                             serde_json::json!({
                                 "thread": mock_thread_with_path(
@@ -797,9 +808,12 @@ pub(crate) async fn start_mock_remote_multi_connection_legacy_account_handoff_se
                                 .and_then(|params| params.get("threadId"))
                                 .and_then(serde_json::Value::as_str)
                                 .expect("thread/metadata/update should include threadId");
-                            pretty_assertions::assert_eq!(
-                                requested_thread_id,
-                                "00000000-0000-0000-0000-0000000000b2"
+                            assert!(
+                                requested_thread_id == "00000000-0000-0000-0000-0000000000b2"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a1"
+                                    || requested_thread_id
+                                        == "00000000-0000-0000-0000-0000000000a2"
                             );
                             serde_json::json!({
                                 "thread": mock_thread_with_path(

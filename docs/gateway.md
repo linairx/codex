@@ -417,6 +417,12 @@ Detailed plan:
 
 Recent progress:
 
+- the gateway HTTP adapter and embedded gateway regression fixtures now pass
+  through the new `ThreadListParams::ancestor_thread_id` field explicitly, and
+  the split `embedded_tests_health_late_restore.rs` account-exhaustion handoff
+  tests were repaired so the restored thread id still targets the exhausted
+  worker route; the full `codex-gateway` package test suite now passes after
+  the split
 - the `v2_tests_cases_4.rs` thread-start and account-capacity tail has been
   split again so the active-thread exhaustion case and the registered-worker,
   load-balancing, unlabeled-fallback, and affinity-skipping thread-start cases
@@ -482,6 +488,12 @@ Recent progress:
   the no-capacity, account-retry, and final capacity-error thread-start cases
   now live in `v2_tests_cases_4_thread_start.rs`, keeping the reconnect and
   fail-closed routing coverage in the parent module easier to scan
+- the `embedded_tests_v2.rs` path-based fail-closed case now lives in
+  `embedded_tests_v2_path_handoff_fail_closed.rs`, keeping the parent module
+  focused on the remaining worker-id handoff fail-closed coverage
+- the `embedded_tests_v2.rs` thread-id fail-closed case now lives in
+  `embedded_tests_v2_thread_handoff_fail_closed.rs`, keeping the parent module
+  focused on the remaining account-capacity handoff coverage
 - the Stage A required-method matrix is now documented in
   [docs/gateway-v2-method-matrix.md](/home/lin/project/codex/docs/gateway-v2-method-matrix.md)
 - the northbound v2 cleanup path has been split again so worker teardown
@@ -787,6 +799,23 @@ Recent progress:
   fail-closed coverage into `embedded_tests_v2_restore_fail_closed.rs`, so the
   v2 shell stays narrow while the restoration and fail-closed cases are easier
   to reason about separately
+- the embedded v2 thread-id handoff fail-closed coverage now lives in
+  `embedded_tests_v2_thread_handoff_fail_closed.rs` and
+  `embedded_tests_v2_thread_handoff_fail_closed_tail.rs`, keeping the core
+  thread/read/rollback path cases separate from the metadata and collection
+  method tail without changing the exercised scenarios
+- the embedded v2 account-restoration coverage now keeps path resume and
+  fork in `embedded_tests_v2_restore.rs` and moves the legacy conversation
+  summary recovery case into
+  `embedded_tests_v2_restore_legacy_summary.rs`, keeping the remaining
+  restore module focused on the path-based handoff scenarios without changing
+  the exercised behavior
+- the embedded v2 fail-closed restoration turns and mutations coverage now
+  keeps each scenario family in dedicated dispatcher-backed files, so
+  `embedded_tests_v2_restore_fail_closed_restore_turns.rs` and
+  `embedded_tests_v2_restore_fail_closed_restore_mutations.rs` now split into
+  per-scenario modules while the parent fail-closed harness stays a thin
+  dispatcher
 - the shared embedded test-support shell now keeps the large mock remote
   workflow server in `embedded_test_support_remote_workflow.rs`, which trims
   the root `embedded_test_support.rs` module down to the plugin fixture and
@@ -4606,6 +4635,41 @@ Phase 6 includes the following validated transport and rollout properties:
   `northbound/v2_tests_cases_3_late_reconnect_routes.rs`, keeping the parent
   reconnect module centered on the earlier server-request and
   config-reconnect coverage
+- the embedded v2 restore tail has been split again so the path-handoff,
+  thread-handoff, and legacy-summary cases now live in dedicated modules,
+  keeping `embedded_tests_v2.rs` focused on the remaining restore and
+  fail-closed coverage while the account-handoff scenarios stay easier to
+  review separately
+- the embedded v2 restore path-handoff cases now live in dedicated resume and
+  fork modules, keeping `embedded_tests_v2_restore.rs` focused on the shared
+  path-restore setup while the two protocol shapes stay easier to review on
+  their own
+- the remaining embedded v2 turn-control fail-closed case now lives in its
+  own module, keeping `embedded_tests_v2.rs` focused on module wiring while
+  the turn-steer and turn-interrupt coverage stays isolated from the other
+  handoff regressions
+- the embedded v2 turn-control fail-closed case now lives in dedicated
+  steer and interrupt modules, keeping the shared turn-control setup thin
+  while the two method-specific failure paths stay easy to review on their
+  own
+- the embedded v2 restore fail-closed scenario groups have been split again so
+  the inject-items, name-set, memory-mode, turns-list, increment-elicitation,
+  and decrement-elicitation cases now live in dedicated leaf modules, keeping
+  the restore fail-closed dispatcher thin while the method-specific coverage
+  stays isolated
+- the health-late multi-worker route and discovery coverage now lives in
+  `embedded_tests_health_late_routes.rs`, keeping `embedded_tests_health_late.rs`
+  focused on the reconnect, bootstrap, mutation, and account-handoff coverage
+  that still remains in the parent dispatcher
+- the health-late account-exhaustion restore matrix now lives in
+  `embedded_tests_health_late_restore.rs`, keeping
+  `embedded_tests_health_late.rs` focused on the smaller bootstrap and legacy
+  client coverage that still needs to sit beside the shared setup modules
+- the health-late bootstrap-account aggregation and legacy-client coverage now
+  live in `embedded_tests_health_late_bootstrap_account.rs` and
+  `embedded_tests_health_late_legacy_client.rs`, keeping
+  `embedded_tests_health_late.rs` focused on the shared module wiring and the
+  remaining small support suites
 
 Phase 6 now consists of:
 

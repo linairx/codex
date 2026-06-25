@@ -117,6 +117,7 @@ async fn remote_multi_worker_supports_v2_client_thread_routing_and_aggregation()
             request_id: RequestId::Integer(3),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),

@@ -81,10 +81,6 @@ use crate::northbound::v2_counts::server_request_backlog_method_counts;
 #[cfg(test)]
 use crate::northbound::v2_counts::server_request_backlog_worker_counts;
 #[cfg(test)]
-use crate::northbound::v2_notifications::MAX_FORWARDED_CONNECTION_NOTIFICATION_PAYLOADS_PER_METHOD;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_notifications::forwarded_connection_notification_duplicate;
-#[cfg(test)]
 pub(crate) use crate::northbound::v2_notifications::log_suppressed_duplicate_connection_notification;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_notifications::log_suppressed_hidden_thread_notification;
@@ -92,10 +88,6 @@ pub(crate) use crate::northbound::v2_notifications::log_suppressed_hidden_thread
 pub(crate) use crate::northbound::v2_notifications::log_suppressed_opted_out_notification;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_notifications::log_suppressed_skills_changed_notification;
-#[cfg(test)]
-use crate::northbound::v2_notifications::record_forwarded_connection_notification;
-#[cfg(test)]
-use crate::northbound::v2_notifications::should_deduplicate_connection_notification;
 #[cfg(test)]
 use crate::northbound::v2_routing::worker_for_notification;
 #[cfg(test)]

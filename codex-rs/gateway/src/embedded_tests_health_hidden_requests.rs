@@ -126,6 +126,7 @@ async fn remote_multi_worker_rejects_hidden_downstream_server_requests_across_sc
             request_id: RequestId::Integer(2),
             params: ThreadListParams {
                 parent_thread_id: None,
+                ancestor_thread_id: None,
                 use_state_db_only: false,
                 cursor: None,
                 limit: Some(10),
