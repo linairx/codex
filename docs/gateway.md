@@ -417,6 +417,101 @@ Detailed plan:
 
 Recent progress:
 
+- the remaining `v2_tests_cases_3.rs` reconnect-backoff fail-closed coverage
+  for fuzzy search, fanout setup mutations, and fs-watch now lives in
+  `northbound/v2_tests_cases_3_reconnect_backoff.rs`, leaving the parent
+  reconnect case file focused on successful reconnect and fallback routing
+  scenarios
+- the remaining fs-watch reconnect/replay coverage was moved out of
+  `northbound/v2_tests_cases_4.rs` and consolidated in
+  `northbound/v2_tests_cases_4_reconnect_and_fs.rs`, removing the duplicate
+  `websocket_upgrade_forwards_fs_changed_from_reconnected_worker_after_fs_watch`
+  case from the parent module and leaving `v2_tests_cases_4.rs` as a small
+  router-lifecycle dispatcher
+- the reconnect-and-fs-watch coverage that used to live at the top of
+  `northbound/v2_tests_cases_4.rs` now lives in
+  `northbound/v2_tests_cases_4_reconnect_and_fs.rs`, leaving
+  `northbound/v2_tests_cases_4.rs` focused on the remaining reconnect and
+  worker-session tail coverage
+- the late websocket observability and disconnect coverage now lives in
+  `northbound/v2_tests_cases_0_websocket_late.rs`, leaving
+  `northbound/v2_tests_cases_0_websocket.rs` focused on the earlier setup,
+  auth, handshake, and initialization-path coverage
+- the shared late-case connection/backlog coverage now lives in
+  `northbound/v2_tests_cases_0_late_connection_and_backlog.rs`, and the
+  late-case delivery coverage now lives in
+  `northbound/v2_tests_cases_0_late_delivery.rs`, leaving
+  `northbound/v2_tests_cases_0_late.rs` focused on the shared case wiring
+  and summary assertions
+- the `v2_tests_cases_4.rs` reconnect logging and reconnect metrics/backoff
+  coverage now lives in `northbound/v2_tests_cases_4_reconnect_logs.rs` and
+  `northbound/v2_tests_cases_4_reconnect_metrics.rs`, leaving
+  `northbound/v2_tests_cases_4.rs` focused more tightly on the earlier
+  reconnect, fs-watch, and router lifecycle coverage
+- the `v2_tests_cases_4` multi-worker tail now lives in
+  `northbound/v2_tests_cases_4_late_multi_worker_topology.rs`, leaving
+  `northbound/v2_tests_cases_4.rs` focused a little more tightly on
+  reconnect, fs-watch, and router lifecycle coverage
+- the shared v2 late-case metrics assertions for fail-closed, degraded
+  discovery, thread-list dedupe, thread-route recovery, upstream failures,
+  and notification suppression/forwarding now live in
+  `northbound/v2_tests_cases_0_late_support.rs`, leaving
+  `northbound/v2_tests_cases_0_late.rs` focused a little more tightly on the
+  remaining case coverage
+- the shared `v2_tests_cases` websocket helper wiring now lives in
+  `northbound/v2_tests_cases_support.rs`, and the late-case support helpers
+  now live in dedicated `northbound/v2_tests_cases_late_*_support.rs`
+  modules, leaving the parent case files focused on route coverage
+- the late-case initialize and reconnect helper coverage now lives in
+  `northbound/v2_tests_cases_late_initialize_support.rs`,
+  `northbound/v2_tests_cases_late_initialize_after_support.rs`,
+  `northbound/v2_tests_cases_late_reconnect_support.rs`,
+  `northbound/v2_tests_cases_late_reconnect_requests_support.rs`,
+  `northbound/v2_tests_cases_late_reconnect_request_helpers_support.rs`, and
+  `northbound/v2_tests_cases_late_reconnect_catalog_support.rs`, keeping the
+  parent late-case module centered on the remaining harness utilities
+- the top-level `v2_tests_cases_late` route-diagnostics test now lives in
+  `northbound/v2_tests_cases_late_route_diagnostics.rs`, leaving
+  `northbound/v2_tests_cases_late.rs` focused on helper wiring and the
+  remaining harness utilities
+- the northbound `v2_tests_cases_2` thread-id handoff coverage now lives in
+  `northbound/v2_tests_cases_2_thread_id_handoff.rs`, leaving the parent case
+  file focused on the remaining path-based thread handoff coverage
+- the northbound `v2_tests_cases_2` thread-control coverage now lives in
+  `northbound/v2_tests_cases_2_thread_controls.rs`, leaving the parent case
+  file focused on the remaining thread-handoff, path, and summary coverage
+- the northbound `v2_tests_cases_2` thread-handoff coverage now lives in
+  `northbound/v2_tests_cases_2_thread_handoff.rs`, leaving the parent case
+  file focused on the remaining thread-list, path, and conversation-summary
+  coverage
+- the northbound `v2_tests_cases_2` conversation-summary coverage now lives
+  in `northbound/v2_tests_cases_2_conversation_summary.rs`, leaving the parent
+  case file focused on the remaining thread, path, and handoff coverage
+- the northbound `v2_tests_cases_2` thread-id resume success and rejection
+  coverage now lives in `northbound/v2_tests_cases_2_thread_resume.rs`,
+  leaving `northbound/v2_tests_cases_2_thread_handoff.rs` focused more tightly
+  on the remaining thread/read, unarchive, metadata-update, rollback, and
+  archive coverage
+- the northbound `v2_tests_cases_2` thread/read and thread/unarchive coverage
+  now lives in `northbound/v2_tests_cases_2_thread_read_unarchive.rs`,
+  leaving `northbound/v2_tests_cases_2_thread_handoff.rs` focused more tightly
+  on metadata-update, rollback, and archive coverage
+- the northbound `v2_tests_cases_2` metadata-update and rollback coverage now
+  lives in `northbound/v2_tests_cases_2_thread_metadata_rollback.rs`, and the
+  archive coverage now lives in
+  `northbound/v2_tests_cases_2_thread_archive.rs`, leaving
+  `northbound/v2_tests_cases_2_thread_handoff.rs` as a thin owner list for the
+  handoff-oriented thread test modules
+- the northbound `v2_tests_cases_2` thread/turns/list and
+  thread/increment_elicitation coverage now lives in
+  `northbound/v2_tests_cases_2_thread_turns_increment.rs`, leaving
+  `northbound/v2_tests_cases_2_thread_controls.rs` focused on the remaining
+  thread-control table-driven coverage
+- the northbound `v2_tests_cases_2` path-based thread resume and fork
+  coverage now lives in `northbound/v2_tests_cases_2_path_resume.rs` and
+  `northbound/v2_tests_cases_2_path_fork.rs`, leaving
+  `northbound/v2_tests_cases_2_path_handoff.rs` as a thin owner list for the
+  path-handoff test modules
 - the gateway HTTP adapter and embedded gateway regression fixtures now pass
   through the new `ThreadListParams::ancestor_thread_id` field explicitly, and
   the split `embedded_tests_health_late_restore.rs` account-exhaustion handoff
@@ -4524,6 +4619,25 @@ Phase 6 includes the following validated transport and rollout properties:
   `observability_tests_support.rs` modules, leaving
   `observability_tests.rs` focused on the remaining rejection, reconnect, and
   account-capacity coverage
+- the northbound `v2_tests_cases_0_late` request-metric and lifecycle helper
+  coverage now shares its common assertions from
+  `northbound/v2_tests_cases_0_late_support.rs`, leaving
+  `northbound/v2_tests_cases_0_late.rs` focused on the remaining tests and
+  request-specific helpers
+- the northbound `v2_tests_cases_0_late` server-request lifecycle, rejection,
+  and connection metric helpers now live in
+  `northbound/v2_tests_cases_0_late_server_request_support.rs`, leaving
+  `northbound/v2_tests_cases_0_late.rs` focused on the remaining protocol and
+  account-capacity helpers
+- the northbound `v2_tests_cases_0_late` protocol, connection, downstream,
+  client-timeout, and account-capacity metric helpers now live in
+  `northbound/v2_tests_cases_0_late_metrics_support.rs`, leaving
+  `northbound/v2_tests_cases_0_late.rs` focused on the remaining test bodies
+  and request-metric helpers
+- the northbound `v2_tests_cases_3` reconnect-backoff coverage now includes
+  the config/read cases in `northbound/v2_tests_cases_3_reconnect_backoff.rs`,
+  leaving `northbound/v2_tests_cases_3.rs` focused on the earlier reconnect
+  and fallback scenarios
 - the northbound `v2_tests_cases_0` tail coverage was split again so the
   pending-response settlement, server-request cleanup, connection-health, and
   request-metric helper coverage now live in

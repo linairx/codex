@@ -1,4 +1,6 @@
 use super::*;
+use crate::northbound::v2_aggregation::aggregate_account_rate_limits_response;
+use crate::northbound::v2_aggregation_catalog::aggregate_collaboration_mode_list_response;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -122,7 +124,7 @@ async fn aggregate_account_rate_limits_response_merges_multi_worker_data() {
     let context = GatewayRequestContext::default();
     let observability = GatewayObservability::default();
 
-    let response = super::super::super::super::aggregate_account_rate_limits_response(
+    let response = aggregate_account_rate_limits_response(
         &router,
         &context,
         &observability,
@@ -254,7 +256,7 @@ async fn aggregate_account_rate_limits_response_updates_account_capacity() {
     let context = GatewayRequestContext::default();
     let observability = GatewayObservability::default();
 
-    super::super::super::super::aggregate_account_rate_limits_response(
+    aggregate_account_rate_limits_response(
         &router,
         &context,
         &observability,
@@ -457,7 +459,7 @@ async fn aggregate_collaboration_mode_list_response_deduplicates_and_sorts_multi
     .await
     .expect("downstream router should connect");
 
-    let response = super::super::super::super::aggregate_collaboration_mode_list_response(
+    let response = aggregate_collaboration_mode_list_response(
         &router,
         &JSONRPCRequest {
             id: RequestId::String("collaboration-mode-list".to_string()),

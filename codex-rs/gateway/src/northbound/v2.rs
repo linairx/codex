@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
-use crate::northbound::v2_aggregation::*;
-#[cfg(test)]
 use crate::northbound::v2_connection::ClientServerRequestAnswer;
 #[cfg(test)]
 use crate::northbound::v2_connection::DownstreamServerRequestKey;
@@ -89,35 +87,17 @@ pub(crate) use crate::northbound::v2_notifications::log_suppressed_opted_out_not
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_notifications::log_suppressed_skills_changed_notification;
 #[cfg(test)]
-use crate::northbound::v2_routing::worker_for_notification;
-#[cfg(test)]
-use crate::northbound::v2_routing::worker_for_request;
-#[cfg(test)]
 pub(crate) use crate::northbound::v2_scope::log_failed_visible_thread_worker_route_recovery;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_scope::log_recovered_visible_thread_worker_route;
 #[cfg(test)]
-pub(crate) use crate::northbound::v2_scope::response_thread_id;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_server_request_cleanup::record_worker_cleanup_resolution_send_failure;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_server_request_cleanup::reject_pending_server_requests;
-#[cfg(test)]
 pub(crate) use crate::northbound::v2_server_request_cleanup::report_worker_server_request_cleanup;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_server_request_cleanup::should_reject_pending_server_requests_after_connection_error;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_server_requests::collect_server_request_cleanup_for_worker;
 #[cfg(test)]
 use crate::northbound::v2_server_requests::log_duplicate_downstream_server_request;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_server_requests::log_worker_server_request_cleanup;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_server_requests::publish_worker_server_request_cleanup_event;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_server_requests::record_client_server_request_cleanup_metrics;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_server_requests::record_worker_server_request_cleanup_metrics;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_server_requests_logging::log_rejected_pending_server_requests;
 #[cfg(test)]
@@ -139,8 +119,6 @@ pub(crate) use crate::northbound::v2_wire::log_downstream_server_request_forward
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_wire::log_notification_send_failure;
 #[cfg(test)]
-pub(crate) use crate::northbound::v2_wire::observe_v2_connection;
-#[cfg(test)]
 pub(crate) use crate::northbound::v2_wire::observe_v2_request;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_wire::server_notification_to_jsonrpc;
@@ -156,8 +134,6 @@ pub(crate) use crate::northbound::v2_wire_send::send_client_jsonrpc;
 pub(crate) use crate::northbound::v2_wire_send::send_client_jsonrpc_error;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_wire_send::send_observed_close_frame;
-#[cfg(test)]
-pub(crate) use crate::v2_connection_health::GatewayV2ConnectionPendingCounts;
 
 pub(crate) const INVALID_REQUEST_CODE: i64 = -32600;
 pub(crate) const INVALID_PARAMS_CODE: i64 = -32602;
