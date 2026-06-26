@@ -536,6 +536,7 @@ async fn websocket_upgrade_forwards_mcp_startup_status_from_reconnected_worker()
                         "name": "worker-b-mcp",
                         "status": "ready",
                         "error": null,
+                        "failureReason": null,
                     }))
                 );
                 saw_startup_notification = true;

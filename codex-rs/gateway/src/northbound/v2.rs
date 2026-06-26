@@ -101,10 +101,6 @@ pub(crate) use crate::northbound::v2_server_requests::publish_worker_server_requ
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_server_requests_logging::log_rejected_pending_server_requests;
 #[cfg(test)]
-pub(crate) use crate::northbound::v2_wire::INVALID_CLIENT_JSONRPC_PAYLOAD_CLOSE_REASON;
-#[cfg(test)]
-pub(crate) use crate::northbound::v2_wire::INVALID_CLIENT_UTF8_PAYLOAD_CLOSE_REASON;
-#[cfg(test)]
 pub(crate) use crate::northbound::v2_wire::classify_v2_connection_error;
 #[cfg(test)]
 pub(crate) use crate::northbound::v2_wire::log_client_response_send_failure;

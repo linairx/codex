@@ -70,6 +70,7 @@ async fn embedded_server_supports_mcp_oauth_login_over_v2() {
                 name: "demo-mcp".to_string(),
                 scopes: Some(vec!["calendar.read".to_string()]),
                 timeout_secs: Some(30),
+                thread_id: None,
             },
         })
         .await

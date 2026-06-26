@@ -417,6 +417,51 @@ Detailed plan:
 
 Recent progress:
 
+- the observability thread-routing diagnostics metric regressions now live in
+  `observability_tests_routing_diagnostics.rs`, leaving
+  `observability_tests_tail.rs` focused on the remaining lifecycle,
+  protocol-violation, backpressure, and timeout metric coverage
+- the observability notification metric regressions now keep server-request
+  forward, answer, and rejection delivery failure coverage in
+  `observability_tests_transport_failures.rs`, leaving
+  `observability_tests_notifications.rs` focused on forwarded, suppressed, and
+  notification-send outcome metrics
+- the remaining observability request-rejection, worker-reconnect, and
+  account-capacity metric regressions now live in
+  `observability_tests_rejections.rs` and
+  `observability_tests_worker_capacity.rs`, leaving
+  `observability_tests.rs` as a small observability test module owner beside
+  the existing metrics, routing, connection, notification, and transport
+  failure modules
+- the late v2 cleanup tail now splits duplicate downstream server-request id,
+  single-worker pending cleanup, single-worker unresolved cleanup,
+  worker-disconnect cleanup, and worker-session-ended cleanup coverage into
+  dedicated `northbound/v2_tests_cases_4_late_cleanup_*` modules, leaving
+  `northbound/v2_tests_cases_4_late_cleanup_tail.rs` as a small module owner
+  plus the multi-worker topology regression
+- the late northbound v2 notification-deduplication matrix now splits exact
+  duplicates, interleaved duplicates, setup/warning/notice tail cases,
+  same-worker repeated notifications, and newer exact-duplicate notification
+  types into dedicated
+  `northbound/v2_tests_cases_3_late_notifications_*` modules, leaving
+  `northbound/v2_tests_cases_3_late_notifications.rs` as a small module owner
+- the early northbound v2 websocket case file now splits downstream initialize
+  handling, multi-worker initialize/fanout, upgrade policy, frame
+  handling, and repeated-initialize tail coverage into dedicated
+  `northbound/v2_tests_cases_0_*` modules, leaving
+  `northbound/v2_tests_cases_0.rs` as a small module owner plus the local
+  timeout helper tests
+- the late reconnect route-recovery matrix is now split by capability
+  aggregation, bootstrap aggregation, thread aggregation, sticky thread
+  routing, sticky thread controls, review route backfill, realtime routing,
+  turn/start routing, and primary-worker routing, leaving
+  `northbound/v2_tests_cases_3_late_reconnect_routes.rs` as a small module
+  owner list
+- the late v2 observability and cleanup log assertion matrix is now split by
+  cleanup, request limits, delivery failures, connection pressure,
+  pending-client cleanup, server-request lifecycle, notification/protocol, and
+  routing diagnostics, leaving `northbound/v2_tests_cases_late.rs` focused on
+  late-case module wiring and the shared mock remote server helpers
 - the remaining `v2_tests_cases_3.rs` reconnect-backoff fail-closed coverage
   for fuzzy search, fanout setup mutations, and fs-watch now lives in
   `northbound/v2_tests_cases_3_reconnect_backoff.rs`, leaving the parent
@@ -507,6 +552,20 @@ Recent progress:
   `northbound/v2_tests_cases_2_thread_turns_increment.rs`, leaving
   `northbound/v2_tests_cases_2_thread_controls.rs` focused on the remaining
   thread-control table-driven coverage
+- the embedded v2 late multi-worker parity coverage now lives in dedicated
+  bootstrap/setup, capability/discovery, primary-worker, and auth/account
+  modules, leaving `embedded_tests_v2_late.rs` as a small owner list beside the
+  existing aggregation module
+- the remote single-worker bootstrap coverage now lives in dedicated workflow
+  and setup modules, with the setup-method matrix split again into discovery
+  and MCP, plugin/files/search, and account/command helper modules, leaving
+  `embedded_tests_remote_bootstrap.rs` as a small owner list beside the existing
+  thread lifecycle and reentry modules
+- the single-worker reconnect bootstrap-refresh coverage now splits its
+  recovered-session request matrix into discovery, setup, and filesystem/search
+  tail helper modules, leaving
+  `embedded_tests_multi_worker_single_worker_bootstrap.rs` focused on worker
+  recovery setup, v2 client connection, and teardown
 - the northbound `v2_tests_cases_2` path-based thread resume and fork
   coverage now lives in `northbound/v2_tests_cases_2_path_resume.rs` and
   `northbound/v2_tests_cases_2_path_fork.rs`, leaving
@@ -879,6 +938,15 @@ Recent progress:
   `observability_tests.rs`, leaving `observability.rs` focused on the shared
   logging and metric surface while the assertions and fixture setup sit in a
   separate test module
+- the remaining observability tail tests now keep v2 connection logging and
+  audit-log assertions in `observability_tests_connection_logs.rs`, leaving
+  `observability_tests_tail.rs` focused on health and metric mirror coverage
+- the v2 connection metric regression now splits client-request metric
+  assertions from server-request backlog assertions in
+  `observability_tests_connection_client.rs` and
+  `observability_tests_connection_server_requests.rs`, leaving
+  `observability_tests_connection.rs` as the shared sample setup and module
+  owner
 - the remote runtime regression harness now keeps the core routing and
   server-request cases in `remote_runtime_tests.rs` and moves the health
   coverage into `remote_runtime_tests_health.rs`, keeping the runtime shell
@@ -4784,6 +4852,10 @@ Phase 6 includes the following validated transport and rollout properties:
   `embedded_tests_health_late_legacy_client.rs`, keeping
   `embedded_tests_health_late.rs` focused on the shared module wiring and the
   remaining small support suites
+- the miscellaneous embedded health regression file has been split into local
+  connection health, remote single-worker health, remote multi-worker health,
+  slow-client timeout, and transport-configuration modules, leaving
+  `embedded_tests_misc_health.rs` as a thin dispatcher
 
 Phase 6 now consists of:
 

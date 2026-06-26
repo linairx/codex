@@ -1,6 +1,8 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+use crate::northbound::v2::STRANDED_CONNECTION_SERVER_REQUEST_CLOSE_REASON;
+
 #[tokio::test]
 async fn websocket_upgrade_closes_when_worker_disconnects_with_pending_connection_server_request() {
     let worker_a = start_mock_remote_server_for_initialize().await;
