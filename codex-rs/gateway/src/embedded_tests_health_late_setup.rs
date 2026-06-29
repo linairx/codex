@@ -161,6 +161,7 @@ async fn remote_multi_worker_v2_session_readds_recovered_primary_worker_for_setu
             request_id: RequestId::Integer(4),
             params: LoginAccountParams::Chatgpt {
                 codex_streamlined_login: false,
+                callback_port: None,
             },
         }),
     )

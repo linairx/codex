@@ -7900,6 +7900,14 @@
         },
         {
           "properties": {
+            "callbackPort": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "codexStreamlinedLogin": {
               "type": "boolean"
             },

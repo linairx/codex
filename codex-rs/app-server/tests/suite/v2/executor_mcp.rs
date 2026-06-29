@@ -123,8 +123,8 @@ async fn selected_executor_plugin_exposes_its_mcps_only_to_that_thread() -> Resu
         "mock_provider",
         "compact",
     )?;
-    let codex_bin = toml::Value::String(
-        codex_utils_cargo_bin::cargo_bin("codex")?
+    let exec_server_bin = toml::Value::String(
+        codex_utils_cargo_bin::cargo_bin("codex-app-server-test-exec-server")?
             .to_string_lossy()
             .into_owned(),
     );
@@ -137,8 +137,8 @@ include_local = true
 
 [[environments]]
 id = "{EXECUTOR_ID}"
-program = {codex_bin}
-args = ["exec-server", "--listen", "stdio"]
+program = {exec_server_bin}
+args = ["--listen", "stdio"]
 [environments.env]
 {EXECUTOR_ENV_NAME} = "{EXECUTOR_ENV_VALUE}"
 HTTP_PROXY = {http_proxy}

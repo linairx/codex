@@ -2722,6 +2722,7 @@ mod tests {
             request_id: RequestId::Integer(3),
             params: v2::LoginAccountParams::Chatgpt {
                 codex_streamlined_login: false,
+                callback_port: None,
             },
         };
         assert_eq!(
@@ -2729,7 +2730,8 @@ mod tests {
                 "method": "account/login/start",
                 "id": 3,
                 "params": {
-                    "type": "chatgpt"
+                    "type": "chatgpt",
+                    "callbackPort": null
                 }
             }),
             serde_json::to_value(&request)?,
@@ -2743,6 +2745,7 @@ mod tests {
             request_id: RequestId::Integer(3),
             params: v2::LoginAccountParams::Chatgpt {
                 codex_streamlined_login: true,
+                callback_port: None,
             },
         };
         assert_eq!(
@@ -2751,7 +2754,31 @@ mod tests {
                 "id": 3,
                 "params": {
                     "type": "chatgpt",
+                    "callbackPort": null,
                     "codexStreamlinedLogin": true
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_account_login_chatgpt_callback_port() -> Result<()> {
+        let request = ClientRequest::LoginAccount {
+            request_id: RequestId::Integer(3),
+            params: v2::LoginAccountParams::Chatgpt {
+                codex_streamlined_login: false,
+                callback_port: Some(1455),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "account/login/start",
+                "id": 3,
+                "params": {
+                    "type": "chatgpt",
+                    "callbackPort": 1455
                 }
             }),
             serde_json::to_value(&request)?,

@@ -1,0 +1,1 @@
+No local metrics backend was configured for this Docker container. The gateway does not expose a /metrics HTTP route; docs/gateway-operations.md says metrics must be queried from the configured codex_otel pipeline for the same capture window.

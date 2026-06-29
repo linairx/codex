@@ -1,3 +1,8 @@
+use crate::adapter::account_cancel_login_request;
+use crate::adapter::account_login_api_key_request;
+use crate::adapter::account_login_chatgpt_request;
+use crate::adapter::account_logout_request;
+use crate::adapter::account_read_request;
 use crate::adapter::thread_list_request;
 use crate::adapter::thread_read_request;
 use crate::adapter::thread_start_request;
@@ -27,6 +32,10 @@ use crate::scope::GatewayScopeRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
 use async_trait::async_trait;
 use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_protocol::CancelLoginAccountResponse;
+use codex_app_server_protocol::GetAccountResponse;
+use codex_app_server_protocol::LoginAccountResponse;
+use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListResponse as AppServerThreadListResponse;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -48,6 +57,47 @@ use tracing::warn;
 /// Implementations are responsible for mapping gateway operations onto the
 /// underlying execution stack, such as an embedded or remote app-server.
 pub trait GatewayRuntime: Send + Sync {
+    async fn read_openai_account(
+        &self,
+        refresh_token: bool,
+    ) -> Result<GetAccountResponse, GatewayError> {
+        let _ = refresh_token;
+        Err(GatewayError::Upstream(
+            "OpenAI account management is not supported by this gateway runtime".to_string(),
+        ))
+    }
+    async fn login_openai_api_key(
+        &self,
+        api_key: String,
+    ) -> Result<LoginAccountResponse, GatewayError> {
+        let _ = api_key;
+        Err(GatewayError::Upstream(
+            "OpenAI account management is not supported by this gateway runtime".to_string(),
+        ))
+    }
+    async fn start_openai_chatgpt_login(
+        &self,
+        callback_port: Option<u16>,
+    ) -> Result<LoginAccountResponse, GatewayError> {
+        let _ = callback_port;
+        Err(GatewayError::Upstream(
+            "OpenAI account management is not supported by this gateway runtime".to_string(),
+        ))
+    }
+    async fn cancel_openai_login(
+        &self,
+        login_id: String,
+    ) -> Result<CancelLoginAccountResponse, GatewayError> {
+        let _ = login_id;
+        Err(GatewayError::Upstream(
+            "OpenAI account management is not supported by this gateway runtime".to_string(),
+        ))
+    }
+    async fn logout_openai_account(&self) -> Result<LogoutAccountResponse, GatewayError> {
+        Err(GatewayError::Upstream(
+            "OpenAI account management is not supported by this gateway runtime".to_string(),
+        ))
+    }
     async fn create_thread(
         &self,
         context: GatewayRequestContext,
@@ -244,6 +294,67 @@ impl AppServerGatewayRuntime {
 
 #[async_trait]
 impl GatewayRuntime for AppServerGatewayRuntime {
+    async fn read_openai_account(
+        &self,
+        refresh_token: bool,
+    ) -> Result<GetAccountResponse, GatewayError> {
+        let response = self
+            .app_server()
+            .request_typed(account_read_request(self.next_request_id(), refresh_token))
+            .await?;
+        Ok(response)
+    }
+
+    async fn login_openai_api_key(
+        &self,
+        api_key: String,
+    ) -> Result<LoginAccountResponse, GatewayError> {
+        let response = self
+            .app_server()
+            .request_typed(account_login_api_key_request(
+                self.next_request_id(),
+                api_key,
+            ))
+            .await?;
+        Ok(response)
+    }
+
+    async fn start_openai_chatgpt_login(
+        &self,
+        callback_port: Option<u16>,
+    ) -> Result<LoginAccountResponse, GatewayError> {
+        let response = self
+            .app_server()
+            .request_typed(account_login_chatgpt_request(
+                self.next_request_id(),
+                callback_port,
+            ))
+            .await?;
+        Ok(response)
+    }
+
+    async fn cancel_openai_login(
+        &self,
+        login_id: String,
+    ) -> Result<CancelLoginAccountResponse, GatewayError> {
+        let response = self
+            .app_server()
+            .request_typed(account_cancel_login_request(
+                self.next_request_id(),
+                login_id,
+            ))
+            .await?;
+        Ok(response)
+    }
+
+    async fn logout_openai_account(&self) -> Result<LogoutAccountResponse, GatewayError> {
+        let response = self
+            .app_server()
+            .request_typed(account_logout_request(self.next_request_id()))
+            .await?;
+        Ok(response)
+    }
+
     async fn create_thread(
         &self,
         context: GatewayRequestContext,

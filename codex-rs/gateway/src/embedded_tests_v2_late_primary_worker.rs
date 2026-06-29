@@ -122,6 +122,7 @@ async fn remote_multi_worker_supports_primary_worker_onboarding_and_feedback_flo
             request_id: RequestId::Integer(3),
             params: LoginAccountParams::Chatgpt {
                 codex_streamlined_login: false,
+                callback_port: None,
             },
         }),
     )

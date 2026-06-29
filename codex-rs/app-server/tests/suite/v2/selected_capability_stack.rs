@@ -712,15 +712,17 @@ async fn wait_for_selected_mcp_server(
 }
 
 async fn spawn_exec_server(codex_home: &std::path::Path, url: &str) -> Result<Child> {
-    let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
-        .args(["exec-server", "--listen", url])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .env("CODEX_HOME", codex_home)
-        .env(EXECUTOR_ENV_NAME, EXECUTOR_ENV_VALUE)
-        .spawn()?;
+    let mut child = Command::new(codex_utils_cargo_bin::cargo_bin(
+        "codex-app-server-test-exec-server",
+    )?)
+    .args(["--listen", url])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit())
+    .kill_on_drop(true)
+    .env("CODEX_HOME", codex_home)
+    .env(EXECUTOR_ENV_NAME, EXECUTOR_ENV_VALUE)
+    .spawn()?;
     let stdout = child
         .stdout
         .take()

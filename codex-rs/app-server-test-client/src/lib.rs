@@ -1723,6 +1723,7 @@ impl CodexClient {
             request_id: request_id.clone(),
             params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
                 codex_streamlined_login: false,
+                callback_port: None,
             },
         };
 

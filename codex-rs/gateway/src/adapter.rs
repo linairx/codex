@@ -1,7 +1,10 @@
 use crate::api::CreateThreadRequest;
 use crate::api::ListThreadsRequest;
 use crate::api::StartTurnRequest;
+use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::GetAccountParams;
+use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
@@ -10,6 +13,47 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
+
+pub fn account_read_request(request_id: RequestId, refresh_token: bool) -> ClientRequest {
+    ClientRequest::GetAccount {
+        request_id,
+        params: GetAccountParams { refresh_token },
+    }
+}
+
+pub fn account_login_api_key_request(request_id: RequestId, api_key: String) -> ClientRequest {
+    ClientRequest::LoginAccount {
+        request_id,
+        params: LoginAccountParams::ApiKey { api_key },
+    }
+}
+
+pub fn account_login_chatgpt_request(
+    request_id: RequestId,
+    callback_port: Option<u16>,
+) -> ClientRequest {
+    ClientRequest::LoginAccount {
+        request_id,
+        params: LoginAccountParams::Chatgpt {
+            codex_streamlined_login: false,
+            callback_port,
+        },
+    }
+}
+
+pub fn account_cancel_login_request(request_id: RequestId, login_id: String) -> ClientRequest {
+    ClientRequest::CancelLoginAccount {
+        request_id,
+        params: CancelLoginAccountParams { login_id },
+    }
+}
+
+pub fn account_logout_request(request_id: RequestId) -> ClientRequest {
+    ClientRequest::LogoutAccount {
+        request_id,
+        params: None,
+    }
+}
 
 pub fn thread_start_request(request_id: RequestId, request: CreateThreadRequest) -> ClientRequest {
     ClientRequest::ThreadStart {

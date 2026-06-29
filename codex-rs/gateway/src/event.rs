@@ -373,6 +373,7 @@ mod tests {
             updated_at: 2,
             recency_at: Some(2),
             status: codex_app_server_protocol::ThreadStatus::Idle,
+            history_mode: Default::default(),
             path: None,
             cwd: std::path::PathBuf::from("/tmp/project")
                 .try_into()

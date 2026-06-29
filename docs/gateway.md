@@ -467,6 +467,10 @@ Recent progress:
   `northbound/v2_tests_cases_3_reconnect_backoff.rs`, leaving the parent
   reconnect case file focused on successful reconnect and fallback routing
   scenarios
+- the reconnect-backoff fail-closed coverage now splits plugin/MCP fallback,
+  config fallback, and search/setup/fs-watch fallback into dedicated
+  `northbound/v2_tests_cases_3_reconnect_backoff_*` modules, leaving
+  `northbound/v2_tests_cases_3_reconnect_backoff.rs` as a small dispatcher
 - the remaining fs-watch reconnect/replay coverage was moved out of
   `northbound/v2_tests_cases_4.rs` and consolidated in
   `northbound/v2_tests_cases_4_reconnect_and_fs.rs`, removing the duplicate
@@ -488,6 +492,13 @@ Recent progress:
   `northbound/v2_tests_cases_0_late_delivery.rs`, leaving
   `northbound/v2_tests_cases_0_late.rs` focused on the shared case wiring
   and summary assertions
+- the shared late-case connection/backlog coverage has been split again so
+  server-request cleanup collection, cleanup metrics, pending cleanup delivery,
+  and worker-cleanup resolved delivery failure coverage now lives in
+  `northbound/v2_tests_cases_0_late_connection_and_backlog_cleanup.rs`,
+  leaving `northbound/v2_tests_cases_0_late_connection_and_backlog.rs`
+  focused on pagination bounds, connection-error classification, and
+  connection backlog outcome metrics
 - the `v2_tests_cases_4.rs` reconnect logging and reconnect metrics/backoff
   coverage now lives in `northbound/v2_tests_cases_4_reconnect_logs.rs` and
   `northbound/v2_tests_cases_4_reconnect_metrics.rs`, leaving
@@ -4800,6 +4811,12 @@ Phase 6 includes the following validated transport and rollout properties:
   `northbound/v2_tests_cases_1_websocket_lifecycle.rs` focused on the
   downstream-lag case while the unknown-server-request coverage stays in its
   dedicated module
+- the unknown-server-request websocket lifecycle coverage now splits client
+  response handling into
+  `northbound/v2_tests_cases_1_websocket_lifecycle_unknown_server_request_response.rs`,
+  leaving
+  `northbound/v2_tests_cases_1_websocket_lifecycle_unknown_server_request.rs`
+  focused on the client-error handling cases
 - the `v2_tests_cases_3_late_reconnect.rs` config-read tail has been split
   again so the matching-cwd and threadless config reconnect cases now live in
   `northbound/v2_tests_cases_3_late_reconnect_config.rs`, keeping the parent
@@ -4856,9 +4873,77 @@ Phase 6 includes the following validated transport and rollout properties:
   connection health, remote single-worker health, remote multi-worker health,
   slow-client timeout, and transport-configuration modules, leaving
   `embedded_tests_misc_health.rs` as a thin dispatcher
+- the northbound HTTP router regression file has been split into health
+  summary, project-route health, remote-worker health, v2-connection health,
+  project-route selection, v1 route, SSE, auth/error, and metrics/admission
+  modules, leaving `northbound/http_tests.rs` as the shared fake runtime plus
+  module dispatcher
+- the v2 connection health registry tests have been split into connection
+  lifecycle, pending-count timestamp/peak, account/route/reconnect event,
+  request metric, notification/transport failure, and protocol violation
+  modules, leaving `v2_connection_health_tests.rs` as a shared prelude plus
+  module dispatcher
+- the v2 connection health pending-count coverage now keeps timestamp/backfill
+  behavior in `v2_connection_health_tests_pending_counts.rs`, with peak
+  accounting and completed-connection outcome/duration coverage split into
+  dedicated modules
+- the northbound `v2_tests_cases_2_late_aggregation` regression file has been
+  split into catalog/discovery, plugin-list aggregation, account, model
+  pagination, and capability aggregation modules, leaving the parent file as a
+  small shared prelude plus module dispatcher
+- the northbound thread read/unarchive account-handoff regressions now live in
+  dedicated `v2_tests_cases_2_thread_read.rs` and
+  `v2_tests_cases_2_thread_unarchive.rs` modules, leaving
+  `v2_tests_cases_2_thread_read_unarchive.rs` as a small dispatcher
 
 Phase 6 now consists of:
 
+- freeze the current gateway test-splitting pass at the dispatcher/module
+  boundary already reached, and use any follow-up edits only to fix compile,
+  module wiring, or clearly oversized remaining test files that block review
+- validate the split test tree before taking on more restructuring: run
+  formatting, run the gateway crate test target, and keep any failures scoped
+  to the moved test modules or their shared preludes rather than starting a
+  broader cleanup
+- move the next implementation focus to the Docker deployment path: verify the
+  gateway and app-server entrypoint wrapper smoke tests, the Compose wiring
+  smoke test, and the gateway/app-server image builds from the repository root
+- prove the actual Compose deployment, not just rendered configuration, by
+  starting the embedded gateway profile, checking `/healthz`, then starting the
+  remote profile with the bundled app-server worker and confirming the gateway
+  reports the remote worker and v2 transport health expected by the rollout
+  checklist
+- once Docker deployment is green, capture the smallest release-gate evidence
+  needed for the target profile: health snapshots, remote worker labels,
+  project-route selection events, metrics, and audit logs for the same
+  tenant/project/account scope
+- after a local container starts successfully, treat the next step as evidence
+  capture rather than more design work: save a baseline `/healthz` snapshot,
+  point a real Codex client or v2-compatible client workflow at the gateway,
+  run bootstrap plus thread/turn traffic through the deployed container, and
+  save the post-traffic `/healthz`, `/v1/events`, logs, and metrics for the
+  same capture window
+- keep the first post-container pass scoped to the embedded profile unless the
+  deployment under review specifically needs remote workers; embedded evidence
+  should prove that the packaged gateway starts, accepts real client traffic,
+  and reports stable v2 connection health before remote topology evidence is
+  collected
+- once embedded evidence is captured, repeat the same workflow with the
+  built-in single-worker remote Compose profile so the evidence includes the
+  downstream worker URL, worker health, reconnect configuration, and any
+  worker-auth settings used by the deployment
+- create a promotion evidence bundle only after real traffic has produced data;
+  the bundle should record the gateway build, topology id, worker build and
+  URL, tenant/project scope, auth mode, timeout values, pending-request limits,
+  and links to the captured transcript, health, events, metrics, and logs
+- use multi-worker evidence as a separate Stage B validation step: run it only
+  after embedded and single-worker remote evidence is green, require matching
+  account labels for every account-backed worker, and keep evidence from
+  different worker builds, URLs, labels, auth modes, or timeout settings in
+  separate bundles
+- only after that deployment path is working, resume any remaining test
+  splitting as a reviewability task; prefer narrow, topic-based moves over
+  another broad restructuring pass
 - keep using the real-client embedded and single-worker remote harnesses as the
   release gate, extending them when new v2 workflows land so those two
   topologies remain the drop-in baseline instead of drifting behind the gateway
