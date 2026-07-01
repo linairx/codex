@@ -10,6 +10,7 @@ use crate::remote_worker::GatewayRemoteWorker;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
+use crate::worker_pool::GatewayWorkerPoolState;
 use codex_app_server_protocol::RequestId;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -36,9 +37,15 @@ pub struct RemoteWorkerGatewayRuntime {
     events: broadcast::Sender<GatewayEvent>,
     scope_registry: Arc<GatewayScopeRegistry>,
     worker_health: Arc<RemoteWorkerHealthRegistry>,
+    worker_pool: Arc<GatewayWorkerPoolState>,
     v2_transport: GatewayV2TransportConfig,
     v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
     observability: GatewayObservability,
+}
+
+pub(crate) struct RemoteWorkerRuntimeState {
+    pub(crate) worker_health: Arc<RemoteWorkerHealthRegistry>,
+    pub(crate) worker_pool: Arc<GatewayWorkerPoolState>,
 }
 
 impl RemoteWorkerGatewayRuntime {
@@ -47,7 +54,7 @@ impl RemoteWorkerGatewayRuntime {
         selection_policy: GatewayRemoteSelectionPolicy,
         events: broadcast::Sender<GatewayEvent>,
         scope_registry: Arc<GatewayScopeRegistry>,
-        worker_health: Arc<RemoteWorkerHealthRegistry>,
+        runtime_state: RemoteWorkerRuntimeState,
         v2_transport: GatewayV2TransportConfig,
         observability: GatewayObservability,
     ) -> Result<Self, GatewayError> {
@@ -64,7 +71,8 @@ impl RemoteWorkerGatewayRuntime {
             next_request_id: Arc::new(AtomicI64::new(1)),
             events,
             scope_registry,
-            worker_health,
+            worker_health: runtime_state.worker_health,
+            worker_pool: runtime_state.worker_pool,
             v2_transport,
             v2_connection_health: observability.v2_connection_health(),
             observability,

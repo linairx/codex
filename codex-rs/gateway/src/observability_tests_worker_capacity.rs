@@ -137,3 +137,95 @@ fn records_account_capacity_event_metrics_with_worker_and_event_tags() {
 
     assert!(saw_count);
 }
+
+#[test]
+fn records_worker_pool_inventory_metrics_with_kind_tags() {
+    let exporter = InMemoryMetricExporter::default();
+    let metrics = codex_otel::MetricsClient::new(
+        codex_otel::MetricsConfig::in_memory(
+            "test",
+            "codex-gateway",
+            env!("CARGO_PKG_VERSION"),
+            exporter,
+        )
+        .with_runtime_reader(),
+    )
+    .expect("metrics");
+    let observability = GatewayObservability::new(Some(metrics), true);
+
+    observability.record_worker_pool_inventory(&GatewayWorkerPoolSnapshot {
+        account_count: 2,
+        leased_account_count: 1,
+        policy_eligible_account_count: 1,
+        policy_ineligible_account_count: 1,
+        worker_slot_count: 3,
+        bound_worker_slot_count: 2,
+        accounts: vec![GatewayAccountPoolEntry {
+            account_id: "acct-a".to_string(),
+            lease_state: GatewayAccountLeaseState::Leased,
+            leased_worker_id: Some(0),
+            project_route_count: 0,
+            account_capacity: GatewayAccountCapacityStatus::Available,
+            account_capacity_reason: None,
+            policy_eligible: true,
+            policy_ineligibility_reason: None,
+            cooldown_reason: None,
+            last_error: None,
+        }],
+        worker_slots: vec![GatewayWorkerPoolSlot {
+            worker_id: 0,
+            websocket_url: "ws://127.0.0.1:9001/v2".to_string(),
+            account_id: Some("acct-a".to_string()),
+            account_login_state_path: None,
+        }],
+    });
+
+    let resource_metrics = observability
+        .metrics
+        .as_ref()
+        .expect("metrics client")
+        .snapshot()
+        .expect("snapshot");
+    let metrics = resource_metrics
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics);
+
+    let mut inventory = BTreeMap::new();
+    for metric in metrics {
+        if metric.name() == WORKER_POOL_INVENTORY_METRIC {
+            match metric.data() {
+                AggregatedMetrics::I64(data) => match data {
+                    MetricData::Gauge(gauge) => {
+                        for point in gauge.data_points() {
+                            let attributes: BTreeMap<String, String> = point
+                                .attributes()
+                                .map(|attribute| {
+                                    (
+                                        attribute.key.as_str().to_string(),
+                                        attribute.value.as_str().to_string(),
+                                    )
+                                })
+                                .collect();
+                            let kind = attributes.get("kind").expect("kind tag").clone();
+                            inventory.insert(kind, point.value());
+                        }
+                    }
+                    _ => panic!("unexpected worker-pool inventory aggregation"),
+                },
+                _ => panic!("unexpected worker-pool inventory type"),
+            }
+        }
+    }
+
+    assert_eq!(
+        inventory,
+        BTreeMap::from([
+            ("accounts".to_string(), 2),
+            ("leased_accounts".to_string(), 1),
+            ("policy_eligible_accounts".to_string(), 1),
+            ("policy_ineligible_accounts".to_string(), 1),
+            ("worker_slots".to_string(), 3),
+            ("bound_worker_slots".to_string(), 2),
+        ])
+    );
+}

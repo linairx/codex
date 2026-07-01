@@ -149,6 +149,7 @@ async fn runtime_errors_map_to_http_status_codes() {
                 remote_unlabeled_account_worker_ids: Some(Vec::new()),
                 remote_unlabeled_account_workers: Some(Vec::new()),
                 project_worker_routes: Some(Vec::new()),
+                worker_pool: None,
             }
         }
 

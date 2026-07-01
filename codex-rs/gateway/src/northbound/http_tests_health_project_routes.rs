@@ -103,6 +103,7 @@ async fn health_route_serializes_project_worker_routes() {
                     worker_healthy: true,
                     account_routing_eligible: true,
                 }]),
+                worker_pool: None,
             }
         }
 
@@ -307,6 +308,7 @@ async fn health_route_serializes_mixed_project_worker_routes() {
                         account_routing_eligible: false,
                     },
                 ]),
+                worker_pool: None,
             }
         }
 

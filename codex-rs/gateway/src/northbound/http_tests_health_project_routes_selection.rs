@@ -148,6 +148,7 @@ async fn health_route_serializes_project_route_selection_and_mixed_project_worke
                         account_routing_eligible: false,
                     },
                 ]),
+                worker_pool: None,
             }
         }
 
@@ -344,6 +345,7 @@ async fn health_route_marks_ineligible_project_worker_routes() {
                     worker_healthy: false,
                     account_routing_eligible: false,
                 }]),
+                worker_pool: None,
             }
         }
 

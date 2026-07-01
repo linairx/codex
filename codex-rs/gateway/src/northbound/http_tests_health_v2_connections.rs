@@ -451,6 +451,7 @@ async fn health_route_serializes_v2_client_send_timeout_connection_outcome() {
                 remote_unlabeled_account_worker_ids: Some(Vec::new()),
                 remote_unlabeled_account_workers: Some(Vec::new()),
                 project_worker_routes: Some(Vec::new()),
+                worker_pool: None,
             }
         }
 

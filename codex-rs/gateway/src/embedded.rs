@@ -381,6 +381,7 @@ async fn start_single_runtime_gateway_http_server(
         scope_registry.clone(),
         GatewayRuntimeHealthConfig {
             remote_worker_health: None,
+            worker_pool: None,
             v2_transport,
             v2_connection_health: v2_connection_health.clone(),
             observability: observability.clone(),
@@ -426,6 +427,7 @@ async fn start_single_runtime_gateway_http_server(
             scope_registry,
             GatewayRuntimeHealthConfig {
                 remote_worker_health: None,
+                worker_pool: None,
                 v2_transport,
                 v2_connection_health,
                 observability,

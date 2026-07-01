@@ -13,6 +13,7 @@ use crate::api::GatewayV2ConnectionHealth;
 use crate::api::GatewayV2TransportConfig;
 use crate::api::ListThreadsRequest;
 use crate::api::ResolveServerRequestRequest;
+use crate::config::GatewayRemoteRuntimeConfig;
 use crate::config::GatewayRemoteSelectionPolicy;
 use crate::error::GatewayError;
 use crate::observability::GatewayObservability;
@@ -21,6 +22,7 @@ use crate::runtime::GatewayRuntime;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
+use crate::worker_pool::GatewayWorkerPoolState;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
@@ -49,6 +51,15 @@ fn test_thread(id: &str, created_at: i64, updated_at: i64) -> GatewayThread {
 
 fn empty_v2_connection_health() -> Arc<GatewayV2ConnectionHealthRegistry> {
     Arc::new(GatewayV2ConnectionHealthRegistry::default())
+}
+
+fn empty_worker_pool() -> Arc<GatewayWorkerPoolState> {
+    Arc::new(GatewayWorkerPoolState::from_remote_runtime(
+        &GatewayRemoteRuntimeConfig {
+            selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
+            workers: Vec::new(),
+        },
+    ))
 }
 
 fn test_metrics() -> codex_otel::MetricsClient {
@@ -95,6 +106,7 @@ fn sorts_threads_by_created_at_desc_by_default() {
         worker_health: Arc::new(crate::remote_health::RemoteWorkerHealthRegistry::new(
             Vec::new(),
         )),
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -138,6 +150,7 @@ fn sorts_threads_by_updated_at_ascending() {
         worker_health: Arc::new(crate::remote_health::RemoteWorkerHealthRegistry::new(
             Vec::new(),
         )),
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -236,6 +249,7 @@ fn active_thread_request_fails_closed_when_account_capacity_is_exhausted() {
         events,
         scope_registry,
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -292,6 +306,7 @@ fn downstream_turn_start_capacity_error_marks_account_exhausted() {
         events,
         scope_registry: Arc::new(GatewayScopeRegistry::default()),
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -350,6 +365,7 @@ async fn interrupt_turn_fails_closed_when_account_capacity_is_exhausted() {
         events,
         scope_registry,
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -418,6 +434,7 @@ async fn server_request_response_fails_closed_when_account_capacity_is_exhausted
         events,
         scope_registry: scope_registry.clone(),
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -498,6 +515,7 @@ async fn server_request_response_fails_closed_using_pending_worker_without_threa
         events,
         scope_registry: scope_registry.clone(),
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -570,6 +588,7 @@ async fn server_request_response_type_mismatch_records_invalid_response_lifecycl
         events,
         scope_registry: scope_registry.clone(),
         worker_health: Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(Vec::new())),
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -633,6 +652,7 @@ async fn server_request_response_keeps_pending_request_when_remote_worker_route_
         events,
         scope_registry: scope_registry.clone(),
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -700,6 +720,7 @@ fn reports_reconnecting_remote_health_with_retry_metadata() {
         events: broadcast::channel(4).0,
         scope_registry: Arc::new(GatewayScopeRegistry::default()),
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,

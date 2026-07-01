@@ -256,6 +256,7 @@ impl GatewayRuntime for FakeRuntime {
             remote_unlabeled_account_worker_ids: None,
             remote_unlabeled_account_workers: None,
             project_worker_routes: None,
+            worker_pool: None,
         }
     }
 

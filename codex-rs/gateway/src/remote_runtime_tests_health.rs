@@ -177,6 +177,7 @@ fn reports_degraded_remote_health_when_some_workers_are_unhealthy() {
         events: broadcast::channel(4).0,
         scope_registry,
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -307,6 +308,7 @@ fn reports_complete_remote_account_labels_for_labeled_multi_worker_health() {
         events: broadcast::channel(4).0,
         scope_registry,
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -385,6 +387,7 @@ fn reports_project_worker_routes_for_multiple_labeled_projects() {
         events: broadcast::channel(4).0,
         scope_registry,
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -471,6 +474,7 @@ fn reports_mixed_project_worker_route_eligibility_after_worker_health_changes() 
         events: broadcast::channel(4).0,
         scope_registry,
         worker_health: worker_health.clone(),
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -541,6 +545,7 @@ fn remote_health_treats_blank_account_labels_as_unlabeled_for_project_routes() {
         events: broadcast::channel(4).0,
         scope_registry,
         worker_health,
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,
@@ -614,6 +619,7 @@ fn project_worker_routes_track_worker_health_and_capacity_changes() {
         events: broadcast::channel(4).0,
         scope_registry,
         worker_health: worker_health.clone(),
+        worker_pool: empty_worker_pool(),
         v2_transport: GatewayV2TransportConfig {
             initialize_timeout_seconds: 30,
             client_send_timeout_seconds: 10,

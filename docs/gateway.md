@@ -402,6 +402,72 @@ Exit criteria:
   restored, the gateway returns an explicit fail-closed error instead of
   silently retrying on an unrelated account
 
+7. Account pool and worker orchestration
+
+Status: planned; the current gateway can connect to account-labeled remote
+workers, but it does not yet own worker lifecycle, account leases, or automatic
+account reassignment
+
+Goal:
+
+- let one gateway manage a pool of ordinary Codex app-server workers and a
+  separate pool of account identities, so clients connect only to the gateway
+  while workers continue running the standard app-server runtime
+
+Required behavior:
+
+- introduce an account-pool model that records account identity, login-state
+  location, capacity state, cooldown state, policy eligibility, last error, and
+  current lease
+- introduce a worker-pool model that records worker slots, process/container
+  health, current account binding, app-server WebSocket endpoint, and the
+  account-specific `CODEX_HOME` or equivalent login-state directory mounted into
+  the worker
+- keep each worker slot bound to at most one account at a time; do not mix
+  multiple account login states inside one app-server process
+- let gateway-managed workers run the ordinary app-server implementation, with
+  the account-pool and scheduling policy living in the gateway layer instead of
+  in `codex-app-server` or `codex-core`
+- make project scheduling choose a healthy worker/account pair, keep that
+  project sticky while the pair remains eligible, and avoid exhausted or
+  unhealthy account-backed workers for new project routes
+- when a worker becomes unavailable or its account becomes exhausted, release or
+  cool down the account lease, choose an eligible replacement account-backed
+  worker when one exists, and update the project route only after a bounded
+  restore path succeeds
+- support a deployment-controlled first version where workers and account
+  directories are pre-provisioned, before adding any automatic container or
+  process creation
+- expose account-pool, worker-pool, account-lease, and project-route state in
+  `/healthz`, audit logs, events, and metrics
+
+Design constraints:
+
+- account-pool orchestration must build on the existing multi-worker routing,
+  account-label, account-capacity, and handoff machinery instead of replacing
+  the app-server protocol proxy
+- account assignment is a lease; concurrent requests must not race two projects
+  into the same exclusive worker/account slot unless policy explicitly allows
+  that sharing
+- route reassignment must preserve tenant/project policy and must not silently
+  move live side-effecting work that cannot be safely restored
+- the first implementation should prefer static worker slots with distinct
+  mounted login-state directories over dynamic worker creation, so the gateway
+  can prove scheduling and failover behavior before it owns container lifecycle
+
+Exit criteria:
+
+- a deployment can configure multiple worker slots and multiple account
+  login-state directories, and the gateway can report the effective
+  worker/account bindings
+- new projects are assigned to eligible healthy account-backed workers with
+  stable same-project affinity
+- exhausted or unhealthy account-backed workers are removed from new-project
+  selection and produce observable account-pool and project-route events
+- resumable project routes can be handed off to an eligible replacement
+  worker/account pair, while non-resumable live work fails closed with an
+  explicit gateway error
+
 Overall release criteria:
 
 - an unmodified Codex client can connect to `codex-gateway` over the app-server
@@ -417,6 +483,22 @@ Detailed plan:
 
 Recent progress:
 
+- the Phase 7 account-pool/worker-pool model now has a first static snapshot
+  path for remote runtimes: `/healthz.workerPool` exposes leased account
+  entries, worker slots, current account capacity, policy eligibility, and the
+  configured worker/account binding so pre-provisioned account-backed workers
+  can be inspected before the gateway owns dynamic worker lifecycle. The
+  account policy eligibility field now follows the leased worker's live health
+  and account-capacity state, including explicit ineligibility reasons for
+  missing, unhealthy, or exhausted workers, and each leased account now reports
+  the current project-route count so account lease state can be reconciled with
+  same-project affinity. The worker-pool health snapshot also includes bounded
+  top-level account and worker-slot counts so operators can compare pool size,
+  bound slots, and policy-eligible versus ineligible account inventory without
+  scanning every entry. Remote startup now also records the same bounded
+  inventory counts through the `gateway_worker_pool_inventory{kind=...}` gauge,
+  so account-pool rollout dashboards can track account, lease, policy
+  eligibility, worker-slot, and bound-slot totals without scraping `/healthz`.
 - the observability thread-routing diagnostics metric regressions now live in
   `observability_tests_routing_diagnostics.rs`, leaving
   `observability_tests_tail.rs` focused on the remaining lifecycle,

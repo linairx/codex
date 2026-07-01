@@ -125,6 +125,7 @@ fn sse_event_filter_drops_events_outside_request_scope() {
                 remote_unlabeled_account_worker_ids: None,
                 remote_unlabeled_account_workers: None,
                 project_worker_routes: None,
+                worker_pool: None,
             }
         }
 

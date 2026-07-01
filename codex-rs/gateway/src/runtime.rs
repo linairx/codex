@@ -9,6 +9,7 @@ use crate::adapter::thread_start_request;
 use crate::adapter::turn_interrupt_request;
 use crate::adapter::turn_start_request;
 use crate::api::CreateThreadRequest;
+use crate::api::GatewayAccountCapacityStatus;
 use crate::api::GatewayExecutionMode;
 use crate::api::GatewayHealthResponse;
 use crate::api::GatewayHealthStatus;
@@ -30,6 +31,7 @@ use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::scope::GatewayRequestContext;
 use crate::scope::GatewayScopeRegistry;
 use crate::v2_connection_health::GatewayV2ConnectionHealthRegistry;
+use crate::worker_pool::GatewayWorkerPoolState;
 use async_trait::async_trait;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::CancelLoginAccountResponse;
@@ -144,6 +146,7 @@ pub struct AppServerGatewayRuntime {
     events: broadcast::Sender<GatewayEvent>,
     scope_registry: Arc<GatewayScopeRegistry>,
     remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
+    worker_pool: Option<Arc<GatewayWorkerPoolState>>,
     v2_transport: GatewayV2TransportConfig,
     v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
     observability: GatewayObservability,
@@ -152,6 +155,7 @@ pub struct AppServerGatewayRuntime {
 #[derive(Clone)]
 pub struct GatewayRuntimeHealthConfig {
     pub remote_worker_health: Option<Arc<RemoteWorkerHealthRegistry>>,
+    pub worker_pool: Option<Arc<GatewayWorkerPoolState>>,
     pub v2_transport: GatewayV2TransportConfig,
     pub v2_connection_health: Arc<GatewayV2ConnectionHealthRegistry>,
     pub observability: GatewayObservability,
@@ -191,6 +195,7 @@ impl AppServerGatewayRuntime {
             events,
             scope_registry,
             remote_worker_health: health_config.remote_worker_health,
+            worker_pool: health_config.worker_pool,
             v2_transport: health_config.v2_transport,
             v2_connection_health: health_config.v2_connection_health,
             observability: health_config.observability,
@@ -567,6 +572,25 @@ impl GatewayRuntime for AppServerGatewayRuntime {
             remote_unlabeled_account_worker_ids: None,
             remote_unlabeled_account_workers: None,
             project_worker_routes: None,
+            worker_pool: self.worker_pool.as_ref().map(|pool| {
+                if let Some(remote_worker_health) = &self.remote_worker_health {
+                    let project_worker_routes = self.scope_registry.project_worker_routes(
+                        |worker_id| remote_worker_health.is_healthy(worker_id),
+                        |worker_id| remote_worker_health.account_id(worker_id),
+                        |worker_id| {
+                            remote_worker_health
+                                .account_capacity(worker_id)
+                                .unwrap_or(GatewayAccountCapacityStatus::Exhausted)
+                        },
+                    );
+                    pool.snapshot_with_worker_health_and_project_routes(
+                        remote_worker_health,
+                        &project_worker_routes,
+                    )
+                } else {
+                    pool.snapshot()
+                }
+            }),
         }
     }
 

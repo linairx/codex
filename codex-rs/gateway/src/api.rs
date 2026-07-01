@@ -143,6 +143,51 @@ pub enum GatewayAccountCapacityStatus {
     Exhausted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayWorkerPoolSnapshot {
+    pub account_count: usize,
+    pub leased_account_count: usize,
+    pub policy_eligible_account_count: usize,
+    pub policy_ineligible_account_count: usize,
+    pub worker_slot_count: usize,
+    pub bound_worker_slot_count: usize,
+    pub accounts: Vec<GatewayAccountPoolEntry>,
+    pub worker_slots: Vec<GatewayWorkerPoolSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayAccountPoolEntry {
+    pub account_id: String,
+    pub lease_state: GatewayAccountLeaseState,
+    pub leased_worker_id: Option<usize>,
+    pub project_route_count: usize,
+    pub account_capacity: GatewayAccountCapacityStatus,
+    pub account_capacity_reason: Option<String>,
+    pub policy_eligible: bool,
+    pub policy_ineligibility_reason: Option<String>,
+    pub cooldown_reason: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GatewayAccountLeaseState {
+    Available,
+    Leased,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayWorkerPoolSlot {
+    pub worker_id: usize,
+    pub websocket_url: String,
+    pub account_id: Option<String>,
+    pub account_login_state_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayV2TransportConfig {
@@ -545,6 +590,8 @@ pub struct GatewayHealthResponse {
     pub remote_unlabeled_account_worker_ids: Option<Vec<usize>>,
     pub remote_unlabeled_account_workers: Option<Vec<GatewayRemoteUnlabeledAccountWorker>>,
     pub project_worker_routes: Option<Vec<GatewayProjectWorkerRoute>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_pool: Option<GatewayWorkerPoolSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

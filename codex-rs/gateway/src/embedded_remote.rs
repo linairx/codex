@@ -11,12 +11,14 @@ use crate::config::normalize_remote_account_id;
 use crate::observability::GatewayObservability;
 use crate::remote_health::RemoteWorkerHealthRegistry;
 use crate::remote_runtime::RemoteWorkerGatewayRuntime;
+use crate::remote_runtime::RemoteWorkerRuntimeState;
 use crate::remote_worker::GatewayRemoteWorker;
 use crate::runtime::AppServerGatewayRuntime;
 use crate::runtime::GatewayRuntime;
 use crate::runtime::GatewayRuntimeHealthConfig;
 use crate::scope::GatewayScopeRegistry;
 use crate::v2::GatewayV2SessionFactory;
+use crate::worker_pool::GatewayWorkerPoolState;
 use axum::serve;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 use codex_app_server_client::RemoteAppServerEndpoint;
@@ -234,6 +236,8 @@ pub(super) async fn start_remote_runtime_gateway_http_server(
             .with_operator_events(events_tx.clone());
     record_remote_account_worker_label_metrics(&observability, &remote_runtime);
     let v2_connection_health = observability.v2_connection_health();
+    let worker_pool = Arc::new(GatewayWorkerPoolState::from_remote_runtime(&remote_runtime));
+    observability.record_worker_pool_inventory(&worker_pool.snapshot());
     let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(
         remote_runtime
             .workers
@@ -349,7 +353,10 @@ pub(super) async fn start_remote_runtime_gateway_http_server(
             remote_runtime.selection_policy,
             events_tx.clone(),
             scope_registry.clone(),
-            worker_health.clone(),
+            RemoteWorkerRuntimeState {
+                worker_health: worker_health.clone(),
+                worker_pool: worker_pool.clone(),
+            },
             v2_transport,
             observability.clone(),
         )
@@ -397,6 +404,7 @@ pub(super) async fn start_remote_runtime_gateway_http_server(
             scope_registry.clone(),
             GatewayRuntimeHealthConfig {
                 remote_worker_health: Some(worker_health.clone()),
+                worker_pool: Some(worker_pool.clone()),
                 v2_transport,
                 v2_connection_health: v2_connection_health.clone(),
                 observability: observability.clone(),

@@ -91,6 +91,7 @@ async fn health_route_serializes_incomplete_remote_account_labels() {
                     websocket_url: "ws://127.0.0.1:8082".to_string(),
                 }]),
                 project_worker_routes: Some(Vec::new()),
+                worker_pool: None,
             }),
             ..FakeRuntime::default()
         }),

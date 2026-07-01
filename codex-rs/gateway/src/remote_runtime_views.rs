@@ -81,6 +81,17 @@ pub(super) fn health_response(runtime: &RemoteWorkerGatewayRuntime) -> GatewayHe
         GatewayHealthStatus::Unavailable
     };
 
+    let project_worker_routes = runtime.scope_registry.project_worker_routes(
+        |worker_id| runtime.worker_health.is_healthy(worker_id),
+        |worker_id| runtime.worker_health.account_id(worker_id),
+        |worker_id| {
+            runtime
+                .worker_health
+                .account_capacity(worker_id)
+                .unwrap_or(GatewayAccountCapacityStatus::Exhausted)
+        },
+    );
+
     GatewayHealthResponse {
         status,
         runtime_mode: "remote".to_string(),
@@ -105,16 +116,15 @@ pub(super) fn health_response(runtime: &RemoteWorkerGatewayRuntime) -> GatewayHe
         remote_unlabeled_account_worker_count: Some(remote_unlabeled_account_worker_count),
         remote_unlabeled_account_worker_ids: Some(remote_unlabeled_account_worker_ids),
         remote_unlabeled_account_workers: Some(remote_unlabeled_account_workers),
-        project_worker_routes: Some(runtime.scope_registry.project_worker_routes(
-            |worker_id| runtime.worker_health.is_healthy(worker_id),
-            |worker_id| runtime.worker_health.account_id(worker_id),
-            |worker_id| {
-                runtime
-                    .worker_health
-                    .account_capacity(worker_id)
-                    .unwrap_or(GatewayAccountCapacityStatus::Exhausted)
-            },
-        )),
+        project_worker_routes: Some(project_worker_routes.clone()),
+        worker_pool: Some(
+            runtime
+                .worker_pool
+                .snapshot_with_worker_health_and_project_routes(
+                    &runtime.worker_health,
+                    &project_worker_routes,
+                ),
+        ),
     }
 }
 
