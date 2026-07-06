@@ -304,6 +304,22 @@ async fn thread_start_marks_exhausted_account_and_retries_available_account() {
             "reason": "rate limit reached",
         })
     );
+    let cooldown_event = operator_events_rx
+        .recv()
+        .await
+        .expect("v2 account lease cooldown event should be published");
+    assert_eq!(cooldown_event.method, "gateway/accountLeaseChanged");
+    assert_eq!(
+        cooldown_event.data,
+        serde_json::json!({
+            "tenantId": "tenant-a",
+            "projectId": "project-a",
+            "workerId": 0,
+            "accountId": "acct-a",
+            "leaseState": "cooldown",
+            "reason": "rate limit reached",
+        })
+    );
     let failover_event = operator_events_rx
         .recv()
         .await

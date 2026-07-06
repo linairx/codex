@@ -147,11 +147,19 @@ pub enum GatewayAccountCapacityStatus {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayWorkerPoolSnapshot {
     pub account_count: usize,
+    pub available_account_count: usize,
     pub leased_account_count: usize,
+    pub cooldown_account_count: usize,
     pub policy_eligible_account_count: usize,
     pub policy_ineligible_account_count: usize,
     pub worker_slot_count: usize,
     pub bound_worker_slot_count: usize,
+    pub healthy_worker_slot_count: usize,
+    pub unhealthy_worker_slot_count: usize,
+    pub reconnecting_worker_slot_count: usize,
+    pub account_login_state_path_count: usize,
+    pub worker_account_login_state_path_count: usize,
+    pub pool_account_login_state_path_count: usize,
     pub accounts: Vec<GatewayAccountPoolEntry>,
     pub worker_slots: Vec<GatewayWorkerPoolSlot>,
 }
@@ -160,6 +168,7 @@ pub struct GatewayWorkerPoolSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayAccountPoolEntry {
     pub account_id: String,
+    pub account_login_state_path: Option<String>,
     pub lease_state: GatewayAccountLeaseState,
     pub leased_worker_id: Option<usize>,
     pub project_route_count: usize,
@@ -186,6 +195,11 @@ pub struct GatewayWorkerPoolSlot {
     pub websocket_url: String,
     pub account_id: Option<String>,
     pub account_login_state_path: Option<String>,
+    pub account_capacity: Option<GatewayAccountCapacityStatus>,
+    pub account_capacity_reason: Option<String>,
+    pub healthy: Option<bool>,
+    pub reconnecting: Option<bool>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

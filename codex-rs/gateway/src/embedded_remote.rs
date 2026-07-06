@@ -31,8 +31,16 @@ use tokio::time::Duration;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
+const REMOTE_ACCOUNT_LOGIN_STATE_PATHS_ENV: &str = "CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_STATE_PATHS";
+const REMOTE_ACCOUNT_POOL_ACCOUNT_IDS_ENV: &str = "CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS";
+const REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS_ENV: &str =
+    "CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS";
+
 #[path = "embedded_remote_loop.rs"]
 mod embedded_remote_loop;
+#[cfg(test)]
+#[path = "embedded_remote_tests.rs"]
+mod tests;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct UnlabeledRemoteAccountWorker {
@@ -199,6 +207,190 @@ pub(super) fn record_remote_account_worker_label_metrics(
     }
 }
 
+fn remote_account_login_state_paths_from_config_or_env(
+    configured_paths: Option<&[String]>,
+    worker_count: usize,
+) -> io::Result<Vec<Option<String>>> {
+    if let Some(configured_paths) = configured_paths {
+        return parse_remote_account_login_state_path_values(configured_paths, worker_count);
+    }
+
+    let raw_paths = std::env::var(REMOTE_ACCOUNT_LOGIN_STATE_PATHS_ENV).ok();
+    parse_remote_account_login_state_paths(raw_paths.as_deref(), worker_count)
+}
+
+fn parse_remote_account_login_state_paths(
+    raw_paths: Option<&str>,
+    worker_count: usize,
+) -> io::Result<Vec<Option<String>>> {
+    let Some(raw_paths) = raw_paths else {
+        return Ok(vec![None; worker_count]);
+    };
+    if raw_paths.trim().is_empty() {
+        return Ok(vec![None; worker_count]);
+    }
+
+    let paths: Vec<Option<String>> = raw_paths
+        .split(',')
+        .map(str::trim)
+        .map(|path| {
+            if path.is_empty() {
+                Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("{REMOTE_ACCOUNT_LOGIN_STATE_PATHS_ENV} must not contain blank paths"),
+                ))
+            } else {
+                Ok(Some(path.to_string()))
+            }
+        })
+        .collect::<io::Result<_>>()?;
+
+    if paths.len() != worker_count {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{REMOTE_ACCOUNT_LOGIN_STATE_PATHS_ENV} must contain one path per remote worker when configured"
+            ),
+        ));
+    }
+
+    Ok(paths)
+}
+
+fn parse_remote_account_login_state_path_values(
+    paths: &[String],
+    worker_count: usize,
+) -> io::Result<Vec<Option<String>>> {
+    if paths.len() != worker_count {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "--remote-account-login-state-path must be provided once per remote worker when configured",
+        ));
+    }
+
+    Ok(paths.iter().cloned().map(Some).collect())
+}
+
+fn remote_account_pool_account_ids_from_config_or_env(
+    configured_account_ids: Option<&[String]>,
+) -> io::Result<Vec<String>> {
+    if let Some(configured_account_ids) = configured_account_ids {
+        return parse_remote_account_pool_account_id_values(configured_account_ids);
+    }
+
+    let raw_account_ids = std::env::var(REMOTE_ACCOUNT_POOL_ACCOUNT_IDS_ENV).ok();
+    parse_remote_account_pool_account_ids(raw_account_ids.as_deref())
+}
+
+fn parse_remote_account_pool_account_ids(raw_account_ids: Option<&str>) -> io::Result<Vec<String>> {
+    let Some(raw_account_ids) = raw_account_ids else {
+        return Ok(Vec::new());
+    };
+    if raw_account_ids.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    raw_account_ids
+        .split(',')
+        .map(str::trim)
+        .map(|account_id| {
+            if account_id.is_empty() {
+                Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{REMOTE_ACCOUNT_POOL_ACCOUNT_IDS_ENV} must not contain blank account ids"
+                    ),
+                ))
+            } else {
+                Ok(account_id.to_string())
+            }
+        })
+        .collect()
+}
+
+fn parse_remote_account_pool_account_id_values(account_ids: &[String]) -> io::Result<Vec<String>> {
+    account_ids
+        .iter()
+        .map(|account_id| {
+            let account_id = account_id.trim();
+            if account_id.is_empty() {
+                Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "--remote-account-pool-account-id must not be blank",
+                ))
+            } else {
+                Ok(account_id.to_string())
+            }
+        })
+        .collect()
+}
+
+fn remote_account_pool_login_state_paths_from_config_or_env(
+    configured_paths: Option<&[String]>,
+    account_count: usize,
+) -> io::Result<Vec<Option<String>>> {
+    if let Some(configured_paths) = configured_paths {
+        return parse_remote_account_pool_login_state_path_values(configured_paths, account_count);
+    }
+
+    let raw_paths = std::env::var(REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS_ENV).ok();
+    parse_remote_account_pool_login_state_paths(raw_paths.as_deref(), account_count)
+}
+
+fn parse_remote_account_pool_login_state_paths(
+    raw_paths: Option<&str>,
+    account_count: usize,
+) -> io::Result<Vec<Option<String>>> {
+    let Some(raw_paths) = raw_paths else {
+        return Ok(vec![None; account_count]);
+    };
+    if raw_paths.trim().is_empty() {
+        return Ok(vec![None; account_count]);
+    }
+
+    let paths: Vec<Option<String>> = raw_paths
+        .split(',')
+        .map(str::trim)
+        .map(|path| {
+            if path.is_empty() {
+                Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS_ENV} must not contain blank paths"
+                    ),
+                ))
+            } else {
+                Ok(Some(path.to_string()))
+            }
+        })
+        .collect::<io::Result<_>>()?;
+
+    if paths.len() != account_count {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS_ENV} must contain one path per account-pool account when configured"
+            ),
+        ));
+    }
+
+    Ok(paths)
+}
+
+fn parse_remote_account_pool_login_state_path_values(
+    paths: &[String],
+    account_count: usize,
+) -> io::Result<Vec<Option<String>>> {
+    if paths.len() != account_count {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "--remote-account-pool-login-state-path must be provided once per account-pool account when configured",
+        ));
+    }
+
+    Ok(paths.iter().cloned().map(Some).collect())
+}
+
 pub(super) async fn start_remote_runtime_gateway_http_server(
     gateway_config: GatewayConfig,
     otel: Option<codex_otel::OtelProvider>,
@@ -236,8 +428,30 @@ pub(super) async fn start_remote_runtime_gateway_http_server(
             .with_operator_events(events_tx.clone());
     record_remote_account_worker_label_metrics(&observability, &remote_runtime);
     let v2_connection_health = observability.v2_connection_health();
-    let worker_pool = Arc::new(GatewayWorkerPoolState::from_remote_runtime(&remote_runtime));
-    observability.record_worker_pool_inventory(&worker_pool.snapshot());
+    let account_login_state_paths = remote_account_login_state_paths_from_config_or_env(
+        gateway_config.remote_account_login_state_paths.as_deref(),
+        remote_runtime.workers.len(),
+    )?;
+    let account_pool_account_ids = remote_account_pool_account_ids_from_config_or_env(
+        gateway_config.remote_account_pool_account_ids.as_deref(),
+    )?;
+    let account_pool_login_state_paths = remote_account_pool_login_state_paths_from_config_or_env(
+        gateway_config
+            .remote_account_pool_login_state_paths
+            .as_deref(),
+        account_pool_account_ids.len(),
+    )?;
+    let worker_pool = Arc::new(
+        GatewayWorkerPoolState::from_remote_runtime_with_account_pool(
+            &remote_runtime,
+            &account_pool_account_ids,
+            &account_login_state_paths,
+            &account_pool_login_state_paths,
+        ),
+    );
+    let worker_pool_snapshot = worker_pool.snapshot();
+    observability.record_worker_pool_inventory(&worker_pool_snapshot);
+    observability.record_worker_pool_account_leases(&worker_pool_snapshot);
     let worker_health = Arc::new(RemoteWorkerHealthRegistry::new_with_accounts(
         remote_runtime
             .workers

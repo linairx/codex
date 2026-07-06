@@ -1,3 +1,4 @@
+use crate::api::GatewayAccountLeaseState;
 use crate::api::GatewayWorkerPoolSnapshot;
 use crate::event::GatewayEvent;
 use crate::scope::GatewayRequestContext;
@@ -23,12 +24,15 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 #[path = "observability_metrics.rs"]
 mod observability_metrics;
+#[path = "observability_worker_pool_metrics.rs"]
+mod observability_worker_pool_metrics;
 
 const REQUEST_COUNT_METRIC: &str = "gateway_http_requests";
 const REQUEST_DURATION_METRIC: &str = "gateway_http_request_duration";
 const REMOTE_ACCOUNT_LABEL_EVENT_COUNT_METRIC: &str = "gateway_remote_account_label_events";
 const PROJECT_WORKER_ROUTE_SELECTION_COUNT_METRIC: &str = "gateway_project_worker_route_selections";
 const WORKER_POOL_INVENTORY_METRIC: &str = "gateway_worker_pool_inventory";
+const ACCOUNT_LEASE_EVENT_COUNT_METRIC: &str = "gateway_account_lease_events";
 const ACCOUNT_CAPACITY_EVENT_COUNT_METRIC: &str = "gateway_account_capacity_events";
 const SERVER_REQUEST_ANSWER_DELIVERY_FAILURE_COUNT_METRIC: &str =
     "gateway_server_request_answer_delivery_failures";

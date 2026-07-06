@@ -1,3 +1,4 @@
+use crate::api::GatewayAccountLeaseState;
 use crate::event::GatewayAccountActiveThreadHandoffFailed;
 use crate::event::GatewayEvent;
 use crate::northbound::v2_connection::FailClosedMultiWorkerRouteError;
@@ -78,6 +79,14 @@ fn sync_worker_account_capacity_from_rate_limits<'a>(
                 Some(context),
                 Some(reason.as_str()),
             );
+            publish_account_lease_changed(
+                downstream,
+                context,
+                observability,
+                worker_id,
+                GatewayAccountLeaseState::Cooldown,
+                Some(reason.as_str()),
+            );
         }
     } else if downstream.mark_worker_account_available(worker_id) {
         observability.record_v2_account_capacity_event(
@@ -85,6 +94,14 @@ fn sync_worker_account_capacity_from_rate_limits<'a>(
             "available",
             Some(context),
             Some("account/rateLimits reported available capacity"),
+        );
+        publish_account_lease_changed(
+            downstream,
+            context,
+            observability,
+            worker_id,
+            GatewayAccountLeaseState::Leased,
+            None,
         );
     }
 }
@@ -186,7 +203,16 @@ pub(crate) async fn route_thread_start_request_with_account_capacity_failover(
         match response {
             Ok(result) => {
                 if let Some(worker_id) = worker.worker_id {
-                    downstream.mark_worker_account_available(worker_id);
+                    if downstream.mark_worker_account_available(worker_id) {
+                        publish_account_lease_changed(
+                            downstream,
+                            connection.request_context,
+                            connection.observability,
+                            worker_id,
+                            GatewayAccountLeaseState::Leased,
+                            None,
+                        );
+                    }
                     if !exhausted_worker_ids.is_empty() {
                         connection.observability.publish_operator_event(
                             GatewayEvent::account_failover_succeeded(
@@ -250,7 +276,16 @@ pub(crate) async fn route_thread_start_request_with_account_capacity_failover(
                             error.message.as_str(),
                         ),
                     );
-                    downstream.mark_worker_account_exhausted(worker_id, error.message.clone());
+                    if downstream.mark_worker_account_exhausted(worker_id, error.message.clone()) {
+                        publish_account_lease_changed(
+                            downstream,
+                            connection.request_context,
+                            connection.observability,
+                            worker_id,
+                            GatewayAccountLeaseState::Cooldown,
+                            Some(error.message.as_str()),
+                        );
+                    }
                     exhausted_worker_ids.push(worker_id);
                 }
                 if first_capacity_error.is_none() {
@@ -266,6 +301,32 @@ pub(crate) async fn route_thread_start_request_with_account_capacity_failover(
             "gateway v2 connection has no downstream app-server sessions with available account capacity",
         )
     })
+}
+
+fn publish_account_lease_changed(
+    downstream: &GatewayV2DownstreamRouter,
+    context: &GatewayRequestContext,
+    observability: &GatewayObservability,
+    worker_id: usize,
+    lease_state: GatewayAccountLeaseState,
+    reason: Option<&str>,
+) {
+    let account_id = downstream.worker_account_id(worker_id);
+    observability.record_account_lease_event(
+        lease_state,
+        account_id.as_deref(),
+        Some(worker_id),
+        Some(context),
+        reason,
+    );
+    observability.publish_operator_event(GatewayEvent::account_lease_changed(
+        context.tenant_id.as_str(),
+        context.project_id.as_deref(),
+        worker_id,
+        account_id,
+        lease_state,
+        reason,
+    ));
 }
 
 fn account_capacity_exhaustion_reason<'a>(

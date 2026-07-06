@@ -220,6 +220,7 @@ comma-separated worker URLs and matching comma-separated account ids:
 CODEX_GATEWAY_RUNTIME=remote \
 CODEX_GATEWAY_REMOTE_WEBSOCKET_URLS=ws://host.docker.internal:9001/v2,ws://host.docker.internal:9002/v2 \
 CODEX_GATEWAY_REMOTE_ACCOUNT_IDS=acct-a,acct-b \
+CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS=acct-a,acct-b,acct-c \
 docker compose -f docker-compose.gateway.yml up --build
 ```
 
@@ -232,6 +233,9 @@ Common `CODEX_GATEWAY_*` variables:
 - `CODEX_GATEWAY_REMOTE_AUTH_TOKEN`
 - `CODEX_GATEWAY_REMOTE_WEBSOCKET_URLS`
 - `CODEX_GATEWAY_REMOTE_ACCOUNT_IDS`
+- `CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS`
+- `CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS`
+- `CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_STATE_PATHS`
 - `CODEX_GATEWAY_V2_INITIALIZE_TIMEOUT_SECONDS`
 - `CODEX_GATEWAY_V2_CLIENT_SEND_TIMEOUT_SECONDS`
 - `CODEX_GATEWAY_V2_RECONNECT_RETRY_BACKOFF_SECONDS`
@@ -248,6 +252,26 @@ The gateway entrypoint waits for the local worker `/readyz` probe before it
 starts in that built-in remote profile, so the remote stack comes up in a
 usable order instead of racing the first connection attempt.
 
+Use the Compose smoke script before collecting release evidence. By default it
+checks the rendered Compose configuration and Docker build context allowlist:
+
+```bash
+sh scripts/test-gateway-docker-compose.sh
+```
+
+To verify the actual local Compose deployment with already-built images, run:
+
+```bash
+CODEX_GATEWAY_DOCKER_COMPOSE_RUN=1 sh scripts/test-gateway-docker-compose.sh
+```
+
+That runtime smoke starts the embedded gateway profile, waits for `/healthz`,
+then starts the bundled single-worker remote profile and waits until
+`/healthz.remoteWorkers[0]` reports the local worker as healthy. Set
+`CODEX_GATEWAY_DOCKER_COMPOSE_BUILD=1` on the same command when the local
+`codex-gateway:local` and `codex-app-server:local` images should be rebuilt
+first.
+
 Multi-worker remote mode is a bounded Stage B profile until the exact
 deployment shape has promotion evidence. Every account-backed worker in an
 account-aware validation should have a matching `--remote-account-id`; unlabeled
@@ -262,8 +286,13 @@ cargo run -p codex-gateway -- \
   --remote-auth-token "$WORKER_TOKEN" \
   --remote-websocket-url ws://127.0.0.1:9001/v2 \
   --remote-account-id acct-a \
+  --remote-account-pool-account-id acct-a \
+  --remote-account-pool-account-id acct-b \
+  --remote-account-pool-account-id acct-c \
+  --remote-account-login-state-path /var/lib/codex/accounts/acct-a \
   --remote-websocket-url ws://127.0.0.1:9002/v2 \
   --remote-account-id acct-b \
+  --remote-account-login-state-path /var/lib/codex/accounts/acct-b \
   --v2-initialize-timeout-seconds 30 \
   --v2-client-send-timeout-seconds 10 \
   --v2-reconnect-retry-backoff-seconds 1 \
@@ -273,6 +302,42 @@ cargo run -p codex-gateway -- \
 
 When `--remote-account-id` is configured, it must be provided once per
 `--remote-websocket-url`.
+
+Static account-pool deployments can set
+`--remote-account-pool-account-id` once per known account identity, or set
+`CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS` to a comma-separated list. The
+current static worker scheduler only routes to accounts already leased to
+worker slots; extra account-pool entries are reported in
+`/healthz.workerPool.accounts[]` with `leaseState: "available"` and
+`policyEligible: false` until dynamic worker/account assignment exists.
+`/healthz.workerPool.availableAccountCount` and the
+`gateway_worker_pool_inventory{kind="available_accounts"}` gauge expose the
+bounded inventory total without requiring operators to scan every account
+entry.
+
+Static worker-pool deployments can also set
+`--remote-account-login-state-path` once per `--remote-websocket-url`, or set
+`CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_STATE_PATHS` to a comma-separated list of
+account login-state directories. When configured, provide one non-empty path per
+remote worker; `/healthz.workerPool.workerSlots[].accountLoginStatePath` then
+reports the effective worker/account directory binding used for promotion
+evidence, while `/healthz.workerPool.accountLoginStatePathCount` reports the
+bounded configured-path count. Static account-pool deployments can set
+`--remote-account-pool-login-state-path` once per
+`--remote-account-pool-account-id`, or set
+`CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS` to a comma-separated
+list, so unleased accounts can report their login-state directory before
+dynamic worker/account reassignment exists.
+`/healthz.workerPool.workerAccountLoginStatePathCount` and
+`/healthz.workerPool.poolAccountLoginStatePathCount` split the same total by
+worker-bound versus account-pool source, and matching
+`gateway_worker_pool_inventory{kind="worker_account_login_state_paths"}` and
+`gateway_worker_pool_inventory{kind="pool_account_login_state_paths"}` gauges
+make that split available to dashboards. `/healthz.workerPool.cooldownAccountCount`
+summarizes exhausted account leases without requiring operators to scan every
+account entry during quota-failover review. The worker-pool slot entries also
+mirror worker health, reconnect state, and last error so the configured slot,
+account binding, and current process state can be reviewed together.
 
 ## Health Checks
 
@@ -697,6 +762,113 @@ promotion:
    caught while the run can still be reproduced.
 9. Write `decision.md` only after every required route class has either passed
    or has been explicitly excluded from the promotion scope.
+
+After the gateway is running, use the baseline capture helper to populate the
+first artifact set from the live `/healthz` endpoint:
+
+```bash
+just gateway-promotion-baseline-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --gateway-url http://127.0.0.1:8080 \
+  --bearer-token "$GATEWAY_TOKEN" \
+  --captured-by "$USER"
+```
+
+The helper writes `transcripts/01-baseline.txt`, `healthz/01-baseline.json`,
+`events/01-baseline.sse`, `metrics/01-baseline.json`, and
+`logs/01-baseline.log`, fills the baseline README and worksheet rows, and
+sets missing capture start/end timestamps to the baseline capture time. Update
+the README capture end after later scenario artifacts are added. The events,
+metrics, and logs files are intentionally placeholders until the matching live
+streams or backend exports are captured for the scenario.
+
+Before running a traffic scenario, start a scoped event capture in another
+terminal so operator events land in the same bundle:
+
+```bash
+just gateway-promotion-events-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --gateway-url http://127.0.0.1:8080 \
+  --bearer-token "$GATEWAY_TOKEN" \
+  --prefix 02-steady-state-project-a \
+  --duration-seconds 120
+```
+
+The helper writes `events/<prefix>.sse` with the same metadata format used by
+the bundle checker. It treats the configured duration as the capture window and
+accepts curl's timeout exit after the SSE stream has been held open.
+
+Immediately after the traffic scenario finishes, capture the scoped `/healthz`
+snapshot while the relevant connection, route, or capacity counters are still
+visible:
+
+```bash
+just gateway-promotion-health-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --gateway-url http://127.0.0.1:8080 \
+  --bearer-token "$GATEWAY_TOKEN" \
+  --prefix 02-steady-state-project-a
+```
+
+The helper writes `healthz/<prefix>.json` and fills the README / worksheet row
+for the matching scenario without overwriting the event artifact captured before
+the traffic run.
+
+Use one shared capture timestamp for every artifact in a scenario so the bundle
+checker can prove they belong to the same evidence window:
+
+```bash
+CAPTURE_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+```
+
+Pass that value as `--capture-time` to the event, health, and artifact capture
+helpers. Import the saved client transcript, metrics export, and gateway logs
+with the same prefix:
+
+```bash
+just gateway-promotion-artifact-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --kind transcript \
+  --prefix 02-steady-state-project-a \
+  --source transcripts/raw-steady-state.txt \
+  --capture-time "$CAPTURE_TIME"
+
+just gateway-promotion-artifact-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --kind metrics \
+  --prefix 02-steady-state-project-a \
+  --source metrics/raw-steady-state.json \
+  --capture-time "$CAPTURE_TIME"
+
+just gateway-promotion-artifact-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --kind logs \
+  --prefix 02-steady-state-project-a \
+  --source logs/raw-steady-state.log \
+  --capture-time "$CAPTURE_TIME"
+```
+
+For ordinary scenarios, prefer the scenario capture wrapper so events, health,
+transcript, metrics, and logs share one timestamp and worksheet row:
+
+```bash
+just gateway-promotion-scenario-capture -- \
+  --bundle evidence/gw-build/topology-a \
+  --gateway-url http://127.0.0.1:8080 \
+  --bearer-token "$GATEWAY_TOKEN" \
+  --prefix 02-steady-state-project-a \
+  --scenario "Steady-state bootstrap and thread/turn" \
+  --metrics-source metrics/raw-steady-state.json \
+  --logs-source logs/raw-steady-state.log \
+  --duration-seconds 120 \
+  -- ./scripts/run-gateway-client-scenario.sh
+```
+
+When `--transcript-source` is omitted, the wrapper captures the command's
+stdout and stderr as `transcripts/<prefix>.txt`. Use `--transcript-source` when
+the client already writes its transcript elsewhere. Keep using the individual
+helpers when the event stream must be held open from a separate terminal before
+manual traffic starts.
 
 Useful health slices:
 

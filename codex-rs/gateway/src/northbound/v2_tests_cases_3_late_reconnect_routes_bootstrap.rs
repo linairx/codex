@@ -445,6 +445,7 @@ async fn websocket_upgrade_reconnects_missing_worker_before_aggregated_bootstrap
                             },
                             "installed": false,
                             "enabled": false,
+                            "version": null,
                             "installPolicy": "AVAILABLE",
                             "authPolicy": "ON_USE",
                             "interface": {
@@ -485,6 +486,7 @@ async fn websocket_upgrade_reconnects_missing_worker_before_aggregated_bootstrap
                             },
                             "installed": true,
                             "enabled": true,
+                            "version": null,
                             "installPolicy": "AVAILABLE",
                             "authPolicy": "ON_USE",
                             "interface": {

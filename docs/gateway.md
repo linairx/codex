@@ -490,19 +490,68 @@ Recent progress:
   can be inspected before the gateway owns dynamic worker lifecycle. The
   account policy eligibility field now follows the leased worker's live health
   and account-capacity state, including explicit ineligibility reasons for
-  missing, unhealthy, or exhausted workers, and each leased account now reports
-  the current project-route count so account lease state can be reconciled with
-  same-project affinity. The worker-pool health snapshot also includes bounded
-  top-level account and worker-slot counts so operators can compare pool size,
-  bound slots, and policy-eligible versus ineligible account inventory without
-  scanning every entry. Remote startup now also records the same bounded
+  missing, unhealthy, or exhausted workers. Exhausted account-backed workers
+  now surface the account as `cooldown` with a reason until capacity returns,
+  account entries now surface the leased worker's last error, and each leased
+  account now reports the current project-route count so account lease state
+  can be reconciled with same-project affinity. The
+  worker-pool health snapshot also includes bounded top-level account and
+  worker-slot counts so operators can compare pool size, bound slots, and
+  policy-eligible versus ineligible account inventory without scanning every
+  entry. Remote startup now also records the same bounded
   inventory counts through the `gateway_worker_pool_inventory{kind=...}` gauge,
   so account-pool rollout dashboards can track account, lease, policy
   eligibility, worker-slot, and bound-slot totals without scraping `/healthz`.
+  It also records `gateway_account_lease_events{event,account_id,worker_id}`
+  and matching audit logs for the observed account lease states at startup, so
+  pre-provisioned account-to-worker bindings are visible in metrics/logs before
+  dynamic worker lifecycle and account reassignment are introduced. Runtime
+  account-capacity exhaustion now also emits a bounded
+  `gateway/accountLeaseChanged` event when the affected account-backed worker
+  enters cooldown, so `/v1/events` consumers can correlate project failover
+  with account lease state. The northbound v2 compatibility path now emits the
+  same account-lease change event when `account/rateLimits` synchronization or
+  `thread/start` account-capacity failover moves a worker account into
+  cooldown or back to leased, keeping WebSocket clients and HTTP/SSE operators
+  on the same account-pool evidence stream. Those runtime lease transitions
+  now also record `gateway_account_lease_events{event,account_id,worker_id}`
+  and matching audit logs, so dashboards and log review can reconcile startup
+  inventory with later account-capacity changes. Static remote deployments can
+  now provide `--remote-account-pool-account-id` or
+  `CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS` to declare account identities
+  that are not yet leased to a worker slot. Those accounts appear in
+  `/healthz.workerPool.accounts[]` with `leaseState: "available"` and
+  `policyEligible: false`, and `/healthz.workerPool.availableAccountCount` plus
+  `gateway_worker_pool_inventory{kind="available_accounts"}` report the bounded
+  unleased account inventory while dynamic worker/account reassignment remains
+  planned. Static remote deployments can also provide
+  `--remote-account-login-state-path` or
+  `CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_STATE_PATHS` with one login-state
+  directory per worker, and `/healthz.workerPool.workerSlots[]` reports those
+  account directory bindings while
+  `/healthz.workerPool.accountLoginStatePathCount` reports the bounded
+  configured-path count for promotion evidence before the gateway owns dynamic
+  worker lifecycle. `/healthz.workerPool.workerAccountLoginStatePathCount` and
+  `/healthz.workerPool.poolAccountLoginStatePathCount` now split that bounded
+  login-state directory inventory by worker-bound versus account-pool source,
+  and `gateway_worker_pool_inventory{kind="worker_account_login_state_paths"}`
+  plus `gateway_worker_pool_inventory{kind="pool_account_login_state_paths"}`
+  expose the same split for dashboards. `/healthz.workerPool.cooldownAccountCount`
+  now also reports the bounded number of account leases currently in cooldown,
+  so quota-failover evidence can compare available, leased, cooldown, and
+  policy-ineligible pool totals without scanning every account entry.
+  Worker-pool slot entries now also mirror worker health, reconnect state, and
+  last error, so the configured slot, account binding, login-state path, and
+  current process state can be reviewed as one pool snapshot.
 - the observability thread-routing diagnostics metric regressions now live in
   `observability_tests_routing_diagnostics.rs`, leaving
   `observability_tests_tail.rs` focused on the remaining lifecycle,
   protocol-violation, backpressure, and timeout metric coverage
+- worker-pool inventory and account-lease metric recording now live in
+  `observability_worker_pool_metrics.rs`, leaving
+  `observability_metrics.rs` focused on the general HTTP, v2 transport,
+  routing, server-request, notification, and failure metric surfaces while
+  keeping the account-pool rollout evidence under its own owner module
 - the observability notification metric regressions now keep server-request
   forward, answer, and rejection delivery failure coverage in
   `observability_tests_transport_failures.rs`, leaving
@@ -4995,6 +5044,16 @@ Phase 6 now consists of:
   remote profile with the bundled app-server worker and confirming the gateway
   reports the remote worker and v2 transport health expected by the rollout
   checklist
+- the Compose smoke script now has an opt-in runtime check:
+  `CODEX_GATEWAY_DOCKER_COMPOSE_RUN=1 sh scripts/test-gateway-docker-compose.sh`
+  starts the embedded profile, waits for `/healthz`, starts the bundled
+  single-worker remote profile, waits for the worker to become healthy in the
+  gateway health snapshot, verifies the configured account-pool and
+  login-state-path fields in `/healthz.workerPool`, and then cleans up the
+  temporary Compose project. The default script path remains a fast
+  rendered-configuration check, and `CODEX_GATEWAY_DOCKER_COMPOSE_BUILD=1` can
+  be used when the local gateway and app-server images need to be rebuilt
+  before the runtime smoke.
 - once Docker deployment is green, capture the smallest release-gate evidence
   needed for the target profile: health snapshots, remote worker labels,
   project-route selection events, metrics, and audit logs for the same
@@ -5005,6 +5064,30 @@ Phase 6 now consists of:
   run bootstrap plus thread/turn traffic through the deployed container, and
   save the post-traffic `/healthz`, `/v1/events`, logs, and metrics for the
   same capture window
+- the baseline evidence capture now has a scriptable first step:
+  `just gateway-promotion-baseline-capture -- --bundle <bundle> --gateway-url <url>`
+  fetches the live `/healthz` endpoint, writes the first baseline artifact set,
+  and fills the baseline README / worksheet rows so post-container evidence
+  collection starts from concrete files instead of a manual checklist
+- scoped `/v1/events` evidence now has the same scriptable path:
+  `just gateway-promotion-events-capture -- --bundle <bundle> --gateway-url <url>`
+  records an SSE event artifact with bundle metadata, tenant/project headers,
+  optional bearer auth, and a bounded capture duration for the traffic scenario
+- post-scenario `/healthz` evidence now has a dedicated capture helper:
+  `just gateway-promotion-health-capture -- --bundle <bundle> --gateway-url <url>`
+  writes a scoped health artifact and updates the matching evidence rows without
+  replacing the event stream captured for the same traffic window
+- transcript, metrics, and logs now share a generic artifact importer:
+  `just gateway-promotion-artifact-capture -- --bundle <bundle> --kind <kind> --prefix <prefix>`
+  wraps raw scenario evidence with the bundle metadata required by the checker,
+  and all capture helpers accept `--capture-time` so a scenario's artifacts can
+  be tied to one explicit evidence window
+- ordinary traffic scenarios now have a wrapper:
+  `just gateway-promotion-scenario-capture -- --bundle <bundle> --gateway-url <url> --prefix <prefix> --scenario <name>`
+  starts scoped `/v1/events` capture, runs an optional scenario command or
+  imports a transcript file, captures post-scenario `/healthz`, imports metrics
+  and logs, and writes all five artifact classes with one shared capture time
+  so the evidence row is harder to populate inconsistently
 - keep the first post-container pass scoped to the embedded profile unless the
   deployment under review specifically needs remote workers; embedded evidence
   should prove that the packaged gateway starts, accepts real client traffic,

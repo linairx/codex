@@ -341,6 +341,19 @@ fn downstream_turn_start_capacity_error_marks_account_exhausted() {
             "reason": "rate limit exceeded",
         })
     );
+    let event = event_rx.try_recv().expect("lease event");
+    assert_eq!(event.method, "gateway/accountLeaseChanged");
+    assert_eq!(
+        event.data,
+        serde_json::json!({
+            "tenantId": "tenant-a",
+            "projectId": "project-a",
+            "workerId": 0,
+            "accountId": "acct-a",
+            "leaseState": "cooldown",
+            "reason": "rate limit exceeded",
+        })
+    );
 }
 
 #[tokio::test]

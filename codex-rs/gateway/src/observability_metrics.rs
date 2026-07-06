@@ -52,36 +52,6 @@ impl GatewayObservability {
         }
     }
 
-    pub(crate) fn record_worker_pool_inventory(&self, snapshot: &GatewayWorkerPoolSnapshot) {
-        let inventory = [
-            ("accounts", snapshot.account_count),
-            ("leased_accounts", snapshot.leased_account_count),
-            (
-                "policy_eligible_accounts",
-                snapshot.policy_eligible_account_count,
-            ),
-            (
-                "policy_ineligible_accounts",
-                snapshot.policy_ineligible_account_count,
-            ),
-            ("worker_slots", snapshot.worker_slot_count),
-            ("bound_worker_slots", snapshot.bound_worker_slot_count),
-        ];
-
-        for (kind, value) in inventory {
-            let tags = [("kind", kind)];
-            if let Some(metrics) = &self.metrics
-                && let Err(err) = metrics.gauge(
-                    WORKER_POOL_INVENTORY_METRIC,
-                    value.min(i64::MAX as usize) as i64,
-                    &tags,
-                )
-            {
-                tracing::warn!("failed to record gateway worker-pool inventory metric: {err}");
-            }
-        }
-    }
-
     pub(crate) fn record_project_worker_route_selected(
         &self,
         worker_id: usize,

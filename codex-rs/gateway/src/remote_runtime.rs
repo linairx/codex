@@ -1,4 +1,5 @@
 use crate::api::GatewayAccountCapacityStatus;
+use crate::api::GatewayAccountLeaseState;
 use crate::api::GatewayV2TransportConfig;
 use crate::config::GatewayRemoteSelectionPolicy;
 use crate::error::GatewayError;
@@ -231,15 +232,34 @@ impl RemoteWorkerGatewayRuntime {
             reason = reason.as_str(),
             "gateway HTTP marked account-backed worker exhausted after downstream request failure"
         );
+        let account_id = self.worker_health.account_id(worker_id);
         let _ = self.events.send(GatewayEvent::account_capacity_exhausted(
             context.tenant_id.as_str(),
             context.project_id.as_deref(),
             worker_id,
-            self.worker_health.account_id(worker_id),
+            account_id.clone(),
             reason.as_str(),
         ));
-        self.worker_health
-            .mark_account_exhausted_for_worker(worker_id, reason);
+        if self
+            .worker_health
+            .mark_account_exhausted_for_worker(worker_id, reason.clone())
+        {
+            self.observability.record_account_lease_event(
+                GatewayAccountLeaseState::Cooldown,
+                account_id.as_deref(),
+                Some(worker_id),
+                Some(context),
+                Some(reason.as_str()),
+            );
+            let _ = self.events.send(GatewayEvent::account_lease_changed(
+                context.tenant_id.as_str(),
+                context.project_id.as_deref(),
+                worker_id,
+                account_id,
+                GatewayAccountLeaseState::Cooldown,
+                Some(reason.as_str()),
+            ));
+        }
     }
 
     fn record_server_request_delivery_failure(&self, response_kind: &str) {

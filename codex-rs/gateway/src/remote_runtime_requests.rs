@@ -6,6 +6,7 @@ use crate::adapter::turn_interrupt_request;
 use crate::adapter::turn_start_request;
 use crate::api::CreateThreadRequest;
 use crate::api::GatewayAccountCapacityStatus;
+use crate::api::GatewayAccountLeaseState;
 use crate::api::GatewayHealthResponse;
 use crate::api::InterruptTurnResponse;
 use crate::api::ListThreadsRequest;
@@ -44,8 +45,27 @@ impl GatewayRuntime for RemoteWorkerGatewayRuntime {
                 .await
             {
                 Ok(response) => {
-                    self.worker_health
-                        .mark_account_available_for_worker(worker.id());
+                    if self
+                        .worker_health
+                        .mark_account_available_for_worker(worker.id())
+                    {
+                        let account_id = self.worker_health.account_id(worker.id());
+                        self.observability.record_account_lease_event(
+                            GatewayAccountLeaseState::Leased,
+                            account_id.as_deref(),
+                            Some(worker.id()),
+                            Some(&context),
+                            None,
+                        );
+                        let _ = self.events.send(GatewayEvent::account_lease_changed(
+                            context.tenant_id.as_str(),
+                            context.project_id.as_deref(),
+                            worker.id(),
+                            account_id,
+                            GatewayAccountLeaseState::Leased,
+                            None,
+                        ));
+                    }
                     if !exhausted_worker_ids.is_empty() {
                         let _ = self.events.send(GatewayEvent::account_failover_succeeded(
                             context.tenant_id.as_str(),

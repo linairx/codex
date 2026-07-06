@@ -66,6 +66,7 @@ async fn remote_runtime_retries_thread_start_after_account_capacity_error() {
 
         let mut buffered = String::new();
         let mut exhausted_event = None;
+        let mut cooldown_event = None;
         let mut failover_event = None;
         loop {
             let chunk = events_response
@@ -81,14 +82,24 @@ async fn remote_runtime_retries_thread_start_after_account_capacity_error() {
 
                 if event.contains("event: gateway/accountCapacityExhausted") {
                     exhausted_event = Some(event);
+                } else if event.contains("event: gateway/accountLeaseChanged")
+                    && event.contains("\"leaseState\":\"cooldown\"")
+                {
+                    cooldown_event = Some(event);
                 } else if event.contains("event: gateway/accountFailoverSucceeded") {
                     failover_event = Some(event);
                 }
 
-                if let (Some(exhausted_event), Some(failover_event)) =
-                    (exhausted_event.as_ref(), failover_event.as_ref())
-                {
-                    return (exhausted_event.clone(), failover_event.clone());
+                if let (Some(exhausted_event), Some(cooldown_event), Some(failover_event)) = (
+                    exhausted_event.as_ref(),
+                    cooldown_event.as_ref(),
+                    failover_event.as_ref(),
+                ) {
+                    return (
+                        exhausted_event.clone(),
+                        cooldown_event.clone(),
+                        failover_event.clone(),
+                    );
                 }
             }
         }
@@ -110,10 +121,11 @@ async fn remote_runtime_retries_thread_start_after_account_capacity_error() {
     let thread: ThreadResponse = response.json().await.expect("thread");
     assert_eq!(thread.thread.id, "thread-worker-b");
 
-    let (exhausted_event, failover_event) = timeout(Duration::from_secs(5), event_task)
-        .await
-        .expect("timed out waiting for account failover events")
-        .expect("event task should finish");
+    let (exhausted_event, cooldown_event, failover_event) =
+        timeout(Duration::from_secs(5), event_task)
+            .await
+            .expect("timed out waiting for account failover events")
+            .expect("event task should finish");
 
     assert_eq!(
         exhausted_event.contains("event: gateway/accountCapacityExhausted"),
@@ -128,6 +140,19 @@ async fn remote_runtime_retries_thread_start_after_account_capacity_error() {
     assert_eq!(exhausted_event.contains("\"accountId\":\"acct-a\""), true);
     assert_eq!(
         exhausted_event.contains("\"reason\":\"rate limit reached\""),
+        true
+    );
+    assert_eq!(
+        cooldown_event.contains("event: gateway/accountLeaseChanged"),
+        true
+    );
+    assert_eq!(cooldown_event.contains("\"tenantId\":\"default\""), true);
+    assert_eq!(cooldown_event.contains("\"projectId\":\"project-a\""), true);
+    assert_eq!(cooldown_event.contains("\"workerId\":0"), true);
+    assert_eq!(cooldown_event.contains("\"accountId\":\"acct-a\""), true);
+    assert_eq!(cooldown_event.contains("\"leaseState\":\"cooldown\""), true);
+    assert_eq!(
+        cooldown_event.contains("\"reason\":\"rate limit reached\""),
         true
     );
     assert_eq!(

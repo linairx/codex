@@ -227,6 +227,56 @@ gateway-docker-up-remote:
 gateway-promotion-bundle-check-test:
     {{ justfile_directory() }}/scripts/test-check-gateway-promotion-bundle.sh
 
+# Capture baseline health artifacts into a gateway promotion bundle.
+[no-cd]
+gateway-promotion-baseline-capture *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-baseline.sh "$@"
+
+# Smoke-test the gateway promotion baseline capture helper.
+[no-cd]
+gateway-promotion-baseline-capture-test:
+    {{ justfile_directory() }}/scripts/test-capture-gateway-promotion-baseline.sh
+
+# Capture scoped /v1/events SSE artifacts into a gateway promotion bundle.
+[no-cd]
+gateway-promotion-events-capture *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-events.sh "$@"
+
+# Smoke-test the gateway promotion event capture helper.
+[no-cd]
+gateway-promotion-events-capture-test:
+    {{ justfile_directory() }}/scripts/test-capture-gateway-promotion-events.sh
+
+# Capture scoped post-scenario /healthz artifacts into a gateway promotion bundle.
+[no-cd]
+gateway-promotion-health-capture *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-health.sh "$@"
+
+# Smoke-test the gateway promotion health capture helper.
+[no-cd]
+gateway-promotion-health-capture-test:
+    {{ justfile_directory() }}/scripts/test-capture-gateway-promotion-health.sh
+
+# Import transcript, metrics, or log artifacts into a gateway promotion bundle.
+[no-cd]
+gateway-promotion-artifact-capture *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-artifact.sh "$@"
+
+# Smoke-test the gateway promotion artifact capture helper.
+[no-cd]
+gateway-promotion-artifact-capture-test:
+    {{ justfile_directory() }}/scripts/test-capture-gateway-promotion-artifact.sh
+
+# Capture one gateway promotion traffic scenario artifact set.
+[no-cd]
+gateway-promotion-scenario-capture *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-scenario.sh "$@"
+
+# Smoke-test the gateway promotion scenario capture helper.
+[no-cd]
+gateway-promotion-scenario-capture-test:
+    {{ justfile_directory() }}/scripts/test-capture-gateway-promotion-scenario.sh
+
 # Validate a gateway promotion bundle layout.
 [no-cd]
 gateway-promotion-bundle-check *args:

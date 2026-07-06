@@ -254,7 +254,9 @@ async fn aggregate_account_rate_limits_response_updates_account_capacity() {
     .await
     .expect("downstream router should connect");
     let context = GatewayRequestContext::default();
-    let observability = GatewayObservability::default();
+    let (operator_events_tx, _) = broadcast::channel(4);
+    let mut operator_events_rx = operator_events_tx.subscribe();
+    let observability = GatewayObservability::default().with_operator_events(operator_events_tx);
 
     aggregate_account_rate_limits_response(
         &router,
@@ -307,6 +309,38 @@ async fn aggregate_account_rate_limits_response_updates_account_capacity() {
     assert_eq!(
         health.last_account_capacity_event_reason.as_deref(),
         Some("account/rateLimits reported Worker B WorkspaceMemberUsageLimitReached")
+    );
+    let available_lease_event = operator_events_rx
+        .recv()
+        .await
+        .expect("available account lease event should be published");
+    assert_eq!(available_lease_event.method, "gateway/accountLeaseChanged");
+    assert_eq!(
+        available_lease_event.data,
+        serde_json::json!({
+            "tenantId": "default",
+            "projectId": null,
+            "workerId": 0,
+            "accountId": "acct-a",
+            "leaseState": "leased",
+            "reason": null,
+        })
+    );
+    let cooldown_lease_event = operator_events_rx
+        .recv()
+        .await
+        .expect("cooldown account lease event should be published");
+    assert_eq!(cooldown_lease_event.method, "gateway/accountLeaseChanged");
+    assert_eq!(
+        cooldown_lease_event.data,
+        serde_json::json!({
+            "tenantId": "default",
+            "projectId": null,
+            "workerId": 1,
+            "accountId": "acct-b",
+            "leaseState": "cooldown",
+            "reason": "account/rateLimits reported Worker B WorkspaceMemberUsageLimitReached",
+        })
     );
 
     let available_response: GetAccountRateLimitsResponse =
@@ -367,6 +401,45 @@ async fn aggregate_account_rate_limits_response_updates_account_capacity() {
             (0, [("available".to_string(), 1)].into()),
             (1, [("exhausted".to_string(), 1)].into()),
         ]
+    );
+
+    let recovered_response: GetAccountRateLimitsResponse =
+        serde_json::from_value(serde_json::json!({
+            "rateLimits": {
+                "limitId": "worker-b",
+                "limitName": "Worker B",
+                "primary": null,
+                "secondary": null,
+                "credits": null,
+                "planType": null,
+                "rateLimitReachedType": null,
+            },
+            "rateLimitsByLimitId": null,
+        }))
+        .expect("recovered rate limits response should parse");
+    crate::northbound::v2_account_capacity::sync_worker_account_capacity_from_rate_limits_response(
+        &router,
+        &context,
+        &observability,
+        Some(1),
+        &recovered_response,
+    );
+
+    let recovered_lease_event = operator_events_rx
+        .recv()
+        .await
+        .expect("recovered account lease event should be published");
+    assert_eq!(recovered_lease_event.method, "gateway/accountLeaseChanged");
+    assert_eq!(
+        recovered_lease_event.data,
+        serde_json::json!({
+            "tenantId": "default",
+            "projectId": null,
+            "workerId": 1,
+            "accountId": "acct-b",
+            "leaseState": "leased",
+            "reason": null,
+        })
     );
 }
 

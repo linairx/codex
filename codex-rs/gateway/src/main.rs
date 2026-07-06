@@ -96,6 +96,27 @@ struct GatewayCli {
         value_parser = parse_remote_account_id
     )]
     remote_account_id: Vec<String>,
+
+    #[arg(
+        long = "remote-account-pool-account-id",
+        value_name = "ACCOUNT_ID",
+        value_parser = parse_remote_account_pool_account_id
+    )]
+    remote_account_pool_account_id: Vec<String>,
+
+    #[arg(
+        long = "remote-account-pool-login-state-path",
+        value_name = "PATH",
+        value_parser = parse_remote_account_pool_login_state_path
+    )]
+    remote_account_pool_login_state_path: Vec<String>,
+
+    #[arg(
+        long = "remote-account-login-state-path",
+        value_name = "PATH",
+        value_parser = parse_remote_account_login_state_path
+    )]
+    remote_account_login_state_path: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -114,6 +135,33 @@ fn parse_remote_account_id(value: &str) -> Result<String, String> {
     }
 
     Ok(account_id.to_string())
+}
+
+fn parse_remote_account_pool_account_id(value: &str) -> Result<String, String> {
+    let account_id = value.trim();
+    if account_id.is_empty() {
+        return Err("--remote-account-pool-account-id must not be blank".to_string());
+    }
+
+    Ok(account_id.to_string())
+}
+
+fn parse_remote_account_pool_login_state_path(value: &str) -> Result<String, String> {
+    let path = value.trim();
+    if path.is_empty() {
+        return Err("--remote-account-pool-login-state-path must not be blank".to_string());
+    }
+
+    Ok(path.to_string())
+}
+
+fn parse_remote_account_login_state_path(value: &str) -> Result<String, String> {
+    let path = value.trim();
+    if path.is_empty() {
+        return Err("--remote-account-login-state-path must not be blank".to_string());
+    }
+
+    Ok(path.to_string())
 }
 
 fn parse_remote_websocket_url(value: &str) -> Result<String, String> {
@@ -145,7 +193,31 @@ fn main() -> anyhow::Result<()> {
                 "--remote-account-id must be provided once per --remote-websocket-url when configured"
             );
         }
+        if !top_cli.inner.remote_account_login_state_path.is_empty()
+            && top_cli.inner.remote_account_login_state_path.len()
+                != top_cli.inner.remote_websocket_url.len()
+        {
+            anyhow::bail!(
+                "--remote-account-login-state-path must be provided once per --remote-websocket-url when configured"
+            );
+        }
+        if !top_cli
+            .inner
+            .remote_account_pool_login_state_path
+            .is_empty()
+            && top_cli.inner.remote_account_pool_login_state_path.len()
+                != top_cli.inner.remote_account_pool_account_id.len()
+        {
+            anyhow::bail!(
+                "--remote-account-pool-login-state-path must be provided once per --remote-account-pool-account-id when configured"
+            );
+        }
         let remote_account_ids = top_cli.inner.remote_account_id.clone();
+        let remote_account_pool_account_ids = top_cli.inner.remote_account_pool_account_id.clone();
+        let remote_account_pool_login_state_paths =
+            top_cli.inner.remote_account_pool_login_state_path.clone();
+        let remote_account_login_state_paths =
+            top_cli.inner.remote_account_login_state_path.clone();
         let server = start_gateway_server(
             GatewayConfig {
                 bind_address: top_cli.inner.listen,
@@ -185,6 +257,13 @@ fn main() -> anyhow::Result<()> {
                     .inner
                     .v2_max_pending_client_requests
                     .unwrap_or(default_gateway_config.v2_max_pending_client_requests),
+                remote_account_pool_account_ids: (!remote_account_pool_account_ids.is_empty())
+                    .then_some(remote_account_pool_account_ids),
+                remote_account_pool_login_state_paths: (!remote_account_pool_login_state_paths
+                    .is_empty())
+                .then_some(remote_account_pool_login_state_paths),
+                remote_account_login_state_paths: (!remote_account_login_state_paths.is_empty())
+                    .then_some(remote_account_login_state_paths),
                 remote_runtime: (!top_cli.inner.remote_websocket_url.is_empty()).then_some(
                     GatewayRemoteRuntimeConfig {
                         selection_policy: GatewayRemoteSelectionPolicy::RoundRobin,
@@ -220,6 +299,9 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::parse_remote_account_id;
+    use super::parse_remote_account_login_state_path;
+    use super::parse_remote_account_pool_account_id;
+    use super::parse_remote_account_pool_login_state_path;
     use super::parse_remote_websocket_url;
     use pretty_assertions::assert_eq;
 
@@ -236,6 +318,54 @@ mod tests {
         assert_eq!(
             parse_remote_account_id("  acct-a  "),
             Ok("acct-a".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_pool_account_id_parser_rejects_blank_values() {
+        assert_eq!(
+            parse_remote_account_pool_account_id("   "),
+            Err("--remote-account-pool-account-id must not be blank".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_pool_account_id_parser_trims_valid_values() {
+        assert_eq!(
+            parse_remote_account_pool_account_id("  acct-extra  "),
+            Ok("acct-extra".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_pool_login_state_path_parser_rejects_blank_values() {
+        assert_eq!(
+            parse_remote_account_pool_login_state_path("   "),
+            Err("--remote-account-pool-login-state-path must not be blank".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_pool_login_state_path_parser_trims_valid_values() {
+        assert_eq!(
+            parse_remote_account_pool_login_state_path("  /codex-home/acct-extra  "),
+            Ok("/codex-home/acct-extra".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_login_state_path_parser_rejects_blank_values() {
+        assert_eq!(
+            parse_remote_account_login_state_path("   "),
+            Err("--remote-account-login-state-path must not be blank".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_account_login_state_path_parser_trims_valid_values() {
+        assert_eq!(
+            parse_remote_account_login_state_path("  /codex-home/acct-a  "),
+            Ok("/codex-home/acct-a".to_string())
         );
     }
 
