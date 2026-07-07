@@ -1,8 +1,12 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-{"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-a
+capture time: 2026-07-07T05:48:48Z
+gateway_v2_worker_reconnect_events_total{worker_id="0",outcome="success"} 1
+gateway_v2_forwarded_notifications_total{method="item/agentMessage/delta"} 1
+gateway_v2_forwarded_notifications_total{method="turn/completed"} 1
+gateway_v2_server_request_lifecycle_events_total{event="client_server_request_delivered",method="item/tool/requestUserInput"} 1
+gateway_v2_server_request_lifecycle_events_total{event="client_server_request_resolved",method="item/tool/requestUserInput"} 1

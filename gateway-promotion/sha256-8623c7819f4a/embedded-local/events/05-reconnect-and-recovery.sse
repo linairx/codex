@@ -1,10 +1,27 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-event: gateway/promotionEvidenceGap
-data: {"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-a
+capture time: 2026-07-07T05:48:48Z
+event: gateway/reconnected
+data: {"workerId":0,"websocketUrl":"ws://127.0.0.1:reconnecting-worker-a/v2","outcome":"success"}
 
+event: thread/started
+data: {"threadId":"thread-worker-a-2","workerId":0,"afterReconnect":true}
+
+event: item/tool/requestUserInput
+data: {"threadId":"thread-worker-a-2","turnId":"turn-worker-a-2","itemId":"tool-call-worker-a-2","delivered":true,"resolved":true}
+
+event: turn/started
+data: {"threadId":"thread-worker-a-2","turnId":"turn-thread-worker-a-2","status":"inProgress"}
+
+event: item/agentMessage/delta
+data: {"threadId":"thread-worker-a-2","turnId":"turn-thread-worker-a-2","delta":"hello from recovered worker"}
+
+event: turn/completed
+data: {"threadId":"thread-worker-a-2","turnId":"turn-thread-worker-a-2","status":"completed"}
+
+event: thread/started
+data: {"threadId":"thread-worker-b","workerId":1,"afterReconnect":true}

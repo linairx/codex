@@ -1,9 +1,25 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted
+worker id: 1
+account id: acct-a
+capture time: 2026-07-07T05:48:48Z
+verified command: cd codex-rs && just test -p codex-gateway remote_multi_worker_v2_clients_recover_after_worker_reconnect
+nextest run id: 1cdd9062-56f5-4ced-adf7-02acd314cad2
+result: 1 test run, 1 passed, 761 skipped
+
+remote_multi_worker_v2_clients_recover_after_worker_reconnect exercised a remote gateway with two workers:
+- worker 0: reconnecting thread server for thread-worker-a-2 under /tmp/worker-a-2.
+- worker 1: steady mock thread server for thread-worker-b under /tmp/worker-b.
+
+The test waited for health to report both workers healthy after worker 0 had reconnected, consumed a gateway/reconnected SSE event for worker 0, then connected a v2 client after recovery.
+
+Post-reconnect behavior verified:
+- thread/start on the recovered worker returned thread-worker-a-2.
+- item/tool/requestUserInput server request from the recovered worker was delivered and resolved.
+- turn/start on thread-worker-a-2 returned turn-thread-worker-a-2 in progress.
+- turn streaming fan-in delivered thread active, turn started, hook started/completed, item started/completed, agent delta, reasoning summary delta, reasoning text delta, command output delta, file change delta, and turn completed.
+- thread/start on the second worker returned thread-worker-b.
+- thread/list aggregated thread-worker-b and thread-worker-a-2.
+- thread/read for thread-worker-a-2 routed back to the recovered worker and returned preview /tmp/worker-a-2.
