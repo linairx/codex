@@ -1,0 +1,8 @@
+gateway build: sha256-8623c7819f4a
+worker build: embedded-in-process
+tenant id: local-tenant
+project id: local-project
+worker id: 0
+account id: local-account
+capture time: 2026-07-07T04:41:39Z
+{"note":"gateway /metrics returned 404 for this capture window; health, SSE events, and container logs were captured directly"}

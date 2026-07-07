@@ -1,0 +1,9 @@
+gateway build: sha256-8623c7819f4a
+worker build: embedded-in-process
+tenant id: local-tenant
+project id: local-project
+worker id: 0
+account id: local-account
+capture time: 2026-07-07T04:41:39Z
+scenario gap: not captured in embedded mounted-auth smoke
+reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted

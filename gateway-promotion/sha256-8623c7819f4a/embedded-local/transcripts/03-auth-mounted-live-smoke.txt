@@ -1,0 +1,12 @@
+gateway build: sha256-8623c7819f4a
+worker build: embedded-in-process
+tenant id: local-tenant
+project id: local-project
+worker id: 0
+account id: local-account
+capture time: 2026-07-07T04:41:39Z
+# gateway embedded live event smoke with mounted auth
+create_response={"thread":{"id":"019f3ad9-35a1-7d82-810c-08636bd0ba09","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783398741,"updatedAt":1783398741,"status":{"type":"idle"}}}
+thread_id=019f3ad9-35a1-7d82-810c-08636bd0ba09
+turn_response={"turn":{"id":"019f3ad9-35c4-7721-ba26-5fc4884ee991","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
+turn_id=019f3ad9-35c4-7721-ba26-5fc4884ee991

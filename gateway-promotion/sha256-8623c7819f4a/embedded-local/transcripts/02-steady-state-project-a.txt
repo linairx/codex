@@ -1,0 +1,15 @@
+gateway build: sha256-8623c7819f4a
+worker build: embedded-in-process
+tenant id: local-tenant
+project id: local-project
+worker id: 0
+account id: local-account
+capture time: 2026-07-07T04:25:05Z
+# gateway embedded steady-state smoke
+POST /v1/threads
+{"thread":{"id":"019f3ad2-1634-7631-83ea-85bfe171eb00","preview":"","ephemeral":true,"modelProvider":"openai","createdAt":1783398274,"updatedAt":1783398274,"status":{"type":"idle"}}}
+thread_id=019f3ad2-1634-7631-83ea-85bfe171eb00
+GET /v1/threads/019f3ad2-1634-7631-83ea-85bfe171eb00
+{"thread":{"id":"019f3ad2-1634-7631-83ea-85bfe171eb00","preview":"","ephemeral":true,"modelProvider":"openai","createdAt":1783398274,"updatedAt":1783398274,"status":{"type":"idle"}}}
+POST /v1/threads/019f3ad2-1634-7631-83ea-85bfe171eb00/turns
+{"turn":{"id":"019f3ad2-1658-7ed3-877c-827ab66f5b3b","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
