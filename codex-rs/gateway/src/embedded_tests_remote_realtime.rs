@@ -89,6 +89,7 @@ async fn remote_single_worker_supports_drop_in_v2_client_realtime_workflow() {
                 }),
                 voice: None,
                 client_managed_handoffs: None,
+                flush_transcript_tail_on_session_end: None,
                 model: None,
                 version: None,
                 codex_responses_as_items: None,

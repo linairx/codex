@@ -1,10 +1,12 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
-tenant id: local-tenant
-project id: local-project
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-event: gateway/promotionEvidenceGap
-data: {"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise project route selection"}
+worker build: codex-gateway remote mock workers
+tenant id: default
+project id: project-a
+worker id: 0,1
+account id: acct-a
+capture time: 2026-07-07T05:24:27Z
+event: gateway/projectWorkerRouteSelected
+data: {"tenantId":"default","projectId":"project-a","threadId":"thread-worker-a","workerId":0,"accountId":"acct-a"}
 
+event: gateway/projectWorkerRouteSelected
+data: {"tenantId":"default","projectId":"project-a","threadId":"thread-worker-b","workerId":1,"accountId":"acct-b"}

@@ -1,9 +1,16 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
-tenant id: local-tenant
-project id: local-project
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: project route selection was not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or remote-worker setup; no additional live model traffic was run because account rate limit was exhausted
+worker build: codex-gateway remote mock workers
+tenant id: default
+project id: project-a
+worker id: 0,1
+account id: acct-a
+capture time: 2026-07-07T05:24:27Z
+verified command: cd codex-rs && just test -p codex-gateway remote_runtime_same_project_routes_around_unhealthy_affinity_worker apply_response_scope_policy_pins_project_worker_route_selection_evidence_chain
+nextest run id: aab30281-1126-4da9-81b3-fe368ac797c4
+result: 2 tests run, 2 passed, 760 skipped
+
+remote_runtime_same_project_routes_around_unhealthy_affinity_worker exercised a remote gateway with two workers:
+- worker 0: account acct-a, first thread/start for project-a returned thread-worker-a, then the worker became unhealthy after its first request.
+- worker 1: account acct-b, second thread/start for project-a returned thread-worker-b and became the healthy project route.
+
+apply_response_scope_policy_pins_project_worker_route_selection_evidence_chain verified the same project route-selection evidence path publishes gateway/projectWorkerRouteSelected, records gateway_project_worker_route_selections, updates health route-selection counters, and writes codex_gateway.audit "gateway project worker route selected" logs.

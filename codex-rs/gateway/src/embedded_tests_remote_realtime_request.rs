@@ -216,6 +216,7 @@ stream_max_retries = 0
                 }),
                 voice: None,
                 client_managed_handoffs: None,
+                flush_transcript_tail_on_session_end: None,
                 model: None,
                 version: None,
                 codex_responses_as_items: None,

@@ -134,6 +134,7 @@ async fn remote_single_worker_supports_v2_realtime_workflow_after_worker_reconne
                 transport: None,
                 voice: None,
                 client_managed_handoffs: None,
+                flush_transcript_tail_on_session_end: None,
                 model: None,
                 version: None,
                 codex_responses_as_items: None,

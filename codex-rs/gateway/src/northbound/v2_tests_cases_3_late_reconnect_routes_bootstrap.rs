@@ -447,6 +447,7 @@ async fn websocket_upgrade_reconnects_missing_worker_before_aggregated_bootstrap
                             "enabled": false,
                             "version": null,
                             "installPolicy": "AVAILABLE",
+                            "installPolicySource": null,
                             "authPolicy": "ON_USE",
                             "interface": {
                                 "displayName": "Worker A Plugin",
@@ -488,6 +489,7 @@ async fn websocket_upgrade_reconnects_missing_worker_before_aggregated_bootstrap
                             "enabled": true,
                             "version": null,
                             "installPolicy": "AVAILABLE",
+                            "installPolicySource": null,
                             "authPolicy": "ON_USE",
                             "interface": {
                                 "displayName": "Worker B Plugin",

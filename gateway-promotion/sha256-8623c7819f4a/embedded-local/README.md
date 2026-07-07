@@ -2,11 +2,11 @@
 
 - Gateway build: sha256-8623c7819f4a
 - Topology id: embedded-local
-- Worker builds: embedded-in-process
-- Tenant/project scope: tenant=local-tenant, projects=local-project
+- Worker builds: embedded-in-process, codex-gateway remote mock workers, codex-gateway remote mock workers
+- Tenant/project scope: tenant=default, projects=project-a
 - Captured by: codex
 - Capture start: 2026-07-07T04:21:37Z
-- Capture end: 2026-07-07T04:41:39Z
+- Capture end: 2026-07-07T05:24:27Z
 - Decision file: decision.md
 
 ## Topology
@@ -14,6 +14,8 @@
 | Worker id | Build id | WebSocket URL | Account id | Auth mode | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 0 | embedded-in-process | embedded://in-process | local-account | none | |
+| 1 | codex-gateway remote mock workers | remote-mock://worker-0 | acct-a | none | project route-selection evidence |
+| 2 | codex-gateway remote mock workers | remote-mock://worker-1 | acct-b | none | project route-selection evidence |
 
 ## Runtime Configuration
 

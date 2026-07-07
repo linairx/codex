@@ -192,6 +192,7 @@ async fn remote_multi_worker_fails_closed_when_thread_realtime_controls_have_no_
                             transport: None,
                             voice: None,
                             client_managed_handoffs: None,
+                            flush_transcript_tail_on_session_end: None,
                             model: None,
                             version: None,
                             codex_responses_as_items: None,

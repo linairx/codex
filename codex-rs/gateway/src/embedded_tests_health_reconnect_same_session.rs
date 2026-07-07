@@ -969,6 +969,7 @@ async fn remote_multi_worker_v2_session_readds_recovered_worker_after_disconnect
                 transport: None,
                 voice: None,
                 client_managed_handoffs: None,
+                flush_transcript_tail_on_session_end: None,
                 model: None,
                 version: None,
                 codex_responses_as_items: None,
