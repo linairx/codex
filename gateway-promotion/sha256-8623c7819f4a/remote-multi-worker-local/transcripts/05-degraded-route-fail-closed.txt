@@ -1,0 +1,10 @@
+gateway build: sha256-8623c7819f4a
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-07T16:11:35Z
+
+Degraded-route fail-closed
+Out of scope for this local topology capture; follow-up requires unavailable-worker route evidence.

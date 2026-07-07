@@ -1,0 +1,32 @@
+gateway build: sha256-8623c7819f4a
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-07T16:11:35Z
+
+event: gateway/projectWorkerRouteSelected
+data: {"method":"gateway/projectWorkerRouteSelected","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"accountId":"acct-a","projectId":"project-a","tenantId":"tenant-a","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","workerId":0}}
+
+event: thread/started
+data: {"method":"thread/started","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"thread":{"agentNickname":null,"agentRole":null,"cliVersion":"0.0.0","createdAt":1783440695,"cwd":"/app","ephemeral":false,"extra":null,"forkedFromId":null,"gitInfo":null,"historyMode":"legacy","id":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","modelProvider":"openai","name":null,"parentThreadId":null,"path":"/home/codex/.codex/sessions/2026/07/07/rollout-2026-07-07T16-11-35-019f3d59-5f41-7fa1-9a3c-1c10698d0871.jsonl","preview":"","recencyAt":1783440695,"sessionId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","source":"appServer","status":{"type":"idle"},"threadSource":null,"turns":[],"updatedAt":1783440695}}}
+
+event: thread/status/changed
+data: {"method":"thread/status/changed","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"status":{"activeFlags":[],"type":"active"},"threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871"}}
+
+event: turn/started
+data: {"method":"turn/started","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","turn":{"completedAt":null,"durationMs":null,"error":null,"id":"019f3d59-5f9d-7963-be7d-b240f8952750","items":[],"itemsView":"notLoaded","startedAt":1783440695,"status":"inProgress"}}}
+
+event: item/started
+data: {"method":"item/started","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"item":{"clientId":null,"content":[{"text":"multi-worker project-a smoke","text_elements":[],"type":"text"}],"id":"b301f4c9-c906-4544-a431-ec7ae0d45c98","type":"userMessage"},"startedAtMs":1783440696913,"threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","turnId":"019f3d59-5f9d-7963-be7d-b240f8952750"}}
+
+event: item/completed
+data: {"method":"item/completed","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"completedAtMs":1783440696913,"item":{"clientId":null,"content":[{"text":"multi-worker project-a smoke","text_elements":[],"type":"text"}],"id":"b301f4c9-c906-4544-a431-ec7ae0d45c98","type":"userMessage"},"threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","turnId":"019f3d59-5f9d-7963-be7d-b240f8952750"}}
+
+event: error
+data: {"method":"error","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"error":{"additionalDetails":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: a1782053b8a3658e-SIN","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}},"message":"Reconnecting... 2/5"},"threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","turnId":"019f3d59-5f9d-7963-be7d-b240f8952750","willRetry":true}}
+
+event: error
+data: {"method":"error","threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","data":{"error":{"additionalDetails":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: a178205e8858fd0b-SIN","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}},"message":"Reconnecting... 3/5"},"threadId":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","turnId":"019f3d59-5f9d-7963-be7d-b240f8952750","willRetry":true}}
+

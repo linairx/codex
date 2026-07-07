@@ -1,0 +1,20 @@
+gateway build: sha256-8623c7819f4a
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-07T16:11:35Z
+loopback worker URL note: gateway uses 127.0.0.1:19001 and 127.0.0.1:19002 TCP forwards to satisfy remote auth transport policy in local Docker multi-worker topology
+GET /v1/threads project-a
+{"data":[],"nextCursor":null,"backwardsCursor":null}
+POST /v1/threads project-a
+{"thread":{"id":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783440695,"updatedAt":1783440695,"status":{"type":"idle"}}}
+GET /v1/threads/019f3d59-5f41-7fa1-9a3c-1c10698d0871 project-a
+{"thread":{"id":"019f3d59-5f41-7fa1-9a3c-1c10698d0871","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783440695,"updatedAt":1783440695,"status":{"type":"idle"}}}
+POST /v1/threads/019f3d59-5f41-7fa1-9a3c-1c10698d0871/turns project-a
+{"turn":{"id":"019f3d59-5f9d-7963-be7d-b240f8952750","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
+POST /v1/threads project-b
+{"thread":{"id":"019f3d59-5fa6-7330-8628-cb00afe33774","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783440695,"updatedAt":1783440695,"status":{"type":"idle"}}}
+POST /v1/threads/019f3d59-5fa6-7330-8628-cb00afe33774/turns project-b
+{"turn":{"id":"019f3d59-5fc0-7390-9d53-9aef43b43476","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
