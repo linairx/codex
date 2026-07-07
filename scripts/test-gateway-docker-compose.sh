@@ -6,6 +6,7 @@ compose_file="$repo_root/docker-compose.gateway.yml"
 
 default_config="$(docker compose -f "$compose_file" config)"
 remote_config="$(docker compose -f "$compose_file" --profile remote config)"
+multi_worker_config="$(docker compose -f "$compose_file" --profile remote-multi-worker config)"
 dockerignore="$repo_root/.dockerignore"
 
 printf '%s\n' "$default_config" | grep -Fq 'dockerfile: Dockerfile.gateway'
@@ -19,13 +20,20 @@ printf '%s\n' "$remote_config" | grep -Fq 'CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_ST
 printf '%s\n' "$remote_config" | grep -Fq 'CODEX_APP_SERVER_WS_TOKEN: codex-local-worker-token'
 printf '%s\n' "$remote_config" | grep -Fq 'network_mode: service:gateway'
 printf '%s\n' "$remote_config" | grep -Fq 'condition: service_started'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'gateway-multi-worker:'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'app-server-a:'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'app-server-b:'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'ws://127.0.0.1:19001/v2'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'ws://127.0.0.1:19002/v2'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'condition: service_healthy'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'published: "8081"'
 
 grep -Fq '!Dockerfile.app-server' "$dockerignore"
 grep -Fq '!scripts/' "$dockerignore"
 grep -Fq '!scripts/**' "$dockerignore"
 
 if [ "${CODEX_GATEWAY_DOCKER_COMPOSE_BUILD:-0}" = "1" ]; then
-  docker compose -f "$compose_file" build gateway app-server
+  docker compose -f "$compose_file" build gateway app-server gateway-multi-worker app-server-a app-server-b
 fi
 
 if [ "${CODEX_GATEWAY_DOCKER_COMPOSE_RUN:-0}" != "1" ]; then
@@ -47,11 +55,13 @@ smoke_port="${CODEX_GATEWAY_SMOKE_PORT:-18080}"
 health_url="http://127.0.0.1:${smoke_port}/healthz"
 
 compose() {
-  CODEX_GATEWAY_PORT="$smoke_port" docker compose -p "$project_name" -f "$compose_file" "$@"
+  CODEX_GATEWAY_PORT="$smoke_port" \
+  CODEX_GATEWAY_MULTI_WORKER_PORT="${CODEX_GATEWAY_MULTI_WORKER_PORT:-}" \
+    docker compose -p "$project_name" -f "$compose_file" "$@"
 }
 
 cleanup() {
-  compose --profile remote down -v --remove-orphans >/dev/null 2>&1 || true
+  compose --profile remote --profile remote-multi-worker down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -103,3 +113,11 @@ CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS=/codex-home/acct-a,/codex-ho
 wait_for_healthz \
   '.runtimeMode == "remote" and .v2Compatibility == "remoteSingleWorker" and (.remoteWorkers | length) == 1 and .remoteWorkers[0].websocketUrl == "ws://127.0.0.1:9001/v2" and .remoteWorkers[0].accountId == "acct-a" and .remoteWorkers[0].healthy == true and .v2Transport.reconnectRetryBackoffSeconds != null and .workerPool.accountCount == 2 and .workerPool.leasedAccountCount == 1 and .workerPool.availableAccountCount == 1 and .workerPool.accountLoginStatePathCount == 2 and .workerPool.workerAccountLoginStatePathCount == 1 and .workerPool.poolAccountLoginStatePathCount == 1 and .workerPool.workerSlots[0].accountLoginStatePath == "/codex-home/acct-a" and (.workerPool.accounts[] | select(.accountId == "acct-b" and .leaseState == "available" and .accountLoginStatePath == "/codex-home/acct-b"))' \
   "remote gateway health"
+compose --profile remote down -v --remove-orphans
+
+CODEX_GATEWAY_MULTI_WORKER_PORT="$smoke_port" \
+  compose --profile remote-multi-worker up -d --no-build \
+    gateway-multi-worker app-server-a app-server-b
+wait_for_healthz \
+  '.runtimeMode == "remote" and .v2Compatibility == "remoteMultiWorker" and (.remoteWorkers | length) == 2 and all(.remoteWorkers[]; .healthy == true) and .remoteAccountLabelsComplete == true and .workerPool.accountCount == 2 and .workerPool.leasedAccountCount == 2 and .workerPool.healthyWorkerSlotCount == 2 and (.remoteWorkers[] | select(.workerId == 0 and .websocketUrl == "ws://127.0.0.1:19001/v2" and .accountId == "acct-a")) and (.remoteWorkers[] | select(.workerId == 1 and .websocketUrl == "ws://127.0.0.1:19002/v2" and .accountId == "acct-b"))' \
+  "remote multi-worker gateway health"

@@ -44,3 +44,88 @@ services:
     environment:
       CODEX_APP_SERVER_WS_TOKEN: ${CODEX_GATEWAY_REMOTE_AUTH_TOKEN:-codex-local-worker-token}
       CODEX_APP_SERVER_LISTEN: ${CODEX_APP_SERVER_LISTEN:-ws://0.0.0.0:9001}
+  gateway-multi-worker:
+    profiles:
+      - remote-multi-worker
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: codex-gateway:local
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |
+        set -eu
+
+        wait_for_readyz() {
+          readyz_url=$$1
+          attempt=0
+          while :; do
+            if wget -qO- "$$readyz_url" >/dev/null 2>&1; then
+              return 0
+            fi
+            attempt=$$((attempt + 1))
+            if [ "$$attempt" -ge 30 ]; then
+              echo "timed out waiting for app-server at $$readyz_url" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+        }
+
+        wait_for_readyz http://app-server-a:9001/readyz
+        wait_for_readyz http://app-server-b:9001/readyz
+
+        nc -lk -p 19001 -s 127.0.0.1 -e nc app-server-a 9001 &
+        nc -lk -p 19002 -s 127.0.0.1 -e nc app-server-b 9001 &
+
+        exec /usr/local/bin/codex-gateway \
+          --listen "$${CODEX_GATEWAY_LISTEN:-0.0.0.0:8080}" \
+          --runtime remote \
+          --remote-auth-token "$${CODEX_GATEWAY_REMOTE_AUTH_TOKEN:-codex-local-worker-token}" \
+          --remote-websocket-url ws://127.0.0.1:19001/v2 \
+          --remote-websocket-url ws://127.0.0.1:19002/v2 \
+          --remote-account-id "$${CODEX_GATEWAY_REMOTE_ACCOUNT_A_ID:-acct-a}" \
+          --remote-account-id "$${CODEX_GATEWAY_REMOTE_ACCOUNT_B_ID:-acct-b}" \
+          --remote-account-login-state-path "$${CODEX_GATEWAY_REMOTE_ACCOUNT_A_LOGIN_STATE_PATH:-/codex-home/acct-a}" \
+          --remote-account-login-state-path "$${CODEX_GATEWAY_REMOTE_ACCOUNT_B_LOGIN_STATE_PATH:-/codex-home/acct-b}" \
+          --remote-account-pool-account-id "$${CODEX_GATEWAY_REMOTE_ACCOUNT_A_ID:-acct-a}" \
+          --remote-account-pool-account-id "$${CODEX_GATEWAY_REMOTE_ACCOUNT_B_ID:-acct-b}" \
+          --remote-account-pool-login-state-path "$${CODEX_GATEWAY_REMOTE_ACCOUNT_A_LOGIN_STATE_PATH:-/codex-home/acct-a}" \
+          --remote-account-pool-login-state-path "$${CODEX_GATEWAY_REMOTE_ACCOUNT_B_LOGIN_STATE_PATH:-/codex-home/acct-b}"
+    ports:
+      - "${CODEX_GATEWAY_MULTI_WORKER_PORT:-8081}:8080"
+    depends_on:
+      app-server-a:
+        condition: service_healthy
+      app-server-b:
+        condition: service_healthy
+    environment:
+      CODEX_GATEWAY_LISTEN: 0.0.0.0:8080
+      CODEX_GATEWAY_REMOTE_AUTH_TOKEN: ${CODEX_GATEWAY_REMOTE_AUTH_TOKEN:-codex-local-worker-token}
+      CODEX_GATEWAY_REMOTE_ACCOUNT_A_ID: ${CODEX_GATEWAY_REMOTE_ACCOUNT_A_ID:-acct-a}
+      CODEX_GATEWAY_REMOTE_ACCOUNT_B_ID: ${CODEX_GATEWAY_REMOTE_ACCOUNT_B_ID:-acct-b}
+      CODEX_GATEWAY_REMOTE_ACCOUNT_A_LOGIN_STATE_PATH: ${CODEX_GATEWAY_REMOTE_ACCOUNT_A_LOGIN_STATE_PATH:-/codex-home/acct-a}
+      CODEX_GATEWAY_REMOTE_ACCOUNT_B_LOGIN_STATE_PATH: ${CODEX_GATEWAY_REMOTE_ACCOUNT_B_LOGIN_STATE_PATH:-/codex-home/acct-b}
+  app-server-a:
+    profiles:
+      - remote-multi-worker
+    build:
+      context: .
+      dockerfile: Dockerfile.app-server
+    image: codex-app-server:local
+    restart: unless-stopped
+    environment:
+      CODEX_APP_SERVER_WS_TOKEN: ${CODEX_GATEWAY_REMOTE_AUTH_TOKEN:-codex-local-worker-token}
+      CODEX_APP_SERVER_LISTEN: ws://0.0.0.0:9001
+  app-server-b:
+    profiles:
+      - remote-multi-worker
+    build:
+      context: .
+      dockerfile: Dockerfile.app-server
+    image: codex-app-server:local
+    restart: unless-stopped
+    environment:
+      CODEX_APP_SERVER_WS_TOKEN: ${CODEX_GATEWAY_REMOTE_AUTH_TOKEN:-codex-local-worker-token}
+      CODEX_APP_SERVER_LISTEN: ws://0.0.0.0:9001
