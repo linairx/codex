@@ -1,9 +1,18 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:06:08Z
+verified command: cd codex-rs && just test -p codex-gateway remote_multi_worker_healthz_reports_slow_client_timeout_outcome
+nextest run id: e2dafa9e-45a6-4b32-a8f1-d93bbdb64b4a
+result: 1 test run, 1 passed, 761 skipped
+
+remote_multi_worker_healthz_reports_slow_client_timeout_outcome verified bounded slow-client/backlog behavior:
+- gateway ran in remote multi-worker mode with v2_client_send_timeout=1ms.
+- worker 1 forwarded account/chatgptAuthTokens/refresh as a server request before the slow-client timeout.
+- active health reported activeConnectionServerRequestBacklogCount=1, max=1, peak=1, and worker 1 backlog count=1.
+- settled health reported lastConnectionOutcome=client_send_timed_out, clientSendTimeoutCount=1, lastConnectionDetail="gateway websocket send timed out", and totalConnectionCount=1.
+- settled health preserved the last connection pending server request and backlog counts, including method account/chatgptAuthTokens/refresh and workerId=1.
+- notification send failure accounting recorded method=warning with outcome=client_send_timed_out.

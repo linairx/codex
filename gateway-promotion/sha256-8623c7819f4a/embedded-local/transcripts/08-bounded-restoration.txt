@@ -1,9 +1,22 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:02:27Z
+verified command: cd codex-rs && just test -p codex-gateway remote_multi_worker_restores_thread_read_after_account_exhaustion_over_v2 thread_id_resume_records_handoff_failure_when_no_replacement_restores_context
+nextest run id: 1e75134a-79a0-4b9f-9264-a8c84d5e3b82
+result: 2 tests run, 2 passed, 760 skipped
+
+remote_multi_worker_restores_thread_read_after_account_exhaustion_over_v2 verified successful bounded restoration:
+- account/rateLimits/read marked worker 1/account acct-b exhausted after worker-b reported RateLimitReached.
+- thread/read for thread 00000000-0000-0000-0000-0000000000b2 restored through replacement worker 0/account acct-a.
+- the restored response kept the same thread id and returned cwd /tmp/worker-a-read.
+- gateway/accountThreadHandoffSucceeded included tenant=default, projectId=null, method=thread/read, exhaustedWorkerId=1, exhaustedAccountId=acct-b, replacementWorkerId=0, and replacementAccountId=acct-a.
+
+thread_id_resume_records_handoff_failure_when_no_replacement_restores_context verified bounded fail-closed behavior:
+- worker 1/account acct-b was exhausted for thread-worker-b.
+- replacement worker 0/account acct-a returned thread not found for thread/resume.
+- the gateway left thread-worker-b pinned to worker 1 and failed closed with "no replacement worker restored the context".
+- metrics and operator events recorded thread_resume_handoff_failure with tenant-a/project-a, exhaustedWorkerId=1, and exhaustedAccountId=acct-b.

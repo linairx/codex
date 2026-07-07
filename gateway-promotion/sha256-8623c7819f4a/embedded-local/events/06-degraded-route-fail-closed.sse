@@ -1,10 +1,11 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-event: gateway/promotionEvidenceGap
-data: {"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
-
+worker id: 1
+account id: acct-a
+capture time: 2026-07-07T05:50:40Z
+operator event stream: no gateway operator event is emitted for degraded-route fail-closed diagnostics.
+evidence location: healthz/06-degraded-route-fail-closed.json mirrors failClosedRequestCounts and degradedThreadDiscoveryCounts.
+evidence location: metrics/06-degraded-route-fail-closed.json records gateway_v2_fail_closed_requests and gateway_v2_degraded_thread_discovery.
+evidence location: logs/06-degraded-route-fail-closed.log records available, unavailable, and reconnect-backoff worker route details.

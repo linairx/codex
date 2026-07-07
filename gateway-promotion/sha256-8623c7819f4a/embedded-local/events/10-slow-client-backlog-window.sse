@@ -1,10 +1,11 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-event: gateway/promotionEvidenceGap
-data: {"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
-
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:06:08Z
+operator event stream: no gateway operator event is emitted for slow-client backlog, timeout, or notification-send-failure diagnostics.
+evidence location: healthz/10-slow-client-backlog-window.json mirrors active and last-completed server-request backlog plus notificationSendFailureCounts.
+evidence location: metrics/10-slow-client-backlog-window.json records gateway_v2_connection_server_request_backlog, gateway_v2_client_send_timeouts, and gateway_v2_notification_send_failures.
+evidence location: logs/10-slow-client-backlog-window.log records the backlog, timeout, and notification send failure details.

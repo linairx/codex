@@ -6,7 +6,7 @@
 - Tenant/project scope: tenant=default, projects=project-a
 - Captured by: codex
 - Capture start: 2026-07-07T04:21:37Z
-- Capture end: 2026-07-07T05:48:48Z
+- Capture end: 2026-07-07T15:36:07Z
 - Decision file: decision.md
 
 ## Topology

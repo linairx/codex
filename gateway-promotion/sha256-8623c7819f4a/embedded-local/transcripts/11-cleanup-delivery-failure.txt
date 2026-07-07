@@ -1,9 +1,19 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T15:36:07Z
+verified command: cd codex-rs && just test -p codex-gateway deliver_client_server_request_answer_records_delivery_failure_lifecycle reject_pending_server_requests_records_failed_cleanup_delivery worker_cleanup_records_failed_synthesized_resolved_delivery
+nextest run id: 86570511-3e23-4ae5-93f8-f27a590da826
+result: 3 tests run, 3 passed, 759 skipped
+verified command: cd codex-rs && just test -p codex-gateway worker_server_request_cleanup_publishes_operator_event worker_server_request_cleanup_report_logs_and_publishes_operator_event
+nextest run id: d24c87ec-a24b-4021-8d12-a83f67eaa7c7
+result: 2 tests run, 2 passed, 760 skipped
+
+cleanup and delivery-failure observability verified:
+- answered client server-request delivery to a missing downstream worker fails closed and records client_server_request_answered plus client_server_request_delivery_failed lifecycle events.
+- failed cleanup rejection delivery records client_cleanup_rejected_thread_scoped, client_cleanup_rejected_connection_scoped, client_cleanup_rejection_failed, and client_cleanup_rejection_skipped_unavailable_worker lifecycle events.
+- worker-loss cleanup publishes gateway/v2ServerRequestCleanup on the operator event stream with resolved and stranded server-request ids, methods, thread ids, remaining worker count, and worker route.
+- worker-loss cleanup records failed synthesized serverRequest/resolved delivery with outcome=client_send_timed_out, affected thread id, gateway request id, worker id, and worker websocket url.

@@ -1,9 +1,22 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:04:15Z
+verified command: cd codex-rs && just test -p codex-gateway remote_multi_worker_fails_closed_when_turn_steer_has_no_account_replacement_over_v2 remote_multi_worker_fails_closed_when_turn_interrupt_has_no_account_replacement_over_v2
+nextest run id: bf122017-6008-4572-adf1-386d80f2a22e
+result: 2 tests run, 2 passed, 760 skipped
+
+remote_multi_worker_fails_closed_when_turn_steer_has_no_account_replacement_over_v2 verified live active-context no-handoff for turn/steer:
+- a live turn was started on worker 1/account acct-b before account exhaustion.
+- account/rateLimits/read then marked worker 1/account acct-b exhausted.
+- turn/steer against the active turn failed closed instead of moving the live context to worker 0/account acct-a.
+- gateway/accountActiveThreadHandoffFailed included method=turn/steer, exhaustedWorkerId=1, exhaustedAccountId=acct-b, and the pinned thread id.
+
+remote_multi_worker_fails_closed_when_turn_interrupt_has_no_account_replacement_over_v2 verified live active-context no-handoff for turn/interrupt:
+- a live turn was started on worker 1/account acct-b before account exhaustion.
+- account/rateLimits/read then marked worker 1/account acct-b exhausted.
+- turn/interrupt against the active turn failed closed instead of moving the live context to worker 0/account acct-a.
+- gateway/accountActiveThreadHandoffFailed included method=turn/interrupt, exhaustedWorkerId=1, exhaustedAccountId=acct-b, and the pinned thread id.

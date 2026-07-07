@@ -1,10 +1,12 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-event: gateway/promotionEvidenceGap
-data: {"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:04:15Z
+event: gateway/accountActiveThreadHandoffFailed
+data: {"tenantId":"default","projectId":null,"method":"turn/steer","threadId":"00000000-0000-0000-0000-0000000000b2","exhaustedWorkerId":1,"exhaustedAccountId":"acct-b","reason":"thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for turn/steer"}
 
+event: gateway/accountActiveThreadHandoffFailed
+data: {"tenantId":"default","projectId":null,"method":"turn/interrupt","threadId":"00000000-0000-0000-0000-0000000000b2","exhaustedWorkerId":1,"exhaustedAccountId":"acct-b","reason":"thread 00000000-0000-0000-0000-0000000000b2 is pinned to worker 1 with exhausted account capacity for turn/interrupt"}

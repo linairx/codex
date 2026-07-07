@@ -1,8 +1,11 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-{"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:06:08Z
+gateway_v2_connection_server_request_backlog{worker_id="1",method="account/chatgptAuthTokens/refresh",outcome="client_send_timed_out"} 1
+gateway_v2_connection_max_server_request_backlog{worker_id="1",method="account/chatgptAuthTokens/refresh",outcome="client_send_timed_out"} 1
+gateway_v2_client_send_timeouts{outcome="client_send_timed_out"} 1
+gateway_v2_notification_send_failures{method="warning",outcome="client_send_timed_out"} 1

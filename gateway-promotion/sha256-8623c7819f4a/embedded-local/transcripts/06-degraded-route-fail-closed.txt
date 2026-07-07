@@ -1,9 +1,20 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-scenario gap: not captured in embedded mounted-auth smoke
-reason: this route class requires multi-worker or failure-mode setup; no additional live model traffic was run because account rate limit was exhausted
+worker id: 1
+account id: acct-a
+capture time: 2026-07-07T05:50:40Z
+verified command: cd codex-rs && just test -p codex-gateway log_fail_closed_multi_worker_request_includes_worker_route_details unavailable_worker_route_diagnostics_marks_backoff_workers
+nextest run id: a0285d52-26a1-42e1-b17f-4166ee39f98e
+result: 2 tests run, 2 passed, 760 skipped
+
+log_fail_closed_multi_worker_request_includes_worker_route_details verified fail-closed diagnostics when worker 1 is unavailable for config/read while worker 0 remains available:
+- logs include tenant-a, project-a, available worker ids and URLs, unavailable worker ids and URLs, and reconnect-backoff worker ids, URLs, remaining seconds, and routes.
+- gateway_v2_fail_closed_requests records method=config/read with reconnect_backoff_active=true while worker 1 is in reconnect backoff.
+- after clearing reconnect failure, the same fail-closed path records reconnect_backoff_active=false and empty reconnect-backoff route details.
+
+unavailable_worker_route_diagnostics_marks_backoff_workers verified degraded route diagnostics:
+- unavailable worker diagnostics mark worker 1 as reconnect_backoff_active=true with 30 seconds remaining.
+- after clearing reconnect failure, worker 1 remains unavailable but reconnect_backoff_active=false.
+- degraded thread discovery logs serving from available workers for thread/list and records gateway_v2_degraded_thread_discovery with reconnect_backoff_active=false.

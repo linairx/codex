@@ -1,8 +1,8 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-{"status":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T06:02:27Z
+{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteMultiWorker","v2Connections":{"accountCapacityEventCounts":{"thread_read_handoff_success":1,"thread_resume_handoff_failure":1},"accountCapacityEventWorkerCounts":[{"workerId":0,"eventCounts":{"thread_read_handoff_success":1}},{"workerId":1,"eventCounts":{"thread_resume_handoff_failure":1}}],"lastAccountCapacityEvent":"thread_resume_handoff_failure","lastAccountCapacityEventWorkerId":1,"lastAccountCapacityEventTenantId":"tenant-a","lastAccountCapacityEventProjectId":"project-a","lastAccountCapacityEventReason":"thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/resume, and no replacement worker restored the context","lastAccountCapacityEventAt":1710000400},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://127.0.0.1:restore-worker-a/v2","accountId":"acct-a","accountCapacity":"available","healthy":true,"reconnecting":false},{"workerId":1,"websocketUrl":"ws://127.0.0.1:restore-worker-b/v2","accountId":"acct-b","accountCapacity":"exhausted","accountCapacityReason":"account/rateLimits reported worker-b RateLimitReached","healthy":true,"reconnecting":false}],"remoteAccountLabelsComplete":true,"remoteUnlabeledAccountWorkerCount":0,"remoteUnlabeledAccountWorkerIds":[],"remoteUnlabeledAccountWorkers":[],"projectWorkerRoutes":[]}

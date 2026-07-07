@@ -1,8 +1,8 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-{"status":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-a
+capture time: 2026-07-07T05:50:40Z
+{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteMultiWorker","v2Connections":{"failClosedRequestCounts":[{"method":"config/read","reconnectBackoffActive":true,"count":1},{"method":"config/read","reconnectBackoffActive":false,"count":1}],"lastFailClosedRequestMethod":"config/read","lastFailClosedRequestReconnectBackoffActive":false,"lastFailClosedRequestAt":1710000200,"degradedThreadDiscoveryCounts":[{"method":"thread/list","reconnectBackoffActive":false,"count":1}],"lastDegradedThreadDiscoveryMethod":"thread/list","lastDegradedThreadDiscoveryReconnectBackoffActive":false,"lastDegradedThreadDiscoveryAt":1710000200},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://worker-a.invalid","accountId":null,"accountCapacity":"available","healthy":true,"reconnecting":false},{"workerId":1,"websocketUrl":"ws://worker-b.invalid","accountId":null,"accountCapacity":"available","healthy":false,"reconnecting":true,"reconnectBackoffRemainingSeconds":30}],"remoteAccountLabelsComplete":true,"remoteUnlabeledAccountWorkerCount":0,"remoteUnlabeledAccountWorkerIds":[],"remoteUnlabeledAccountWorkers":[],"projectWorkerRoutes":[]}

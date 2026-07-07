@@ -1,8 +1,8 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
-worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-{"status":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+worker id: 1
+account id: acct-b
+capture time: 2026-07-07T15:36:07Z
+{"status":"degraded","runtimeMode":"remote","executionMode":"workerManaged","v2Compatibility":"remoteMultiWorker","v2Connections":{"serverRequestAnswerDeliveryFailureCounts":[{"responseKind":"response","count":1}],"lastServerRequestAnswerDeliveryFailureResponseKind":"response","lastServerRequestAnswerDeliveryFailureAt":1710001145,"serverRequestRejectionDeliveryFailureCounts":[{"method":"item/tool/requestUserInput","count":2}],"lastServerRequestRejectionDeliveryFailureMethod":"item/tool/requestUserInput","lastServerRequestRejectionDeliveryFailureAt":1710001145,"serverRequestLifecycleEventCounts":[{"event":"client_server_request_answered","method":"response","count":1},{"event":"client_server_request_delivery_failed","method":"response","count":1},{"event":"client_cleanup_rejected_thread_scoped","method":"item/tool/requestUserInput","count":1},{"event":"client_cleanup_rejected_connection_scoped","method":"item/tool/requestUserInput","count":1},{"event":"client_cleanup_rejection_failed","method":"item/tool/requestUserInput","count":1},{"event":"client_cleanup_rejection_skipped_unavailable_worker","method":"item/tool/requestUserInput","count":1},{"event":"worker_cleanup_resolution_send_failed","method":"item/tool/requestUserInput","count":1}],"lastServerRequestLifecycleEvent":"worker_cleanup_resolution_send_failed","lastServerRequestLifecycleMethod":"item/tool/requestUserInput","lastServerRequestLifecycleAt":1710001145},"remoteWorkers":[{"workerId":0,"websocketUrl":"ws://worker-a.invalid","accountId":"acct-a","accountCapacity":"available","healthy":true,"reconnecting":false},{"workerId":1,"websocketUrl":"ws://worker-b.invalid","accountId":"acct-b","accountCapacity":"available","healthy":true,"reconnecting":false}],"remoteAccountLabelsComplete":true,"remoteUnlabeledAccountWorkerCount":0,"remoteUnlabeledAccountWorkerIds":[],"remoteUnlabeledAccountWorkers":[]}

@@ -1,10 +1,21 @@
 gateway build: sha256-8623c7819f4a
-worker build: embedded-in-process
+worker build: codex-gateway remote mock workers
 tenant id: default
 project id: project-a
 worker id: 0
-account id: local-account
-capture time: 2026-07-07T04:41:39Z
-event: gateway/promotionEvidenceGap
-data: {"result":"not_captured","reason":"embedded mounted-auth smoke did not exercise this multi-worker route class"}
+account id: acct-a
+capture time: 2026-07-07T05:56:12Z
+event: gateway/accountCapacityExhausted
+data: {"tenantId":"default","projectId":"project-a","workerId":0,"accountId":"acct-a","reason":"rate limit reached"}
 
+event: gateway/accountLeaseChanged
+data: {"tenantId":"default","projectId":"project-a","workerId":0,"accountId":"acct-a","leaseState":"cooldown","reason":"rate limit reached"}
+
+event: gateway/accountFailoverSucceeded
+data: {"tenantId":"default","projectId":"project-a","replacementWorkerId":1,"replacementAccountId":"acct-b","exhaustedWorkerIds":[0]}
+
+event: gateway/accountActiveThreadHandoffFailed
+data: {"tenantId":"tenant-a","projectId":"project-a","method":"turn/start","threadId":"thread-worker-b","exhaustedWorkerId":1,"exhaustedAccountId":"acct-b","reason":"thread thread-worker-b is pinned to worker 1 with exhausted account capacity for turn/start"}
+
+event: gateway/accountThreadHandoffFailed
+data: {"tenantId":"tenant-a","projectId":"project-a","method":"thread/unsubscribe","threadId":"thread-worker-b","exhaustedWorkerId":1,"exhaustedAccountId":"acct-b","reason":"thread thread-worker-b is pinned to worker 1 with exhausted account capacity for thread/unsubscribe, and no replacement worker restored the context"}
