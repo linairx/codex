@@ -121,8 +121,10 @@ async fn remote_multi_worker_supports_primary_worker_onboarding_and_feedback_flo
         client.request_typed(ClientRequest::LoginAccount {
             request_id: RequestId::Integer(3),
             params: LoginAccountParams::Chatgpt {
+                app_brand: None,
                 codex_streamlined_login: false,
                 callback_port: None,
+                use_hosted_login_success_page: false,
             },
         }),
     )

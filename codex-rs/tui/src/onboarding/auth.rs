@@ -874,8 +874,10 @@ impl AuthModeWidget {
                 .request_typed::<LoginAccountResponse>(ClientRequest::LoginAccount {
                     request_id: onboarding_request_id(),
                     params: LoginAccountParams::Chatgpt {
-                        codex_streamlined_login: false,
+                        app_brand: None,
                         callback_port: None,
+                        codex_streamlined_login: false,
+                        use_hosted_login_success_page: false,
                     },
                 })
                 .await
@@ -951,6 +953,7 @@ impl AuthModeWidget {
                     ApiAuthMode::ApiKey => AuthMode::ApiKey,
                     ApiAuthMode::Chatgpt => AuthMode::Chatgpt,
                     ApiAuthMode::ChatgptAuthTokens => AuthMode::ChatgptAuthTokens,
+                    ApiAuthMode::Headers => AuthMode::Headers,
                     ApiAuthMode::AgentIdentity => AuthMode::AgentIdentity,
                     ApiAuthMode::PersonalAccessToken => AuthMode::PersonalAccessToken,
                     ApiAuthMode::BedrockApiKey => AuthMode::BedrockApiKey,

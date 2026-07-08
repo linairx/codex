@@ -37,8 +37,10 @@ pub(super) async fn assert_bootstrap_setup_account_and_command(client: &mut Remo
         .request_typed(ClientRequest::LoginAccount {
             request_id: RequestId::Integer(24),
             params: LoginAccountParams::Chatgpt {
+                app_brand: None,
                 codex_streamlined_login: false,
                 callback_port: None,
+                use_hosted_login_success_page: false,
             },
         })
         .await

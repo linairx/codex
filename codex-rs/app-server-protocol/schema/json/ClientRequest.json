@@ -1463,6 +1463,17 @@
         },
         {
           "properties": {
+            "appBrand": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/LoginAppBrand"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "callbackPort": {
               "format": "uint16",
               "minimum": 0.0,
@@ -1480,6 +1491,9 @@
               ],
               "title": "ChatgptLoginAccountParamsType",
               "type": "string"
+            },
+            "useHostedLoginSuccessPage": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -1539,6 +1553,13 @@
           "type": "object"
         }
       ]
+    },
+    "LoginAppBrand": {
+      "enum": [
+        "codex",
+        "chatgpt"
+      ],
+      "type": "string"
     },
     "MarketplaceAddParams": {
       "properties": {

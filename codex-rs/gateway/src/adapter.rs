@@ -35,8 +35,10 @@ pub fn account_login_chatgpt_request(
     ClientRequest::LoginAccount {
         request_id,
         params: LoginAccountParams::Chatgpt {
+            app_brand: None,
             codex_streamlined_login: false,
             callback_port,
+            use_hosted_login_success_page: false,
         },
     }
 }
