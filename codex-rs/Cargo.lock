@@ -3143,6 +3143,7 @@ dependencies = [
  "codex-utils-cli",
  "core_test_support",
  "futures",
+ "opentelemetry",
  "opentelemetry_sdk",
  "pretty_assertions",
  "reqwest 0.12.28",

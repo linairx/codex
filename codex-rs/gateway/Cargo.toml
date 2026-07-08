@@ -27,6 +27,8 @@ codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-cli = { workspace = true }
 futures = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
@@ -40,7 +42,6 @@ app_test_support = { workspace = true }
 codex-config = { workspace = true }
 core_test_support = { workspace = true }
 futures = { workspace = true }
-opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rmcp = { workspace = true, default-features = false, features = [

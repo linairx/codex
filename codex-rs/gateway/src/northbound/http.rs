@@ -34,6 +34,7 @@ use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::middleware;
+use axum::response::IntoResponse;
 use axum::response::Redirect;
 use axum::response::Sse;
 use axum::response::sse::Event;
@@ -51,13 +52,15 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 #[derive(Clone)]
 pub struct GatewayHttpState {
     runtime: Arc<dyn GatewayRuntime>,
+    observability: GatewayObservability,
     openai_callback_port: Arc<RwLock<Option<u16>>>,
 }
 
 impl GatewayHttpState {
-    pub fn new(runtime: Arc<dyn GatewayRuntime>) -> Self {
+    pub fn new(runtime: Arc<dyn GatewayRuntime>, observability: GatewayObservability) -> Self {
         Self {
             runtime,
+            observability,
             openai_callback_port: Arc::new(RwLock::new(None)),
         }
     }
@@ -106,7 +109,7 @@ pub fn router_with_observability(
     v2_session_factory: Option<Arc<GatewayV2SessionFactory>>,
     v2_timeouts: GatewayV2Timeouts,
 ) -> Router {
-    let state = GatewayHttpState::new(runtime);
+    let state = GatewayHttpState::new(runtime, observability.clone());
     let auth_routes = Router::new()
         .route("/openai/account", get(read_openai_account))
         .route("/openai/account", post(create_openai_account))
@@ -160,6 +163,7 @@ pub fn router_with_observability(
             ),
         )
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .nest("/auth", auth_routes)
         .nest("/v1", v1)
         .route("/v1", any(|| async { axum::http::StatusCode::NOT_FOUND }))
@@ -172,6 +176,19 @@ pub fn router_with_observability(
 
 async fn healthz(State(state): State<GatewayHttpState>) -> Json<GatewayHealthResponse> {
     Json(state.runtime.health())
+}
+
+async fn metrics(State(state): State<GatewayHttpState>) -> axum::response::Response {
+    match state.observability.metrics_snapshot() {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("gateway metrics snapshot unavailable: {err}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn read_openai_account(

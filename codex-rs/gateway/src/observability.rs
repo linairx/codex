@@ -12,6 +12,11 @@ use axum::middleware::Next;
 use axum::response::Response;
 use codex_otel::MetricsClient;
 use codex_otel::OtelProvider;
+use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+use opentelemetry_sdk::metrics::data::MetricData;
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -107,6 +112,75 @@ pub struct GatewayObservability {
     operator_events: Option<broadcast::Sender<GatewayEvent>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayMetricsSnapshot {
+    pub metrics: Vec<GatewayMetricSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayMetricSnapshot {
+    pub name: String,
+    pub description: String,
+    pub unit: String,
+    pub data: GatewayMetricDataSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GatewayMetricDataSnapshot {
+    Gauge {
+        points: Vec<GatewayMetricPointSnapshot>,
+    },
+    Sum {
+        monotonic: bool,
+        points: Vec<GatewayMetricPointSnapshot>,
+    },
+    Histogram {
+        points: Vec<GatewayHistogramPointSnapshot>,
+    },
+    ExponentialHistogram {
+        points: Vec<GatewayExponentialHistogramPointSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayMetricPointSnapshot {
+    pub attributes: BTreeMap<String, String>,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistogramPointSnapshot {
+    pub attributes: BTreeMap<String, String>,
+    pub count: u64,
+    pub sum: f64,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub bounds: Vec<f64>,
+    pub bucket_counts: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayExponentialHistogramPointSnapshot {
+    pub attributes: BTreeMap<String, String>,
+    pub count: usize,
+    pub sum: f64,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub scale: i8,
+    pub zero_count: u64,
+    pub zero_threshold: f64,
+    pub positive_bucket_offset: i32,
+    pub positive_bucket_counts: Vec<u64>,
+    pub negative_bucket_offset: i32,
+    pub negative_bucket_counts: Vec<u64>,
+}
+
 impl GatewayObservability {
     pub fn new(metrics: Option<MetricsClient>, audit_logs_enabled: bool) -> Self {
         Self {
@@ -139,6 +213,13 @@ impl GatewayObservability {
 impl GatewayObservability {
     pub fn v2_connection_health(&self) -> Arc<GatewayV2ConnectionHealthRegistry> {
         Arc::clone(&self.v2_connection_health)
+    }
+
+    pub fn metrics_snapshot(&self) -> Result<GatewayMetricsSnapshot, codex_otel::MetricsError> {
+        let Some(metrics) = &self.metrics else {
+            return Err(codex_otel::MetricsError::ExporterDisabled);
+        };
+        Ok(metrics_snapshot_from_resource(metrics.snapshot()?))
     }
 
     fn emit_audit_log(
@@ -367,6 +448,126 @@ impl GatewayObservability {
             _ => unreachable!("v2 connection log level should stay within info/warn"),
         }
     }
+}
+
+fn metrics_snapshot_from_resource(resource_metrics: ResourceMetrics) -> GatewayMetricsSnapshot {
+    let mut metrics = Vec::new();
+    for scope_metrics in resource_metrics.scope_metrics() {
+        for metric in scope_metrics.metrics() {
+            metrics.push(GatewayMetricSnapshot {
+                name: metric.name().to_string(),
+                description: metric.description().to_string(),
+                unit: metric.unit().to_string(),
+                data: metric_data_snapshot(metric.data()),
+            });
+        }
+    }
+    GatewayMetricsSnapshot { metrics }
+}
+
+fn metric_data_snapshot(data: &AggregatedMetrics) -> GatewayMetricDataSnapshot {
+    match data {
+        AggregatedMetrics::F64(data) => metric_data_snapshot_for(data),
+        AggregatedMetrics::U64(data) => metric_data_snapshot_for(data),
+        AggregatedMetrics::I64(data) => metric_data_snapshot_for(data),
+    }
+}
+
+fn metric_data_snapshot_for<T>(data: &MetricData<T>) -> GatewayMetricDataSnapshot
+where
+    T: MetricSnapshotValue,
+{
+    match data {
+        MetricData::Gauge(gauge) => GatewayMetricDataSnapshot::Gauge {
+            points: gauge
+                .data_points()
+                .map(|point| GatewayMetricPointSnapshot {
+                    attributes: metric_attributes(point.attributes()),
+                    value: point.value().as_f64(),
+                })
+                .collect(),
+        },
+        MetricData::Sum(sum) => GatewayMetricDataSnapshot::Sum {
+            monotonic: sum.is_monotonic(),
+            points: sum
+                .data_points()
+                .map(|point| GatewayMetricPointSnapshot {
+                    attributes: metric_attributes(point.attributes()),
+                    value: point.value().as_f64(),
+                })
+                .collect(),
+        },
+        MetricData::Histogram(histogram) => GatewayMetricDataSnapshot::Histogram {
+            points: histogram
+                .data_points()
+                .map(|point| GatewayHistogramPointSnapshot {
+                    attributes: metric_attributes(point.attributes()),
+                    count: point.count(),
+                    sum: point.sum().as_f64(),
+                    min: point.min().map(MetricSnapshotValue::as_f64),
+                    max: point.max().map(MetricSnapshotValue::as_f64),
+                    bounds: point.bounds().collect(),
+                    bucket_counts: point.bucket_counts().collect(),
+                })
+                .collect(),
+        },
+        MetricData::ExponentialHistogram(histogram) => {
+            GatewayMetricDataSnapshot::ExponentialHistogram {
+                points: histogram
+                    .data_points()
+                    .map(|point| GatewayExponentialHistogramPointSnapshot {
+                        attributes: metric_attributes(point.attributes()),
+                        count: point.count(),
+                        sum: point.sum().as_f64(),
+                        min: point.min().map(MetricSnapshotValue::as_f64),
+                        max: point.max().map(MetricSnapshotValue::as_f64),
+                        scale: point.scale(),
+                        zero_count: point.zero_count(),
+                        zero_threshold: point.zero_threshold(),
+                        positive_bucket_offset: point.positive_bucket().offset(),
+                        positive_bucket_counts: point.positive_bucket().counts().collect(),
+                        negative_bucket_offset: point.negative_bucket().offset(),
+                        negative_bucket_counts: point.negative_bucket().counts().collect(),
+                    })
+                    .collect(),
+            }
+        }
+    }
+}
+
+trait MetricSnapshotValue: Copy {
+    fn as_f64(self) -> f64;
+}
+
+impl MetricSnapshotValue for f64 {
+    fn as_f64(self) -> f64 {
+        self
+    }
+}
+
+impl MetricSnapshotValue for u64 {
+    fn as_f64(self) -> f64 {
+        self as f64
+    }
+}
+
+impl MetricSnapshotValue for i64 {
+    fn as_f64(self) -> f64 {
+        self as f64
+    }
+}
+
+fn metric_attributes<'a>(
+    attributes: impl Iterator<Item = &'a opentelemetry::KeyValue>,
+) -> BTreeMap<String, String> {
+    attributes
+        .map(|attribute| {
+            (
+                attribute.key.as_str().to_string(),
+                attribute.value.as_str().to_string(),
+            )
+        })
+        .collect()
 }
 
 pub async fn observe_http_request(
