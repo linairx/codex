@@ -61,44 +61,7 @@ async fn embedded_server_supports_external_auth_onboarding_flows_over_v2() {
         .expect("account/login/start should succeed through embedded gateway");
     assert_eq!(login, LoginAccountResponse::ChatgptAuthTokens {});
 
-    let login_completed = timeout(Duration::from_secs(5), async {
-        loop {
-            let event = client
-                .next_event()
-                .await
-                .expect("event stream should stay open");
-            if let AppServerEvent::ServerNotification(ServerNotification::AccountLoginCompleted(
-                notification,
-            )) = event
-            {
-                break notification;
-            }
-        }
-    })
-    .await
-    .expect("account/login/completed notification should arrive");
-    assert_eq!(login_completed.login_id, None);
-    assert_eq!(login_completed.success, true);
-    assert_eq!(login_completed.error, None);
-
-    let account_updated = timeout(Duration::from_secs(5), async {
-        loop {
-            let event = client
-                .next_event()
-                .await
-                .expect("event stream should stay open");
-            if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
-                notification,
-            )) = event
-            {
-                break notification;
-            }
-        }
-    })
-    .await
-    .expect("account/updated notification should arrive");
-    assert_eq!(account_updated.auth_mode, Some(AuthMode::ChatgptAuthTokens));
-    assert_eq!(account_updated.plan_type, Some(AccountPlanType::Pro));
+    wait_for_external_auth_login_notifications(&mut client).await;
 
     let cancel_login: CancelLoginAccountResponse = client
         .request_typed(ClientRequest::CancelLoginAccount {
@@ -209,24 +172,7 @@ requires_openai_auth = true
         .expect("account/login/start should succeed through embedded gateway");
     assert_eq!(login, LoginAccountResponse::ChatgptAuthTokens {});
 
-    let account_updated = timeout(Duration::from_secs(5), async {
-        loop {
-            let event = client
-                .next_event()
-                .await
-                .expect("event stream should stay open");
-            if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
-                notification,
-            )) = event
-            {
-                break notification;
-            }
-        }
-    })
-    .await
-    .expect("account/updated notification should arrive");
-    assert_eq!(account_updated.auth_mode, Some(AuthMode::ChatgptAuthTokens));
-    assert_eq!(account_updated.plan_type, Some(AccountPlanType::Pro));
+    wait_for_external_auth_login_notifications(&mut client).await;
 
     let started: AppServerThreadStartResponse = client
         .request_typed(ClientRequest::ThreadStart {
@@ -267,4 +213,45 @@ requires_openai_auth = true
     assert_remote_client_shutdown(client.shutdown().await);
     server.shutdown().await.expect("shutdown");
     model_server.shutdown().await;
+}
+
+async fn wait_for_external_auth_login_notifications(client: &mut RemoteAppServerClient) {
+    let login_completed = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = client
+                .next_event()
+                .await
+                .expect("event stream should stay open");
+            if let AppServerEvent::ServerNotification(ServerNotification::AccountLoginCompleted(
+                notification,
+            )) = event
+            {
+                break notification;
+            }
+        }
+    })
+    .await
+    .expect("account/login/completed notification should arrive");
+    assert_eq!(login_completed.login_id, None);
+    assert_eq!(login_completed.success, true);
+    assert_eq!(login_completed.error, None);
+
+    let account_updated = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = client
+                .next_event()
+                .await
+                .expect("event stream should stay open");
+            if let AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(
+                notification,
+            )) = event
+            {
+                break notification;
+            }
+        }
+    })
+    .await
+    .expect("account/updated notification should arrive");
+    assert_eq!(account_updated.auth_mode, Some(AuthMode::ChatgptAuthTokens));
+    assert_eq!(account_updated.plan_type, Some(AccountPlanType::Pro));
 }
