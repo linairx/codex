@@ -1,0 +1,18 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+command: just test -p codex-gateway thread_start_marks_exhausted_account_and_retries_available_account
+scenario capture time: 2026-07-09T07:40:52Z
+
+RUST_MIN_STACK=8388608 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.55s
+────────────
+ Nextest run ID cbf3a252-5ff8-44d2-b172-6d88b89ea000 with nextest profile: local
+    Starting 1 test across 2 binaries (763 tests skipped)
+        PASS [   0.062s] (1/1) codex-gateway northbound::v2::tests::cases::v2_tests_cases_4::v2_tests_cases_4_thread_start::thread_start_marks_exhausted_account_and_retries_available_account
+────────────
+     Summary [   0.066s] 1 test run: 1 passed, 763 skipped

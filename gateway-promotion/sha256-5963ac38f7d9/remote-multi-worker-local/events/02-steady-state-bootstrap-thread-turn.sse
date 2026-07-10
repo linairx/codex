@@ -1,0 +1,34 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:05Z
+event: gateway/projectWorkerRouteSelected
+data: {"method":"gateway/projectWorkerRouteSelected","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"accountId":"acct-a","projectId":"project-a","tenantId":"tenant-a","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","workerId":0}}
+
+event: thread/started
+data: {"method":"thread/started","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"thread":{"agentNickname":null,"agentRole":null,"cliVersion":"0.0.0","createdAt":1783582806,"cwd":"/app","ephemeral":false,"extra":null,"forkedFromId":null,"gitInfo":null,"historyMode":"legacy","id":"019f45d1-d005-7da0-8b52-fe11b852e5e7","modelProvider":"openai","name":null,"parentThreadId":null,"path":"/home/codex/.codex/sessions/2026/07/09/rollout-2026-07-09T07-40-06-019f45d1-d005-7da0-8b52-fe11b852e5e7.jsonl","preview":"","recencyAt":1783582806,"sessionId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","source":"appServer","status":{"type":"idle"},"threadSource":null,"turns":[],"updatedAt":1783582806}}}
+
+event: thread/status/changed
+data: {"method":"thread/status/changed","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"status":{"activeFlags":[],"type":"active"},"threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7"}}
+
+event: turn/started
+data: {"method":"turn/started","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","turn":{"completedAt":null,"durationMs":null,"error":null,"id":"019f45d1-d0bf-7d12-b88b-2236a5767759","items":[],"itemsView":"notLoaded","startedAt":1783582806,"status":"inProgress"}}}
+
+event: error
+data: {"method":"error","threadId":"019f45d1-82e8-7270-828b-8c51b5942968","data":{"error":{"additionalDetails":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a185adbb48ac6097-SIN, request id: ac7a7a1d-974d-407b-8350-7c6f9ed4d47f","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}},"message":"Reconnecting... 3/5"},"threadId":"019f45d1-82e8-7270-828b-8c51b5942968","turnId":"019f45d1-838e-7071-b5e2-244ae27a8c09","willRetry":true}}
+
+event: item/started
+data: {"method":"item/started","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"item":{"clientId":null,"content":[{"text":"gateway docker multi-worker steady state","text_elements":[],"type":"text"}],"id":"a257186e-641a-4d23-a776-965870f1d78b","type":"userMessage"},"startedAtMs":1783582807538,"threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","turnId":"019f45d1-d0bf-7d12-b88b-2236a5767759"}}
+
+event: item/completed
+data: {"method":"item/completed","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"completedAtMs":1783582807538,"item":{"clientId":null,"content":[{"text":"gateway docker multi-worker steady state","text_elements":[],"type":"text"}],"id":"a257186e-641a-4d23-a776-965870f1d78b","type":"userMessage"},"threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","turnId":"019f45d1-d0bf-7d12-b88b-2236a5767759"}}
+
+event: error
+data: {"method":"error","threadId":"019f45d1-82e8-7270-828b-8c51b5942968","data":{"error":{"additionalDetails":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a185adc7ac5bdf08-SIN, request id: 48a44278-57e3-40ed-b75a-fcab49e32552","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}},"message":"Reconnecting... 4/5"},"threadId":"019f45d1-82e8-7270-828b-8c51b5942968","turnId":"019f45d1-838e-7071-b5e2-244ae27a8c09","willRetry":true}}
+
+event: error
+data: {"method":"error","threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","data":{"error":{"additionalDetails":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: a185add10c8e9ba3-SIN","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}},"message":"Reconnecting... 2/5"},"threadId":"019f45d1-d005-7da0-8b52-fe11b852e5e7","turnId":"019f45d1-d0bf-7d12-b88b-2236a5767759","willRetry":true}}
+

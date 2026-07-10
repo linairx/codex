@@ -1,0 +1,8 @@
+gateway build: sha256-5963ac38f7d9
+worker build: embedded-in-process
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: local-account
+capture time: 2026-07-09T00:22:34Z
+baseline health capture from http://127.0.0.1:8080/healthz

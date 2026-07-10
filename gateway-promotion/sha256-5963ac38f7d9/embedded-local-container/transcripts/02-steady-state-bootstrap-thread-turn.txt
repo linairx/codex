@@ -1,0 +1,15 @@
+gateway build: sha256-5963ac38f7d9
+worker build: embedded-in-process
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: local-account
+capture time: 2026-07-09T00:23:35Z
+POST /v1/threads
+{"thread":{"id":"019f4442-2d47-76a0-aa38-49d12aa94e8c","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783556615,"updatedAt":1783556615,"status":{"type":"idle"}}}
+GET /v1/threads/019f4442-2d47-76a0-aa38-49d12aa94e8c
+{"thread":{"id":"019f4442-2d47-76a0-aa38-49d12aa94e8c","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783556615,"updatedAt":1783556615,"status":{"type":"idle"}}}
+GET /v1/threads
+{"data":[],"nextCursor":null,"backwardsCursor":null}
+POST /v1/threads/019f4442-2d47-76a0-aa38-49d12aa94e8c/turns
+{"turn":{"id":"019f4442-2da7-7cf1-b309-120b312f826e","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}

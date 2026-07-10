@@ -1,0 +1,15 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+{
+  "scenario": "Reconnect and recovery",
+  "source": "codex-gateway targeted test",
+  "testFilter": "websocket_upgrade_reconnects_missing_worker_before_turn_start",
+  "summary": "worker reconnects before turn/start and preserves sticky routing",
+  "eventSummary": "gateway/v2WorkerReconnect, outcome=success",
+  "result": "passed"
+}

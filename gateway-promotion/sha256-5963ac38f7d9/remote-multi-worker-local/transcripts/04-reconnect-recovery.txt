@@ -1,0 +1,18 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+command: just test -p codex-gateway websocket_upgrade_reconnects_missing_worker_before_turn_start
+scenario capture time: 2026-07-09T07:40:52Z
+
+RUST_MIN_STACK=8388608 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+────────────
+ Nextest run ID 488db434-742d-48d9-9666-ccdb5977ae52 with nextest profile: local
+    Starting 1 test across 2 binaries (763 tests skipped)
+        PASS [   0.230s] (1/1) codex-gateway northbound::v2::tests::cases::v2_tests_cases_3::v2_tests_cases_3_late::v2_tests_cases_3_late_reconnect::v2_tests_cases_3_late_reconnect_routes::v2_tests_cases_3_late_reconnect_routes_turn_start::websocket_upgrade_reconnects_missing_worker_before_turn_start
+────────────
+     Summary [   0.235s] 1 test run: 1 passed, 763 skipped

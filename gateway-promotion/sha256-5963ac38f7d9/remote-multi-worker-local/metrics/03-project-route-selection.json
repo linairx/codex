@@ -1,0 +1,45 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:25Z
+{
+  "metric": "gateway_project_worker_route_selections",
+  "note": "metrics backend not configured; route-selection metric represented by healthz counters for local Docker evidence",
+  "value": 5,
+  "workerCounts": [
+    {
+      "workerId": 0,
+      "projectWorkerRouteSelectionCount": 3
+    },
+    {
+      "workerId": 1,
+      "projectWorkerRouteSelectionCount": 2
+    }
+  ],
+  "lastProjectWorkerRouteSelectedWorkerId": 1,
+  "lastProjectWorkerRouteSelectedProjectId": "project-b",
+  "lastProjectWorkerRouteSelectedAccountId": "acct-b",
+  "projectWorkerRoutes": [
+    {
+      "tenantId": "tenant-a",
+      "projectId": "project-a",
+      "workerId": 0,
+      "accountId": "acct-a",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    },
+    {
+      "tenantId": "tenant-a",
+      "projectId": "project-b",
+      "workerId": 1,
+      "accountId": "acct-b",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    }
+  ]
+}

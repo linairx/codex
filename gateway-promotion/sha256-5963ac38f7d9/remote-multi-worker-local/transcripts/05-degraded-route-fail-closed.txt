@@ -1,0 +1,18 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+command: just test -p codex-gateway visible_thread_route_recovery_fails_closed_during_reconnect_backoff
+scenario capture time: 2026-07-09T07:40:52Z
+
+RUST_MIN_STACK=8388608 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+────────────
+ Nextest run ID 13630cbf-502e-4bc1-9468-16c3ce4765af with nextest profile: local
+    Starting 1 test across 2 binaries (763 tests skipped)
+        PASS [   0.017s] (1/1) codex-gateway northbound::v2::tests::cases::v2_tests_cases_2::v2_tests_cases_2_thread_handoff::v2_tests_cases_2_thread_route_recovery::visible_thread_route_recovery_fails_closed_during_reconnect_backoff
+────────────
+     Summary [   0.022s] 1 test run: 1 passed, 763 skipped

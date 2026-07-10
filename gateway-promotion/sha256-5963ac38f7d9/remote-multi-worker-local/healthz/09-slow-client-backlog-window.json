@@ -1,0 +1,14 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+{
+  "scenario": "Slow-client or backlog window",
+  "source": "codex-gateway targeted test",
+  "testFilter": "observe_v2_connection_records_client_send_timeout_outcome",
+  "summary": "slow client exposes bounded server-request backlog and send timeout health",
+  "result": "passed"
+}

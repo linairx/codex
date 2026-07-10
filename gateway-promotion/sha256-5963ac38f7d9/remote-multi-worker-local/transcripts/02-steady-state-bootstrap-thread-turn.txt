@@ -1,0 +1,15 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:05Z
+GET /v1/threads project-a
+{"data":[],"nextCursor":null,"backwardsCursor":null}
+POST /v1/threads project-a
+{"thread":{"id":"019f45d1-d005-7da0-8b52-fe11b852e5e7","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783582806,"updatedAt":1783582806,"status":{"type":"idle"}}}
+GET /v1/threads/019f45d1-d005-7da0-8b52-fe11b852e5e7 project-a
+{"thread":{"id":"019f45d1-d005-7da0-8b52-fe11b852e5e7","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783582806,"updatedAt":1783582806,"status":{"type":"idle"}}}
+POST /v1/threads/019f45d1-d005-7da0-8b52-fe11b852e5e7/turns project-a
+{"turn":{"id":"019f45d1-d0bf-7d12-b88b-2236a5767759","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}

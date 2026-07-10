@@ -1,0 +1,18 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+command: just test -p codex-gateway active_thread_account_exhaustion_publishes_handoff_failure_event
+scenario capture time: 2026-07-09T07:40:52Z
+
+RUST_MIN_STACK=8388608 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+────────────
+ Nextest run ID 6d8b1882-a266-48c9-9e45-44f9a9805cf3 with nextest profile: local
+    Starting 1 test across 2 binaries (763 tests skipped)
+        PASS [   0.189s] (1/1) codex-gateway northbound::v2::tests::cases::v2_tests_cases_4::v2_tests_cases_4_thread_start_tail_account_capacity::active_thread_account_exhaustion_publishes_handoff_failure_event
+────────────
+     Summary [   0.194s] 1 test run: 1 passed, 763 skipped

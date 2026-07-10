@@ -1,0 +1,15 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+{
+  "scenario": "Bounded restoration",
+  "source": "codex-gateway targeted test",
+  "testFilter": "thread_read_uses_replacement_worker_when_pinned_account_is_exhausted",
+  "summary": "thread/read restores bounded context through a replacement worker",
+  "eventSummary": "gateway/accountThreadHandoffSucceeded",
+  "result": "passed"
+}

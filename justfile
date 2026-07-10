@@ -272,6 +272,16 @@ gateway-promotion-artifact-capture-test:
 gateway-promotion-scenario-capture *args:
     if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-scenario.sh "$@"
 
+# Capture repeatable targeted-test evidence for the gateway promotion fault matrix.
+[no-cd]
+gateway-promotion-fault-matrix-capture *args:
+    if [ "${1:-}" = "--" ]; then shift; fi; {{ justfile_directory() }}/scripts/capture-gateway-promotion-fault-matrix.sh "$@"
+
+# Smoke-test the gateway promotion fault-matrix capture helper.
+[no-cd]
+gateway-promotion-fault-matrix-capture-test:
+    {{ justfile_directory() }}/scripts/test-capture-gateway-promotion-fault-matrix.sh
+
 # Smoke-test the gateway promotion scenario capture helper.
 [no-cd]
 gateway-promotion-scenario-capture-test:

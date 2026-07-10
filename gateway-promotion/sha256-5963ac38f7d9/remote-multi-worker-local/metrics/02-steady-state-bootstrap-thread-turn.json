@@ -1,0 +1,31 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:05Z
+{
+  "note": "metrics backend not configured; route counters captured from healthz",
+  "projectWorkerRouteSelectionCount": 2,
+  "projectWorkerRoutes": [
+    {
+      "tenantId": "tenant-a",
+      "projectId": "project-a",
+      "workerId": 0,
+      "accountId": "acct-a",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    },
+    {
+      "tenantId": "tenant-a",
+      "projectId": "project-b",
+      "workerId": 1,
+      "accountId": "acct-b",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:25Z
+POST /v1/threads project-a
+{"thread":{"id":"019f45d2-1bf1-72c1-82a0-68ebf7c64dc2","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783582825,"updatedAt":1783582825,"status":{"type":"idle"}}}
+POST /v1/threads/019f45d2-1bf1-72c1-82a0-68ebf7c64dc2/turns project-a
+{"turn":{"id":"019f45d2-1c16-7860-84b4-90d21291aaf1","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
+POST /v1/threads project-b
+{"thread":{"id":"019f45d2-1c1e-7d40-b98b-a09ce79c43de","preview":"","ephemeral":false,"modelProvider":"openai","createdAt":1783582825,"updatedAt":1783582825,"status":{"type":"idle"}}}
+POST /v1/threads/019f45d2-1c1e-7d40-b98b-a09ce79c43de/turns project-b
+{"turn":{"id":"019f45d2-1c42-7020-aeef-c9dd2626a8c7","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
+health route summary
+{
+  "projectWorkerRouteSelectionCount": 5,
+  "projectWorkerRoutes": [
+    {
+      "tenantId": "tenant-a",
+      "projectId": "project-a",
+      "workerId": 0,
+      "accountId": "acct-a",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    },
+    {
+      "tenantId": "tenant-a",
+      "projectId": "project-b",
+      "workerId": 1,
+      "accountId": "acct-b",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    }
+  ]
+}

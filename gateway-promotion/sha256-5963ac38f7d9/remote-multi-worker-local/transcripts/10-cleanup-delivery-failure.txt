@@ -1,0 +1,18 @@
+gateway build: sha256-5963ac38f7d9
+worker build: sha256-ddb5ca60b296
+tenant id: tenant-a
+project id: project-a
+worker id: 0
+account id: acct-a
+capture time: 2026-07-09T07:40:52Z
+command: just test -p codex-gateway websocket_upgrade_logs_worker_cleanup_ids_when_worker_disconnects_with_pending_connection_server_request
+scenario capture time: 2026-07-09T07:40:52Z
+
+RUST_MIN_STACK=8388608 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+────────────
+ Nextest run ID ef1ea1c5-92a5-4d38-a26b-64baa7a65db6 with nextest profile: local
+    Starting 1 test across 2 binaries (763 tests skipped)
+        PASS [   0.018s] (1/1) codex-gateway northbound::v2::tests::cases::v2_tests_cases_4::v2_tests_cases_4_late::v2_tests_cases_4_late_cleanup_tail::v2_tests_cases_4_late_connection_cleanup::websocket_upgrade_logs_worker_cleanup_ids_when_worker_disconnects_with_pending_connection_server_request
+────────────
+     Summary [   0.022s] 1 test run: 1 passed, 763 skipped
