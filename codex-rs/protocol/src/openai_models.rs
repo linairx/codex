@@ -375,7 +375,6 @@ pub struct ModelInfo {
     pub model_messages: Option<ModelMessages>,
     #[serde(default)]
     pub include_skills_usage_instructions: bool,
-    pub supports_reasoning_summaries: bool,
     #[serde(default)]
     pub default_reasoning_summary: ReasoningSummary,
     pub support_verbosity: bool,
@@ -466,14 +465,17 @@ impl ModelInfo {
                 .get_personality_message(personality)
                 .unwrap_or_default();
             template.replace(PERSONALITY_PLACEHOLDER, personality_message.as_str())
-        } else if let Some(personality) = personality {
-            warn!(
-                model = %self.slug,
-                %personality,
-                "Model personality requested but model_messages is missing, falling back to base instructions."
-            );
-            self.base_instructions.clone()
         } else {
+            match personality {
+                Some(personality @ (Personality::Friendly | Personality::Pragmatic)) => {
+                    warn!(
+                        model = %self.slug,
+                        %personality,
+                        "Model personality requested but model_messages is missing, falling back to base instructions."
+                    );
+                }
+                Some(Personality::None) | None => {}
+            }
             self.base_instructions.clone()
         }
     }
@@ -678,7 +680,6 @@ mod tests {
             base_instructions: "base".to_string(),
             model_messages: spec,
             include_skills_usage_instructions: false,
-            supports_reasoning_summaries: false,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
             default_verbosity: None,
@@ -981,7 +982,6 @@ mod tests {
             "upgrade": null,
             "base_instructions": "base",
             "model_messages": null,
-            "supports_reasoning_summaries": false,
             "default_reasoning_summary": "auto",
             "support_verbosity": false,
             "default_verbosity": null,
