@@ -1,0 +1,8 @@
+gateway build: codex-gateway-6e29ba757b
+worker build: embedded
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: chatgpt-authenticated
+capture time: 2026-07-11T10:38:10Z
+{"note":"export gateway metrics for this capture window from the configured telemetry backend"}

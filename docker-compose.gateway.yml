@@ -29,6 +29,8 @@ services:
       CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS: ${CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_ACCOUNT_IDS:-}
       CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS: ${CODEX_GATEWAY_REMOTE_ACCOUNT_POOL_LOGIN_STATE_PATHS:-}
       CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_STATE_PATHS: ${CODEX_GATEWAY_REMOTE_ACCOUNT_LOGIN_STATE_PATHS:-}
+    volumes:
+      - ./config/gateway-metrics.toml:/home/codex/.codex/config.toml:ro
   app-server:
     profiles:
       - remote
@@ -57,27 +59,8 @@ services:
       - |
         set -eu
 
-        wait_for_readyz() {
-          readyz_url=$$1
-          attempt=0
-          while :; do
-            if wget -qO- "$$readyz_url" >/dev/null 2>&1; then
-              return 0
-            fi
-            attempt=$$((attempt + 1))
-            if [ "$$attempt" -ge 30 ]; then
-              echo "timed out waiting for app-server at $$readyz_url" >&2
-              exit 1
-            fi
-            sleep 1
-          done
-        }
-
-        wait_for_readyz http://app-server-a:9001/readyz
-        wait_for_readyz http://app-server-b:9001/readyz
-
-        nc -lk -p 19001 -s 127.0.0.1 -e nc app-server-a 9001 &
-        nc -lk -p 19002 -s 127.0.0.1 -e nc app-server-b 9001 &
+        socat TCP-LISTEN:19001,bind=127.0.0.1,reuseaddr,fork TCP:app-server-a:9001 &
+        socat TCP-LISTEN:19002,bind=127.0.0.1,reuseaddr,fork TCP:app-server-b:9001 &
 
         exec /usr/local/bin/codex-gateway \
           --listen "$${CODEX_GATEWAY_LISTEN:-0.0.0.0:8080}" \
@@ -107,6 +90,8 @@ services:
       CODEX_GATEWAY_REMOTE_ACCOUNT_B_ID: ${CODEX_GATEWAY_REMOTE_ACCOUNT_B_ID:-acct-b}
       CODEX_GATEWAY_REMOTE_ACCOUNT_A_LOGIN_STATE_PATH: ${CODEX_GATEWAY_REMOTE_ACCOUNT_A_LOGIN_STATE_PATH:-/codex-home/acct-a}
       CODEX_GATEWAY_REMOTE_ACCOUNT_B_LOGIN_STATE_PATH: ${CODEX_GATEWAY_REMOTE_ACCOUNT_B_LOGIN_STATE_PATH:-/codex-home/acct-b}
+    volumes:
+      - ./config/gateway-metrics.toml:/home/codex/.codex/config.toml:ro
   app-server-a:
     profiles:
       - remote-multi-worker
@@ -126,6 +111,20 @@ services:
       dockerfile: Dockerfile.app-server
     image: codex-app-server:local
     restart: unless-stopped
+    user: "${CODEX_GATEWAY_WORKER_B_UID:-1000}:${CODEX_GATEWAY_WORKER_B_GID:-1000}"
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - >-
+        mkdir -p /tmp/codex && cp /run/codex-auth/auth.json /tmp/codex/auth.json &&
+        exec /usr/local/bin/codex-app-server
+        --listen "$${CODEX_APP_SERVER_LISTEN}"
+        --session-source app-server
+        --ws-auth capability-token
+        --ws-token-sha256 "$$(printf '%s' "$${CODEX_APP_SERVER_WS_TOKEN}" | sha256sum | awk '{print $$1}')"
     environment:
+      CODEX_HOME: /tmp/codex
       CODEX_APP_SERVER_WS_TOKEN: ${CODEX_GATEWAY_REMOTE_AUTH_TOKEN:-codex-local-worker-token}
       CODEX_APP_SERVER_LISTEN: ws://0.0.0.0:9001
+    volumes:
+      - ${HOME}/.codex/auth.json:/run/codex-auth/auth.json:ro

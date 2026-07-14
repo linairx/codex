@@ -1,0 +1,10 @@
+gateway build: codex-gateway-6e29ba757b
+worker build: embedded
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: none
+capture time: 2026-07-11T04:47:30Z
+POST /v1/threads -> thread_id=019f4f80-868e-7672-9f0a-c118d7b8237b
+{"turn":{"id":"019f4f80-8698-7f40-8b2f-2268b51ae218","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
+HTTP_STATUS:200

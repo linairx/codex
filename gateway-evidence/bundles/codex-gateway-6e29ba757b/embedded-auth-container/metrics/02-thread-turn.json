@@ -1,0 +1,8 @@
+gateway build: codex-gateway-6e29ba757b
+worker build: embedded
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: chatgpt-authenticated
+capture time: 2026-07-11T10:43:21Z
+No local metrics backend was configured for this Docker container; gateway metrics are exported through the configured codex_otel pipeline.

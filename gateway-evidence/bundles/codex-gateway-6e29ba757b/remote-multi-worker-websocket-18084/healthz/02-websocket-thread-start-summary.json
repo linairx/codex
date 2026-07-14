@@ -1,0 +1,63 @@
+{
+  "runtimeMode": "remote",
+  "executionMode": "workerManaged",
+  "v2Compatibility": "remoteMultiWorker",
+  "v2Connections": {
+    "totalConnectionCount": 2,
+    "peakActiveConnectionCount": 1,
+    "requestCounts": [
+      {
+        "method": "initialize",
+        "outcome": "ok",
+        "count": 2
+      },
+      {
+        "method": "thread/start",
+        "outcome": "ok",
+        "count": 2
+      }
+    ],
+    "lastRequestMethod": "thread/start",
+    "lastRequestOutcome": "ok",
+    "connectionOutcomeCounts": [
+      {
+        "outcome": "client_closed",
+        "count": 2
+      }
+    ]
+  },
+  "remoteWorkers": [
+    {
+      "workerId": 0,
+      "accountId": "acct-a",
+      "healthy": true,
+      "accountCapacity": "available"
+    },
+    {
+      "workerId": 1,
+      "accountId": "acct-b",
+      "healthy": true,
+      "accountCapacity": "available"
+    }
+  ],
+  "projectWorkerRoutes": [
+    {
+      "tenantId": "tenant-evidence-ws",
+      "projectId": "project-ws-a",
+      "workerId": 0,
+      "accountId": "acct-a",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    },
+    {
+      "tenantId": "tenant-evidence-ws",
+      "projectId": "project-ws-b",
+      "workerId": 1,
+      "accountId": "acct-b",
+      "accountCapacity": "available",
+      "workerHealthy": true,
+      "accountRoutingEligible": true
+    }
+  ]
+}

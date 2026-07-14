@@ -39,9 +39,11 @@ RUN cargo build --locked -p codex-gateway --release
 
 FROM codex-alpine:3.24 AS runtime
 
-RUN apk add --no-cache ca-certificates libgcc wget
+RUN apk add --no-cache ca-certificates libgcc socat wget
 
-RUN adduser -D -u 10001 codex
+RUN adduser -D -u 10001 codex \
+    && mkdir -p /home/codex/.codex \
+    && chown codex:codex /home/codex/.codex
 
 WORKDIR /app
 

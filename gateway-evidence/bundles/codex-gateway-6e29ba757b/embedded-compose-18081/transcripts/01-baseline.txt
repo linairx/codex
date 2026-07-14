@@ -1,0 +1,8 @@
+gateway build: codex-gateway-6e29ba757b
+worker build: embedded
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: none
+capture time: 2026-07-11T04:46:14Z
+baseline health capture from http://127.0.0.1:18081/healthz

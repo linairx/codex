@@ -1,0 +1,5 @@
+[analytics]
+enabled = true
+
+[features]
+runtime_metrics = true

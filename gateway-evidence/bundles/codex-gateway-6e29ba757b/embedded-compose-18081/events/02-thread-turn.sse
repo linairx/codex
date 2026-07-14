@@ -1,0 +1,7 @@
+gateway build: codex-gateway-6e29ba757b
+worker build: embedded
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: none
+capture time: 2026-07-11T04:47:30Z

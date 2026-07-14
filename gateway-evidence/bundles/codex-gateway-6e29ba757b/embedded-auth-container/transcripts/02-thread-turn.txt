@@ -1,0 +1,10 @@
+gateway build: codex-gateway-6e29ba757b
+worker build: embedded
+tenant id: local
+project id: /tmp/project
+worker id: 0
+account id: chatgpt-authenticated
+capture time: 2026-07-11T10:43:21Z
+POST /v1/threads -> thread_id=019f50c6-4f03-70c1-8732-85359615ee71
+{"turn":{"id":"019f50c6-4f61-7ff2-8eba-e79c19252fe7","status":"inProgress","startedAt":null,"completedAt":null,"durationMs":null,"errorMessage":null}}
+HTTP_STATUS:200

@@ -25,6 +25,8 @@ printf '%s\n' "$multi_worker_config" | grep -Fq 'app-server-a:'
 printf '%s\n' "$multi_worker_config" | grep -Fq 'app-server-b:'
 printf '%s\n' "$multi_worker_config" | grep -Fq 'ws://127.0.0.1:19001/v2'
 printf '%s\n' "$multi_worker_config" | grep -Fq 'ws://127.0.0.1:19002/v2'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'socat TCP-LISTEN:19001,bind=127.0.0.1,reuseaddr,fork TCP:app-server-a:9001'
+printf '%s\n' "$multi_worker_config" | grep -Fq 'socat TCP-LISTEN:19002,bind=127.0.0.1,reuseaddr,fork TCP:app-server-b:9001'
 printf '%s\n' "$multi_worker_config" | grep -Fq 'condition: service_healthy'
 printf '%s\n' "$multi_worker_config" | grep -Fq 'published: "8081"'
 
@@ -33,7 +35,7 @@ grep -Fq '!scripts/' "$dockerignore"
 grep -Fq '!scripts/**' "$dockerignore"
 
 if [ "${CODEX_GATEWAY_DOCKER_COMPOSE_BUILD:-0}" = "1" ]; then
-  docker compose -f "$compose_file" build gateway app-server gateway-multi-worker app-server-a app-server-b
+  docker compose -f "$compose_file" build gateway app-server
 fi
 
 if [ "${CODEX_GATEWAY_DOCKER_COMPOSE_RUN:-0}" != "1" ]; then
@@ -75,13 +77,33 @@ with urllib.request.urlopen(sys.argv[1], timeout=1) as response:
 PY
 }
 
+create_thread() {
+  project_id=$1
+  curl --fail --silent --show-error \
+    -H 'content-type: application/json' \
+    -H 'x-codex-tenant-id: compose-smoke' \
+    -H "x-codex-project-id: $project_id" \
+    --data '{"cwd":"/tmp/'"$project_id"'","ephemeral":true}' \
+    "${health_url%/healthz}/v1/threads"
+}
+
+read_thread() {
+  project_id=$1
+  thread_id=$2
+
+  curl --fail --silent --show-error --max-time 10 \
+    -H 'x-codex-tenant-id: compose-smoke' \
+    -H "x-codex-project-id: $project_id" \
+    "${health_url%/healthz}/v1/threads/$thread_id"
+}
+
 wait_for_healthz() {
   jq_filter=$1
   label=$2
-  deadline=$((SECONDS + 60))
+  deadline=$(($(date +%s) + 60))
   last_body=""
 
-  while [ "$SECONDS" -lt "$deadline" ]; do
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     if last_body=$(fetch_healthz 2>/dev/null); then
       if printf '%s\n' "$last_body" | jq -e "$jq_filter" >/dev/null; then
         return 0
@@ -116,8 +138,46 @@ wait_for_healthz \
 compose --profile remote down -v --remove-orphans
 
 CODEX_GATEWAY_MULTI_WORKER_PORT="$smoke_port" \
+CODEX_GATEWAY_V2_RECONNECT_RETRY_BACKOFF_SECONDS=1 \
   compose --profile remote-multi-worker up -d --no-build \
     gateway-multi-worker app-server-a app-server-b
 wait_for_healthz \
   '.runtimeMode == "remote" and .v2Compatibility == "remoteMultiWorker" and (.remoteWorkers | length) == 2 and all(.remoteWorkers[]; .healthy == true) and .remoteAccountLabelsComplete == true and .workerPool.accountCount == 2 and .workerPool.leasedAccountCount == 2 and .workerPool.healthyWorkerSlotCount == 2 and (.remoteWorkers[] | select(.workerId == 0 and .websocketUrl == "ws://127.0.0.1:19001/v2" and .accountId == "acct-a")) and (.remoteWorkers[] | select(.workerId == 1 and .websocketUrl == "ws://127.0.0.1:19002/v2" and .accountId == "acct-b"))' \
   "remote multi-worker gateway health"
+
+create_thread "project-a" >/dev/null
+thread_b=$(create_thread "project-b")
+thread_b_id=$(printf '%s\n' "$thread_b" | jq -er '.thread.id')
+wait_for_healthz \
+  '(.projectWorkerRoutes[] | select(.tenantId == "compose-smoke" and .projectId == "project-a" and .workerId == 0)) and (.projectWorkerRoutes[] | select(.tenantId == "compose-smoke" and .projectId == "project-b" and .workerId == 1))' \
+  "project routes pinned to separate workers"
+
+compose --profile remote-multi-worker stop app-server-b
+wait_for_healthz \
+  '(.remoteWorkers[] | select(.workerId == 1 and .healthy == false and .reconnecting == true))' \
+  "worker B reconnecting after stop"
+
+if read_thread "project-b" "$thread_b_id"; then
+  echo "thread/read unexpectedly succeeded while worker B was stopped" >&2
+  exit 1
+fi
+
+compose --profile remote-multi-worker up -d --no-build app-server-b
+deadline=$(($(date +%s) + 60))
+recovered_thread=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  if recovered_thread=$(read_thread "project-b" "$thread_b_id" 2>/dev/null); then
+    printf '%s\n' "$recovered_thread" | jq -e --arg thread_id "$thread_b_id" '.thread.id == $thread_id' >/dev/null
+    break
+  fi
+  sleep 1
+done
+
+if [ "${recovered_thread:-}" = "" ]; then
+  echo "timed out waiting for thread/read to recover through worker B" >&2
+  exit 1
+fi
+
+wait_for_healthz \
+  '(.remoteWorkers[] | select(.workerId == 1 and .healthy == true and .reconnecting == false))' \
+  "worker B reconnect recovery"
