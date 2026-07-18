@@ -112,7 +112,10 @@ fn clear_instruction_messages(model: &mut ModelInfo) {
     if let Some(model_messages) = &mut model.model_messages {
         model_messages.instructions_template = None;
         model_messages.instructions_variables = None;
-        if model_messages.approvals.is_none() {
+        if model_messages.approvals.is_none()
+            && model_messages.auto_review.is_none()
+            && model_messages.permissions.is_none()
+        {
             model.model_messages = None;
         }
     }
@@ -139,6 +142,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         base_instructions: BASE_INSTRUCTIONS.to_string(),
         model_messages: local_personality_messages_for_slug(slug),
         include_skills_usage_instructions: false,
+        supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
@@ -175,6 +179,8 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
                 personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
             }),
             approvals: None,
+            auto_review: None,
+            permissions: None,
         }),
         _ => None,
     }
