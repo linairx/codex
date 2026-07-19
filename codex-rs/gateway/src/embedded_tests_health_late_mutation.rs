@@ -63,6 +63,7 @@ async fn remote_multi_worker_deduplicates_external_agent_import_completed_notifi
             params: ExternalAgentConfigImportParams {
                 migration_items: Vec::new(),
                 source: None,
+                migration_source: None,
             },
         }),
     )
@@ -161,6 +162,7 @@ async fn remote_multi_worker_supports_drop_in_v2_client_setup_mutation_workflow(
             params: ExternalAgentConfigImportParams {
                 migration_items: Vec::new(),
                 source: None,
+                migration_source: None,
             },
         }),
     )

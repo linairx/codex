@@ -89,6 +89,7 @@ async fn remote_multi_worker_v2_session_readds_recovered_worker_for_setup_mutati
             params: ExternalAgentConfigImportParams {
                 migration_items: Vec::new(),
                 source: None,
+                migration_source: None,
             },
         })
         .await

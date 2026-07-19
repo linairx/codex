@@ -450,6 +450,8 @@ async fn remote_multi_worker_aggregates_setup_discovery_requests_over_v2() {
             params: ExternalAgentConfigDetectParams {
                 include_home: true,
                 cwds: Some(vec!["/tmp/shared-repo".into()]),
+                source: None,
+                migration_source: None,
             },
         }),
     )

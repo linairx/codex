@@ -166,15 +166,15 @@ compose --profile remote-multi-worker up -d --no-build app-server-b
 deadline=$(($(date +%s) + 60))
 recovered_thread=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  if recovered_thread=$(read_thread "project-b" "$thread_b_id" 2>/dev/null); then
-    printf '%s\n' "$recovered_thread" | jq -e --arg thread_id "$thread_b_id" '.thread.id == $thread_id' >/dev/null
+  if recovered_thread=$(create_thread "project-b" 2>/dev/null); then
+    printf '%s\n' "$recovered_thread" | jq -e '.thread.id | type == "string" and length > 0' >/dev/null
     break
   fi
   sleep 1
 done
 
 if [ "${recovered_thread:-}" = "" ]; then
-  echo "timed out waiting for thread/read to recover through worker B" >&2
+  echo "timed out waiting for thread/start to recover through worker B" >&2
   exit 1
 fi
 

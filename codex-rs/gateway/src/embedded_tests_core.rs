@@ -463,6 +463,8 @@ async fn embedded_server_supports_drop_in_v2_client_bootstrap_setup_methods() {
             params: ExternalAgentConfigDetectParams {
                 include_home: false,
                 cwds: Some(vec![codex_home.path().to_path_buf()]),
+                source: None,
+                migration_source: None,
             },
         })
         .await
@@ -475,6 +477,7 @@ async fn embedded_server_supports_drop_in_v2_client_bootstrap_setup_methods() {
             params: ExternalAgentConfigImportParams {
                 migration_items: Vec::new(),
                 source: None,
+                migration_source: None,
             },
         })
         .await

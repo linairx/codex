@@ -449,6 +449,7 @@ async fn websocket_upgrade_reconnects_missing_worker_before_aggregated_bootstrap
                             "installPolicy": "AVAILABLE",
                             "installPolicySource": null,
                             "authPolicy": "ON_USE",
+                            "mustShowInstallationInterstitial": null,
                             "interface": {
                                 "displayName": "Worker A Plugin",
                                 "shortDescription": "Worker A plugin",
@@ -491,6 +492,7 @@ async fn websocket_upgrade_reconnects_missing_worker_before_aggregated_bootstrap
                             "installPolicy": "AVAILABLE",
                             "installPolicySource": null,
                             "authPolicy": "ON_USE",
+                            "mustShowInstallationInterstitial": null,
                             "interface": {
                                 "displayName": "Worker B Plugin",
                                 "shortDescription": "Worker B plugin",

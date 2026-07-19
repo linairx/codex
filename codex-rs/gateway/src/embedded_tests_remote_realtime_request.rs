@@ -221,7 +221,7 @@ stream_max_retries = 0
                 version: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
-                codex_response_handoff_prefix: None,
+                codex_response_handoff_mode: None,
                 include_startup_context: None,
             },
         })

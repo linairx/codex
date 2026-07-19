@@ -8,6 +8,8 @@ pub(super) async fn assert_bootstrap_setup_discovery_and_mcp(client: &mut Remote
             params: ExternalAgentConfigDetectParams {
                 include_home: false,
                 cwds: Some(vec![PathBuf::from("/tmp/remote-project")]),
+                source: None,
+                migration_source: None,
             },
         })
         .await
@@ -20,6 +22,7 @@ pub(super) async fn assert_bootstrap_setup_discovery_and_mcp(client: &mut Remote
             params: ExternalAgentConfigImportParams {
                 migration_items: Vec::new(),
                 source: None,
+                migration_source: None,
             },
         })
         .await

@@ -2,7 +2,7 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn embedded_gateway_environment_manager_preserves_remote_exec_server_url() {
+async fn embedded_gateway_environment_manager_builds_remote_environment() {
     let environment_manager = gateway_environment_manager(
         &GatewayConfig {
             exec_server_url: Some("ws://127.0.0.1:9753".to_string()),
@@ -19,7 +19,7 @@ async fn embedded_gateway_environment_manager_preserves_remote_exec_server_url()
     let environment = environment_manager
         .default_environment()
         .expect("default environment");
-    assert_eq!(environment.exec_server_url(), Some("ws://127.0.0.1:9753"));
+    assert!(environment.is_remote());
 }
 
 #[tokio::test]

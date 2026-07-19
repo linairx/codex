@@ -124,6 +124,8 @@ pub(crate) async fn start_reconnecting_v2_bootstrap_refresh_server() -> String {
                                     Some(serde_json::json!({
                                         "includeHome": true,
                                         "cwds": ["/tmp/reconnected-project"],
+                                        "source": null,
+                                        "migrationSource": null,
                                     })),
                                 );
                                 write_websocket_message(

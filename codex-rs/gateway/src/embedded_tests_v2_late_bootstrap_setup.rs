@@ -157,6 +157,8 @@ async fn remote_multi_worker_supports_drop_in_v2_client_bootstrap_setup_workflow
             params: ExternalAgentConfigDetectParams {
                 include_home: true,
                 cwds: Some(vec!["/tmp/shared-repo".into()]),
+                source: None,
+                migration_source: None,
             },
         }),
     )

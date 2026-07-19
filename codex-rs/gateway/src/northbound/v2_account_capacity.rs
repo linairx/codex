@@ -362,6 +362,7 @@ mod tests {
                 plan_type: None,
                 rate_limit_reached_type: None,
                 individual_limit: None,
+                spend_control_reached: None,
             },
             RateLimitSnapshot {
                 limit_id: Some("credits".to_string()),
@@ -372,6 +373,7 @@ mod tests {
                 plan_type: None,
                 rate_limit_reached_type: Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted),
                 individual_limit: None,
+                spend_control_reached: None,
             },
         ];
 

@@ -334,7 +334,7 @@ async fn validate_gateway_environment_manager(
         return Ok(());
     };
 
-    if environment.exec_server_url().is_none() {
+    if !environment.is_remote() {
         return Ok(());
     }
 

@@ -202,7 +202,7 @@ async fn remote_multi_worker_supports_v2_realtime_workflow_after_worker_reconnec
                 version: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
-                codex_response_handoff_prefix: None,
+                codex_response_handoff_mode: None,
                 include_startup_context: None,
             },
         })
@@ -226,7 +226,7 @@ async fn remote_multi_worker_supports_v2_realtime_workflow_after_worker_reconnec
                 version: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
-                codex_response_handoff_prefix: None,
+                codex_response_handoff_mode: None,
                 include_startup_context: None,
             },
         })

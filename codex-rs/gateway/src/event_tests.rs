@@ -40,6 +40,7 @@ fn builds_gateway_event_from_notification() {
             .expect("absolute path"),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::Custom("gateway".to_string()),
+        can_accept_direct_input: None,
         thread_source: None,
         agent_nickname: None,
         agent_role: None,

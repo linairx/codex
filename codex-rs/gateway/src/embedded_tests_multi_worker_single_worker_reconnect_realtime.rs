@@ -139,7 +139,7 @@ async fn remote_single_worker_supports_v2_realtime_workflow_after_worker_reconne
                 version: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
-                codex_response_handoff_prefix: None,
+                codex_response_handoff_mode: None,
                 include_startup_context: None,
             },
         })

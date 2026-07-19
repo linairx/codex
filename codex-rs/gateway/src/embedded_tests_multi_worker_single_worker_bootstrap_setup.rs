@@ -201,6 +201,7 @@ pub(super) async fn assert_bootstrap_refresh_setup_requests(v2_client: &mut Remo
             params: ExternalAgentConfigImportParams {
                 migration_items: Vec::new(),
                 source: None,
+                migration_source: None,
             },
         }),
     )

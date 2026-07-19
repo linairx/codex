@@ -88,6 +88,7 @@ async fn embedded_server_supports_drop_in_v2_client_account_rate_limits_read() {
                     RateLimitReachedType::WorkspaceMemberUsageLimitReached,
                 ),
                 individual_limit: None,
+                spend_control_reached: None,
             },
             rate_limits_by_limit_id: Some(
                 [
@@ -112,6 +113,7 @@ async fn embedded_server_supports_drop_in_v2_client_account_rate_limits_read() {
                                 RateLimitReachedType::WorkspaceMemberUsageLimitReached,
                             ),
                             individual_limit: None,
+                            spend_control_reached: None,
                         },
                     ),
                     (
@@ -129,6 +131,7 @@ async fn embedded_server_supports_drop_in_v2_client_account_rate_limits_read() {
                             plan_type: Some(AccountPlanType::Pro),
                             rate_limit_reached_type: None,
                             individual_limit: None,
+                            spend_control_reached: None,
                         },
                     ),
                 ]

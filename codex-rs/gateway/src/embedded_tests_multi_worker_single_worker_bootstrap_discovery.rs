@@ -40,6 +40,7 @@ pub(super) async fn assert_bootstrap_refresh_discovery_requests(
         plan_type: Some(AccountPlanType::Pro),
         rate_limit_reached_type: None,
         individual_limit: None,
+        spend_control_reached: None,
     };
     let rate_limits: GetAccountRateLimitsResponse = timeout(
         Duration::from_secs(5),
@@ -89,6 +90,8 @@ pub(super) async fn assert_bootstrap_refresh_discovery_requests(
             params: ExternalAgentConfigDetectParams {
                 include_home: true,
                 cwds: Some(vec![PathBuf::from("/tmp/reconnected-project")]),
+                source: None,
+                migration_source: None,
             },
         }),
     )
